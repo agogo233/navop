@@ -11,7 +11,6 @@ gpui.workspace = true
 gpui-component.workspace = true
 middleware-runtime.workspace = true
 one-core.workspace = true
-one-ui.workspace = true
 rust-i18n.workspace = true
 tracing.workspace = true
 

@@ -266,6 +266,8 @@ pub struct MiddlewareTopicsPage {
     topics: Vec<MiddlewareTopicInfo>,
     /// 加载状态
     load_state: LoadState,
+    /// 刷新代号(递增使旧在途刷新的回写失效)
+    refresh_generation: u64,
     /// 名称过滤词
     filter_text: String,
     /// 激活的类型过滤(空集=全部)
@@ -335,6 +337,7 @@ impl MiddlewareTopicsPage {
             capabilities,
             topics: Vec::new(),
             load_state: LoadState::Idle,
+            refresh_generation: 0,
             filter_text: String::new(),
             active_types: HashSet::new(),
             filter_input,
@@ -389,18 +392,26 @@ impl MiddlewareTopicsPage {
         });
     }
 
-    /// 刷新 Topic 列表
+    /// 刷新 Topic 列表(回写带 generation 防护,旧请求晚到不覆盖新数据)
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.load_state = LoadState::Loading;
+        // 递增代号使旧的在途刷新回写失效
+        let generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_generation = generation;
         let handle = self.handle.clone();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, async move {
                 handle.list_topics().await.map_err(anyhow::Error::new)
             })
             .await;
+            // generation 不匹配说明期间又发起了新刷新,过期数据直接丢弃
+            let stale = |view: &Self| view.refresh_generation != generation;
             match result {
                 Ok(topics) => {
                     _ = this.update(cx, |view, cx| {
+                        if stale(view) {
+                            return;
+                        }
                         view.topics = topics;
                         view.load_state = LoadState::Loaded;
                         view.page = 1;
@@ -418,6 +429,9 @@ impl MiddlewareTopicsPage {
                         ),
                     );
                     _ = this.update(cx, |view, cx| {
+                        if stale(view) {
+                            return;
+                        }
                         view.load_state = LoadState::Failed(message);
                         cx.notify();
                     });

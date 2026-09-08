@@ -31,6 +31,8 @@ pub struct MiddlewareOverviewPage {
     metrics: Option<MiddlewareMetrics>,
     /// 加载状态
     load_state: LoadState,
+    /// 刷新代号(递增使旧在途刷新的回写失效)
+    refresh_generation: u64,
     /// 焦点句柄
     focus_handle: FocusHandle,
 }
@@ -46,20 +48,25 @@ impl MiddlewareOverviewPage {
             overview: None,
             metrics: None,
             load_state: LoadState::Idle,
+            refresh_generation: 0,
             focus_handle: cx.focus_handle(),
         };
         this.refresh(cx);
         this
     }
 
-    /// 同时刷新集群概览与指标快照
+    /// 同时刷新集群概览与指标快照(两请求并发执行,回写带 generation 防护)
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.load_state = LoadState::Loading;
+        // 递增代号使旧的在途刷新回写失效
+        let generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_generation = generation;
         let handle = self.handle.clone();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
+            // 先创建两个任务再依次汇合:两请求在 Tokio 运行时并发执行(F6)
             // 两个数据源各自尽力加载,单个失败不影响另一个
-            let metrics_result = if handle.capabilities().metrics {
-                Tokio::spawn_result(cx, {
+            let metrics_task = if handle.capabilities().metrics {
+                Some(Tokio::spawn_result(cx, {
                     let handle = handle.clone();
                     async move {
                         handle
@@ -68,20 +75,25 @@ impl MiddlewareOverviewPage {
                             .map(Some)
                             .map_err(anyhow::Error::new)
                     }
-                })
-                .await
+                }))
             } else {
-                Ok::<Option<MiddlewareMetrics>, anyhow::Error>(None)
+                None
             };
-            let overview_result = if handle.capabilities().cluster_overview {
-                Tokio::spawn_result(cx, {
+            let overview_task = if handle.capabilities().cluster_overview {
+                Some(Tokio::spawn_result(cx, {
                     let handle = handle.clone();
                     async move { handle.cluster_overview().await.map_err(anyhow::Error::new) }
-                })
-                .await
-                .map(Some)
+                }))
             } else {
-                Ok::<Option<ClusterOverview>, anyhow::Error>(None)
+                None
+            };
+            let metrics_result = match metrics_task {
+                Some(task) => task.await,
+                None => Ok::<Option<MiddlewareMetrics>, anyhow::Error>(None),
+            };
+            let overview_result = match overview_task {
+                Some(task) => task.await.map(Some),
+                None => Ok::<Option<ClusterOverview>, anyhow::Error>(None),
             };
 
             let metrics = match metrics_result {
@@ -113,7 +125,11 @@ impl MiddlewareOverviewPage {
                 }
             };
 
+            // generation 不匹配说明期间又发起了新刷新,过期数据直接丢弃(F2)
             _ = this.update(cx, |view, cx| {
+                if view.refresh_generation != generation {
+                    return;
+                }
                 view.metrics = metrics;
                 view.overview = overview;
                 view.load_state = LoadState::Loaded;

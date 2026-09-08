@@ -324,6 +324,8 @@ pub struct MiddlewareMessagesPage {
     result: BackendPage,
     /// 加载状态
     load_state: LoadState,
+    /// 查询代号(递增使旧在途查询的回写失效)
+    refresh_generation: u64,
     /// 当前页(1 起,查询时传给后端)
     page: u32,
     /// 每页条数(10/20/50)
@@ -414,6 +416,7 @@ impl MiddlewareMessagesPage {
             mode: QueryMode::TimeWindow,
             result: BackendPage::default(),
             load_state: LoadState::Idle,
+            refresh_generation: 0,
             page: 1,
             page_size: 10,
             topic_input,
@@ -529,9 +532,12 @@ impl MiddlewareMessagesPage {
         }
     }
 
-    /// 执行查询并回填结果
+    /// 执行查询并回填结果(回写带 generation 防护,旧查询晚到不覆盖新结果)
     fn execute_query(&mut self, query: MessageQuery, cx: &mut Context<Self>) {
         self.load_state = LoadState::Loading;
+        // 递增代号使旧的在途查询回写失效
+        let generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_generation = generation;
         let handle = self.handle.clone();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Tokio::spawn_result(cx, async move {
@@ -541,9 +547,14 @@ impl MiddlewareMessagesPage {
                     .map_err(anyhow::Error::new)
             })
             .await;
+            // generation 不匹配说明期间又发起了新查询,过期结果直接丢弃
+            let stale = |view: &Self| view.refresh_generation != generation;
             match result {
                 Ok(page) => {
                     _ = this.update(cx, |view, cx| {
+                        if stale(view) {
+                            return;
+                        }
                         view.result = page;
                         view.load_state = LoadState::Loaded;
                         view.sync_table(cx);
@@ -560,6 +571,9 @@ impl MiddlewareMessagesPage {
                         ),
                     );
                     _ = this.update(cx, |view, cx| {
+                        if stale(view) {
+                            return;
+                        }
                         view.load_state = LoadState::Failed(message);
                         cx.notify();
                     });
