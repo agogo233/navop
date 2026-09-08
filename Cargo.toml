@@ -41,7 +41,7 @@ members = [
     "crates/json_view",
     "tools/gpui-rdp-smoke",
     "tools/windows-rdp-probe",
-    "main", "crates/ssh", "crates/x11_forwarding", "crates/sftp", "crates/sftp_transfer", "crates/sftp_view", "crates/one_ui", "crates/redis-runtime", "crates/mongodb-runtime", "crates/redis_view", "crates/license_tool", "crates/mongodb_view", "crates/remote_file_editor", "crates/remote_image_preview", "crates/mqtt-runtime", "crates/mqtt_view", "crates/middleware-runtime"]
+    "main", "crates/ssh", "crates/x11_forwarding", "crates/sftp", "crates/sftp_transfer", "crates/sftp_view", "crates/one_ui", "crates/redis-runtime", "crates/mongodb-runtime", "crates/redis_view", "crates/license_tool", "crates/mongodb_view", "crates/remote_file_editor", "crates/remote_image_preview", "crates/mqtt-runtime", "crates/mqtt_view", "crates/middleware-runtime", "crates/rocketmq-runtime"]
 resolver = "2"
 
 [workspace.package]
@@ -120,6 +120,7 @@ mongodb-runtime = { path = "crates/mongodb-runtime" }
 mqtt_view = { path = "crates/mqtt_view" }
 mqtt-runtime = { path = "crates/mqtt-runtime" }
 middleware-runtime = { path = "crates/middleware-runtime" }
+rocketmq-runtime = { path = "crates/rocketmq-runtime" }
 one-ui = { path = "crates/one_ui" }
 ssh = { path = "crates/ssh" }
 x11_forwarding = { path = "crates/x11_forwarding" }
@@ -197,6 +198,7 @@ sqlformat = "0.5.0"
 sqlparser = "0.62.0"
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
 rust_xlsxwriter = "0.94.0"
+sha1 = "0.10"
 dashmap = "5.5.3"
 moka = { version = "0.12", features = ["sync"] }
 thiserror="2.0.14"
