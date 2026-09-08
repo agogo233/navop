@@ -8363,6 +8363,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "middleware_view"
+version = "0.15.2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui_ce",
+ "gpui_ce_components",
+ "middleware-runtime",
+ "one-core",
+ "one-ui",
+ "rust-i18n",
+ "tracing",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8612,6 +8627,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "connection_tunnel",
+ "middleware-runtime",
  "one-core",
  "rumqttc",
  "rust-i18n",
@@ -8634,6 +8650,7 @@ dependencies = [
  "dashmap 5.5.3",
  "gpui_ce",
  "gpui_ce_components",
+ "middleware_view",
  "mqtt-runtime",
  "one-core",
  "one-ui",
@@ -12077,6 +12094,27 @@ dependencies = [
  "quote",
  "serde_json",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "rocketmq-runtime"
+version = "0.15.2"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "connection_tunnel",
+ "dashmap 5.5.3",
+ "hmac 0.12.1",
+ "middleware-runtime",
+ "one-core",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "sha1 0.10.6",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

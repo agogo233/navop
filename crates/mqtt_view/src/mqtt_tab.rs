@@ -8,11 +8,15 @@
 //! - 树 SubscriptionAdded/SubscriptionRemoved -> SubscribeView 刷新订阅列表
 //! - SubscribeView SubscriptionsChanged -> 树刷新订阅子节点
 
+use std::collections::HashSet;
+
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div, px,
 };
 use gpui_component::{ActiveTheme, Icon, IconName, IconSize, Sizable, h_flex};
+use middleware_view::{MiddlewareAdminHandle, MiddlewarePages};
+use mqtt_runtime::MqttAdminAdapter;
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::{ActiveConnections, StoredConnection, Workspace};
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent, TabItem};
@@ -37,6 +41,8 @@ pub struct MqttTabView {
     tab_container: Entity<TabContainer>,
     /// 默认操作页(订阅/消息/发布)
     subscribe_view: Entity<MqttSubscribeView>,
+    /// 已追加标准管理页签组的连接 ID(幂等防重)
+    middleware_tab_conns: HashSet<String>,
     /// 工作区信息
     workspace: Option<Workspace>,
     /// 焦点句柄
@@ -85,7 +91,7 @@ impl MqttTabView {
         subscriptions.push(cx.subscribe_in(
             &tree_view,
             window,
-            |this, tree, event: &MqttTreeViewEvent, _window, cx| match event {
+            |this, tree, event: &MqttTreeViewEvent, window, cx| match event {
                 MqttTreeViewEvent::ConnectionEstablished { connection_id } => {
                     let same_binding =
                         this.subscribe_view.read(cx).connection_id() == connection_id.as_str();
@@ -102,6 +108,8 @@ impl MqttTabView {
                             view.start_message_stream(cx);
                         });
                     }
+                    // 连接建立后追加标准管理页签组(按能力位降级,幂等防重)
+                    this.add_middleware_tabs(connection_id, window, cx);
                 }
                 MqttTreeViewEvent::ConnectionClosed { connection_id } => {
                     if this.subscribe_view.read(cx).connection_id() == connection_id.as_str() {
@@ -109,6 +117,8 @@ impl MqttTabView {
                             view.stop_message_stream(cx);
                         });
                     }
+                    // 连接断开后移除该连接的标准管理页签组
+                    this.remove_middleware_tabs(connection_id, window, cx);
                 }
                 MqttTreeViewEvent::SubscriptionAdded { connection_id, .. }
                 | MqttTreeViewEvent::SubscriptionRemoved { connection_id, .. } => {
@@ -144,6 +154,7 @@ impl MqttTabView {
             tree_view,
             tab_container,
             subscribe_view,
+            middleware_tab_conns: HashSet::new(),
             workspace,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -165,6 +176,53 @@ impl MqttTabView {
         } else {
             self.connections.first()
         }
+    }
+
+    /// 连接建立后追加标准管理页签组(Overview/Topics/Messages,按能力位生成)
+    ///
+    /// 页签持有独立的 MqttAdminAdapter(内部惰性打开 pubsub 流并维护本地缓冲/计数);
+    /// 幂等:同一连接只追加一次。
+    fn add_middleware_tabs(
+        &mut self,
+        connection_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if connection_id.is_empty() || self.middleware_tab_conns.contains(connection_id) {
+            return;
+        }
+        let Some(connection) = cx.global::<GlobalMqttState>().get_connection(connection_id) else {
+            return;
+        };
+        let handle: MiddlewareAdminHandle = std::sync::Arc::new(MqttAdminAdapter::new(connection));
+        let tabs = MiddlewarePages::new(handle, connection_id, window, cx);
+        if tabs.is_empty() {
+            return;
+        }
+        self.tab_container.update(cx, |container, cx| {
+            for tab in tabs {
+                container.add_tab(tab, cx);
+            }
+        });
+        self.middleware_tab_conns.insert(connection_id.to_string());
+    }
+
+    /// 连接断开后移除该连接的标准管理页签组
+    fn remove_middleware_tabs(
+        &mut self,
+        connection_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.middleware_tab_conns.remove(connection_id) {
+            return;
+        }
+        self.tab_container.update(cx, |container, cx| {
+            for suffix in ["overview", "topics", "groups", "messages"] {
+                let tab_id = format!("{connection_id}-{suffix}");
+                container.close_tab_by_id(&tab_id, window, cx).detach();
+            }
+        });
     }
 }
 

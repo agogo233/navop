@@ -12,6 +12,9 @@ mod builtin;
 #[cfg(feature = "builtin-mqtt")]
 pub use builtin::MqttConnectionImpl as BuiltinMqttConnection;
 
+pub mod admin;
+
+pub use admin::MqttAdminAdapter;
 pub use connection::MqttConnection;
 pub use pubsub::{MQTT_MESSAGE_CHANNEL_CAPACITY, MqttPubSubHandle};
 pub use types::*;

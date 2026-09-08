@@ -31,4 +31,19 @@ impl MqttPubSubHandle {
             }
         }
     }
+
+    /// 非阻塞接收:有待处理消息返回 `Some`;无消息或通道已关闭返回 `None`。
+    ///
+    /// 滞后(Lagged)表示本接收端消费过慢、旧消息已被广播端丢弃,此时跳过继续取后续消息。
+    /// 供管理适配器等需要批量排水(drain)缓冲的场景使用。
+    pub fn try_recv(&mut self) -> Option<MqttMessage> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(message) => return Some(message),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => return None,
+            }
+        }
+    }
 }

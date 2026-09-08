@@ -11,6 +11,7 @@ dashmap.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 ai_chat_view = { workspace = true, default-features = false }
+middleware_view.workspace = true
 mqtt-runtime.workspace = true
 one-core.workspace = true
 one-ui.workspace = true
