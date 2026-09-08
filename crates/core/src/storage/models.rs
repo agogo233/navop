@@ -911,18 +911,13 @@ impl RedisParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MongoDriverVariant {
+    #[default]
     Modern,
     Legacy,
     Legacy32,
-}
-
-impl Default for MongoDriverVariant {
-    fn default() -> Self {
-        Self::Modern
-    }
 }
 
 impl MongoDriverVariant {
@@ -1637,7 +1632,7 @@ impl DbConnectionConfig {
 
     pub fn server_info(&self) -> String {
         match self.database_type {
-            DatabaseType::SQLite | DatabaseType::DuckDB => format!("{}", self.host),
+            DatabaseType::SQLite | DatabaseType::DuckDB => self.host.clone(),
             _ => format!("{}:{}", self.host, self.port),
         }
     }
@@ -2388,7 +2383,7 @@ impl StoredConnection {
 
     pub fn from_db_connection(connection: DbConnectionConfig) -> Self {
         let name = connection.name.clone();
-        let workspace_id = connection.workspace_id.clone();
+        let workspace_id = connection.workspace_id;
         Self::new_database(name, connection, workspace_id)
     }
 

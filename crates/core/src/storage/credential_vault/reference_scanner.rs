@@ -45,14 +45,14 @@ impl CredentialRepository {
                 rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
             let identity = load_credential_identity(&transaction, credential_id)?;
             if identity.cloud_id.is_none()
-                && !transaction
+                && transaction
                     .query_row(
                         "SELECT 1 FROM credential_entries WHERE id = ?1",
                         [credential_id],
                         |_| Ok(()),
                     )
                     .optional()?
-                    .is_some()
+                    .is_none()
             {
                 transaction.commit()?;
                 return Ok(DeleteCredentialOutcome::NotFound);
