@@ -95,8 +95,8 @@ impl NewConnectionWindow {
     ) -> Option<NewConnectionKind> {
         kinds
             .iter()
-            .cloned()
             .find(|kind| category == NewConnectionCategory::All || kind.category() == category)
+            .cloned()
     }
 
     fn first_visible_item(&self, category: NewConnectionCategory) -> Option<NewConnectionKind> {
@@ -106,11 +106,11 @@ impl NewConnectionWindow {
     fn visible_items(&self) -> Vec<NewConnectionKind> {
         self.connection_kinds
             .iter()
-            .cloned()
             .filter(|kind| {
                 self.selected_category == NewConnectionCategory::All
                     || kind.category() == self.selected_category
             })
+            .cloned()
             .collect()
     }
 

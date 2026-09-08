@@ -14,11 +14,14 @@ use crate::universal_plugins::UniversalPluginService;
 
 enum State {
     Connecting,
-    Connected {
-        activation: ActivationHandle,
-        resource: OpenedExtensionResource,
-    },
+    /// 变体载荷远大于其他变体,整体装箱以压缩枚举尺寸
+    Connected(Box<ConnectedState>),
     Failed(String),
+}
+
+struct ConnectedState {
+    activation: ActivationHandle,
+    resource: OpenedExtensionResource,
 }
 
 pub(crate) struct ExtensionConnectionTab {
@@ -76,10 +79,12 @@ impl ExtensionConnectionTab {
         cx: &mut Context<Self>,
     ) {
         self.state = match result {
-            Ok((activation, resource)) if !self.closing => State::Connected {
-                activation,
-                resource,
-            },
+            Ok((activation, resource)) if !self.closing => {
+                State::Connected(Box::new(ConnectedState {
+                    activation,
+                    resource,
+                }))
+            }
             Ok((activation, mut resource)) => {
                 let service = self.service.clone();
                 one_core::gpui_tokio::Tokio::spawn_result(cx, async move {
@@ -99,13 +104,13 @@ impl ExtensionConnectionTab {
         self.closing = true;
         let state = std::mem::replace(&mut self.state, State::Failed("Connection closed".into()));
         self.connection_lease.take();
-        let State::Connected {
-            activation,
-            mut resource,
-        } = state
-        else {
+        let State::Connected(connected) = state else {
             return Task::ready(true);
         };
+        let ConnectedState {
+            activation,
+            mut resource,
+        } = *connected;
         let service = self.service.clone();
         let task = one_core::gpui_tokio::Tokio::spawn_result(cx, async move {
             resource.close().await;
@@ -150,13 +155,13 @@ impl Drop for ExtensionConnectionTab {
     fn drop(&mut self) {
         self.connection_lease.take();
         let state = std::mem::replace(&mut self.state, State::Failed("Connection dropped".into()));
-        let State::Connected {
-            activation,
-            mut resource,
-        } = state
-        else {
+        let State::Connected(connected) = state else {
             return;
         };
+        let ConnectedState {
+            activation,
+            mut resource,
+        } = *connected;
         let service = self.service.clone();
         self.tokio.spawn(async move {
             resource.close().await;
@@ -177,7 +182,8 @@ impl Render for ExtensionConnectionTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().p_4().child(match &self.state {
             State::Connecting => "Connecting extension...".to_string(),
-            State::Connected { resource, .. } => {
+            State::Connected(connected) => {
+                let resource = &connected.resource;
                 format!(
                     "Connected\n\nCapabilities:\n{}",
                     resource.capabilities().join("\n")
