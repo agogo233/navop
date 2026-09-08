@@ -21,6 +21,7 @@ pub(super) fn connection_share_text_for_locale(
         ConnectionType::Redis => redis_fields(locale, connection.to_redis_params().ok()?),
         ConnectionType::MongoDB => mongodb_fields(locale, connection.to_mongodb_params().ok()?),
         ConnectionType::Mqtt => mqtt_fields(locale, connection.to_mqtt_params().ok()?),
+        ConnectionType::Rocketmq => rocketmq_fields(locale, connection.to_rocketmq_params().ok()?),
         ConnectionType::Serial => serial_fields(locale, connection.to_serial_params().ok()?),
         ConnectionType::Telnet => telnet_fields(locale, connection.to_telnet_params().ok()?),
         ConnectionType::PortForwarding => {
@@ -180,6 +181,24 @@ fn mqtt_fields(locale: &str, params: one_core::storage::MqttParams) -> Vec<(&'st
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
         ),
+    ]
+}
+
+fn rocketmq_fields(
+    locale: &str,
+    params: one_core::storage::RocketmqParams,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("namesrv_addrs", params.namesrv_addrs.join(";")),
+        ("access_key", params.access_key.clone().unwrap_or_default()),
+        (
+            "acl",
+            tr(
+                locale,
+                yes_no_key(params.access_key.is_some() && params.secret_key.is_some()),
+            ),
+        ),
+        ("domain", params.domain.unwrap_or_default()),
     ]
 }
 
@@ -372,6 +391,7 @@ fn connection_type_key(connection_type: ConnectionType) -> &'static str {
         ConnectionType::Redis => "Connection.Share.type_redis",
         ConnectionType::MongoDB => "Connection.Share.type_mongodb",
         ConnectionType::Mqtt => "Connection.Share.type_mqtt",
+        ConnectionType::Rocketmq => "Connection.Share.type_rocketmq",
         ConnectionType::Serial => "Connection.Share.type_serial",
         ConnectionType::Telnet => "Connection.Share.type_telnet",
         ConnectionType::PortForwarding => "Connection.Share.type_port_forwarding",

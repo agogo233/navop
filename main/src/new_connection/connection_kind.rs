@@ -70,6 +70,7 @@ pub(super) enum NewConnectionKind {
     Redis,
     MongoDB,
     Mqtt,
+    Rocketmq,
     Serial,
     Telnet,
     PortForwarding,
@@ -95,6 +96,7 @@ impl NewConnectionKind {
             Self::Redis,
             Self::MongoDB,
             Self::Mqtt,
+            Self::Rocketmq,
             Self::Serial,
             Self::Telnet,
             Self::PortForwarding,
@@ -118,6 +120,7 @@ impl NewConnectionKind {
             Self::Redis => "Redis".to_string(),
             Self::MongoDB => "MongoDB".to_string(),
             Self::Mqtt => "MQTT".to_string(),
+            Self::Rocketmq => "RocketMQ".to_string(),
             Self::Serial => "Serial".to_string(),
             Self::Telnet => "Telnet".to_string(),
             Self::PortForwarding => t!("PortForwarding.new").to_string(),
@@ -136,6 +139,7 @@ impl NewConnectionKind {
             Self::Redis => t!("NewConnection.description_redis").to_string(),
             Self::MongoDB => t!("NewConnection.description_mongodb").to_string(),
             Self::Mqtt => t!("NewConnection.description_mqtt").to_string(),
+            Self::Rocketmq => t!("NewConnection.description_rocketmq").to_string(),
             Self::Serial => t!("NewConnection.description_serial").to_string(),
             Self::Telnet => t!("NewConnection.description_telnet").to_string(),
             Self::PortForwarding => t!("NewConnection.description_port_forwarding").to_string(),
@@ -156,7 +160,7 @@ impl NewConnectionKind {
             | Self::PortForwarding => NewConnectionCategory::Terminal,
             Self::MoreConnections => NewConnectionCategory::All,
             Self::Redis | Self::MongoDB => NewConnectionCategory::NoSql,
-            Self::Mqtt => NewConnectionCategory::Middleware,
+            Self::Mqtt | Self::Rocketmq => NewConnectionCategory::Middleware,
             Self::Database(DatabaseType::TDengine) => NewConnectionCategory::TimeSeries,
             Self::Database(_) => NewConnectionCategory::Database,
             Self::ExternalDatabase { category, .. } => {
@@ -180,6 +184,9 @@ impl NewConnectionKind {
                 connection_type_icon(ConnectionType::MongoDB, ConnectionVisualSize::Hero)
             }
             Self::Mqtt => connection_type_icon(ConnectionType::Mqtt, ConnectionVisualSize::Hero),
+            Self::Rocketmq => {
+                connection_type_icon(ConnectionType::Rocketmq, ConnectionVisualSize::Hero)
+            }
             Self::Serial => {
                 connection_type_icon(ConnectionType::Serial, ConnectionVisualSize::Hero)
             }

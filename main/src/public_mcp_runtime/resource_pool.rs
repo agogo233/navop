@@ -180,6 +180,7 @@ fn connection_kind(connection: &StoredConnection) -> ResourceKind {
         ConnectionType::Redis => ResourceKind::Redis,
         ConnectionType::MongoDB => ResourceKind::Mongo,
         ConnectionType::Mqtt => ResourceKind::Other("mqtt".into()),
+        ConnectionType::Rocketmq => ResourceKind::Other("rocketmq".into()),
         ConnectionType::Serial => ResourceKind::Terminal,
         ConnectionType::Telnet => ResourceKind::Terminal,
         ConnectionType::PortForwarding => ResourceKind::Other("port-forwarding".into()),

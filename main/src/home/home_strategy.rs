@@ -37,6 +37,10 @@ pub(crate) fn build_connection_open_strategy(
             connection,
             workspace,
         }),
+        ConnectionType::Rocketmq => Box::new(RocketmqOpenStrategy {
+            connection,
+            workspace,
+        }),
         ConnectionType::Serial => Box::new(SerialOpenStrategy { connection }),
         ConnectionType::Telnet => Box::new(TelnetOpenStrategy { connection }),
         ConnectionType::PortForwarding => Box::new(PortForwardingOpenStrategy { connection }),
@@ -316,6 +320,41 @@ impl ConnectionOpenStrategy for MqttOpenStrategy {
                 // 一期仅提供 builtin 后端;无后端时提示不可用
                 window.push_notification(
                     Notification::warning(format!("MQTT backend unavailable: {}", connection.name)),
+                    cx,
+                );
+            }
+        }
+    }
+}
+
+struct RocketmqOpenStrategy {
+    connection: StoredConnection,
+    workspace: Option<Workspace>,
+}
+
+impl ConnectionOpenStrategy for RocketmqOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        let RocketmqOpenStrategy {
+            connection,
+            workspace,
+        } = *self;
+        match rocketmq_runtime::default_backend_kind() {
+            rocketmq_runtime::RocketmqBackendKind::Builtin => {
+                home.open_rocketmq_tab_with_mode(connection, workspace, mode, window, cx);
+            }
+            rocketmq_runtime::RocketmqBackendKind::Unavailable => {
+                // 一期仅提供 builtin 后端;无后端时提示不可用
+                window.push_notification(
+                    Notification::warning(format!(
+                        "RocketMQ backend unavailable: {}",
+                        connection.name
+                    )),
                     cx,
                 );
             }

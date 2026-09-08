@@ -87,6 +87,7 @@ pub enum ConnectionType {
     Redis,
     MongoDB,
     Mqtt,
+    Rocketmq,
     Serial,
     Telnet,
     PortForwarding,
@@ -104,6 +105,7 @@ impl fmt::Display for ConnectionType {
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
             ConnectionType::Mqtt => "Mqtt",
+            ConnectionType::Rocketmq => "Rocketmq",
             ConnectionType::Serial => "Serial",
             ConnectionType::Telnet => "Telnet",
             ConnectionType::PortForwarding => "PortForwarding",
@@ -124,6 +126,7 @@ impl ConnectionType {
             ConnectionType::Redis,
             ConnectionType::MongoDB,
             ConnectionType::Mqtt,
+            ConnectionType::Rocketmq,
             ConnectionType::Serial,
             ConnectionType::Telnet,
             ConnectionType::PortForwarding,
@@ -139,6 +142,7 @@ impl ConnectionType {
             "Redis" => ConnectionType::Redis,
             "MongoDB" => ConnectionType::MongoDB,
             "Mqtt" => ConnectionType::Mqtt,
+            "Rocketmq" => ConnectionType::Rocketmq,
             "Serial" => ConnectionType::Serial,
             "Telnet" => ConnectionType::Telnet,
             "PortForwarding" => ConnectionType::PortForwarding,
@@ -157,6 +161,7 @@ impl ConnectionType {
             ConnectionType::Redis => "Redis",
             ConnectionType::MongoDB => "MongoDB",
             ConnectionType::Mqtt => "MQTT",
+            ConnectionType::Rocketmq => "RocketMQ",
             ConnectionType::Serial => "Serial",
             ConnectionType::Telnet => "Telnet",
             ConnectionType::PortForwarding => "Port Forwarding",
@@ -176,6 +181,9 @@ impl ConnectionType {
             // 外部 gpui-component 未提供 MQTT 品牌图标,
             // 核心层回退通用网络图标;品牌图标经应用 AssetSource 提供
             ConnectionType::Mqtt => IconName::Network,
+            // 外部 gpui-component 未提供 RocketMQ 品牌图标,同 MQTT 回退通用网络图标;
+            // 品牌图标经应用 AssetSource 提供
+            ConnectionType::Rocketmq => IconName::Network,
             ConnectionType::Serial => IconName::SerialPort,
             ConnectionType::Telnet => IconName::SquareTerminalColor,
             ConnectionType::PortForwarding => IconName::PortForwardingColor,
@@ -195,6 +203,8 @@ pub const NAVOP_TDENGINE_COLOR_ICON: &str = "navop/tdengine-color.svg";
 pub const NAVOP_TDENGINE_LINE_COLOR_ICON: &str = "navop/tdengine-line-color.svg";
 pub const NAVOP_MQTT_COLOR_ICON: &str = "navop/mqtt-color.svg";
 pub const NAVOP_MQTT_LINE_ICON: &str = "navop/mqtt-line.svg";
+pub const NAVOP_ROCKETMQ_COLOR_ICON: &str = "navop/rocketmq-color.svg";
+pub const NAVOP_ROCKETMQ_LINE_ICON: &str = "navop/rocketmq-line.svg";
 
 /// Database type enumeration
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1218,6 +1228,169 @@ impl MqttParams {
     }
 }
 
+/// RocketMQ SSH 隧道配置(与 MQTT 同构,复用统一隧道结构)
+pub type RocketmqSshTunnelConfig = SshTunnelConfig;
+
+/// RocketMQ 连接参数(持久化层)。
+///
+/// JSON 形态与 `rocketmq_runtime::RocketmqParams` 保持一致
+/// (`namesrv_addrs`/`access_key`/`secret_key`/`credential_reference`/
+/// `domain`/`connect_timeout`/`request_timeout`/`ssh_tunnel`),
+/// 运行时侧经 serde 直接反序列化,core 不反向依赖 runtime crate。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RocketmqParams {
+    /// NameServer 地址列表(每项形如 `host:port`,缺省端口由运行时补 9876)
+    #[serde(default = "default_rocketmq_namesrv_addrs")]
+    pub namesrv_addrs: Vec<String>,
+    /// ACL AccessKey(未启用 ACL 时为 None)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<String>,
+    /// ACL SecretKey
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<String>,
+    /// 钥匙串凭据引用(仅持久层使用,运行时透传)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<CredentialReference>,
+    /// 业务域(预留字段)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// 连接超时(秒,缺省由运行时取默认值)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
+    /// 请求超时(毫秒,缺省由运行时取默认值)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout: Option<u64>,
+    /// SSH 隧道配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_tunnel: Option<RocketmqSshTunnelConfig>,
+}
+
+fn default_rocketmq_namesrv_addrs() -> Vec<String> {
+    vec!["127.0.0.1:9876".to_string()]
+}
+
+impl Default for RocketmqParams {
+    fn default() -> Self {
+        Self {
+            namesrv_addrs: default_rocketmq_namesrv_addrs(),
+            access_key: None,
+            secret_key: None,
+            credential_reference: None,
+            domain: None,
+            connect_timeout: None,
+            request_timeout: None,
+            ssh_tunnel: None,
+        }
+    }
+}
+
+impl RocketmqParams {
+    /// 首个 NameServer 地址(默认名称与隧道目标回退使用)
+    pub fn first_namesrv_addr(&self) -> Option<&str> {
+        self.namesrv_addrs
+            .iter()
+            .map(String::as_str)
+            .find(|addr| !addr.trim().is_empty())
+    }
+
+    /// 引用式 SSH 隧道展开:按 connection_id 找到 SSH 连接并回填跳板参数
+    /// (与 MQTT 的展开逻辑一致;target 回退首个 NameServer 地址)
+    pub fn apply_referenced_ssh_tunnel(
+        &mut self,
+        ssh_connection: &StoredConnection,
+    ) -> Result<(), serde_json::Error> {
+        let Some(tunnel) = self.ssh_tunnel.as_mut() else {
+            return Ok(());
+        };
+        let Some(ssh_connection_id) = tunnel.connection_id else {
+            return Ok(());
+        };
+        if ssh_connection.id != Some(ssh_connection_id) {
+            return Ok(());
+        }
+        if ssh_connection.connection_type != ConnectionType::SshSftp {
+            return Ok(());
+        }
+
+        // 先取出首个 NameServer 地址再借用隧道,避免同时可变/不可变借用
+        let first_addr = self
+            .namesrv_addrs
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .find(|addr| !addr.is_empty())
+            .map(str::to_string);
+        let ssh_params = ssh_connection.to_ssh_params()?;
+        tunnel.host = ssh_params.host;
+        tunnel.port = ssh_params.port;
+        tunnel.username = ssh_params.username;
+        tunnel.timeout = ssh_params.connect_timeout;
+        // 隧道目标回退到首个 NameServer 地址(host:port 整体作为目标主机串)
+        if let Some(addr) = first_addr {
+            tunnel.target_host.get_or_insert(addr.clone());
+            let port = addr
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok());
+            if let Some(port) = port {
+                tunnel.target_port.get_or_insert(port);
+            }
+        }
+
+        match ssh_params.auth_method {
+            SshAuthMethod::Password { password } => {
+                tunnel.auth_type = "password".to_string();
+                tunnel.password = Some(password);
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+            SshAuthMethod::PrivateKey {
+                key_path,
+                passphrase,
+            } => {
+                tunnel.auth_type = "private_key".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = Some(key_path);
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = passphrase;
+            }
+            SshAuthMethod::PrivateKeyContent {
+                private_key,
+                passphrase,
+            } => {
+                tunnel.auth_type = "private_key_content".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = Some(private_key);
+                tunnel.private_key_passphrase = passphrase;
+            }
+            SshAuthMethod::Agent => {
+                tunnel.auth_type = "agent".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+            SshAuthMethod::Pageant => {
+                tunnel.auth_type = "pageant".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+            SshAuthMethod::AutoPublicKey => {
+                tunnel.auth_type = "auto_publickey".to_string();
+                tunnel.password = None;
+                tunnel.private_key_path = None;
+                tunnel.private_key_content = None;
+                tunnel.private_key_passphrase = None;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// 串口校验位
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SerialParity {
@@ -2051,6 +2224,17 @@ fn default_mqtt_name(name: String, params: &MqttParams) -> String {
     trimmed_or_default(name, host_port_name(&params.host, params.port))
 }
 
+fn default_rocketmq_name(name: String, params: &RocketmqParams) -> String {
+    // 默认名称回退到首个 NameServer 地址(无地址时退化为占位文本)
+    let fallback = params
+        .first_namesrv_addr()
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .unwrap_or("rocketmq")
+        .to_string();
+    trimmed_or_default(name, fallback)
+}
+
 fn default_serial_name(name: String, params: &SerialParams) -> String {
     trimmed_or_default(name, params.port_name.trim().to_string())
 }
@@ -2285,6 +2469,35 @@ impl StoredConnection {
     }
 
     pub fn to_mqtt_params(&self) -> Result<MqttParams, serde_json::Error> {
+        serde_json::from_str(&self.params)
+    }
+
+    /// 新建 RocketMQ 连接(名称为空时回退首个 NameServer 地址)
+    pub fn new_rocketmq(name: String, params: RocketmqParams, workspace_id: Option<i64>) -> Self {
+        let name = default_rocketmq_name(name, &params);
+        Self {
+            id: None,
+            credential_revision: None,
+            name,
+            connection_type: ConnectionType::Rocketmq,
+            params: serde_json::to_string(&params).expect("RocketmqParams 序列化不应失败"),
+            workspace_id,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+        }
+    }
+
+    /// 解析 RocketMQ 连接参数
+    pub fn to_rocketmq_params(&self) -> Result<RocketmqParams, serde_json::Error> {
         serde_json::from_str(&self.params)
     }
 
@@ -3089,6 +3302,103 @@ mod tests {
             DatabaseType::from_storage_key("DuckDB")
         );
         assert_eq!("/tmp/history.duckdb", config.server_info());
+    }
+
+    #[test]
+    fn rocketmq_params_round_trip_and_defaults() {
+        // 默认参数:回环地址 + 无 ACL
+        let params = RocketmqParams::default();
+        assert_eq!(params.namesrv_addrs, vec!["127.0.0.1:9876".to_string()]);
+        assert!(params.access_key.is_none());
+        assert!(params.ssh_tunnel.is_none());
+
+        // 序列化往返保持字段一致
+        let json = serde_json::to_string(&params).expect("RocketmqParams 序列化不应失败");
+        let back: RocketmqParams = serde_json::from_str(&json).expect("RocketmqParams 反序列化");
+        assert_eq!(back.namesrv_addrs, params.namesrv_addrs);
+        assert_eq!(back.connect_timeout, None);
+        assert_eq!(back.request_timeout, None);
+    }
+
+    #[test]
+    fn rocketmq_params_tolerates_missing_fields() {
+        // 向前兼容:仅地址的旧数据可反序列化
+        let params: RocketmqParams = serde_json::from_str(r#"{"namesrv_addrs":["10.0.0.1:9876"]}"#)
+            .expect("缺失字段应可反序列化");
+        assert_eq!(params.namesrv_addrs.len(), 1);
+        assert_eq!(params.domain, None);
+        assert!(params.ssh_tunnel.is_none());
+    }
+
+    #[test]
+    fn rocketmq_connection_name_falls_back_to_first_namesrv() {
+        // 显式名称优先
+        let params = RocketmqParams::default();
+        let connection = StoredConnection::new_rocketmq("生产集群".into(), params.clone(), None);
+        assert_eq!(connection.name, "生产集群");
+        assert_eq!(connection.connection_type, ConnectionType::Rocketmq);
+
+        // 空名称回退首个 NameServer 地址
+        let connection = StoredConnection::new_rocketmq("  ".into(), params, None);
+        assert_eq!(connection.name, "127.0.0.1:9876");
+
+        // 参数往返
+        let back = connection.to_rocketmq_params().expect("参数应可解析");
+        assert_eq!(back.namesrv_addrs, vec!["127.0.0.1:9876".to_string()]);
+    }
+
+    #[test]
+    fn rocketmq_connection_type_round_trips() {
+        // 展示名/解析名一致,避免持久化类型串台
+        assert_eq!(ConnectionType::Rocketmq.to_string(), "Rocketmq");
+        assert_eq!(
+            ConnectionType::from_str("Rocketmq"),
+            ConnectionType::Rocketmq
+        );
+        assert_eq!(ConnectionType::Rocketmq.label(), "RocketMQ");
+        assert!(ConnectionType::all().contains(&ConnectionType::Rocketmq));
+    }
+
+    #[test]
+    fn rocketmq_apply_referenced_ssh_tunnel_fills_target_from_namesrv() {
+        // JSON 构造 SSH 参数(必填字段:host/port/username/auth_method)
+        let ssh_params: SshParams = serde_json::from_value(serde_json::json!({
+            "host": "10.1.1.1",
+            "port": 2222,
+            "username": "deploy",
+            "connect_timeout": 9,
+            "auth_method": {"Password": {"password": "secret"}}
+        }))
+        .expect("SSH 参数构造应成功");
+        let mut ssh = StoredConnection::new_ssh("跳板".into(), ssh_params, None);
+        ssh.id = Some(11);
+
+        // 无隧道时为空操作
+        let mut params = RocketmqParams::default();
+        params.apply_referenced_ssh_tunnel(&ssh).unwrap();
+        assert!(params.ssh_tunnel.is_none());
+
+        // 引用式隧道:按 connection_id 命中 SSH 连接后回填跳板与目标
+        let mut params = RocketmqParams {
+            namesrv_addrs: vec!["10.2.2.2:9876".into()],
+            ssh_tunnel: Some(RocketmqSshTunnelConfig {
+                enabled: true,
+                connection_id: Some(11),
+                ..RocketmqSshTunnelConfig::default()
+            }),
+            ..RocketmqParams::default()
+        };
+        params.apply_referenced_ssh_tunnel(&ssh).unwrap();
+
+        let tunnel = params.ssh_tunnel.as_ref().expect("隧道应保留");
+        assert_eq!(tunnel.host, "10.1.1.1");
+        assert_eq!(tunnel.port, 2222);
+        assert_eq!(tunnel.username, "deploy");
+        assert_eq!(tunnel.timeout, Some(9));
+        assert_eq!(tunnel.auth_type, "password");
+        assert_eq!(tunnel.password.as_deref(), Some("secret"));
+        assert_eq!(tunnel.target_host.as_deref(), Some("10.2.2.2:9876"));
+        assert_eq!(tunnel.target_port, Some(9876));
     }
 }
 

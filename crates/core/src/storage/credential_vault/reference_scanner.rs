@@ -138,6 +138,7 @@ fn parse_connection_type(value: &str) -> Result<ConnectionType> {
         "Redis" => Ok(ConnectionType::Redis),
         "MongoDB" => Ok(ConnectionType::MongoDB),
         "Mqtt" => Ok(ConnectionType::Mqtt),
+        "Rocketmq" => Ok(ConnectionType::Rocketmq),
         "Serial" => Ok(ConnectionType::Serial),
         "Telnet" => Ok(ConnectionType::Telnet),
         "PortForwarding" => Ok(ConnectionType::PortForwarding),

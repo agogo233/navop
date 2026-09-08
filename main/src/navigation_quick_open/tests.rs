@@ -19,6 +19,7 @@ fn connection_navigation_partition_is_complete_and_stable() {
             ConnectionType::Redis,
             ConnectionType::MongoDB,
             ConnectionType::Mqtt,
+            ConnectionType::Rocketmq,
             ConnectionType::Serial,
             ConnectionType::Telnet,
         ]

@@ -56,6 +56,7 @@ use port_forwarding_view::{
     PortForwardingTabConfig,
 };
 use redis_view::{RedisFormWindow, RedisFormWindowConfig};
+use rocketmq_view::{RocketmqFormConfig, RocketmqFormWindow};
 use rust_i18n::t;
 use terminal_view::{SerialFormWindow, SerialFormWindowConfig};
 use terminal_view::{SshFormWindow, SshFormWindowConfig};

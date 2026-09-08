@@ -126,6 +126,9 @@ fn connection_type_icon(conn_type: &ConnectionType) -> Icon {
         ConnectionType::Redis => IconName::Database.mono(),
         ConnectionType::MongoDB => IconName::Database.mono(),
         ConnectionType::Mqtt => Icon::default().path(one_core::storage::NAVOP_MQTT_LINE_ICON),
+        ConnectionType::Rocketmq => {
+            Icon::default().path(one_core::storage::NAVOP_ROCKETMQ_LINE_ICON)
+        }
         ConnectionType::SshSftp => IconName::Terminal.mono(),
         ConnectionType::Serial => IconName::SquareTerminal.mono(),
         ConnectionType::Telnet => IconName::SquareTerminal.mono(),

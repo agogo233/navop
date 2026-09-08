@@ -1502,6 +1502,10 @@ Connection:
     en: Copy MQTT Address
     zh-CN: 复制 MQTT 地址
     zh-HK: 複製 MQTT 位址
+  copy_rocketmq_target:
+    en: Copy RocketMQ Address
+    zh-CN: 复制 RocketMQ 地址
+    zh-HK: 複製 RocketMQ 位址
   copy_serial_port:
     en: Copy Serial Port
     zh-CN: 复制串口名称
@@ -1808,6 +1812,10 @@ Connection:
       en: MQTT
       zh-CN: MQTT
       zh-HK: MQTT
+    type_rocketmq:
+      en: RocketMQ
+      zh-CN: RocketMQ
+      zh-HK: RocketMQ
     type_serial:
       en: Serial
       zh-CN: 串口
@@ -1967,6 +1975,10 @@ NewConnection:
     en: MQTT message broker connection
     zh-CN: MQTT 消息中间件连接
     zh-HK: MQTT 訊息中介軟體連線
+  description_rocketmq:
+    en: RocketMQ messaging middleware connection
+    zh-CN: RocketMQ 消息中间件连接
+    zh-HK: RocketMQ 訊息中介軟體連線
   description_serial:
     en: Serial device connection
     zh-CN: 串口设备连接

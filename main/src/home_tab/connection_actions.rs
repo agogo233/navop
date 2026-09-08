@@ -52,6 +52,10 @@ impl HomePage {
                 self.editing_connection_id = Some(connection_id);
                 self.show_mqtt_form(window, cx);
             }
+            ConnectionType::Rocketmq => {
+                self.editing_connection_id = Some(connection_id);
+                self.show_rocketmq_form(window, cx);
+            }
             ConnectionType::Serial => {
                 self.editing_connection_id = Some(connection_id);
                 self.show_serial_form(window, cx);

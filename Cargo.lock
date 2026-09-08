@@ -8068,6 +8068,8 @@ dependencies = [
  "remote_desktop_view",
  "remote_file_editor",
  "reqwest_client",
+ "rocketmq-runtime",
+ "rocketmq_view",
  "rust-i18n",
  "semver",
  "serde",
@@ -12115,6 +12117,25 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rocketmq_view"
+version = "0.15.2"
+dependencies = [
+ "anyhow",
+ "connection-form",
+ "dashmap 5.5.3",
+ "gpui_ce",
+ "gpui_ce_components",
+ "middleware-runtime",
+ "middleware_view",
+ "one-core",
+ "one-ui",
+ "rocketmq-runtime",
+ "rust-i18n",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
