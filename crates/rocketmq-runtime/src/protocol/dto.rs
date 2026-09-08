@@ -288,7 +288,7 @@ pub struct ConsumerConnectionBody {
     /// 订阅的 Topic → 订阅数据(仅取键名)
     #[serde(default)]
     pub subscription_table: HashMap<String, serde_json::Value>,
-    /// 消费类型(CONSUME_ACTIVELY=PUSH/CONSUME_PASSIVELY=PULL)
+    /// 消费类型(官方枚举:CONSUME_ACTIVELY=主动消费 PULL、CONSUME_PASSIVELY=被动消费 PUSH)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consume_type: Option<String>,
     /// 消息模型(CLUSTERING/BROADCASTING)

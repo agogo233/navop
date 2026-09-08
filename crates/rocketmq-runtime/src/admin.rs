@@ -332,6 +332,19 @@ fn parse_tps(value: Option<&String>) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 官方消费类型枚举转通用文本。
+///
+/// 对照 release-4.9.4 `org.apache.rocketmq.common.protocol.heartbeat.ConsumeType`:
+/// `CONSUME_ACTIVELY("PULL")` 主动(拉取式)消费、`CONSUME_PASSIVELY("PUSH")`
+/// 被动(推送式)消费;未知值原样透传。
+fn consume_type_text(kind: &str) -> String {
+    match kind {
+        "CONSUME_ACTIVELY" => "PULL".to_string(),
+        "CONSUME_PASSIVELY" => "PUSH".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// 解析 perm 文本("6"/"4"/"2";兼容 "rw"/"r"/"w" 简写),默认读写
 fn parse_perm(text: &str) -> i32 {
     match text.trim() {
@@ -731,12 +744,8 @@ impl middleware_runtime::MiddlewareAdmin for RocketmqConnection {
                             .unwrap_or(0);
                         info.version = Some(min_version.to_string());
                     }
-                    // 官方枚举转通用文本:CONSUME_ACTIVELY=PUSH,CONSUME_PASSIVELY=PULL
-                    info.consume_type = connection.consume_type.as_deref().map(|kind| match kind {
-                        "CONSUME_ACTIVELY" => "PUSH".to_string(),
-                        "CONSUME_PASSIVELY" => "PULL".to_string(),
-                        other => other.to_string(),
-                    });
+                    // 官方枚举转通用文本(见 consume_type_text 文档)
+                    info.consume_type = connection.consume_type.as_deref().map(consume_type_text);
                     info.message_model = connection.message_model;
                 }
                 if let Ok(stats) = self.consume_stats(&masters[0], &name).await {
@@ -1330,6 +1339,19 @@ mod tests {
         assert!((parse_tps(Some(&" 12.5 1.0 2.0".to_string())) - 12.5).abs() < f64::EPSILON);
         assert_eq!(parse_tps(None), 0.0);
         assert_eq!(parse_tps(Some(&"bad".to_string())), 0.0);
+    }
+
+    /// 消费类型映射回归测试(t6 审查 F1 修复)。
+    ///
+    /// 官方依据:release-4.9.4 `common/protocol/heartbeat/ConsumeType.java`:
+    /// `CONSUME_ACTIVELY("PULL")`(主动拉取)、`CONSUME_PASSIVELY("PUSH")`(被动推送)。
+    #[test]
+    fn consume_type_mapping_matches_official_enum() {
+        assert_eq!(consume_type_text("CONSUME_ACTIVELY"), "PULL");
+        assert_eq!(consume_type_text("CONSUME_PASSIVELY"), "PUSH");
+        // 未知值原样透传
+        assert_eq!(consume_type_text("SOMETHING_ELSE"), "SOMETHING_ELSE");
+        assert_eq!(consume_type_text(""), "");
     }
 
     #[test]
