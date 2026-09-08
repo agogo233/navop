@@ -347,9 +347,9 @@ fn terminal_toolbar_icon_button(
             .active(colors.muted)
     };
 
-        IconButton::new(id, panel.icon())
-            .hit_size(item_size)
-            .glyph_size(OneIconSize::Small)
+    IconButton::new(id, panel.icon())
+        .hit_size(item_size)
+        .glyph_size(OneIconSize::Small)
         .custom(style)
         .selected(selected)
         .tooltip(panel.title())
