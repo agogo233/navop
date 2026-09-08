@@ -41,7 +41,7 @@ members = [
     "crates/json_view",
     "tools/gpui-rdp-smoke",
     "tools/windows-rdp-probe",
-    "main", "crates/ssh", "crates/x11_forwarding", "crates/sftp", "crates/sftp_transfer", "crates/sftp_view", "crates/one_ui", "crates/redis-runtime", "crates/mongodb-runtime", "crates/redis_view", "crates/license_tool", "crates/mongodb_view", "crates/remote_file_editor", "crates/remote_image_preview", "crates/mqtt-runtime", "crates/mqtt_view"]
+    "main", "crates/ssh", "crates/x11_forwarding", "crates/sftp", "crates/sftp_transfer", "crates/sftp_view", "crates/one_ui", "crates/redis-runtime", "crates/mongodb-runtime", "crates/redis_view", "crates/license_tool", "crates/mongodb_view", "crates/remote_file_editor", "crates/remote_image_preview", "crates/mqtt-runtime", "crates/mqtt_view", "crates/middleware-runtime"]
 resolver = "2"
 
 [workspace.package]
@@ -119,6 +119,7 @@ redis-runtime = { path = "crates/redis-runtime" }
 mongodb-runtime = { path = "crates/mongodb-runtime" }
 mqtt_view = { path = "crates/mqtt_view" }
 mqtt-runtime = { path = "crates/mqtt-runtime" }
+middleware-runtime = { path = "crates/middleware-runtime" }
 one-ui = { path = "crates/one_ui" }
 ssh = { path = "crates/ssh" }
 x11_forwarding = { path = "crates/x11_forwarding" }

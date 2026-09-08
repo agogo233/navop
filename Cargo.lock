@@ -8352,6 +8352,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "middleware-runtime"
+version = "0.15.2"
+dependencies = [
+ "async-trait",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
