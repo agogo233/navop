@@ -47,6 +47,9 @@ pub struct RocketmqFormConfig {
 }
 
 impl RocketmqFormConfig {
+    /// 是否处于编辑模式(存在正在编辑的连接)
+    ///
+    /// 编辑模式下表单回填既有连接参数,保存时保留云同步元数据。
     pub fn is_editing(&self) -> bool {
         self.editing_connection.is_some()
     }

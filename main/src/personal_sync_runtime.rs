@@ -411,6 +411,11 @@ fn connection_endpoint(connection: &StoredConnection) -> Option<String> {
             .to_mqtt_params()
             .ok()
             .map(|params| format!("{}:{}", params.host, params.port)),
+        // RocketMQ 端点为 NameServer 地址列表,分号拼接展示
+        ConnectionType::Rocketmq => connection
+            .to_rocketmq_params()
+            .ok()
+            .map(|params| params.namesrv_addrs.join(";")),
         ConnectionType::Serial => connection
             .to_serial_params()
             .ok()

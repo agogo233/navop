@@ -46,6 +46,15 @@ pub struct RocketmqTabView {
 }
 
 impl RocketmqTabView {
+    /// 创建 RocketMQ 主标签页视图
+    ///
+    /// - `workspace`:工作区信息(工作区聚合模式下用于页签标题与连接过滤)
+    /// - `connections`:待展示的连接列表(进入左侧连接树)
+    /// - `active_conn_id`:打开时激活并自动连接的连接 ID
+    /// - `window`/`cx`:GPUI 窗口与上下文
+    ///
+    /// 返回的视图左侧为连接树,右侧为 TabContainer;
+    /// 连接建立后自动追加标准四页管理页签组。
     pub fn new_with_active_conn(
         workspace: Option<Workspace>,
         connections: Vec<StoredConnection>,

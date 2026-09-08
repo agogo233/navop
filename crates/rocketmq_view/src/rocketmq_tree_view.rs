@@ -119,6 +119,10 @@ pub struct RocketmqTreeView {
 }
 
 impl RocketmqTreeView {
+    /// 创建空连接树视图(无任何连接节点)
+    ///
+    /// `_window`/`cx` 用于创建焦点句柄;连接配置后续经
+    /// [`RocketmqTreeView::add_stored_connection`] 逐个加入。
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             connection_order: Vec::new(),

@@ -194,7 +194,7 @@ mod tests {
             DatabaseOpenMode::Single,
             &active,
             Some(7),
-            &[active.clone()],
+            std::slice::from_ref(&active),
             |connection| {
                 resolved_ids.push(connection.id);
                 let mut connection = connection.clone();
@@ -356,7 +356,7 @@ mod tests {
             DatabaseOpenMode::Workspace,
             &active,
             Some(7),
-            &[active.clone()],
+            std::slice::from_ref(&active),
             |_| None,
         );
 
