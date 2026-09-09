@@ -85,19 +85,14 @@ jobs:
         with:
           arch: x64
 
-      - name: Verify secrets are set
+      - name: Check optional Supabase secrets
         shell: bash
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
-          if [ -z "$SUPABASE_URL" ]; then
-            echo "::error::SUPABASE_URL secret is empty or not set"
-            exit 1
-          fi
-          if [ -z "$SUPABASE_ANON_KEY" ]; then
-            echo "::error::SUPABASE_ANON_KEY secret is empty or not set"
-            exit 1
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::warning::Supabase secrets not set; building portable binary without baked-in cloud login/sync (runtime env override still works)."
           fi
 
       - name: Resolve application version
