@@ -2,7 +2,7 @@ name: Windows Portable
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
     inputs:
       build_mode:
@@ -112,7 +112,6 @@ jobs:
             exit 1
           fi
           echo "ONETCLI_VERSION=$version" >> "$GITHUB_ENV"
-          echo "PUBLIC_BASENAME=navop-$version-windows-x64" >> "$GITHUB_ENV"
           echo "Resolved Navop version: $version"
 
       - name: Build release binary
@@ -160,19 +159,18 @@ jobs:
             throw "Release binary was not created: '$binary'"
           }
 
-      - name: Package portable zip
+      - name: Assemble portable package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force portable-package | Out-Null
           Copy-Item "target\x86_64-pc-windows-msvc\release\navop.exe" "portable-package\navop.exe"
           Set-Content -Path "portable-package\navop.portable" -Value "" -NoNewline
-          Compress-Archive -Path "portable-package\*" -DestinationPath "${env:PUBLIC_BASENAME}-portable.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: navop-windows-x64-portable
-          path: navop-*-windows-x64-portable.zip
+          path: portable-package/
           if-no-files-found: error
 
       - name: Save shared Cargo inputs
