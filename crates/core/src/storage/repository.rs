@@ -234,6 +234,8 @@ impl ConnectionRepository {
     }
 
     pub fn upsert_cloud_connection(&self, item: &mut StoredConnection) -> Result<()> {
+        // 云端下行可能携带旧版 Mqtt 形态,写入前归一为扩展连接
+        item.try_migrate_legacy_middleware_connection();
         let cloud_id = item
             .cloud_id
             .as_deref()
@@ -307,6 +309,8 @@ impl Repository for ConnectionRepository {
     }
 
     fn insert(&self, item: &mut Self::Entity) -> Result<i64> {
+        // 导入/恢复等路径可能落库旧版 Mqtt 形态,写入前归一为扩展连接
+        item.try_migrate_legacy_middleware_connection();
         let name = item.name.clone();
         let connection_type = item.connection_type.to_string();
         let params_str = item.try_encrypt_params()?;
@@ -950,6 +954,9 @@ mod tests {
 
     #[test]
     fn extension_connections_use_standard_repository_and_scoped_secrets() {
+        let _crypto_guard = crate::crypto::crypto_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::crypto::set_master_key_for_session("extension-connection-test-key").unwrap();
         let (conn, repo) = test_repository();
         let params = ExtensionConnectionParams::new(

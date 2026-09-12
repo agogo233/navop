@@ -13,13 +13,11 @@ use crate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, ColorExt, Div, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
+    AnyElement, App, Div, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
-use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, clipboard::Clipboard, h_flex,
-    scroll::Scrollbar, spinner::Spinner, v_flex,
-};
+use gpui_component::{ActiveTheme, Icon, Sizable, Size, clipboard::Clipboard, h_flex, scroll::Scrollbar, spinner::Spinner, v_flex};
+use one_assets::IconName;
 use rust_i18n::t;
 
 fn message_copy_id(message_id: &str) -> SharedString {
@@ -584,7 +582,12 @@ pub fn render_running_activity(theme: &AgentChatTheme) -> AnyElement {
                 .color(color)
                 .animation_id("ai-chat-activity-spinner"),
         )
-        .child(div().flex_1().min_w_0().child(t!("AgentUi.running").to_string()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(t!("AgentUi.running").to_string()),
+        )
         .into_any_element()
 }
 

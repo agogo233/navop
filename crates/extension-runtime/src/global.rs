@@ -126,10 +126,29 @@ fn build_catalog_with_development(
     DevelopmentCatalogReport,
 )> {
     let mut accepted = Vec::new();
-    let mut catalog = ExtensionRuntimeCatalog::from_manifests(installed.clone())?;
+    // 逐个吸收已安装扩展：单个扩展不合法(如 manifest 校验失败)只跳过该扩展，
+    // 不能让整个 catalog 加载失败而拖垮所有扩展。
+    let mut accepted_installed: Vec<Manifest> = Vec::new();
+    let mut catalog = ExtensionRuntimeCatalog::empty();
+    for manifest in installed {
+        let mut candidate = accepted_installed.clone();
+        candidate.push(manifest.clone());
+        match ExtensionRuntimeCatalog::from_manifests(candidate) {
+            Ok(next) => {
+                accepted_installed.push(manifest);
+                catalog = next;
+            }
+            Err(error) => tracing::warn!(
+                extension_id = %manifest.id,
+                root = %manifest.manifest_dir.display(),
+                error = %error,
+                "installed extension omitted while building catalog"
+            ),
+        }
+    }
     let mut report = DevelopmentCatalogReport::default();
     for manifest in development {
-        let mut candidate = installed.clone();
+        let mut candidate = accepted_installed.clone();
         candidate.extend(accepted.iter().cloned());
         candidate.push(manifest.clone());
         match ExtensionRuntimeCatalog::from_manifests(candidate) {
@@ -230,7 +249,12 @@ mod tests {
     fn invalid_development_manifest_does_not_remove_valid_views() {
         let valid = development_manifest("dev.valid", "/tmp/valid", "tool");
         let mut invalid = development_manifest("dev.invalid", "/tmp/invalid", "tool");
-        invalid.contributes.shell_views[0].category = None;
+        // `shellView.category` is optional (only validated when present), so make
+        // the development manifest genuinely invalid instead: a toolbox view with
+        // an undeclared IPC runtime backend is rejected by `validate_backends`.
+        invalid.contributes.shell_views[0]
+            .backends
+            .insert("search".into(), "missing".into());
 
         let (catalog, accepted, report) =
             build_catalog_with_development(Vec::new(), &[valid, invalid]).unwrap();
