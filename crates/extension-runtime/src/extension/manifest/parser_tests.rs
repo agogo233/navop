@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::{
-    ManifestError, RemoteFileEditorLaunchMode, ResourceWorkbenchTemplate, ShellHostModule,
+    ManifestError, RemoteFileEditorLaunchMode, ResourceWorkbenchPrimitive, ShellHostModule,
     ShellSurface, load_from_dir,
 };
 
@@ -165,7 +165,7 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
                     "resourceType": "search"
                 }],
                 "resourceWorkbenches": [{
-                    "schemaVersion": 1,
+                    "schemaVersion": 3,
                     "id": "search",
                     "title": "Search",
                     "connectionIds": ["search9"],
@@ -193,10 +193,10 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
                         {
                             "id": "overview",
                             "title": "Overview",
-                            "template": "collection",
                             "renderer": {"kind": "native"},
                             "load": {"operation": "list"},
-                            "collection": {
+                            "stack": [{
+                                "kind": "table",
                                 "itemsPath": "/items",
                                 "keyPaths": ["/name"],
                                 "pagination": {"kind": "none"},
@@ -209,12 +209,11 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
                                         "name": {"source": "selection", "path": "/name", "type": "string"}
                                     }
                                 }
-                            }
+                            }]
                         },
                         {
                             "id": "detail",
                             "title": "Detail",
-                            "template": "json",
                             "renderer": {"kind": "native"},
                             "route": {"name": {"type": "string", "required": true}},
                             "load": {"operation": "list"},
@@ -224,23 +223,26 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
                                 "route": {
                                     "name": {"source": "route", "path": "/name", "type": "string"}
                                 }
-                            }]
+                            }],
+                            "stack": [{"kind": "viewer", "format": "json"}]
                         },
                         {
                             "id": "mapping",
                             "title": "Mapping",
-                            "template": "json",
                             "renderer": {"kind": "native"},
                             "route": {"name": {"type": "string", "required": true}},
-                            "load": {"operation": "list"}
+                            "load": {"operation": "list"},
+                            "stack": [{"kind": "viewer", "format": "json"}]
                         },
                         {
                             "id": "search",
                             "title": "Search",
-                            "template": "query",
                             "renderer": {"kind": "shell", "viewId": "search-editor", "fallback": "native"},
-                            "inputs": [{"id": "q", "type": "string", "editor": "text", "default": "*", "required": true}],
-                            "execute": {"operation": "query"}
+                            "stack": [{
+                                "kind": "form",
+                                "submit": {"operation": "query"},
+                                "inputs": [{"id": "q", "type": "string", "editor": "text", "default": "*", "required": true}]
+                            }]
                         }
                     ]
                 }]
@@ -261,7 +263,14 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
     assert_eq!(1, workbench.connection_ids.len());
     // collection open 声明。
     let overview = workbench.pages.iter().find(|p| p.id == "overview").unwrap();
-    let open = overview.collection.as_ref().unwrap().open.as_ref().unwrap();
+    let open = overview
+        .stack
+        .iter()
+        .find_map(|primitive| match primitive {
+            ResourceWorkbenchPrimitive::Table(table) => table.open.as_ref(),
+            _ => None,
+        })
+        .unwrap();
     assert_eq!("detail", open.page_id);
     assert!(open.route.contains_key("name"));
     // detail route 参数与 links。
@@ -272,8 +281,16 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
     // query 页面输入与 job 操作。
     let search = workbench.pages.iter().find(|p| p.id == "search").unwrap();
     assert_eq!(Some("search-editor"), search.renderer.view_id.as_deref());
-    assert_eq!(1, search.inputs.len());
-    assert_eq!("query", search.execute.as_ref().unwrap().operation);
+    let form = search
+        .stack
+        .iter()
+        .find_map(|primitive| match primitive {
+            ResourceWorkbenchPrimitive::Form(form) => Some(form),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(1, form.inputs.len());
+    assert_eq!("query", form.submit.operation);
     let query_op = workbench.operations.get("query").unwrap();
     assert!(matches!(
         query_op.mode,
@@ -282,7 +299,7 @@ fn manifest_loads_resource_workbench_with_route_and_navigation() {
 }
 
 #[test]
-fn manifest_parses_terminal_pages_tabs_and_status_bar() {
+fn manifest_parses_v2_layout_tree_tabs_and_status_bar() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_manifest(
         tmp.path(),
@@ -308,14 +325,79 @@ fn manifest_parses_terminal_pages_tabs_and_status_bar() {
                     "resourceType": "docker"
                 }],
                 "resourceWorkbenches": [{
-                    "schemaVersion": 1,
+                    "schemaVersion": 3,
                     "id": "docker",
                     "title": "Docker",
                     "connectionIds": ["docker-local"],
                     "runtimeId": "main",
                     "resourceType": "docker",
                     "defaultPage": "container-inspect",
-                    "statusBar": { "operation": "systemUsage" },
+                    "layout": {
+                        "left": {
+                            "width": 260,
+                            "source": {
+                                "kind": "tree",
+                                "roots": [{
+                                    "id": "containers",
+                                    "title": "Containers",
+                                    "pageId": "container-inspect",
+                                    "children": {
+                                        "operation": "listContainers",
+                                        "itemsPath": "/containers",
+                                        "keyPaths": ["/id"],
+                                        "labelPath": "/name",
+                                        "open": {
+                                            "pageId": "container-inspect",
+                                            "route": {"id": {"source": "selection", "path": "/id", "type": "string"}}
+                                        },
+                                        "children": {
+                                            "operation": "listContainers",
+                                            "itemsPath": "/mounts",
+                                            "keyPaths": ["/path"],
+                                            "labelPath": "/path",
+                                            "open": {
+                                                "pageId": "container-inspect",
+                                                "route": {"id": {"source": "parent", "path": "/id", "type": "string"}}
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        },
+                        "center": {
+                            "source": {
+                                "kind": "pages",
+                                "tabGroups": [{
+                                    "id": "container",
+                                    "tabs": [
+                                        {
+                                            "id": "inspect",
+                                            "title": "Inspect",
+                                            "pageId": "container-inspect",
+                                            "route": {"id": {"source": "route", "path": "/id", "type": "string"}}
+                                        },
+                                        {
+                                            "id": "exec",
+                                            "title": "Exec",
+                                            "pageId": "container-exec",
+                                            "route": {"id": {"source": "route", "path": "/id", "type": "string"}}
+                                        }
+                                    ]
+                                }]
+                            }
+                        },
+                        "bottom": {
+                            "source": {
+                                "kind": "status",
+                                "operation": "systemUsage",
+                                "items": [
+                                    {"path": "/engine", "label": "Engine", "format": "boolean-up"},
+                                    {"path": "/containers_running", "label": "Containers", "format": "pair", "otherPath": "/containers_total"},
+                                    {"path": "/disk_used_bytes", "label": "Disk", "format": "bytes"}
+                                ]
+                            }
+                        }
+                    },
                     "operations": {
                         "systemUsage": {
                             "mode": "invoke",
@@ -331,43 +413,37 @@ fn manifest_parses_terminal_pages_tabs_and_status_bar() {
                             "params": {
                                 "id": {"source": "route", "path": "/id", "type": "string"}
                             }
+                        },
+                        "listContainers": {
+                            "mode": "invoke",
+                            "method": "docker/container/list",
+                            "requires": ["docker/container/list"],
+                            "effect": "read"
                         }
                     },
                     "pages": [
                         {
                             "id": "container-inspect",
                             "title": "Inspect",
-                            "template": "json",
                             "renderer": {"kind": "native"},
                             "route": {"id": {"type": "string", "required": true}},
                             "load": {"operation": "inspectContainer"},
-                            "tabs": [
-                                {
-                                    "id": "inspect",
-                                    "title": "Inspect",
-                                    "pageId": "container-inspect",
-                                    "route": {"id": {"source": "route", "path": "/id", "type": "string"}}
-                                },
-                                {
-                                    "id": "exec",
-                                    "title": "Exec",
-                                    "pageId": "container-exec",
-                                    "route": {"id": {"source": "route", "path": "/id", "type": "string"}}
-                                }
-                            ]
+                            "tabGroupId": "container",
+                            "stack": [{"kind": "viewer", "format": "json"}]
                         },
                         {
                             "id": "container-exec",
                             "title": "Container Exec",
-                            "template": "terminal",
                             "renderer": {"kind": "native"},
                             "route": {"id": {"type": "string", "required": true}},
-                            "terminal": {
+                            "tabGroupId": "container",
+                            "stack": [{
+                                "kind": "terminal",
                                 "command": "docker",
                                 "args": ["exec", "-it", "{{id}}", "sh"],
                                 "env": {"TERM": "xterm-256color"},
                                 "workingDir": "/"
-                            }
+                            }]
                         }
                     ]
                 }]
@@ -378,35 +454,225 @@ fn manifest_parses_terminal_pages_tabs_and_status_bar() {
     let manifest = load_from_dir(tmp.path()).unwrap();
     let workbench = &manifest.contributes.resource_workbenches[0];
 
-    assert_eq!(
-        "systemUsage",
-        workbench.status_bar.as_ref().unwrap().operation
-    );
-
+    let layout = workbench.layout.as_ref().unwrap();
+    // left tree 根节点 + lazy children 声明。
+    let left = layout.left.as_ref().unwrap();
+    assert_eq!(Some(260), left.width);
+    match &left.source {
+        crate::extension::manifest::ResourceWorkbenchNavSource::Tree { roots } => {
+            assert_eq!(1, roots.len());
+            let children = roots[0].children.as_ref().unwrap();
+            // 旧 manifest 不写 `kind`:必须解析成 remote,行为与改动前逐字一致。
+            assert!(children.is_remote());
+            assert!(children.static_items().is_none());
+            assert!(children.items.is_empty());
+            assert_eq!(Some("listContainers"), children.operation.as_deref());
+            assert_eq!(Some("/containers"), children.items_path.as_deref());
+            let open = children.open.as_ref().unwrap();
+            assert_eq!("container-inspect", open.page_id);
+            // 二级 lazy children:route 用 parent 绑定源引用父行。
+            let nested = children.children.as_deref().unwrap();
+            assert_eq!(Some("/mounts"), nested.items_path.as_deref());
+            assert!(nested.children.is_none());
+            assert_eq!(
+                crate::extension::manifest::ResourceWorkbenchBindingSource::Parent,
+                nested.open.as_ref().unwrap().route["id"].source
+            );
+        }
+        other => panic!("expected tree nav, got {other:?}"),
+    }
+    // center tabGroups:组只声明一份,页面经 tabGroupId 引用。
+    let center = layout.center.as_ref().unwrap();
+    match &center.source {
+        crate::extension::manifest::ResourceWorkbenchCenterSource::Pages { tab_groups } => {
+            assert_eq!(1, tab_groups.len());
+            assert_eq!(2, tab_groups[0].tabs.len());
+            assert_eq!("container-exec", tab_groups[0].tabs[1].page_id);
+        }
+        other => panic!("expected pages center, got {other:?}"),
+    }
     let inspect = workbench
         .pages
         .iter()
         .find(|page| page.id == "container-inspect")
         .unwrap();
-    assert_eq!(2, inspect.tabs.len());
-    assert_eq!("exec", inspect.tabs[1].id);
-    assert_eq!("container-exec", inspect.tabs[1].page_id);
-    assert!(inspect.tabs[1].route.contains_key("id"));
+    assert_eq!(Some("container"), inspect.tab_group_id.as_deref());
+    // bottom status items 声明。
+    let bottom = layout.bottom.as_ref().unwrap();
+    match &bottom.source {
+        crate::extension::manifest::ResourceWorkbenchBottomSource::Status { operation, items } => {
+            assert_eq!("systemUsage", operation);
+            assert_eq!(3, items.len());
+            assert!(matches!(
+                items[1].format,
+                crate::extension::manifest::ResourceWorkbenchStatusFormat::Pair
+            ));
+            assert_eq!(Some("/containers_total"), items[1].other_path.as_deref());
+        }
+        other => panic!("expected status bottom, got {other:?}"),
+    }
 
     let exec = workbench
         .pages
         .iter()
         .find(|page| page.id == "container-exec")
         .unwrap();
-    assert!(matches!(exec.template, ResourceWorkbenchTemplate::Terminal));
-    let terminal = exec.terminal.as_ref().unwrap();
-    assert_eq!("docker", terminal.command);
+    let terminal = exec
+        .stack
+        .iter()
+        .find_map(|primitive| match primitive {
+            ResourceWorkbenchPrimitive::Terminal(terminal) => Some(terminal),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(Some("docker"), terminal.command.as_deref());
     assert_eq!(terminal.args, ["exec", "-it", "{{id}}", "sh"]);
     assert_eq!(
         Some("xterm-256color"),
         terminal.env.get("TERM").map(String::as_str)
     );
     assert_eq!(Some("/"), terminal.working_dir.as_deref());
+}
+
+/// 静态树子项:`kind: "static"` + `items`,展开即得、零请求。
+///
+/// 同一个 `children` 结构体承载两套字段,靠 `kind` 判形。这里把两件事钉在一起:
+/// 静态形态能解析出来,且静态项各自持有自己的 `open`(集合级 `open` 只属于
+/// 远程形态)。写错形态由注册期拒绝,不在解析期静默兜底。
+#[test]
+fn manifest_parses_static_tree_children() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_manifest(
+        tmp.path(),
+        r#"{
+            "schema_version": 1,
+            "id": "com.example.indexstore",
+            "name": "Index Store",
+            "version": "1.0.0",
+            "engines": { "onetcli": ">=0.1.0" },
+            "permissions": ["spawn:./bin/provider"],
+            "runtime": {
+                "ipc": [{
+                    "id": "main",
+                    "entry": { "command": "./bin/provider" },
+                    "transport": { "kind": "local_socket" }
+                }]
+            },
+            "contributes": {
+                "connections": [{
+                    "id": "store",
+                    "label": "Store",
+                    "runtimeId": "main",
+                    "resourceType": "search"
+                }],
+                "resourceWorkbenches": [{
+                    "schemaVersion": 3,
+                    "id": "store",
+                    "title": "Store",
+                    "connectionIds": ["store"],
+                    "runtimeId": "main",
+                    "resourceType": "search",
+                    "defaultPage": "indices",
+                    "operations": {
+                        "listIndices": {
+                            "mode": "invoke",
+                            "method": "store/index/list",
+                            "requires": ["store/index/list"],
+                            "effect": "read"
+                        }
+                    },
+                    "pages": [{
+                        "id": "indices",
+                        "title": "Indices",
+                        "renderer": {"kind": "native"},
+                        "load": {"operation": "listIndices"},
+                        "stack": [{"kind": "viewer", "format": "json"}]
+                    }, {
+                        "id": "index-mapping",
+                        "title": "Mapping",
+                        "renderer": {"kind": "native"},
+                        "route": {"name": {"type": "string", "required": true}},
+                        "stack": [{"kind": "viewer", "format": "json"}]
+                    }, {
+                        "id": "index-settings",
+                        "title": "Settings",
+                        "renderer": {"kind": "native"},
+                        "route": {"name": {"type": "string", "required": true}},
+                        "stack": [{"kind": "viewer", "format": "json"}]
+                    }],
+                    "layout": {
+                        "left": {
+                            "width": 260,
+                            "source": {
+                                "kind": "tree",
+                                "roots": [{
+                                    "id": "indices",
+                                    "title": "Indices",
+                                    "pageId": "indices",
+                                    "children": {
+                                        "operation": "listIndices",
+                                        "itemsPath": "/indices",
+                                        "keyPaths": ["/name"],
+                                        "labelPath": "/name",
+                                        "open": {
+                                            "pageId": "indices",
+                                            "route": {"name": {"source": "selection", "path": "/name", "type": "string"}}
+                                        },
+                                        "children": {
+                                            "kind": "static",
+                                            "items": [
+                                                {
+                                                    "id": "mapping",
+                                                    "title": "Mapping",
+                                                    "open": {
+                                                        "pageId": "index-mapping",
+                                                        "route": {"name": {"source": "parent", "path": "/name", "type": "string"}}
+                                                    }
+                                                },
+                                                {
+                                                    "id": "settings",
+                                                    "title": "Settings",
+                                                    "open": {
+                                                        "pageId": "index-settings",
+                                                        "route": {"name": {"source": "parent", "path": "/name", "type": "string"}}
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }]
+            }
+        }"#,
+    );
+
+    let manifest = load_from_dir(tmp.path()).unwrap();
+    let workbench = &manifest.contributes.resource_workbenches[0];
+    let layout = workbench.layout.as_ref().unwrap();
+    match &layout.left.as_ref().unwrap().source {
+        crate::extension::manifest::ResourceWorkbenchNavSource::Tree { roots } => {
+            let children = roots[0].children.as_ref().unwrap();
+            assert!(children.is_remote());
+            let static_children = children.children.as_deref().unwrap();
+            assert!(!static_children.is_remote());
+            let items = static_children.static_items().unwrap();
+            assert_eq!(2, items.len());
+            assert_eq!("mapping", items[0].id);
+            assert_eq!("settings", items[1].id);
+            // 静态项各带自己的 open:同一层可以指向不同页面。
+            assert_eq!("index-mapping", items[0].open.page_id);
+            assert_eq!("index-settings", items[1].open.page_id);
+            assert_eq!(
+                crate::extension::manifest::ResourceWorkbenchBindingSource::Parent,
+                items[0].open.route["name"].source
+            );
+            assert!(items[0].children.is_none());
+        }
+        other => panic!("expected tree nav, got {other:?}"),
+    }
 }
 
 #[test]

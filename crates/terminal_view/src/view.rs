@@ -12,14 +12,17 @@ use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_component::slider::{Slider, SliderEvent, SliderState, SliderValue};
-use gpui_component::{ActiveTheme, Disableable, ElementExt, Icon, Selectable, Sizable, WindowExt, h_flex, kbd::Kbd, v_flex};
-use one_ui::IconSize;
+use gpui_component::{
+    ActiveTheme, Disableable, ElementExt, Icon, Selectable, Sizable, WindowExt, h_flex, kbd::Kbd,
+    v_flex,
+};
 use one_assets::IconName;
 use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::{
     action_id, keystroke_matches_shortcuts, rebind_keybindings, shortcuts_for,
 };
 use one_core::settings::{AppSettings, resolve_installed_grid_monospace_font_family};
+use one_ui::IconSize;
 use std::borrow::Cow;
 use std::cell::{Cell as StdCell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -69,7 +72,7 @@ use crate::sidebar::{
     LocalWorkspaceSidebar, SidebarPanel, TerminalSidebar, TerminalSidebarEvent,
     TerminalSidebarToolPanel, TerminalSidebarToolbar,
 };
-use crate::terminal_element::{RenderCache, TerminalElement};
+use crate::terminal_element::{LineMargin, RenderCache, TerminalElement};
 use crate::theme::{
     DEFAULT_LINE_HEIGHT_SCALE, MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalTheme, default_font_fallbacks,
     default_monospace_font, normalize_terminal_primary_font, terminal_cell_width_from_advances,
@@ -112,7 +115,7 @@ use paste_safety::{
 };
 use remote_image_preview::image_from_local_path;
 use rust_i18n::t;
-use sftp::{RusshSftpClient, SftpClient};
+use sftp::{RemoteFileClient, RusshSftpClient, SftpClient};
 use ssh::SshSessionManager;
 use std::ops::Deref;
 use terminal::GpuiEventProxy;
@@ -124,8 +127,9 @@ use terminal::terminal::{
     TerminalScrollProxy, TerminalScrollSnapshot, TerminalSshCredentials, TerminalTelnetCredentials,
     resolve_local_working_dir,
 };
+use terminal::{LocalWorkspaceSource, resolve_local_workspace_source};
 use tokio::sync::Mutex;
-use workspace_explorer::{WorkspaceEditor, WorkspaceEditorEvent};
+use workspace_explorer::{WorkspaceBackend, WorkspaceEditor, WorkspaceEditorEvent};
 
 mod actions;
 mod appearance;
@@ -212,6 +216,11 @@ pub struct TerminalView {
     blink_manager: Entity<BlinkCursor>,
     /// 侧边栏
     sidebar: Entity<TerminalSidebar>,
+    /// SSH 工具面板（文件管理器 / 服务器监控）是否还没建好。
+    ///
+    /// 需要运行时输入凭据的 SSH 连接在构造时拿不到 `SshSessionManager`，
+    /// 面板要等凭据提交后再补建，否则这类连接完全没有文件侧边栏。
+    ssh_tool_panels_pending: bool,
     /// 本地工作区文件编辑器（仅本地终端）
     workspace_editor: Option<Entity<WorkspaceEditor>>,
     /// 终端底部命令输入栏
@@ -335,6 +344,14 @@ pub struct TerminalView {
     paste_image_upload: bool,
     /// 在 vim/less/man 等 alt-screen TUI 中,把鼠标滚轮转为方向键发送到 PTY
     vim_scroll_to_arrow_keys: bool,
+    /// 左边距显示每行到达时间
+    show_line_timestamps: bool,
+    /// 左边距显示行号
+    show_line_numbers: bool,
+    /// 行号列宽，按滚屏历史量级定宽，避免行号进位引发网格 reflow
+    line_number_digits: usize,
+    /// 当前帧的左边距内容（时间戳 / 行号）
+    line_margin: LineMargin,
     broadcast_client_id: Option<BroadcastClientId>,
 
     /// 侧边栏面板大小

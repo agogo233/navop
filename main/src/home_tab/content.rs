@@ -1,5 +1,5 @@
-use one_ui::IconSize;
 use super::*;
+use one_ui::IconSize;
 
 /// 非卡片布局下最近区固定容量（历史行为：最多 4 条）。
 const RECENT_ROW_FALLBACK: usize = 4;
@@ -16,27 +16,49 @@ impl HomePage {
     }
 
     /// 让常驻侧栏知道是否作为主页 Tree 布局嵌入渲染。
-    fn sync_sidebar_home_embedded(&self, cx: &mut Context<Self>) {
-        let embedded = self.connection_layout == ConnectionLayout::Tree;
+    pub(crate) fn sync_sidebar_home_embedded(&self, cx: &mut Context<Self>) {
         if let Some(sidebar) = &self.connection_sidebar {
-            sidebar.update(cx, |sidebar, cx| sidebar.set_home_embedded(embedded, cx));
+            if self.connection_layout == ConnectionLayout::Navigation {
+                sidebar.update(cx, |sidebar, cx| sidebar.set_home_navigation_layout(cx));
+            } else {
+                sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_home_embedded(self.connection_layout == ConnectionLayout::Tree, cx)
+                });
+            }
         }
     }
 
     pub(super) fn render_content_area(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let query = self.search_query.read(cx).to_lowercase();
         if self.connection_layout == ConnectionLayout::Tree {
             if let Some(sidebar) = self.connection_sidebar.clone() {
                 // 作为子视图渲染侧栏实体：树在 Render 阶段自己 read(HomePage)，
                 // 不在本页租约内重入读自身（修复布局切换瞬间 panic）。
                 sidebar.update(cx, |sidebar, cx| sidebar.set_home_embedded(true, cx));
-                return sidebar.into_any_element();
+                let count = self.filtered_connection_count(&query);
+                return v_flex()
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(self.render_tree_content_heading(count, window, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(sidebar.into_any_element()),
+                    )
+                    .into_any_element();
             }
         }
-        let query = self.search_query.read(cx).to_lowercase();
+        if self.connection_layout == ConnectionLayout::Navigation {
+            return self.render_navigation_home_content(window, cx);
+        }
         self.render_workspace_view(
             &query,
             self.selected_connection_id,
@@ -44,6 +66,108 @@ impl HomePage {
             window,
             cx,
         )
+    }
+
+    pub(super) fn render_navigation_home_content(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let query = self.search_query.read(cx).trim().to_lowercase();
+        let recent = recent::recent_connections(&self.connections, &self.selected_filter, "", 6);
+        let matching = self
+            .home_groups(&query, cx)
+            .into_iter()
+            .flat_map(|(_, _, connections)| connections)
+            .collect::<Vec<_>>();
+        let right_width = window.bounds().size.width - GLOBAL_NAV_TREE_WIDTH;
+        let (_, card_width) = grid::card_grid_metrics(right_width, window.rem_size());
+        let mut body = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_5()
+            .child(self.render_navigation_heading(
+                query.is_empty(),
+                if query.is_empty() {
+                    recent.len()
+                } else {
+                    matching.len()
+                },
+                window,
+                cx,
+            ));
+        if !query.is_empty() {
+            if matching.is_empty() {
+                body = body.child(self.render_empty_home(cx));
+            } else {
+                body = body.child(self.render_connections_grid(
+                    matching,
+                    self.selected_connection_id,
+                    ConnectionLayout::Card,
+                    false,
+                    card_width,
+                    cx,
+                ));
+            }
+        } else if recent.is_empty() {
+            body = body.child(self.render_empty_home(cx));
+        } else {
+            body = body.child(self.render_recent_group(
+                recent,
+                self.selected_connection_id,
+                ConnectionLayout::Card,
+                card_width,
+                cx,
+            ));
+        }
+        if query.is_empty() {
+            body = body.child(self.render_application_workbench(window, cx));
+            body = body.child(self.render_navigation_status_panel(window, cx));
+        }
+        div()
+            .id("home-navigation-content")
+            .size_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .p_5()
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_navigation_heading(
+        &self,
+        is_recent: bool,
+        count: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(if is_recent {
+                        t!("Home.recent_connections").to_string()
+                    } else {
+                        t!("Home.search_results").to_string()
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(count.to_string()),
+            )
+            // 全局导航布局同样把类型筛选平铺在标题行：工具栏的筛选入口已随
+            // 筛选条统一收口，右侧内容不再依赖工具栏下拉。
+            .child(self.render_connection_type_filter_bar(window, cx))
+            .into_any_element()
     }
 
     pub(super) fn home_groups(
@@ -107,7 +231,7 @@ impl HomePage {
         let groups = self.home_groups(query, cx);
         // 最近区不参与搜索：有搜索词时隐藏，避免同一连接在最近区与分组中重复出现。
         let recent = if query.is_empty() {
-            recent::recent_connections(&self.connections, self.selected_filter, query, columns)
+            recent::recent_connections(&self.connections, &self.selected_filter, query, columns)
         } else {
             Vec::new()
         };
@@ -123,7 +247,7 @@ impl HomePage {
             .w_full()
             .min_w_0()
             .gap_5()
-            .child(self.render_content_heading(visible_count, cx));
+            .child(self.render_content_heading(visible_count, true, window, cx));
         if visible_count == 0 {
             body = body.child(self.render_empty_home(cx));
         }
@@ -151,27 +275,66 @@ impl HomePage {
             .into_any_element()
     }
 
-    fn render_content_heading(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// 页面标题行：连接标题、计数、横向类型筛选条，以及（分组布局下的）分组菜单。
+    fn render_content_heading(
+        &self,
+        count: usize,
+        show_group_menu: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
             .w_full()
+            .min_w_0()
             .gap_2()
             .items_center()
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(t!("Connection.title").to_string()),
             )
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(t!("Home.connection_count", count = count).to_string()),
             )
-            .child(div().flex_1())
-            // 展开/折叠命令归类进「分组」菜单，不再各占一个工具栏按钮（redesign §2.3/§4.3）。
-            .child(self.render_group_menu(cx))
+            // 类型筛选平铺在标题右侧；空间不足时由筛选条自行收入「更多」。
+            .child(self.render_connection_type_filter_bar(window, cx))
+            .when(show_group_menu, |row| {
+                // 展开/折叠命令归类进「分组」菜单，不再各占一个工具栏按钮（redesign §2.3/§4.3）。
+                row.child(self.render_group_menu(cx))
+            })
             .into_any_element()
+    }
+
+    /// Tree 布局的页面标题行：内容区顶部，与树列表共用同一标题、计数与筛选条。
+    fn render_tree_content_heading(
+        &self,
+        count: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex_shrink_0()
+            .w_full()
+            .min_w_0()
+            .px_5()
+            .py_3()
+            .bg(cx.theme().background)
+            .child(self.render_content_heading(count, false, window, cx))
+            .into_any_element()
+    }
+
+    /// Tree 布局标题行的连接计数：与树一致，只按类型筛选与搜索词过滤。
+    fn filtered_connection_count(&self, query: &str) -> usize {
+        self.connections
+            .iter()
+            .filter(|conn| self.match_connection_type(conn) && self.match_connection(conn, query))
+            .count()
     }
 
     fn render_group_menu(&self, cx: &Context<Self>) -> AnyElement {
@@ -245,7 +408,7 @@ impl HomePage {
                         if initial {
                             home.show_new_connection_dialog(window, cx);
                         } else {
-                            home.selected_filter = ConnectionType::All;
+                            home.selected_filter = ConnectionFilter::All;
                             home.clear_workspace_filter(cx);
                             home.search_input
                                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -403,7 +566,7 @@ impl HomePage {
         for (index, conn) in connections.into_iter().enumerate() {
             grid = grid.child(match layout {
                 // Tree 布局在 render_content_area 拦截；这里兜底按列表渲染。
-                ConnectionLayout::List | ConnectionLayout::Tree => {
+                ConnectionLayout::List | ConnectionLayout::Tree | ConnectionLayout::Navigation => {
                     self.render_connection_list_item(conn, selected, index, recent, cx)
                 }
                 // 固定共享列宽：单项组与末行不拉宽（redesign §4.1）。

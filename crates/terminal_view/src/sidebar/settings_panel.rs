@@ -9,7 +9,19 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
     Styled, Subscription, Window, div, px,
 };
-use gpui_component::{ActiveTheme, Colorize, Icon, Sizable, Size, WindowExt, button::{Button, ButtonVariants}, color_picker::{ColorPicker, ColorPickerState}, dialog::DialogButtonProps, h_flex, input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction}, notification::Notification, scroll::ScrollableElement, select::{Select, SelectEvent, SelectItem, SelectState}, switch::Switch, try_parse_color, v_flex};
+use gpui_component::{
+    ActiveTheme, Colorize, Icon, Sizable, Size, WindowExt,
+    button::{Button, ButtonVariants},
+    color_picker::{ColorPicker, ColorPickerState},
+    dialog::DialogButtonProps,
+    h_flex,
+    input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
+    notification::Notification,
+    scroll::ScrollableElement,
+    select::{Select, SelectEvent, SelectItem, SelectState},
+    switch::Switch,
+    try_parse_color, v_flex,
+};
 use one_assets::IconName;
 use rust_i18n::t;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,6 +96,24 @@ fn terminal_font_options(
         fonts.push(TerminalFontOption::new(family, installed_font_names));
     }
 
+    // 系统里已安装的字体同样直接可选（issue #199）。
+    // 以前只有「导入字体」注册过的家族才会出现在这里，所以系统里已经装好的
+    // Sarasa 之类还得再导入一次；`TextSystem::all_font_names()` 拿到的就是
+    // 系统字体集合，GPUI 本身也解析得到，直接列出来即可。
+    // 仍然沿用 `is_supported_terminal_primary_font` 过滤 fallback-only 的 CJK
+    // 界面字体，避免选到会被 `normalize_grid_monospace_font_family` 静默重置的无效项。
+    for family in installed_font_names {
+        let family = family.trim();
+        if !is_supported_terminal_primary_font(family)
+            || fonts
+                .iter()
+                .any(|existing| existing.value.as_ref() == family)
+        {
+            continue;
+        }
+        fonts.push(TerminalFontOption::new(family, installed_font_names));
+    }
+
     fonts
 }
 
@@ -130,6 +160,10 @@ pub enum SettingsPanelEvent {
     VimScrollToArrowKeysChanged(bool),
     /// 选中文本高亮相同内容开关
     SelectionHighlightChanged(bool),
+    /// 左边距显示每行到达时间开关
+    ShowLineTimestampsChanged(bool),
+    /// 左边距显示行号开关
+    ShowLineNumbersChanged(bool),
     /// 路径同步开关变更
     SyncPathChanged(bool),
     /// 自定义高亮规则变更
@@ -182,6 +216,10 @@ pub struct SettingsPanel {
     vim_scroll_to_arrow_keys: bool,
     /// 选中文本高亮相同内容
     selection_highlight: bool,
+    /// 左边距展示每行到达时间
+    show_line_timestamps: bool,
+    /// 左边距展示行号
+    show_line_numbers: bool,
     /// 路径与终端同步开关
     sync_path: bool,
     /// 全局自定义高亮规则
@@ -224,6 +262,8 @@ impl SettingsPanel {
         let scrollback_lines = AppSettings::global(cx).terminal_scrollback_lines;
         let auto_session_logging = AppSettings::global(cx).terminal_auto_session_logging;
         let selection_highlight = AppSettings::global(cx).terminal_selection_highlight;
+        let show_line_timestamps = AppSettings::global(cx).terminal_show_timestamps;
+        let show_line_numbers = AppSettings::global(cx).terminal_show_line_numbers;
         let scrollback_lines_input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(AppSettings::DEFAULT_TERMINAL_SCROLLBACK_LINES.to_string())
@@ -394,6 +434,8 @@ impl SettingsPanel {
             sync_path,
             vim_scroll_to_arrow_keys,
             selection_highlight,
+            show_line_timestamps,
+            show_line_numbers,
             custom_highlights: Vec::new(),
             has_file_manager,
             focus_handle: cx.focus_handle(),
@@ -513,6 +555,16 @@ impl SettingsPanel {
 
     pub fn set_selection_highlight(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.selection_highlight = enabled;
+        cx.notify();
+    }
+
+    pub fn set_show_line_timestamps(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.show_line_timestamps = enabled;
+        cx.notify();
+    }
+
+    pub fn set_show_line_numbers(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.show_line_numbers = enabled;
         cx.notify();
     }
 
@@ -1056,6 +1108,8 @@ impl SettingsPanel {
         let paste_image_upload = self.paste_image_upload;
         let vim_scroll_to_arrow_keys = self.vim_scroll_to_arrow_keys;
         let selection_highlight = self.selection_highlight;
+        let show_line_timestamps = self.show_line_timestamps;
+        let show_line_numbers = self.show_line_numbers;
 
         v_flex()
             .gap_3()
@@ -1245,6 +1299,40 @@ impl SettingsPanel {
                                     .on_click(cx.listener(|this, checked: &bool, _window, cx| {
                                         this.selection_highlight = *checked;
                                         cx.emit(SettingsPanelEvent::SelectionHighlightChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(t!("Settings.show_line_timestamps")))
+                            .child(
+                                Switch::new("show-line-timestamps-switch")
+                                    .checked(show_line_timestamps)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.show_line_timestamps = *checked;
+                                        cx.emit(SettingsPanelEvent::ShowLineTimestampsChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(t!("Settings.show_line_numbers")))
+                            .child(
+                                Switch::new("show-line-numbers-switch")
+                                    .checked(show_line_numbers)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.show_line_numbers = *checked;
+                                        cx.emit(SettingsPanelEvent::ShowLineNumbersChanged(
                                             *checked,
                                         ));
                                     })),
@@ -1737,6 +1825,45 @@ mod tests {
         assert!(values.iter().any(|font| font == "Custom Mono"));
         assert!(!values.iter().any(|font| font == "Noto Sans Mono CJK SC"));
         assert!(!values.iter().any(|font| font == "PingFang SC"));
+    }
+
+    #[test]
+    fn terminal_font_options_include_installed_system_fonts() {
+        // issue #199：系统里已装好的字体应该直接可选，不需要先「导入字体」。
+        let installed = vec!["Sarasa Mono SC".to_string(), "Consolas".to_string()];
+        let fonts = terminal_font_options(&[], &installed);
+        let values = fonts
+            .iter()
+            .map(|font| font.value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.iter().any(|font| font == "Sarasa Mono SC"));
+        // 内置精选列表已经含有 Consolas，不应重复出现。
+        assert_eq!(
+            1,
+            values
+                .iter()
+                .filter(|font| font.as_str() == "Consolas")
+                .count()
+        );
+        // 系统字体是已安装状态，标签里不应带「(未安装)」。
+        assert!(fonts.iter().any(|font| {
+            font.value.as_ref() == "Sarasa Mono SC" && font.label.as_ref() == "Sarasa Mono SC"
+        }));
+    }
+
+    #[test]
+    fn terminal_font_options_exclude_installed_fallback_only_fonts() {
+        // 这些字体只作为 fallback 使用，选成主字体后会被
+        // `normalize_grid_monospace_font_family` 静默重置，所以即使系统里装了也不列出来。
+        let installed = vec!["Microsoft YaHei".to_string(), "Sarasa Mono SC".to_string()];
+        let values = terminal_font_options(&[], &installed)
+            .into_iter()
+            .map(|font| font.value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(!values.iter().any(|font| font == "Microsoft YaHei"));
+        assert!(values.iter().any(|font| font == "Sarasa Mono SC"));
     }
 
     #[test]

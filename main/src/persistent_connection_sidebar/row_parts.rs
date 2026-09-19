@@ -10,7 +10,7 @@ use one_core::storage::{ConnectionType, StoredConnection};
 use rust_i18n::t;
 
 use super::SidebarPalette;
-use crate::connection_visuals::connection_type_label;
+use crate::connection_visuals::connection_type_display_label;
 use crate::home::home_workspace_filter::{WorkspaceDialogConfig, show_workspace_dialog};
 use crate::home_tab::connection_team_badge;
 
@@ -163,13 +163,7 @@ pub(super) fn connection_type_tag(connection: &StoredConnection, cx: &gpui::App)
         .py_0p5()
         .rounded(px(4.0))
         .bg(cx.theme().muted)
-        .child(
-            div()
-                .size(px(6.0))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(dot),
-        )
+        .child(div().size(px(6.0)).flex_shrink_0().rounded_full().bg(dot))
         .child(
             div()
                 .min_w_0()
@@ -179,22 +173,16 @@ pub(super) fn connection_type_tag(connection: &StoredConnection, cx: &gpui::App)
                 .overflow_hidden()
                 .text_ellipsis()
                 .whitespace_nowrap()
-                .child(connection_type_tag_label(kind)),
+                .child(connection_type_display_label(connection, cx)),
         )
         .into_any_element()
-}
-
-fn connection_type_tag_label(kind: ConnectionType) -> String {
-    match kind {
-        ConnectionType::SshSftp => t!("ConnectionType.server").to_string(),
-        _ => connection_type_label(kind),
-    }
 }
 
 fn connection_type_tag_color(kind: ConnectionType, cx: &gpui::App) -> Hsla {
     match kind {
         ConnectionType::Database => cx.theme().blue,
         ConnectionType::SshSftp => cx.theme().success,
+        ConnectionType::Ftp => cx.theme().cyan,
         ConnectionType::Redis => cx.theme().warning,
         ConnectionType::MongoDB => cx.theme().info,
         ConnectionType::Mqtt => cx.theme().accent,

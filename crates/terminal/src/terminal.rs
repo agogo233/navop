@@ -51,6 +51,7 @@ use crate::history::{
     collect_history_search_results, collect_history_suggestions_with_cwd, collect_recent_history,
     normalize_recorded_command, parse_shell_history, push_rich_history_entry,
 };
+use crate::line_timeline::{LineTimelineSample, SharedLineTimeline};
 use crate::pty_backend::{GpuiEventProxy, LocalPtyBackend};
 use crate::recording::{
     RecordingArtifactKind, RecordingBackend, RecordingCompleteness, RecordingMetadata,
@@ -132,8 +133,8 @@ pub enum TerminalModelEvent {
     CommandHistoryChanged,
     /// 终端程序请求存储到剪贴板
     ClipboardStore(String),
-    /// 远程工作目录变更（OSC 7）
-    WorkingDirChanged(String),
+    /// 远程工作目录变更（OSC 7），带上报主机名
+    WorkingDirChanged(crate::osc::ReportedWorkingDir),
     /// 会话锁定/解锁状态变化
     LockStateChanged,
 }
@@ -743,6 +744,13 @@ fn ssh_config_with_confirmed_host_key(
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
 
+/// 本地 PTY 后端异常停止时写入 `child_exited` 的哨兵值。
+///
+/// 后端停止时子进程状态未知（PTY 读取线程可能已异常终止，而子进程本身仍然存在），
+/// 因此不能伪造正常的退出码；负值明确表示“没有可用的退出码”。界面只需要知道
+/// “这个会话已经结束”，从而不再把它当作可输入的活动会话。
+const LOCAL_BACKEND_STOPPED_EXIT_CODE: i32 = -1;
+
 /// 将路径安全地转为 POSIX shell 单参数，避免命令注入。
 pub(crate) fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -891,10 +899,24 @@ pub fn resolve_local_working_dir(working_dir: Option<String>) -> Option<PathBuf>
     }
 }
 
+/// 本地终端文件树的根目录(仅本机/WSL 会话;容器会话返回 `None`)。
+///
+/// WSL 会话以 `wsl.exe --distribution <发行版>` 启动，发行版文件系统在 Windows 侧
+/// 通过 `\\wsl$\<发行版>` 暴露；这类会话没有 Windows 工作目录，若沿用普通本地
+/// 会话的回落逻辑（`dirs::home_dir()`），文件树会显示本机磁盘而不是发行版里的
+/// 文件。因此这里走 [`crate::workspace_source`] 的策略解析。容器 exec 会话的
+/// 文件系统不是本机路径，交由容器后端处理，此处不返回根目录。
+pub fn resolve_local_workspace_root(config: &LocalConfig) -> Option<PathBuf> {
+    match crate::workspace_source::resolve_local_workspace_source(config)? {
+        crate::workspace_source::LocalWorkspaceSource::Host { root } => Some(root),
+        crate::workspace_source::LocalWorkspaceSource::Container { .. } => None,
+    }
+}
+
 /// 准备本地终端的 Shell Integration 环境
 ///
 /// 将 `shell_integration.sh` 写入进程级临时目录 `/tmp/onetcli-<pid>/`，
-/// 仅对当前 OnetCli 进程内的终端会话生效，不污染全局配置。
+/// 仅对当前 Navop 进程内的终端会话生效，不污染全局配置。
 /// 返回 `(额外环境变量, shell 额外参数)`。
 #[cfg(not(target_os = "windows"))]
 fn prepare_shell_integration(shell: Option<&str>) -> (Vec<(String, String)>, Vec<String>) {
@@ -1159,7 +1181,8 @@ pub struct Terminal {
     /// 终端标题
     title: String,
     /// 当前工作目录（由 OSC 7 更新，仅 SSH 终端）
-    current_working_dir: Option<String>,
+    /// 最近一次 OSC 7 上报的远程工作目录（含上报主机名）
+    reported_working_dir: Option<crate::osc::ReportedWorkingDir>,
     /// 子进程退出码
     child_exited: Option<i32>,
     /// 连接状态
@@ -1212,7 +1235,7 @@ pub struct Terminal {
     connection_name: Option<String>,
     /// 初始化命令（连接成功后执行）
     init_commands: Option<String>,
-    /// 当前 OnetCli 会话内记录的命令历史（富条目，含 frecency 元数据）
+    /// 当前 Navop 会话内记录的命令历史（富条目，含 frecency 元数据）
     session_history: VecDeque<HistoryEntry>,
     /// 从 shell 历史文件加载的持久化历史
     persisted_history: Vec<String>,
@@ -1229,6 +1252,8 @@ pub struct Terminal {
     connection_kind: TerminalConnectionKind,
     /// 终端滚屏历史最多保留的行数
     scrollback_lines: usize,
+    /// 逐行到达时间；只用于左边距的时间戳展示，不进网格。
+    line_timeline: SharedLineTimeline,
 }
 
 #[derive(Clone)]
@@ -1629,6 +1654,7 @@ impl Terminal {
         Self::spawn_event_loop(event_rx, wakeup_pending.clone(), cx);
 
         Self {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -1639,7 +1665,7 @@ impl Terminal {
             recording_session_id,
             recording_session_metadata: local_recording_session_metadata(),
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Disconnected { error: Some(error) },
             session_lock: None,
@@ -1782,6 +1808,7 @@ impl Terminal {
         let history_repository = Self::history_repository(cx);
 
         Ok(Self {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -1792,7 +1819,7 @@ impl Terminal {
             recording_session_id,
             recording_session_metadata,
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connected,
             session_lock: None,
@@ -1927,6 +1954,7 @@ impl Terminal {
             });
 
         let mut terminal = Self {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -1937,7 +1965,7 @@ impl Terminal {
             recording_session_id,
             recording_session_metadata,
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connecting,
             session_lock: None,
@@ -2061,6 +2089,7 @@ impl Terminal {
         );
 
         Self {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -2071,7 +2100,7 @@ impl Terminal {
             recording_session_id,
             recording_session_metadata,
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connecting,
             session_lock: None,
@@ -2181,6 +2210,7 @@ impl Terminal {
         }
 
         Self {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -2191,7 +2221,7 @@ impl Terminal {
             recording_session_id,
             recording_session_metadata,
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connecting,
             session_lock: None,
@@ -2323,6 +2353,7 @@ impl Terminal {
 
         (
             Self {
+                line_timeline: Default::default(),
                 term,
                 session_mode,
                 performance_metrics,
@@ -2333,7 +2364,7 @@ impl Terminal {
                 recording_session_id: Self::new_recording_session_id(),
                 recording_session_metadata: RecordingSessionMetadata::default(),
                 title: String::new(),
-                current_working_dir: None,
+                reported_working_dir: None,
                 child_exited: None,
                 // Connected suppresses the live reconnect overlay. Capability
                 // checks still fail closed through `session_mode`.
@@ -3086,7 +3117,7 @@ impl Terminal {
         let Some(command) = normalize_recorded_command(command, history_user.as_deref()) else {
             return;
         };
-        let cwd = self.current_working_dir.clone();
+        let cwd = self.current_working_dir().map(str::to_string);
         let entry = HistoryEntry::new(command.clone())
             .with_cwd(cwd.clone())
             .with_exit_code(Some(exit_code));
@@ -3144,9 +3175,31 @@ impl Terminal {
         }
     }
 
+    /// 采样一次行时间轴。解析器繁忙时跳过，下一个 Wakeup 会补上。
+    fn sample_line_timeline(&self) {
+        let Some(term) = self.term.try_lock_unfair() else {
+            return;
+        };
+        let sample = LineTimelineSample {
+            history_size: term.history_size(),
+            screen_lines: term.screen_lines(),
+            cursor_line: term.grid().cursor.point.line.0,
+            alternate_screen: term.mode().contains(TermMode::ALT_SCREEN),
+            scrollback_lines: self.scrollback_lines,
+        };
+        drop(term);
+        self.line_timeline.observe(sample);
+    }
+
+    /// 行时间轴句柄，视图侧用于查每行时间戳。
+    pub fn line_timeline(&self) -> SharedLineTimeline {
+        self.line_timeline.clone()
+    }
+
     fn handle_terminal_event(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
         match event {
             TerminalEvent::Wakeup => {
+                self.sample_line_timeline();
                 cx.emit(TerminalModelEvent::Wakeup);
             }
             TerminalEvent::SshMfaChanged => {
@@ -3190,15 +3243,26 @@ impl Terminal {
                 self.child_exited = Some(code);
                 cx.emit(TerminalModelEvent::ChildExit(code));
             }
+            TerminalEvent::BackendStopped => {
+                // 本地 PTY 后端已停止：既不会再产出输出，也不会接受输入。
+                // 必须显式结束会话，否则终端会停留在“看起来还在运行”的永久卡死状态，
+                // 用户既看不到错误也无法通过关闭/重连恢复。
+                tracing::warn!("本地终端后端已停止，标记会话结束");
+                self.backend = None;
+                self.child_exited = Some(LOCAL_BACKEND_STOPPED_EXIT_CODE);
+                cx.emit(TerminalModelEvent::ChildExit(
+                    LOCAL_BACKEND_STOPPED_EXIT_CODE,
+                ));
+            }
             TerminalEvent::ClipboardStore(_ty, data) => {
                 cx.emit(TerminalModelEvent::ClipboardStore(data));
             }
             TerminalEvent::ClipboardLoad(_ty) => {
                 // 剪贴板加载由 TerminalView 处理
             }
-            TerminalEvent::WorkingDirChanged(path) => {
-                self.current_working_dir = Some(path.clone());
-                cx.emit(TerminalModelEvent::WorkingDirChanged(path));
+            TerminalEvent::WorkingDirChanged(reported) => {
+                self.reported_working_dir = Some(reported.clone());
+                cx.emit(TerminalModelEvent::WorkingDirChanged(reported));
             }
             TerminalEvent::CommandFinished { exit_code } => {
                 tracing::debug!("命令执行完毕，退出码: {}", exit_code);
@@ -3246,7 +3310,17 @@ impl Terminal {
 
     /// 获取当前工作目录（由 OSC 7 更新，仅 SSH 终端）
     pub fn current_working_dir(&self) -> Option<&str> {
-        self.current_working_dir.as_deref()
+        self.reported_working_dir
+            .as_ref()
+            .map(|reported| reported.path.as_str())
+    }
+
+    /// 获取最近一次 OSC 7 上报的完整信息（路径 + 上报主机名）。
+    ///
+    /// 多跳会话里主机名是判断"这条路径属于哪台机器"的唯一依据，
+    /// 需要主机信息的下游（如侧边栏文件面板）应使用本方法。
+    pub fn reported_working_dir(&self) -> Option<&crate::osc::ReportedWorkingDir> {
+        self.reported_working_dir.as_ref()
     }
 
     pub fn rows(&self) -> usize {
@@ -3276,7 +3350,7 @@ impl Terminal {
             &self.persisted_history,
             prefix,
             limit,
-            self.current_working_dir.as_deref(),
+            self.current_working_dir(),
         );
         merge_history_matches(db_matches, fallback, limit)
     }
@@ -4173,7 +4247,7 @@ impl Terminal {
         }
         drop(term);
         self.child_exited = None;
-        self.current_working_dir = None;
+        self.reported_working_dir = None;
     }
 
     pub fn host_key_verification_request(&self) -> Option<HostKeyVerificationRequest> {
@@ -4512,7 +4586,7 @@ mod tests {
     use super::with_local_terminal_default_env;
     use super::{
         AutomaticSessionLogRequestInput, CommandRecordGate, ConnectionState,
-        HostKeyVerificationReason, HostKeyVerificationRequest, SessionLockState,
+        HostKeyVerificationReason, HostKeyVerificationRequest, LocalConfig, SessionLockState,
         SshConnectionUpdate, SshCredentialPromptPolicy, TermDimensions, Terminal,
         TerminalConnectionKind, TerminalMfaPrompt, TerminalMfaRequest, TerminalMfaResponder,
         TerminalScrollProxy, TerminalSessionMode, TerminalSshCredentials,
@@ -4522,9 +4596,10 @@ mod tests {
         is_reconnect_generation, is_ssh_password_prompt, keyboard_interactive_answers_for_terminal,
         merge_history_matches, normalize_history_matches, parse_stored_telnet_params,
         receive_terminal_event_for_gpui, recent_text_from_term,
-        resolve_default_windows_shell_from_env, resolve_local_working_dir, resolve_ssh_connection,
-        send_coalesced_wakeup, shell_escape_arg, should_install_connected_backend,
-        ssh_config_with_confirmed_host_key, ssh_config_with_runtime_credentials,
+        resolve_default_windows_shell_from_env, resolve_local_working_dir,
+        resolve_local_workspace_root, resolve_ssh_connection, send_coalesced_wakeup,
+        shell_escape_arg, should_install_connected_backend, ssh_config_with_confirmed_host_key,
+        ssh_config_with_runtime_credentials,
     };
     use crate::history::{
         HistoryEntry, ShellHistoryFormat, collect_history_suggestions, normalize_history_command,
@@ -4664,6 +4739,7 @@ mod tests {
         let wakeup_pending = event_proxy.wakeup_pending_handle();
 
         Terminal {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -4681,7 +4757,7 @@ mod tests {
                 ..RecordingSessionMetadata::default()
             },
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connected,
             session_lock: None,
@@ -5639,6 +5715,7 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             "Latest SSH".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -5707,6 +5784,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Prompted SSH".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -5782,6 +5860,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "No keyboard-interactive".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -5843,6 +5922,7 @@ mod tests {
         let connection = StoredConnection::new_ssh(
             "Host-key retry".to_string(),
             SshParams {
+                remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
                 sftp_account: None,
@@ -6053,6 +6133,42 @@ mod tests {
         assert_eq!(
             dirs::home_dir(),
             resolve_local_working_dir(Some("  ".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_local_workspace_root_keeps_the_working_dir_and_home_fallbacks() {
+        let explicit = LocalConfig {
+            shell: Some("cmd.exe".into()),
+            working_dir: Some("D:\\work".into()),
+            ..LocalConfig::default()
+        };
+        assert_eq!(
+            Some(std::path::PathBuf::from("D:\\work")),
+            resolve_local_workspace_root(&explicit)
+        );
+
+        let unspecified = LocalConfig {
+            shell: Some("cmd.exe".into()),
+            ..LocalConfig::default()
+        };
+        assert_eq!(dirs::home_dir(), resolve_local_workspace_root(&unspecified));
+    }
+
+    /// WSL 会话没有 Windows 工作目录；若按普通本地会话回落，文件树会指向本机
+    /// 主目录（issue：WSL 下文件树显示的不是发行版里的目录）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_local_workspace_root_points_wsl_sessions_at_the_distribution() {
+        let config = crate::wsl_distributions::local_config_for_wsl_distro_with(
+            "wsl.exe".into(),
+            "Ubuntu-24.04",
+        )
+        .unwrap();
+
+        assert_eq!(
+            Some(std::path::PathBuf::from(r"\\wsl$\Ubuntu-24.04")),
+            resolve_local_workspace_root(&config)
         );
     }
 
@@ -6780,6 +6896,7 @@ mod tests {
         let shared_metrics = performance_metrics.clone();
         let original_term = term.clone();
         let mut terminal = Terminal {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -6793,7 +6910,10 @@ mod tests {
             recording_session_id: "surface-reset-test-session".to_string(),
             recording_session_metadata: RecordingSessionMetadata::default(),
             title: "old title".to_string(),
-            current_working_dir: Some("/tmp/project".to_string()),
+            reported_working_dir: Some(crate::osc::ReportedWorkingDir::new(
+                Some("host"),
+                "/tmp/project".to_string(),
+            )),
             child_exited: Some(255),
             connection_state: ConnectionState::Connected,
             session_lock: None,
@@ -7064,6 +7184,7 @@ mod tests {
             Terminal::create_term(80, 24, 10_000, event_tx.clone());
         let wakeup_pending = event_proxy.wakeup_pending_handle();
         let mut terminal = Terminal {
+            line_timeline: Default::default(),
             term,
             session_mode: TerminalSessionMode::Live,
             performance_metrics,
@@ -7077,7 +7198,7 @@ mod tests {
             recording_session_id: "scrollback-test-session".to_string(),
             recording_session_metadata: RecordingSessionMetadata::default(),
             title: String::new(),
-            current_working_dir: None,
+            reported_working_dir: None,
             child_exited: None,
             connection_state: ConnectionState::Connected,
             session_lock: None,

@@ -1691,7 +1691,7 @@ fn active_x_host_subclasses_an_isolated_native_child_and_releases_owned_resource
             "in_place_object.Release();",
             "control.Release();",
             "container.Release();",
-            "DestroyWindow(host_window);",
+            "destroy_host_window();",
             "AtlAxWinTerm();",
             "OleUninitialize();",
         ],
@@ -2029,9 +2029,44 @@ fn active_x_event_sink_maps_known_dispids_and_unadvises_before_releasing_the_con
             "client.Release();",
             "control.Release();",
             "container.Release();",
-            "DestroyWindow(host_window);",
+            "destroy_host_window();",
             "AtlAxWinTerm();",
             "OleUninitialize();",
+        ],
+    );
+    // The host window destroy must observe its own result. `DestroyWindow` used
+    // to be called for its side effect only, which made a leaked host HWND
+    // indistinguishable from a clean teardown in the Rust-side logs.
+    assert_tokens_in_scope(
+        active_x,
+        "void destroy_host_window() noexcept",
+        "\n    }\n};",
+        &[
+            "const HWND window = host_window;",
+            // The owner thread has to be read before the window is gone.
+            "GetWindowThreadProcessId(window, nullptr)",
+            "SetLastError(ERROR_SUCCESS);",
+            "const BOOL destroyed = DestroyWindow(window);",
+            "GetLastError()",
+            "IsWindow(window)",
+            "log_native_host_window_destroy(",
+            "host_window = nullptr;",
+        ],
+    );
+    assert_contains_all(
+        active_x,
+        &[
+            // Correlates a destroy trace with one RDP session: Win32 recycles
+            // HWNDs, so the handle alone is ambiguous.
+            "uint64_t host_generation = 0;",
+            "resources->state.host_generation = owner->generation;",
+        ],
+    );
+    assert_contains_all(
+        internal,
+        &[
+            "void log_native_host_window_destroy(",
+            "uint32_t window_still_alive) noexcept;",
         ],
     );
     assert_contains_all(
@@ -2737,7 +2772,7 @@ fn build_is_windows_hosted_msvc_only_and_ci_runs_host_tests() {
     assert_tokens_in_scope(
         ".github/workflows/ci.yml",
         "  test:",
-        "  ci-gate:",
+        "  windows-rdp-probe:",
         &[
             "- uses: actions/checkout@v7",
             "- name: Install NASM",
@@ -2746,8 +2781,28 @@ fn build_is_windows_hosted_msvc_only_and_ci_runs_host_tests() {
             "$nasmDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append",
             "nasm -v",
             "- name: Setup Rust toolchain",
-            "- name: Build ATL/MSVC probe (x64 + x86)",
+            "run: ./script/test-windows.ps1",
         ],
+    );
+    // The ATL/MSVC probe is its own job so the Windows workspace test job stays short;
+    // it must still gate CI and cover both probe architectures.
+    assert_tokens_in_scope(
+        ".github/workflows/ci.yml",
+        "  windows-rdp-probe:",
+        "  ci-gate:",
+        &[
+            "- uses: actions/checkout@v7",
+            "- name: Install NASM",
+            "choco install nasm --no-progress --yes",
+            "$nasmDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append",
+            "- name: Setup Rust toolchain",
+            "- name: Build ATL/MSVC probe",
+            "-Target \"${{ matrix.target }}\"",
+        ],
+    );
+    assert_contains_all(
+        ".github/workflows/ci.yml",
+        &["needs: [prepare, test, windows-rdp-probe]"],
     );
     assert_contains_all(
         ".github/workflows/release.yml",

@@ -12,6 +12,7 @@ impl TerminalView {
             stored_connection,
             sync_path_enabled,
             local_working_dir,
+            workspace_source,
             tab_index,
             duplicate_source,
             recording_playback_name,
@@ -72,17 +73,39 @@ impl TerminalView {
             )
         });
 
-        let workspace_editor = is_local_terminal.then(|| {
-            let theme = crate::sidebar::workspace_theme_from_terminal_colors(
-                &default_theme.colors(),
-                cx.theme(),
-            );
-            cx.new(|_| WorkspaceEditor::new(theme))
-        });
-        let local_workspace = local_working_dir
+        // 文件树后端由会话来源决定:容器会话走 `docker exec`,其余走本机 std::fs。
+        let workspace_backend: Option<std::sync::Arc<dyn WorkspaceBackend>> =
+            workspace_source.as_ref().map(|source| match source {
+                LocalWorkspaceSource::Host { .. } => workspace_explorer::local_backend(),
+                LocalWorkspaceSource::Container { docker, container } => {
+                    workspace_explorer::container_backend(
+                        docker.program.clone(),
+                        docker.global_args.clone(),
+                        container.clone(),
+                        docker.env.clone(),
+                    )
+                }
+            });
+        let workspace_editor =
+            workspace_backend
+                .clone()
+                .filter(|_| is_local_terminal)
+                .map(|backend| {
+                    let theme = crate::sidebar::workspace_theme_from_terminal_colors(
+                        &default_theme.colors(),
+                        cx.theme(),
+                    );
+                    cx.new(move |_| WorkspaceEditor::with_backend(theme, backend))
+                });
+        let local_workspace = workspace_source
             .clone()
             .zip(workspace_editor.clone())
-            .map(|(root, editor)| LocalWorkspaceSidebar { root, editor });
+            .zip(workspace_backend)
+            .map(|((source, editor), backend)| LocalWorkspaceSidebar {
+                root: source.root(),
+                editor,
+                backend,
+            });
 
         // 创建侧边栏（传递 StoredConnection 用于文件管理器）
         let sidebar = cx.new(|cx| {
@@ -104,6 +127,9 @@ impl TerminalView {
             )
         });
         let sidebar_toolbar = cx.new(|_| TerminalSidebarToolbar::new(sidebar.clone()));
+        // 临时连接等需要运行时凭据的 SSH 会话此时还没有 SSH 工具面板，
+        // 等凭据提交后再补建（见 `TerminalView::ensure_ssh_tool_panels`）。
+        let ssh_tool_panels_pending = !sidebar.read(cx).ssh_tool_panels_ready();
         let sidebar_tool_panels = SidebarPanel::all()
             .iter()
             .copied()
@@ -209,6 +235,7 @@ impl TerminalView {
             },
             blink_manager,
             sidebar,
+            ssh_tool_panels_pending,
             workspace_editor,
             command_bar,
             sidebar_toolbar,
@@ -281,6 +308,10 @@ impl TerminalView {
             right_click_paste: false,
             paste_image_upload: true,
             vim_scroll_to_arrow_keys: true,
+            show_line_timestamps: initial_settings.show_line_timestamps,
+            show_line_numbers: initial_settings.show_line_numbers,
+            line_number_digits: super::terminal_render::MIN_LINE_NUMBER_DIGITS,
+            line_margin: LineMargin::default(),
             broadcast_client_id: None,
             sidebar_panel_size: TERMINAL_TOOLS_SIDEBAR_DEFAULT_WIDTH,
             resizing: None,

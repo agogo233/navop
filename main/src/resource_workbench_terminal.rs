@@ -28,7 +28,18 @@ impl TerminalHost for NativeTerminalHost {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<TerminalMount, TerminalMountError> {
-        let command = request.command.trim();
+        if let Some(operation) = request.operation.as_deref() {
+            // runtime pty 通道尚未在扩展协议中提供:此分支是 v3 声明面,
+            // 等扩展协议新增 pty 通道后在此桥接到 provider 侧会话。
+            return Err(TerminalMountError::LaunchFailed(format!(
+                "runtime terminal operation `{operation}` is not supported yet"
+            )));
+        }
+        let command = request
+            .command
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
         if command.is_empty() {
             return Err(TerminalMountError::LaunchFailed(
                 "the terminal page declares an empty command".into(),
@@ -55,7 +66,7 @@ impl TerminalHost for NativeTerminalHost {
 }
 
 /// 注入全局终端 host。应用启动时调用一次,须在 `terminal_view::init` 之后
-/// (由 `onetcli_app::init` 负责)。
+/// (由 `navop_app::init` 负责)。
 pub(crate) fn install_terminal_host(cx: &mut App) {
     cx.set_global(GlobalTerminalHost {
         host: Rc::new(NativeTerminalHost),

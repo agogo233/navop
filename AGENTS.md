@@ -330,6 +330,7 @@
 - **正确做法**：优先把异步任务完成后的 UI 状态变更提取为纯状态 contract，并用普通单元测试覆盖成功、失败、防重复加载、手动刷新等行为；网络解析和下载使用 fake HTTP client 覆盖。对纯 HTTP/IO 的 UI 加载，不要在 GPUI view 层额外包一层 `Tokio::spawn`，优先使用 `cx.background_spawn`，这样 `gpui` 的 `test-support` 能用 `TestAppContext`/`condition` 稳定驱动真实 view 测试。
 - **验证方式**：运行对应状态 contract 测试、fake HTTP 网络测试、真实 GPUI view 测试，以及相关 crate 的 `cargo check` / `cargo clippy -D warnings` / `cargo test`。
 - **适用范围**：`main/src/settings/*`、扩展市场加载、更新检查、数据库驱动安装等 GPUI UI 层异步加载路径。
+- **补充（拆分 init 的固定手法）**：当待测 `init(cx)` 同时做「注册 global」和「`Tokio::spawn` 启动后台任务」时，把注册部分抽成独立函数（如 `register_application_owner`），`#[gpui::test]` 只覆盖注册的纯状态契约（同一 owner、重复注册被拒），被 spawn 的后台任务改用普通 `#[tokio::test]` 直接覆盖（真实 runtime 里 start/stop 是确定性的，因为 `RuntimeMonitor::stop` 用 `select!` 抢在 `sleep` 前返回）。`Tokio::spawn` 完成时会在真实 worker 线程上唤醒 GPUI background executor，测试调度器直接以 “Detected activity on thread Some(\"tokio-rt-worker\")” 失败——这类报错一律按「拆 init」处理，不要加 sleep 或重试。
 
 - **标题**：GPUI `background_spawn` 不得直接轮询依赖 Tokio runtime 的数据库 Future
 - **触发信号**：macOS 上执行 SQL 转储、表导入或表导出时，在 `tokio::time::timeout`、数据库连接初始化或 Tokio socket/timer 路径出现“没有 reactor/runtime”类 panic，随后因 panic 穿过 GPUI 的 `extern "C"` 回调边界而触发 `SIGABRT`。
@@ -518,7 +519,7 @@
 - **根因 / 约束**：GPUI 的无上下文全局 `KeyBinding` 可能在终端 `on_key_down` 前分派 action；即使终端键码转换和 PTY 写入正确，冲突按键仍不会到达终端。`Ctrl+D`、`Ctrl+W`、`Ctrl+C`、`Ctrl+Z` 等是 shell/TTY 标准控制键，不适合作为终端聚焦时仍生效的全局默认快捷键。
 - **正确做法**：窗口、页签和面板 action 优先使用不与终端控制字符冲突的组合，或绑定到排除 `TerminalView` 的明确 key context；运行时默认值、设置页展示和可刷新绑定必须使用同一默认来源。
 - **验证方式**：回归测试同时断言全局默认绑定不包含目标控制键、设置页元数据与运行时一致，并运行 `terminal_view` 键码测试确认目标按键仍编码为预期控制字节。
-- **适用范围**：`main/src/onetcli_app.rs`、`main/src/setting_tab.rs`、`crates/terminal_view/src/view/keybindings.rs` 与所有无 context 的 GPUI 全局快捷键。
+- **适用范围**：`main/src/navop_app.rs`、`main/src/setting_tab.rs`、`crates/terminal_view/src/view/keybindings.rs` 与所有无 context 的 GPUI 全局快捷键。
 
 - **标题**：GPUI `Keystroke.key` 是键帽字符不是输入文本，凭据捕获必须用 `key_char`
 - **触发信号**：SSH/Telnet 连接时手动敲击输入密码一直提示认证失败，粘贴同样密码却正常；密码含大小写与特殊字符（issue #147）。
@@ -558,9 +559,9 @@
 - **标题**：把 main 里互相依赖的插件 UI 模块迁入 crate 必须整簇搬移并下沉 app 级 Global
 - **触发信号**：想把 `main/src/shell_plugin_host` + `shell_plugin_tab` 之类“插件机制”抽出到新 crate，却发现 host 依赖 `UniversalPluginService`、`GlobalTabContainer`、headless `ExtensionConnectionTab` 等仍在 main 里的符号，而 Rust 库 crate 无法 `use main`（bin）。
 - **根因 / 约束**：迁移对象只要引用了任何仍留在 main 的类型，就必须把它们一起搬出或先下沉到 crate，否则必然双向依赖。`shell_plugc`…具体到 Navop：`shell_plugin_host/shell_plugin_tab/universal_plugins/extension_connection_tab/extension_connection_form` 是一整簇互相 `crate::` 引用的单元，`cx.global::<GlobalTabContainer>()` 这类 app 级 tab 打开入口是所有 UI 共同的硬依赖，只能把 `GlobalTabContainer`（仅 `Entity<TabContainer>` 包装）下沉到 `one_core::tab_container`，不能反向注入。
-- **正确做法**：整簇 5 个模块一次搬入新 crate（`crates/universal-plugins`），功能开关用 crate 自带 `shell-plugins` optional dep feature 表达（main 的 `shell-plugins` 改为 `["universal-plugins/shell-plugins"]`），默认 off 时 crate 为空。搬移时把 `pub(crate)`→`pub` 只改 main 真实消费的边界（global 类型、load/service/open_connection/resource_connection/register_headless_tab 与 `ConnectionShellOpen` 字段），簇内引用 `crate::` 路径在新 crate 里解析位置不变，多数文件零改动。main 侧只改 import 路径。
-- **验证方式**：双态验证 `cargo check -p main`（feature off）与 `cargo check -p main --features shell-plugins` 及 `--tests`；`cargo clippy -p universal-plugins --features shell-plugins --all-targets`；`cargo test -p universal-plugins --features shell-plugins`。
-- **适用范围**：`crates/universal-plugins`、`main/src/{home_strategy,home_tab/connection_forms,new_connection/form_page,onetcli_app,file_open,extension_update,home/home_tabs}`、`crates/core/src/tab_container.rs`，以及任何计划从 main 抽 UI 逻辑到新 crate 的后续重构。
+- **正确做法**：整簇 5 个模块一次搬入新 crate（`crates/universal-plugins`），功能开关用 crate 自带 `shell-plugins` optional dep feature 表达（main 的 `shell-plugins` 改为 `["universal-plugins/shell-plugins"]`）。该 feature 自 2026-09-15 起列入 `main` 的 `default`，所以默认构建就带 Shell 页；`crates/universal-plugins` 自身仍保持 `default = []`（给它也设 default 反而会让 `main --no-default-features` 漏进 Shell 页，因为该开关只能关掉当前被选中包的 default）。feature off 时 crate 内这簇为空。搬移时把 `pub(crate)`→`pub` 只改 main 真实消费的边界（global 类型、load/service/open_connection/resource_connection/register_headless_tab 与 `ConnectionShellOpen` 字段），簇内引用 `crate::` 路径在新 crate 里解析位置不变，多数文件零改动。main 侧只改 import 路径。
+- **验证方式**：双态验证默认构建 `cargo check -p main`（含 shell-plugins）与关闭态 `cargo check -p main --no-default-features --features wasm-components,embedded-webview,windows-native-rdp`，各带 `--tests`；`cargo clippy -p universal-plugins --features shell-plugins --all-targets`；`cargo test -p universal-plugins --features shell-plugins`。改共享契约（如 `BindingContext` 加字段）后两态都要跑：漏编发生在关闭态一侧（feature 未开时整个 `shell_plugin_host` 不参与编译），只跑默认构建会漏掉它。
+- **适用范围**：`crates/universal-plugins`、`main/src/{home_strategy,home_tab/connection_forms,new_connection/form_page,navop_app,file_open,extension_update,home/home_tabs}`、`crates/core/src/tab_container.rs`，以及任何计划从 main 抽 UI 逻辑到新 crate 的后续重构。
 
 - **标题**：View 内联渲染自己的引用方会造成 GPUI 实体租约重入 panic
 - **触发信号**：运行时在 `entity_map.rs` 报 `cannot read X while it is already being updated`，场景为 A::render 中直接 `b.update(cx, |b, cx| b.render_something(cx))`，且该路径内部再 `this.a.read(cx)` / `this.a.update(cx)`。
@@ -616,6 +617,55 @@
 - **正确做法**：防抖状态机 = `Option<Task<()>>` + 纯函数判定 `should_scan_after_input(keyword, server_search_keyword)`（空关键词或已扫过 → 不发）；「立刻搜」入口（回车 / 搜索按钮）先 `self.search_debounce = None`，并在**同一函数内同步**写入「已交给服务端」的标记，不要指望事件兜一圈回来由订阅方补写；每次输入都替换 `Task` 字段即完成取消。
 - **验证方式**：`cargo test -p redis_view`；端到端用 `simulate_input` + `advance_clock` 断言「停顿前 0 次、停顿后 1 次、回车后不再补发」，并单独加一个对照分支测试证明 `drop(Task)` 会取消定时器——这样「多写一个代次守卫」这类死代码才会在变异验证里暴露。
 - **适用范围**：`crates/redis_view/src/redis_tree_view.rs`，以及任何 GPUI 视图中的输入防抖、定时器 + 事件订阅组合。
+
+- **标题**：gpui 里「图标整块空白」先查 icon source 与 color mode 的组合，不要先怀疑布局或尺寸
+- **触发信号**：某个图标（尤其外部扩展 / 驱动 / 自定义 SVG）突然不显示，且是「什么都没有」而不是「颜色不对 / 太小」；全量替换为 `Icon::default().data(bytes)` 之后开始出现。
+- **根因 / 约束**：`gpui_component::Icon` 有两个正交维度：`IconSource::{Path, Data}` × `IconColorMode::{Mono, Color}`，其中 **`Data` + `Color` 是坏的组合**：`color_icon_content` 对 Data 走 `svg().data(data).size_full()`，而 gpui-pre 的 `Svg::paint` 把 data 分支写成 `if let Some(color) = style.text.color { paint_svg(..) }`，同时 `Interactivity::compute_style_internal` 只做 `Style::default().refine(base_style)`、**不继承父级 text color** → `None` → 整段 paint 被跳过（不是画错颜色，是根本没画）。Mono 之所以正常，是因为 `into_svg` 会显式 `.text_color(..)`。另一个独立坑：`gpui::img(path_str)` 用 `url::Url::from_str(..).is_ok()` 判 URI，`driver://x/y.svg` **会被判成 URI**（`driver://` 是合法 scheme），于是走 `Resource::Uri` 发 HTTP GET 必然失败；**同理 Windows 绝对路径 `C:\...` 也会被判成 scheme = `c`**（macOS 的 `/abs/path` 反而安全）。只有 `Resource::Embedded`（无冒号的路径串）或 `Resource::Path`（传 `PathBuf`，`Icon` 不暴露）才会进 AssetSource。此外 `svg()` 在 gpui 里本质是 alpha mask 单色着色，**想保留品牌原色只能走 `img()`**。
+- **正确做法**：图标不显示时先确认实际走了哪条来源分支（本仓 `db::ipc::display::preferred_icon_*` → `main/src/connection_visuals.rs::external_driver_icon_source` 是 **file 优先**，且 `icon_file_path_for` 不校验文件是否存在，所以 manifest 里有 `ui.icon` 就一定走 file）。修的时候让所有磁盘图标统一走 `img()`，即把「路径」表达成**无 scheme 的资产路径**再由 `AssetSource` 读盘：驱动包图标用 `db::ipc::DRIVER_ICON_ASSET_PREFIX`（`driver-icons/{id}/{resource}{ext}`，经 `IpcDriverRegistry` 解析到 `manifest_dir.join(ui.icon)`），任意本地文件用 `db::ipc::LOCAL_ICON_ASSET_PREFIX`（`local-icon/{path}`，跨平台都不会被 `is_uri` 命中），调用侧一律 `Icon::default().path(..).color()`（即 `img()`）。**禁止 `Icon::data(bytes)` + `.color()`**，也禁止 `xxx://` 形式与裸绝对路径。
+- **验证方式**：`cargo test -p db --lib ipc::`（新增 `driver_icon_asset_paths_are_never_uris`、`local_icon_asset_paths_are_never_uris_and_round_trip`、`driver_asset_source_serves_local_icon_files_and_driver_icons` 三组回归，用与 gpui 同一个 `url::Url::parse(..).is_ok()` 谓词钉住这个坑）+ `cargo test -p db_view`、`cargo test -p main --lib new_connection`；快速判定某串是否被当 URI，直接用 `target/debug/deps/liburl-*.rlib` 跑 `rustc --extern url=... probe.rs` 实测，比读 gpui 源码猜快。
+- **适用范围**：`crates/db/src/ipc/display.rs` / `resources.rs`、`main/src/connection_visuals.rs`、`main/src/new_connection/connection_kind.rs`、`crates/db_view/{database_tab,db_tree_view}.rs`，以及任何「外部扩展声明的自定义图标」「SSH 自定义图标文件」渲染路径。
+
+- **标题**：`cargo fmt` 不要带文件路径参数——本仓会重写整个 workspace，污染未提交改动
+- **触发信号**：想「只格式化我改的几个文件」而运行 `cargo fmt -- <paths>`（`--` 之后的路径**不是过滤器**，会被当成 rustfmt 附加参数作用于每个 workspace 成员的每个 target）；或想用 `rustfmt --config-path <repo>/rustfmt.toml /tmp/x.rs` 复现 rustfmt 行为、据此判断「某文件是否 rustfmt-clean」。
+- **根因 / 约束**：前者一次性改写了 172 个文件（其中 140+15 个当时是已提交、干净的文件）。后者**不可靠**：文件里若有 `mod x;`，rustfmt 在 `/tmp` 找不到同级模块会报错并跳过格式化，于是「rustfmt(副本) == 当前内容」的判据把这些文件误判成「含真实改动」。
+- **正确做法**：只格式化改动文件时用 `rustfmt --edition <edition> <file>`（直接调 rustfmt）或 `cargo fmt -p <crate>`。判断「某文件是否只是被格式化」要在**同一 crate 上下文**里做：`git worktree add --detach /tmp/wt HEAD` → 在 worktree 内 `rustfmt <file>` → 与工作区文件 `diff`；相等 ⇒ 该文件原本与 HEAD 只差格式化，可安全 `git checkout -- <file>` 精确回滚；不相等 ⇒ 含真实未提交改动，**不要回滚**，交还用户（RustRover Local History 里有「External change」版本可逐文件还原）。
+- **验证方式**：回滚后 `git diff --name-only` 只应剩下自己的改动 + 用户原有 WIP；再跑 `cargo check -p <受影响 crate>` 确认未破坏编译。
+- **适用范围**：任何 Rust 仓库的批量格式化；`rustfmt.toml` 带 `edition`/`style_edition` 时，务必用与 `cargo fmt` 相同的 `--edition` 复现行为。
+
+- **标题**：GPUI 文字选择失灵先分「选区色不透明盖字」与「容器 stop_propagation 拦截窗口级选择」两类
+- **触发信号**：侧边栏/面板里的 `TextView` 富文本（AI 输出等）①可以拖出选区但选中文本被实心色块盖住；②拖动完全没有选区高亮。两类症状共用 gpui-component 的窗口级文字选择机制（`TextSelectionLayer` 在 `gpui_component::Root` 里绘制，选区在 mouse-down **bubble 阶段**才 `begin_in_window`）。
+- **根因 / 约束**：① gpui-base `text/inline.rs` 的 `Inline::paint` 先画字形、后画选区 quads（同仓 `SelectableText` 顺序是对的），不透明选区色直接遮字；应用主题的 `selection` 在组件 `ThemeColor::apply_config` 里被 clamp 到 alpha≤0.3 所以无感，但终端主题选区色（`TerminalTheme.selection`，预设均为不透明 `rgb(..)`）经 `agent_theme_from_terminal_theme` 原样传入就中招。② `tab_container.rs` 贡献式侧边栏浮动 dock（a5f9837d4 引入 absolute 覆盖布局时）在容器上 `on_mouse_down → stop_propagation` 防点击穿透，连带把 bubble 阶段的窗口级选择 handler 一并拦掉，dock 内所有 `TextView` 选区无法开始（终端侧边栏在标签内容区内渲染，不经此容器，故不受影响）。数据库/MongoDB 等侧边栏都是贡献式 dock。
+- **正确做法**：①给 `AgentChatTheme.text_selection` 传色时保证半透明（暗 0.3 / 亮 0.4，用 `Hsla::alpha` 设绝对值而非 `opacity` 乘法），不要信任上游主题源不透明；根治要改 fork 的 `Inline::paint` 绘制顺序（quads 画到 `styled_text.paint` 之前）。②容器要防穿透用 `.occlude()`（把下方内容挡出命中栈，元素级 handler 不触发），**不要用 `stop_propagation`**——后者会连带拦截所有窗口级 mouse handler；`stop_propagation` 只该用在确实要独占事件的窄交互元素（如 resize handle）。
+- **验证方式**：`cargo check -p one-core -p terminal_view`、`cargo test -p terminal_view --lib sidebar::tests`（含选区色 alpha 回归断言）、`cargo test -p one-core --lib tab_container sidebar`、`cargo clippy -p one-core -p terminal_view --all-targets`；手工验证需分别开终端侧边栏 AI 与数据库侧边栏 AI 拖选文字。
+- **适用范围**：`crates/terminal_view/src/sidebar/mod.rs`（终端主题 → AgentChatTheme 映射）、`crates/core/src/tab_container.rs`（贡献式侧边栏 dock）、`crates/ai_chat_view/src/theme.rs`（`text_selection` 消费点），以及任何向 gpui-component `TextViewStyle::with_selection` 传色、或在浮动覆盖容器上处理 mouse-down 的路径。
+
+- **标题**：独立 MSTSC 的凭据 target 是 `TERMSRV/<主机>`，不能带端口
+- **触发信号**：从 Navop 打开 RDP（`WindowsNative` / 独立窗口）后系统 `mstsc.exe` 仍弹「Windows 安全中心 / 输入你的凭据」要求手输密码，且用户名已预填；或反过来想把「同一主机不同端口各存一份 RDP 凭据」做成功能。
+- **根因 / 约束**：MSTSC 在 NLA 阶段查 Windows 凭据管理器时只按**主机名**匹配，`/v:<主机>:<端口>` 里的端口不参与 target，所以 `TERMSRV/192.168.111.245:3389` 永远查不到——默认端口 3389 与自定义端口都一样。截图里预填的用户名并非来自我们写入的凭据，而是 MSTSC 自己的注册表键 `HKCU\Software\Microsoft\Terminal Server Client\Servers\<主机>\UsernameHint`，因此「用户名有、密码没有」不能当凭据写对了的证据。另经对照实验确认：`CRED_TYPE_GENERIC + CRED_PERSIST_SESSION + 注释标记` 的写入方式本身能被 MSTSC 命中，问题只在 target 名。
+- **正确做法**：`mstsc_credentials()` 只拼 `TERMSRV/<host>`，`/v:` 参数继续带端口，连接目标不变；`MstscCredentialInput` 不需要 `port` 字段。副作用是同一主机不同端口无法保存不同凭据，这属 MSTSC 自身限制，不是本仓能解的。
+- **验证方式**：真机 MSTSC 无法单测，用本机 loopback + 假 RDP 服务端做对照实验：假服务端只完成 X.224 协商并声明 `PROTOCOL_HYBRID = 0x02`（**不是 0x0B，写错会被客户端回退成传统安全模式、根本不出凭据框**），按不同 target 写临时凭据后启动 `mstsc /v:127.0.0.1:<端口>`，以是否出现窗口类 `Credential Dialog Xaml Host` / 标题「Windows 安全中心」为判据：端口 3389 与 13389 下 `TERMSRV/host:port` 都弹框，`TERMSRV/host` 都不弹。单元测试用 `cargo test -p main --bin navop home::remote_desktop_window` 锁住 target 不含端口。
+- **适用范围**：`main/src/home/remote_desktop_window*`（独立 MSTSC 唤起路径），以及任何「替 MSTSC / 系统凭据管理器预写密码」的改造。
+
+- **标题**：长期分支合入主干用「反向合并」——在分支侧解冲突，主干 ff 快进
+- **触发信号**：把一个落后主干几十个提交的长期分支合入 `dev`，冲突文件多（含 `Cargo.toml` / `Cargo.lock`、共享 UI 文件），且主干上还有未提交的活跃改动；或已在主干 `git merge --no-commit` 后想撤退。
+- **根因 / 约束**：在主干上直接解冲突会让主干经历冲突中间态，解错的试错成本回灌主干；主干上用户的未提交改动也会被中间态牵连（要整体 `merge --abort` 才还原）。反向合并把风险全留在分支 worktree，主干全程干净。
+- **正确做法**：①预检 `git merge-tree --write-tree --name-only <trunk> <branch>` 拿冲突清单，再用 `comm -12` 求「主干未提交改动文件 ∩ 合并将引入文件」，非空则先停下确认；②在分支 worktree 里 `git merge <trunk>`（主干若残留中间态先 `git -C <trunk> merge --abort`）；③解冲突排序：语义差异（两侧实现同一功能的不同方案）先问用户 → 一侧为超集取超集 → import/重复块按**符号实际是否被使用**收口，不盲目取并集；④依赖 rev 冲突用 `git -C <dep-repo> merge-base --is-ancestor <a> <b>` 判定并取**后代**那个（而非日期更新的），`Cargo.lock` 里同一 rev 多处出现用一次 `replace_all`；⑤`cargo check --workspace --all-targets` 通过后，主干 `git merge --ff-only <branch>`，快进后**再跑一次主干 check**（叠加用户未提交改动，文件不重叠不代表 API 不冲突）。
+- **验证方式**：`cargo metadata --format-version 1 --locked --offline`（exit=0 即 toml/lock 一致）、`cargo check --workspace --all-targets`（分支侧、主干各一次）、核心 crate `--lib` 测试；回退用 `git reset --mixed <原 SHA>`（保留工作区改动）。
+- **适用范围**：任何「长期分支 → 主干」的合并。两个易踩的坑：①worktree 的 `MERGE_HEAD` / `ORIG_HEAD` 在 `<主仓>/.git/worktrees/<name>/` 下，不在 worktree 自己的 `.git`（那是 `gitdir:` 指针文件），查后者会误判「合并已结束」；②分支名与 worktree 目录名常不同（如 `impl/ftp-support-172` ↔ `navop-ftp-support-172`）。
+
+- **标题**：release profile 设 `panic = "abort"` 后，`catch_unwind` 既不能做契约断言也不能做隔离，契约要用返回值表达
+- **触发信号**：把 release profile 改成 `panic = "abort"` 后，用 `catch_unwind` 断言「重复注册 / 非法输入必须 panic」的测试在 `cargo test --release` 下把整个测试进程 abort；或看到 `catch_unwind` 包着调用方回调、就以为 release 里仍能隔离该回调的 panic。
+- **根因 / 约束**：`panic = "abort"` 下 panic 直接终止进程，没有展开可捕获，`catch_unwind` 照常编译但永不返回 `Err`。CI 只跑 dev profile（`unwind`），所以这类断言在 CI 里照常通过，只有 `cargo test --release` 或发布二进制才暴露；用 `#[cfg(panic = "unwind")]` 跳过用例会静默丢掉 release 模式的覆盖。尺寸收益是量出来的：`__eh_frame` 16.0MiB + `__gcc_except_tab` 8.6MiB ≈ 24.6MiB，所以改回 `unwind` 不是零成本。
+- **正确做法**：可表达为契约的重复注册 / 非法状态不用 `assert!` + panic，改为返回 `Option` / `Result`，调用方（如插件服务的 `init`）用 `expect` 保留「这是 bug」的强语义，测试直接断言 `is_none()` / `is_err()`，两个 profile 都能跑。跨 FFI / C ABI 边界或调用方回调处的 `catch_unwind` 在 abort 下是死代码，应确认被包住的主体本身 panic-free（如只做 poison-safe 锁、channel send、原子交换），并在注释里写明该守卫只对 `unwind` 构建生效。
+- **验证方式**：dev 与 release 两个 profile 跑同一用例：`cargo test -p universal-plugins --lib` 与 `cargo test --release -p universal-plugins --lib`（release 想省时间只覆盖 `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`，`panic` 仍取 profile 值），再用 `cargo test --release -p universal-plugins --lib -- --list` 确认用例不再被 cfg 掉。
+- **适用范围**：`crates/universal-plugins/src/universal_plugins.rs`、`crates/terminal/src/recording/runtime.rs`、`crates/windows_rdp_host/src/event.rs`，以及 profile 设了 `panic = "abort"` 后所有用 `catch_unwind`、`#[should_panic]`、`#[cfg(panic = "unwind")]` 表达契约或隔离的测试与调用点。
+
+- **标题**：Windows GUI 进程 spawn 控制台子程序必须走 `process-util` 隐藏控制台，否则启动/操作时闪黑框
+- **触发信号**：Windows 上启动应用闪一下控制台窗口（本次是启动期 `wsl.exe --list --verbose`），或打开某个功能（HTML 预览、容器文件树、设置页装 skill）时闪一个 cmd 黑框；也适用于新增任何 `std::process::Command::new` / `tokio::process::Command::new` 后台调用点时。
+- **根因 / 约束**：Navop 是 windows 子系统 GUI 进程，自身没有控制台。spawn 控制台子系统程序（`wsl.exe`、`cmd.exe`、`docker.exe`、`npx.cmd`、`git.exe`、`reg.exe`…）时若未设 `CREATE_NO_WINDOW`（`0x0800_0000`），Windows 会为子进程新建一个控制台窗口并显示——即使 stdout/stderr 都已重定向到管道也一样，所以「反正输出走管道」不能当作不闪的理由。GUI 子系统程序（`mstsc.exe`、自身 exe）不需要处理。
+- **正确做法**：统一用 `crates/process-util`：`process_util::configure_background_child(&mut std_command)`（std）或 `configure_tokio_background_child(&mut tokio_command)`（tokio）。写法必须是「先 `let mut command = Command::new(..)`、配好 args/env/stdio，再 configure，最后 `spawn()` / `output()`」，不能保留链式 `.spawn()`，否则没有可变绑定可配。仅当纯逻辑小 crate 不想为 `process-util`（它硬依赖 `tokio/process`）拉进 tokio 时，按 `main/src/file_association.rs` 先例内联 `#[cfg(windows)]` 的 `creation_flags(CREATE_NO_WINDOW)` helper，并配 `#[cfg(not(windows))]` 空实现避免 unused 告警。
+- **验证方式**：四条结构 contract（`include_str!` 断言源码里存在对应的 `configure_background_child` / `creation_flags`，沿用 `workspace_explorer/src/git/tests.rs` 风格）——`cargo test -p terminal --lib wsl_distributions`、`cargo test -p html-preview`、`cargo test -p workspace_explorer --lib backend`、`cargo test -p main --bin navop mcp_skill`；再跑受影响 crate 的 `cargo check --tests` 与 `cargo clippy --all-targets`（只比对改动文件是否有新增告警）。**macOS 上 `cfg(windows)` 分支根本不参与编译，本机无法验证「不闪窗」**，最终必须 Windows 实机启动一次确认。
+- **适用范围**：`crates/terminal/src/wsl_distributions.rs`（启动期 WSL 识别，commit 57e31731b 引入的遗漏）、`crates/html-preview/src/browser.rs`（Windows 走 `cmd /C start`）、`crates/workspace_explorer/src/backend.rs`（容器后端 `docker exec`）、`main/src/settings/mcp_skill_install.rs`（`npx`/`node` 启动器），以及所有新增后台外部命令调用点；`workspace_explorer/src/git.rs`、`core/cloud_sync/personal/git_store.rs`、`extension-host/src/process.rs`、`remote_desktop/src/backends/rdp/transport.rs`、`remote_file_editor/src/external_launcher.rs`、`main/src/file_association.rs` 是已按此约定收口的正确样例。
 
 ### 执行原则
 

@@ -29,10 +29,23 @@ use gpui::{
     FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
     PathPromptOptions, Render, SharedString, Styled, WeakEntity, Window, div,
 };
-use gpui_component::{ActiveTheme, AxisExt, Disableable, Icon, IndexPath, Sizable, Size, WindowExt, button::{Button, ButtonVariants as _}, clipboard::Clipboard, group_box::GroupBoxVariant, h_flex, input::{Input, InputState}, kbd::Kbd, scroll::ScrollableElement, select::{Select, SelectItem, SelectState}, setting::{
+use gpui_component::{
+    ActiveTheme, AxisExt, Disableable, Icon, IndexPath, Sizable, Size, WindowExt,
+    button::{Button, ButtonVariants as _},
+    clipboard::Clipboard,
+    group_box::GroupBoxVariant,
+    h_flex,
+    input::{Input, InputState},
+    kbd::Kbd,
+    scroll::ScrollableElement,
+    select::{Select, SelectItem, SelectState},
+    setting::{
         NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings,
-    }, switch::Switch, v_flex};
+    },
+    switch::Switch,
+    v_flex,
+};
 use one_assets::IconName;
 use one_core::cloud_sync::{
     CloudSyncService, GlobalCloudUser, SyncEngine, TeamKeyCacheStatus, TeamOption,
@@ -53,10 +66,10 @@ const TEAM_KEYS_SETTINGS_PAGE_INDEX: usize = 6;
 
 use gpui_component::input::InputEvent;
 pub use one_core::settings::{
-    AppSettings, CustomFont, DatabaseOpenMode, GlobalCurrentUser, GlobalProxySettings, LOCALE_EN,
-    LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK, PersonalSyncBackendKind, PersonalSyncSettings,
-    ProxyType, SyncProvider, effective_locale_for_setting, is_installed_font_family,
-    is_supported_grid_monospace_font,
+    AppSettings, CloseButtonBehavior, CustomFont, DatabaseOpenMode, GlobalCurrentUser,
+    GlobalProxySettings, LOCALE_EN, LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK,
+    PersonalSyncBackendKind, PersonalSyncSettings, ProxyType, SyncProvider,
+    effective_locale_for_setting, is_installed_font_family, is_supported_grid_monospace_font,
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
@@ -83,13 +96,18 @@ fn builtin_app_font_options() -> Vec<(SharedString, SharedString)> {
     .collect()
 }
 
-fn app_font_options(cx: &App) -> Vec<(SharedString, SharedString)> {
-    merge_font_options_with_custom_fonts(
+fn app_font_options(
+    installed_font_names: &[String],
+    custom_fonts: &[CustomFont],
+) -> Vec<(SharedString, SharedString)> {
+    let mut options = merge_font_options_with_custom_fonts(
         builtin_app_font_options(),
-        &AppSettings::global(cx).custom_fonts,
+        custom_fonts,
         FontFamilyKind::Any,
-        None,
-    )
+        Some(installed_font_names),
+    );
+    merge_installed_font_options(&mut options, installed_font_names, FontFamilyKind::Any);
+    options
 }
 
 fn builtin_monospace_font_options() -> Vec<(SharedString, SharedString)> {
@@ -99,14 +117,22 @@ fn builtin_monospace_font_options() -> Vec<(SharedString, SharedString)> {
         .collect()
 }
 
-fn monospace_font_options(cx: &App) -> Vec<(SharedString, SharedString)> {
-    let installed_font_names = cx.text_system().all_font_names();
-    merge_font_options_with_custom_fonts(
+fn monospace_font_options(
+    installed_font_names: &[String],
+    custom_fonts: &[CustomFont],
+) -> Vec<(SharedString, SharedString)> {
+    let mut options = merge_font_options_with_custom_fonts(
         builtin_monospace_font_options(),
-        &AppSettings::global(cx).custom_fonts,
+        custom_fonts,
         FontFamilyKind::Monospace,
-        Some(&installed_font_names),
-    )
+        Some(installed_font_names),
+    );
+    merge_installed_font_options(
+        &mut options,
+        installed_font_names,
+        FontFamilyKind::Monospace,
+    );
+    options
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +183,39 @@ fn mark_missing_font_options(
         if !is_installed_font_family(value.as_ref(), installed_font_names) {
             *label = missing_font_label(value.as_ref());
         }
+    }
+}
+
+/// 把系统里已安装的字体并入下拉选项（issue #199）。
+///
+/// 背景：此前字体下拉只有「内置精选列表 + 用户手动导入的家族」，所以像 Sarasa
+/// 这样已经装进系统的字体必须先走一次「导入字体」才能选到。
+/// `TextSystem::all_font_names()` 覆盖的是当前平台的系统字体集合
+/// （Windows 走 DirectWrite 系统字体集 + 已注册的自定义字体集），
+/// 系统里装好的字体本来就能被 GPUI 解析，直接合并进下拉即可。
+///
+/// 两个刻意的取舍：
+/// - 内置精选列表始终排在前面，常用项不用在几百条里翻。
+/// - 等宽场景（`FontFamilyKind::Monospace`）仍然过滤掉「只适合当 fallback 的
+///   CJK 界面字体」，否则会给出一个会被
+///   `normalize_grid_monospace_font_family` 静默重置回默认值的无效选项。
+fn merge_installed_font_options(
+    options: &mut Vec<(SharedString, SharedString)>,
+    installed_font_names: &[String],
+    kind: FontFamilyKind,
+) {
+    for family in installed_font_names {
+        let family = family.trim();
+        if family.is_empty()
+            || matches!(kind, FontFamilyKind::Monospace)
+                && !is_supported_grid_monospace_font(family)
+            || options
+                .iter()
+                .any(|(value, _)| value.as_ref().eq_ignore_ascii_case(family))
+        {
+            continue;
+        }
+        options.push((family.into(), family.into()));
     }
 }
 
@@ -308,14 +367,20 @@ fn init_tracing(settings: &AppSettings) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    match crate::onetcli_app::configured_log_file_path(&settings.log_file_path) {
-        Ok(log_file_path) => match crate::onetcli_app::log_file_appender(&log_file_path) {
+    match crate::navop_app::configured_log_file_path(&settings.log_file_path) {
+        Ok(log_file_path) => match crate::navop_app::log_file_appender(&log_file_path) {
             Ok(file_appender) => {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                 Box::leak(Box::new(guard));
                 tracing_subscriber::registry()
                     .with(tracing_subscriber::fmt::layer())
-                    .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+                    // 写文件的那一层必须关掉颜色：终端里的样式码落到文件里就是每行
+                    // 前后裹一层转义序列，肉眼读不了、grep 也过滤不干净。
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(non_blocking),
+                    )
                     .with(env_filter)
                     .init();
             }
@@ -387,13 +452,20 @@ pub struct SettingsPanel {
     size: Size,
     group_variant: GroupBoxVariant,
     initial_page_index: usize,
-    monospace_font_options_cache: Option<FontOptionsCache>,
+    font_options_cache: Option<FontOptionsCache>,
 }
 
+/// 字体下拉选项缓存。
+///
+/// `TextSystem::all_font_names()` 在 Windows 上要枚举整个 DirectWrite 字体集
+/// （系统字体有数百个家族），而 `setting_pages` 每次渲染都要构建选项列表，
+/// 所以把枚举结果连带选项一起缓存，只有用户导入 / 移除自定义字体时才重算
+/// ——与 `crates/db_view/src/sql_editor.rs` 的 `SqlEditorFontCache` 同思路。
 #[derive(Clone)]
 struct FontOptionsCache {
     custom_fonts: Vec<CustomFont>,
-    options: Vec<(SharedString, SharedString)>,
+    app_options: Vec<(SharedString, SharedString)>,
+    monospace_options: Vec<(SharedString, SharedString)>,
 }
 
 impl SettingsPanel {
@@ -417,32 +489,45 @@ impl SettingsPanel {
             size: Size::default(),
             group_variant: GroupBoxVariant::Outline,
             initial_page_index,
-            monospace_font_options_cache: None,
+            font_options_cache: None,
         }
     }
 
-    fn cached_monospace_font_options(&mut self, cx: &App) -> Vec<(SharedString, SharedString)> {
+    /// 取字体下拉选项，返回 `(应用字体, 等宽字体)`。
+    ///
+    /// 缓存键只用 `custom_fonts`：枚举系统字体是这条路径上最贵的动作，绝不能放在
+    /// 每帧都会走的地方。导入 / 移除自定义字体本身会改变 `custom_fonts`，
+    /// 而 `all_font_names()` 的结果同样随之变化，所以这一个键就够覆盖两种失效来源。
+    fn cached_font_options(
+        &mut self,
+        cx: &App,
+    ) -> (
+        Vec<(SharedString, SharedString)>,
+        Vec<(SharedString, SharedString)>,
+    ) {
         let custom_fonts = AppSettings::global(cx).custom_fonts.clone();
-        if let Some(cache) = &self.monospace_font_options_cache
+        if let Some(cache) = &self.font_options_cache
             && cache.custom_fonts == custom_fonts
         {
-            return cache.options.clone();
+            return (cache.app_options.clone(), cache.monospace_options.clone());
         }
 
-        let options = monospace_font_options(cx);
-        self.monospace_font_options_cache = Some(FontOptionsCache {
+        let installed_font_names = cx.text_system().all_font_names();
+        let app_options = app_font_options(&installed_font_names, &custom_fonts);
+        let monospace_options = monospace_font_options(&installed_font_names, &custom_fonts);
+        self.font_options_cache = Some(FontOptionsCache {
             custom_fonts,
-            options: options.clone(),
+            app_options: app_options.clone(),
+            monospace_options: monospace_options.clone(),
         });
-        options
+        (app_options, monospace_options)
     }
 
     fn setting_pages(&mut self, _window: &mut Window, cx: &App) -> Vec<SettingPage> {
         let llm_view = self.llm_providers_view.clone();
         let default_settings = AppSettings::default();
         let default_system_hotkey = AppSettings::default().current_system_hotkey().to_string();
-        let app_font_options = app_font_options(cx);
-        let font_options = self.cached_monospace_font_options(cx);
+        let (app_font_options, font_options) = self.cached_font_options(cx);
         let is_portable = one_core::app_paths::is_portable();
         let master_key_setting_title = if is_portable {
             t!("Settings.General.Startup.remember_portable_master_key").to_string()
@@ -547,6 +632,7 @@ impl SettingsPanel {
                                     .to_string(),
                             ),
                         ),
+                    close_behavior_setting_group(default_settings.close_button_behavior),
                     notes_setting_group(),
                     SettingGroup::new()
                         .title(t!("Settings.General.Appearance.group_title"))
@@ -556,7 +642,8 @@ impl SettingsPanel {
                         .item(
                             SettingItem::new(
                                 t!("Settings.General.Font.font_family"),
-                                SettingField::dropdown(
+                                // 选项里已包含系统已装字体，数量可达数百条，必须用可滚动菜单。
+                                SettingField::scrollable_dropdown(
                                     app_font_options,
                                     |cx: &App| {
                                         SharedString::from(
@@ -578,7 +665,7 @@ impl SettingsPanel {
                         .item(
                             SettingItem::new(
                                 t!("Settings.General.Font.sql_editor_font_family"),
-                                SettingField::dropdown(
+                                SettingField::scrollable_dropdown(
                                     font_options.clone(),
                                     |cx: &App| {
                                         SharedString::from(
@@ -625,7 +712,7 @@ impl SettingsPanel {
                         .item(
                             SettingItem::new(
                                 t!("Settings.General.Font.table_preview_font_family"),
-                                SettingField::dropdown(
+                                SettingField::scrollable_dropdown(
                                     font_options.clone(),
                                     |cx: &App| {
                                         SharedString::from(
@@ -652,7 +739,7 @@ impl SettingsPanel {
                         .item(
                             SettingItem::new(
                                 t!("Settings.General.Font.terminal_font_family"),
-                                SettingField::dropdown(
+                                SettingField::scrollable_dropdown(
                                     font_options.clone(),
                                     |cx: &App| {
                                         SharedString::from(
@@ -920,6 +1007,44 @@ impl SettingsPanel {
         }
         pages
     }
+}
+
+/// 关闭主窗口时的行为。托盘不可用时该设置不生效，仍走退出确认。
+fn close_behavior_setting_group(default: CloseButtonBehavior) -> SettingGroup {
+    SettingGroup::new()
+        .title(t!("Settings.General.CloseBehavior.group_title"))
+        .item(
+            SettingItem::new(
+                t!("Settings.General.CloseBehavior.behavior"),
+                SettingField::dropdown(
+                    vec![
+                        (
+                            SharedString::from(CloseButtonBehavior::Ask.as_str()),
+                            t!("Settings.General.CloseBehavior.ask").into(),
+                        ),
+                        (
+                            SharedString::from(CloseButtonBehavior::MinimizeToTray.as_str()),
+                            t!("Settings.General.CloseBehavior.minimize_to_tray").into(),
+                        ),
+                        (
+                            SharedString::from(CloseButtonBehavior::Quit.as_str()),
+                            t!("Settings.General.CloseBehavior.quit").into(),
+                        ),
+                    ],
+                    |cx: &App| {
+                        SharedString::from(AppSettings::global(cx).close_button_behavior.as_str())
+                    },
+                    |val: SharedString, cx: &mut App| {
+                        AppSettings::update_and_save(cx, |settings| {
+                            settings.close_button_behavior =
+                                CloseButtonBehavior::from_str(val.as_ref());
+                        });
+                    },
+                )
+                .default_value(SharedString::from(default.as_str())),
+            )
+            .description(t!("Settings.General.CloseBehavior.behavior_desc").to_string()),
+        )
 }
 
 fn sync_setting_group(
@@ -3174,14 +3299,14 @@ fn set_custom_keybinding(action_id: &str, spec: String, cx: &mut App) {
             .custom_keybindings
             .insert(action_id.to_string(), vec![spec]);
     });
-    crate::onetcli_app::refresh_keybindings(cx);
+    crate::navop_app::refresh_keybindings(cx);
 }
 
 fn reset_custom_keybinding(action_id: &str, cx: &mut App) {
     AppSettings::update_and_save(cx, |settings| {
         settings.custom_keybindings.remove(action_id);
     });
-    crate::onetcli_app::refresh_keybindings(cx);
+    crate::navop_app::refresh_keybindings(cx);
 }
 
 fn clear_custom_keybinding(action_id: &str, cx: &mut App) {
@@ -3190,7 +3315,7 @@ fn clear_custom_keybinding(action_id: &str, cx: &mut App) {
             .custom_keybindings
             .insert(action_id.to_string(), Vec::new());
     });
-    crate::onetcli_app::refresh_keybindings(cx);
+    crate::navop_app::refresh_keybindings(cx);
 }
 
 fn shortcut_spec_from_keystroke(keystroke: &Keystroke) -> Option<String> {
@@ -3498,11 +3623,11 @@ mod tests {
 
     use super::{
         AppSettings, CustomFont, FontFamilyKind, GlobalProxySettings, ProxyType, WINDOW_SHORTCUTS,
-        build_app_http_client, builtin_monospace_font_options, emit_team_key_change_event,
-        is_supported_font_file, master_key_setting_enabled, merge_font_options_with_custom_fonts,
-        parse_font_families, personal_sync_backend_options, personal_sync_status_label,
-        personal_sync_status_view_model, team_key_refresh_success_message,
-        team_key_rotation_inputs_valid,
+        app_font_options, build_app_http_client, builtin_monospace_font_options,
+        emit_team_key_change_event, is_supported_font_file, master_key_setting_enabled,
+        merge_font_options_with_custom_fonts, monospace_font_options, parse_font_families,
+        personal_sync_backend_options, personal_sync_status_label, personal_sync_status_view_model,
+        team_key_refresh_success_message, team_key_rotation_inputs_valid,
     };
     use crate::local_terminal_profiles::setting_options as local_terminal_profile_options;
     use crate::personal_sync_status::PersonalSyncRuntimeStatus;
@@ -3524,6 +3649,32 @@ mod tests {
         assert_eq!(shortcut.keys_other, &["ctrl-shift-w"]);
         assert!(!shortcut.keys_macos.contains(&"ctrl-d"));
         assert!(!shortcut.keys_other.contains(&"ctrl-d"));
+    }
+
+    #[test]
+    fn file_log_layer_disables_ansi_escapes() {
+        let source = include_str!("setting_tab.rs");
+        let compact: String = source.split_whitespace().collect();
+
+        // needle 运行时拼接：写成字面量的话，这个守卫会命中它自己。
+        let file_layer = [
+            "fmt::layer()",
+            ".with_ansi(",
+            "false)",
+            ".with_writer(non_blocking)",
+        ]
+        .concat();
+        assert!(
+            compact.contains(&file_layer),
+            "写文件的那一层必须关掉 ANSI，否则日志每行都裹着转义序列"
+        );
+
+        let ansi_off = [".with_ansi(", "false)"].concat();
+        assert_eq!(
+            1,
+            compact.matches(&ansi_off).count(),
+            "只该对写文件的那一层关 ANSI；终端那一层要保留颜色"
+        );
     }
 
     #[test]
@@ -3941,7 +4092,7 @@ mod tests {
     }
 
     #[test]
-    fn setting_pages_uses_cached_monospace_font_options() {
+    fn setting_pages_uses_cached_font_options() {
         let source = include_str!("setting_tab.rs");
         let setting_pages = source
             .split("fn setting_pages(")
@@ -3951,8 +4102,126 @@ mod tests {
             .next()
             .expect("setting_pages has an end marker");
 
-        assert!(setting_pages.contains("self.cached_monospace_font_options(cx)"));
-        assert!(!setting_pages.contains("let font_options = monospace_font_options(cx);"));
+        // 字体列表里现在包含系统已装字体（数百条），`all_font_names()` 又要枚举
+        // 整个 DirectWrite 字体集，因此 setting_pages 里必须走缓存入口；
+        // 直接调 `app_font_options` / `monospace_font_options` 会退化成每帧重建。
+        assert!(setting_pages.contains("self.cached_font_options(cx)"));
+        assert!(!setting_pages.contains("app_font_options("));
+        assert!(!setting_pages.contains("monospace_font_options("));
+        assert!(!setting_pages.contains("all_font_names("));
+    }
+
+    #[test]
+    fn system_font_enumeration_stays_off_the_render_path() {
+        // `TextSystem::all_font_names()` 没有内部缓存，枚举一次就是整个系统字体集。
+        // 它必须待在缓存命中判断之后，否则设置页每帧都要重新枚举几百个字体家族。
+        let source = include_str!("setting_tab.rs");
+        let cached = source
+            .split("fn cached_font_options(")
+            .nth(1)
+            .expect("cached_font_options exists")
+            .split("fn setting_pages(")
+            .next()
+            .expect("cached_font_options has an end marker");
+
+        let cache_probe = cached
+            .find("cache.custom_fonts == custom_fonts")
+            .expect("缓存命中判断必须还在");
+        let enumeration = cached
+            .find("all_font_names()")
+            .expect("冷路径上仍需枚举系统字体");
+        assert!(
+            cache_probe < enumeration,
+            "枚举系统字体必须在缓存命中判断之后，别把它挪回每帧路径"
+        );
+    }
+
+    #[test]
+    fn installed_system_fonts_are_selectable_without_importing() {
+        // issue #199：系统里已安装的字体应当直接出现在下拉里，
+        // 不需要先走一次「导入字体」。
+        let installed = vec![
+            "Consolas".to_string(),
+            "Sarasa Mono SC".to_string(),
+            "Sarasa Gothic SC".to_string(),
+        ];
+
+        let app_values = app_font_options(&installed, &[])
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+        assert!(app_values.iter().any(|value| value == "Sarasa Gothic SC"));
+        assert!(app_values.iter().any(|value| value == "Sarasa Mono SC"));
+
+        let monospace_values = monospace_font_options(&installed, &[])
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            monospace_values
+                .iter()
+                .any(|value| value == "Sarasa Mono SC")
+        );
+        // 内置精选列表里的 `Consolas` 不应因为合并而重复出现。
+        assert_eq!(
+            1,
+            monospace_values
+                .iter()
+                .filter(|value| value.as_str() == "Consolas")
+                .count()
+        );
+    }
+
+    #[test]
+    fn installed_system_fonts_skip_fallback_only_fonts_for_monospace_lists() {
+        // 这些字体在终端/SQL 编辑器里只作为 fallback 使用，
+        // 选成主字体后会被 `normalize_grid_monospace_font_family` 静默重置，
+        // 所以等宽下拉必须把它们过滤掉；应用字体下拉则照常列出。
+        // `Kaiti SC` 不在内置应用字体列表里，用它证明「应用字体确实并入了系统字体」。
+        let installed = vec![
+            "Microsoft YaHei".to_string(),
+            "SimSun".to_string(),
+            "Kaiti SC".to_string(),
+        ];
+
+        let monospace_values = monospace_font_options(&installed, &[])
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !monospace_values
+                .iter()
+                .any(|value| value == "Microsoft YaHei")
+        );
+        assert!(!monospace_values.iter().any(|value| value == "SimSun"));
+        assert!(!monospace_values.iter().any(|value| value == "Kaiti SC"));
+
+        let app_values = app_font_options(&installed, &[])
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+        assert!(app_values.iter().any(|value| value == "Kaiti SC"));
+    }
+
+    #[test]
+    fn installed_system_fonts_keep_builtin_entries_first() {
+        let installed = vec!["Zzz Last Font".to_string()];
+
+        let values = app_font_options(&installed, &[])
+            .into_iter()
+            .map(|(value, _)| value.to_string())
+            .collect::<Vec<_>>();
+
+        let builtin_first = values
+            .iter()
+            .position(|value| value == "Arial")
+            .expect("内置应用字体仍在列表里");
+        let installed_last = values
+            .iter()
+            .position(|value| value == "Zzz Last Font")
+            .expect("系统字体已并入列表");
+        assert!(builtin_first < installed_last);
+        assert_eq!(values.len() - 1, installed_last);
     }
 
     #[test]

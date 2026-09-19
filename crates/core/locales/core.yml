@@ -133,6 +133,10 @@ Window:
     zh-HK: 視窗置頂
 
 Home:
+  open_connection:
+    en: Open Connection
+    zh-CN: 打开连接
+    zh-HK: 開啟連線
   title:
     en: Home
     zh-CN: 主页
@@ -162,9 +166,9 @@ TabContextMenu:
     zh-CN: "重命名标签页"
     zh-HK: "重命名標籤頁"
   copy_label:
-    en: "Copy \"{{label}}\""
-    zh-CN: "复制 \"{{label}}\""
-    zh-HK: "複製 \"{{label}}\""
+    en: "Copy \"%{label}\""
+    zh-CN: "复制 \"%{label}\""
+    zh-HK: "複製 \"%{label}\""
   copy_label_success:
     en: "Copied to clipboard"
     zh-CN: "已复制到剪贴板"
