@@ -261,10 +261,8 @@ impl AcpAgentInput {
                 .submit_on_enter(true)
                 .placeholder(t!("AgentUi.acp_input_placeholder").to_string());
             // ACP 侧没有 `@` 引用（引用语法是本地运行时的概念），只留 `/` 命令。
-            state.lsp_mut().completion_provider = Some(Rc::new(ComposerCompletionProvider::new(
-                Vec::new(),
-                Vec::new(),
-            )));
+            state.lsp_mut().completion_provider =
+                Some(Rc::new(ComposerCompletionProvider::slash(Vec::new())));
             state
         });
 
@@ -418,10 +416,8 @@ impl AcpAgentInput {
         self.slash_commands = commands;
         let commands = self.slash_commands.clone();
         self.input_state.update(cx, |state, _| {
-            state.lsp_mut().completion_provider = Some(Rc::new(ComposerCompletionProvider::new(
-                Vec::new(),
-                commands,
-            )));
+            state.lsp_mut().completion_provider =
+                Some(Rc::new(ComposerCompletionProvider::slash(commands)));
         });
     }
 

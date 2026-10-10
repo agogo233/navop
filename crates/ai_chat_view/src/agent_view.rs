@@ -1560,8 +1560,12 @@ impl AgentChatView {
         self.runtime_factory = runtime_factory;
         let model_options = self.model_options.clone();
         let tool_options = self.tool_options.clone();
-        self.composer()
-            .set_menu_options(model_options, tool_options, cx);
+        // 宿主刷新的是**本地**模型列表（连着 runtime factory 与工具注册表）：只喂本地
+        // 那份。走 `composer()` 的话，用户在 ACP 会话里改设置会顺手把 agent 声明的
+        // 模型列表顶掉。
+        self.input.update(cx, |input, cx| {
+            input.set_menu_options(model_options, tool_options, cx)
+        });
         if let Some(retained) = retained {
             self.selected_model = Some(retained);
             self.sync_composer(cx);
@@ -1692,10 +1696,10 @@ impl AgentChatView {
             inp.set_menu_options(model_options.clone(), tool_options.clone(), cx);
             inp.set_context(init_ctx.clone(), cx);
         });
-        // ACP 那份只要同一份菜单选项与视图上下文：没有目标选择器，选项由上层
-        // 按后端刷新（切到 ACP 后会被 ACP 自己的模式 / 模型覆盖）。
+        // ACP 那份只接视图上下文（工作区 / 分支 / Worktree / 会话标题这些归属信息）：
+        // 模型与执行模式是 **agent 自己声明的**，接进来之前一律留空——塞一份本地模型
+        // 列表进去，用户在 agent 还没报上模型时看到的会是本地那一串。
         acp_input.update(cx, |inp, cx| {
-            inp.set_menu_options(model_options.clone(), tool_options.clone(), cx);
             inp.set_context(init_ctx, cx);
         });
 
@@ -2036,7 +2040,11 @@ impl AgentChatView {
         let request = envelope.request().clone();
         // 同一时刻只留一个问题：新的顶掉旧的（旧的按取消回给它的 agent）。
         self.cancel_pending_acp_elicitations(cx);
-        self.composer().set_pending_elicitation(Some(&request), cx);
+        // 「agent 提问」是 ACP 独有的东西：只往 ACP 那份输入框送。按后端走的话，
+        // 这份表单就会长在本地输入框里，而本地输入框根本不认识它。
+        self.acp_input.update(cx, |input, cx| {
+            input.set_pending_elicitation(Some(&request), cx)
+        });
         self.pending_acp_elicitations
             .insert(request.request_id.clone(), envelope);
         self.request_scroll_to_bottom();
@@ -2084,7 +2092,8 @@ impl AgentChatView {
     }
 
     fn clear_elicitation_panel(&mut self, cx: &mut Context<Self>) {
-        self.composer().set_pending_elicitation(None, cx);
+        self.acp_input
+            .update(cx, |input, cx| input.set_pending_elicitation(None, cx));
     }
 
     fn spawn_public_mcp_approval_pump(
@@ -2461,8 +2470,10 @@ impl AgentChatView {
             return;
         }
         self.model_options = options.clone();
-        self.composer()
-            .set_menu_options(options, self.tool_options.clone(), cx);
+        // agent 声明的模型只属于 ACP 那份输入框。
+        self.acp_input.update(cx, |input, cx| {
+            input.set_menu_options(options, self.tool_options.clone(), cx)
+        });
     }
 
     /// findbar 查询框的事件。
@@ -2873,11 +2884,6 @@ impl AgentChatView {
             }
             AgentInputEvent::CancelElicitation => {
                 self.resolve_pending_acp_elicitation(AcpElicitationOutcome::Cancel, cx)
-            }
-            AgentInputEvent::SelectAgentBackend { id } => {
-                if !self.is_running {
-                    self.select_backend(id, cx);
-                }
             }
             AgentInputEvent::RemoveQueued { index } => {
                 let session_uid = self.current_session.clone();
@@ -4793,9 +4799,11 @@ impl AgentChatView {
             self.local_context_tokens(),
         );
         apply_composer_snapshot(&mut ctx, self.composer_snapshot(cx));
-        let composer = self.composer();
-        composer.set_slash_commands(self.composer_slash_commands(), cx);
-        composer.set_context(ctx, cx);
+        // `/` 命令只有 ACP agent 声明得出来：与提问面板一样，只喂 ACP 那份。
+        let commands = self.composer_slash_commands();
+        self.acp_input
+            .update(cx, |input, cx| input.set_slash_commands(commands, cx));
+        self.composer().set_context(ctx, cx);
         // ACP 那份的抬头要摆「现在是哪个 agent」：与面板头部同一个来源
         // （`current_agent_label`），连接中显示「连接中」，避免两处叫法打架。
         if self.backend == Backend::Acp {
@@ -4807,6 +4815,14 @@ impl AgentChatView {
             );
             self.acp_input
                 .update(cx, |input, cx| input.set_agent_label(label, cx));
+            // 模式与模型也都是 agent 声明的：在这里一次推齐。散在各条连接路径上推的话，
+            // 总有一条路径只更新了面板字段（`self.tool_options`）而没推给输入框，
+            // 结果下拉里留着的还是上一份列表——比如本地那套「任务类型 / 工具策略」。
+            let modes = self.tool_options.clone();
+            let models = self.model_options.clone();
+            self.acp_input.update(cx, |input, cx| {
+                input.set_menu_options(models, modes, cx);
+            });
         }
     }
 
@@ -4956,8 +4972,10 @@ impl AgentChatView {
             })
             .or_else(|| options.first().cloned());
         self.model_options = options.clone();
-        self.composer()
-            .set_menu_options(options, self.tool_options.clone(), cx);
+        // 探测到的模型也是 agent 声明的：只喂 ACP 那份。
+        self.acp_input.update(cx, |input, cx| {
+            input.set_menu_options(options, self.tool_options.clone(), cx)
+        });
         self.sync_composer(cx);
     }
 
@@ -4966,9 +4984,6 @@ impl AgentChatView {
     /// 命令只来自 Acp agent 的 `available_commands`：内置 agent 没有这套协议，返回空向量，
     /// 输入框里打 `/` 就不弹菜单（不造假的命令表）。
     fn composer_slash_commands(&self) -> Vec<SlashCommandItem> {
-        if self.backend != Backend::Acp {
-            return Vec::new();
-        }
         self.acp
             .as_ref()
             .map(|acp| {
@@ -14738,6 +14753,9 @@ mod tests {
 
         view.update(cx, |view, cx| {
             let _ = view.start_acp_client_session(cx);
+            // 提问面板现在只长在 ACP 那份输入框里（本地那份不认识 elicitation），
+            // 所以这个场景必须有 ACP 后端——真实流程里它也只在这时才会发生。
+            view.backend = Backend::Acp;
             view.receive_acp_elicitation(envelope, cx);
         });
         cx.run_until_parked();
@@ -14787,6 +14805,7 @@ mod tests {
             AcpElicitationEnvelope::new(test_acp_elicitation_request());
 
         view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
             view.receive_acp_elicitation(envelope, cx);
         });
         cx.run_until_parked();
@@ -14813,6 +14832,7 @@ mod tests {
             AcpElicitationEnvelope::new(test_acp_elicitation_request());
 
         view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
             view.receive_acp_elicitation(envelope, cx);
             view.reset_acp_client_session(cx);
         });

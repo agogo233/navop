@@ -420,13 +420,6 @@ impl AgentChatView {
         let acp_state = connection.state();
         self.model_options = acp_model_options(&acp_state, Some(&agent_id));
         self.selected_model = acp_model_option(&acp_state, Some(&agent_id));
-        // 模型选项来自 agent 自己声明的状态：直接送进 ACP 那份输入框。此时
-        // `backend` 还是 Local（下面才切），按 `composer()` 走会喂错人——而
-        // `refresh_acp_model_options` 又会因为 `self.model_options` 已经相等而早退，
-        // 结果 ACP 那份的模型下拉是空的。
-        self.acp_input.update(cx, |input, cx| {
-            input.set_menu_options(self.model_options.clone(), self.tool_options.clone(), cx);
-        });
         self.acp = Some(connection);
         self.restore_persisted_acp_model(cx);
         self.acp_turn_owners.clear();

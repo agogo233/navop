@@ -50,21 +50,6 @@ impl ComposerSlot {
         }
     }
 
-    pub(super) fn set_slash_commands(
-        &self,
-        commands: Vec<SlashCommandItem>,
-        cx: &mut Context<AgentChatView>,
-    ) {
-        match self {
-            Self::One(entity) => {
-                entity.update(cx, |input, cx| input.set_slash_commands(commands, cx))
-            }
-            Self::Acp(entity) => {
-                entity.update(cx, |input, cx| input.set_slash_commands(commands, cx))
-            }
-        }
-    }
-
     pub(super) fn set_queued_submissions(
         &self,
         previews: Vec<QueuedPromptPreview>,
@@ -87,21 +72,6 @@ impl ComposerSlot {
             }
             Self::Acp(entity) => {
                 entity.update(cx, |input, cx| input.set_pending_queue_blocked(blocked, cx))
-            }
-        }
-    }
-
-    pub(super) fn set_pending_elicitation(
-        &self,
-        request: Option<&crate::acp::AcpElicitationRequest>,
-        cx: &mut Context<AgentChatView>,
-    ) {
-        match self {
-            Self::One(entity) => {
-                entity.update(cx, |input, cx| input.set_pending_elicitation(request, cx))
-            }
-            Self::Acp(entity) => {
-                entity.update(cx, |input, cx| input.set_pending_elicitation(request, cx))
             }
         }
     }
