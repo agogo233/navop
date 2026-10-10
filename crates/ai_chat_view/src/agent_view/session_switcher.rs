@@ -287,8 +287,9 @@ impl super::AgentChatView {
         if let Some(target) = target.filter(|target| *target != self.current_session) {
             self.switch_session(&target, cx);
         }
-        self.input
-            .update(cx, |input, cx| input.focus_input(window, cx));
+        // 焦点还给**当前挂载**的那份输入框：后端是 ACP 时 `self.input` 根本没在树上，
+        // 把焦点交给它会等于没有焦点，用户下一次按键静默失效。
+        self.composer().focus_input(window, cx);
     }
 
     pub(super) fn cancel_session_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -296,8 +297,7 @@ impl super::AgentChatView {
             return;
         }
         self.session_switcher.dismiss();
-        self.input
-            .update(cx, |input, cx| input.focus_input(window, cx));
+        self.composer().focus_input(window, cx);
         cx.notify();
     }
 

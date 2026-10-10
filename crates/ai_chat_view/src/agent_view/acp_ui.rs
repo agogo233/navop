@@ -74,8 +74,7 @@ impl AgentChatView {
             self.remove_cached_session_transcript(session_uid);
         }
         self.set_running(false, cx);
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         self._event_task = Self::spawn_event_pump(self.runtime.subscribe(), None, cx);
         self.sync_pending_preview(cx);
         self.sync_composer(cx);
@@ -214,8 +213,7 @@ impl AgentChatView {
         }
         self.transcript
             .set_acp_status(t!("AgentUi.starting_agent", name = config.name).to_string());
-        self.input
-            .update(cx, |input, cx| input.set_running(true, cx));
+        self.set_composers_running(true, cx);
         self.sync_composer(cx);
         cx.notify();
         providers
@@ -258,8 +256,7 @@ impl AgentChatView {
     ) {
         self.acp_connecting = false;
         self.acp_connecting_id = None;
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         self.activate_acp(agent_id, origin_session_uid, connection, cx);
     }
 
@@ -275,8 +272,7 @@ impl AgentChatView {
         self.current_acp_id = Some(config.id.clone());
         self.acp_connecting = false;
         self.acp_connecting_id = None;
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         if let Some(transcript) = self.transcript_for_open_session_mut(&operation.session_uid) {
             transcript.set_acp_status(t!("AgentUi.login_required", name = config.name).to_string());
         }
@@ -297,8 +293,7 @@ impl AgentChatView {
         self.acp_connecting_id = None;
         self.acp_connect_origin_session = None;
         self.current_acp_id = Some(config.id.clone());
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         let error = AcpError::new(
             AcpErrorKind::InitializeFailed,
             config.id.to_string(),
@@ -339,8 +334,7 @@ impl AgentChatView {
             transcript
                 .set_acp_status(t!("AgentUi.logging_in", name = operation.agent_name).to_string());
         }
-        self.input
-            .update(cx, |input, cx| input.set_running(true, cx));
+        self.set_composers_running(true, cx);
         self.sync_pending_preview(cx);
         self.sync_composer(cx);
         cx.notify();
@@ -368,8 +362,7 @@ impl AgentChatView {
         }
         self.acp_connecting = false;
         self.acp_connecting_id = None;
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         match result {
             Ok(connection) => self.activate_acp(
                 operation.agent_id.clone(),
@@ -427,7 +420,11 @@ impl AgentChatView {
         let acp_state = connection.state();
         self.model_options = acp_model_options(&acp_state, Some(&agent_id));
         self.selected_model = acp_model_option(&acp_state, Some(&agent_id));
-        self.input.update(cx, |input, cx| {
+        // 模型选项来自 agent 自己声明的状态：直接送进 ACP 那份输入框。此时
+        // `backend` 还是 Local（下面才切），按 `composer()` 走会喂错人——而
+        // `refresh_acp_model_options` 又会因为 `self.model_options` 已经相等而早退，
+        // 结果 ACP 那份的模型下拉是空的。
+        self.acp_input.update(cx, |input, cx| {
             input.set_menu_options(self.model_options.clone(), self.tool_options.clone(), cx);
         });
         self.acp = Some(connection);

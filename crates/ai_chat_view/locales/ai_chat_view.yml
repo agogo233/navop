@@ -147,6 +147,14 @@ AgentUi:
     en: ACP Session
     zh-CN: ACP 会话
     zh-HK: ACP 工作階段
+  acp_input_placeholder:
+    en: Send a message to the agent…
+    zh-CN: 给 Agent 发消息…
+    zh-HK: 給 Agent 傳訊息…
+  acp_mode_empty:
+    en: This agent declares no session modes
+    zh-CN: 这个 Agent 没有声明会话模式
+    zh-HK: 這個 Agent 沒有宣告工作階段模式
   acp_session_creation_failed:
     en: Failed to create ACP session
     zh-CN: ACP 会话创建失败

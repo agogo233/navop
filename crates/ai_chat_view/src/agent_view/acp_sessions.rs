@@ -422,8 +422,7 @@ impl AgentChatView {
             .to_string(),
         );
         self.set_running(false, cx);
-        self.input
-            .update(cx, |input, cx| input.set_running(true, cx));
+        self.set_composers_running(true, cx);
         self.sync_pending_preview(cx);
         self.sync_composer(cx);
         self.request_scroll_to_bottom();
@@ -454,8 +453,7 @@ impl AgentChatView {
             // 会话已经切走/关掉了：不把连接塞回去，它属于更新那条操作。
             return;
         }
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         match result {
             Ok(()) => {
                 // 回放期间丢过事件：再 load 一次补全。只补一次；第二次仍丢就
@@ -485,8 +483,7 @@ impl AgentChatView {
                         )
                         .to_string(),
                     );
-                    self.input
-                        .update(cx, |input, cx| input.set_running(true, cx));
+                    self.set_composers_running(true, cx);
                     let cwd = self.workspace_root.clone();
                     cx.spawn(async move |this, cx| {
                         let target = AcpSessionId::new(protocol_session_id);

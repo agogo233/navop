@@ -86,12 +86,12 @@ use crate::find_shortcut::{
     AI_CHAT_SEARCH_CONTEXT, FindNextInTranscript, FindPreviousInTranscript, ToggleTranscriptFind,
 };
 use crate::input::{
-    AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption, ComposerBranchOption,
-    ComposerMenuOption, ComposerModelOption, ComposerPlanItem, ComposerResourcePoolItem,
-    ComposerResourcePoolSummary, ComposerResourceSourceOption, ComposerResourceTypeFilter,
-    ComposerScope, ComposerSkillItem, ComposerSkillSummary, ComposerSubAgentItem, ComposerTarget,
-    ComposerWorkspaceInfo, ComposerWorkspaceOption, ComposerWorktreeState, MentionItem,
-    QueuedPromptPreview, SlashCommandItem,
+    AcpAgentInput, AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption,
+    ComposerBranchOption, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
+    ComposerResourcePoolItem, ComposerResourcePoolSummary, ComposerResourceSourceOption,
+    ComposerResourceTypeFilter, ComposerScope, ComposerSkillItem, ComposerSkillSummary,
+    ComposerSubAgentItem, ComposerTarget, ComposerWorkspaceInfo, ComposerWorkspaceOption,
+    ComposerWorktreeState, MentionItem, QueuedPromptPreview, SlashCommandItem,
 };
 use crate::message::ChatMessageUI;
 use crate::message_turn_view::{
@@ -116,6 +116,7 @@ mod acp_options;
 pub(crate) mod acp_sessions;
 mod acp_ui;
 mod attachment_preview;
+mod composer_slot;
 mod decision_dock;
 mod findbar;
 mod message_image_preview;
@@ -1250,6 +1251,17 @@ pub struct AgentChatView {
     available_resources: Vec<ResourceRef>,
     transcript: AgentTranscript,
     input: Entity<AgentInput>,
+    /// ACP agent 那一份输入框（见 [`composer_slot`] 模块文档）。
+    ///
+    /// 与 [`Self::input`] 同时存在、各自持有编辑器与附件：输入区**按后端起手**
+    /// 挂其中一份，切后端只换挂载，不改组件内部的任何状态。
+    acp_input: Entity<AcpAgentInput>,
+    /// 上一次渲染时挂的是哪一份输入框。
+    ///
+    /// 用来发现"后端换了"这一次事实（切换后必然渲染一帧），好把输入内容从旧那份
+    /// 搬到新那份。放在渲染里而不是每个切换点上：赋值 `backend` 的地方以后还会
+    /// 增加，漏一处就会出现"切过去了但刚打的字留在另一份里"。
+    composer_backend: Backend,
     /// 会话切换后待写入输入框的草稿；`Some` 才有动作，在下一次 `render` 应用。
     ///
     /// 之所以不直接写输入框：`InputState::set_value` 需要 `&mut Window`，
@@ -1548,9 +1560,8 @@ impl AgentChatView {
         self.runtime_factory = runtime_factory;
         let model_options = self.model_options.clone();
         let tool_options = self.tool_options.clone();
-        self.input.update(cx, |input, cx| {
-            input.set_menu_options(model_options, tool_options, cx);
-        });
+        self.composer()
+            .set_menu_options(model_options, tool_options, cx);
         if let Some(retained) = retained {
             self.selected_model = Some(retained);
             self.sync_composer(cx);
@@ -1628,12 +1639,17 @@ impl AgentChatView {
                 cx,
             )
         });
+        // ACP 那一份输入框：不是 One agent 的裁剪版，只摆 agent 自己声明的东西
+        // （会话模式、模型、`/` 命令）与必需的工作区归属，别的面板一概没有。
+        let acp_input = cx.new(|cx| AcpAgentInput::new(window, cx));
         Self::register_approval_actions(cx);
         if let Some(theme) = theme.clone() {
-            input.update(cx, |input, cx| input.set_theme(Some(theme), cx));
+            input.update(cx, |input, cx| input.set_theme(Some(theme.clone()), cx));
+            acp_input.update(cx, |input, cx| input.set_theme(Some(theme), cx));
         }
         if sidebar_mode {
             input.update(cx, |input, cx| input.set_edge_to_edge(true, cx));
+            acp_input.update(cx, |input, cx| input.set_edge_to_edge(true, cx));
         }
 
         let stored_mode = AppSettings::current(cx).ai_chat.tool_execution_mode;
@@ -1674,6 +1690,12 @@ impl AgentChatView {
         input.update(cx, |inp, cx| {
             inp.set_target_options(target_options, cx);
             inp.set_menu_options(model_options.clone(), tool_options.clone(), cx);
+            inp.set_context(init_ctx.clone(), cx);
+        });
+        // ACP 那份只要同一份菜单选项与视图上下文：没有目标选择器，选项由上层
+        // 按后端刷新（切到 ACP 后会被 ACP 自己的模式 / 模型覆盖）。
+        acp_input.update(cx, |inp, cx| {
+            inp.set_menu_options(model_options.clone(), tool_options.clone(), cx);
             inp.set_context(init_ctx, cx);
         });
 
@@ -1697,6 +1719,9 @@ impl AgentChatView {
 
         let mut subscriptions = vec![
             cx.subscribe_in(&input, window, Self::on_input_event),
+            // 两份输入框发的是同一个事件枚举：处理逻辑只有一份，ACP 这份只是
+            // 另一个来源（见 `on_acp_input_event`）。
+            cx.subscribe_in(&acp_input, window, Self::on_acp_input_event),
             cx.subscribe(
                 &findbar_input,
                 |this: &mut Self, _, event: &InputEvent, cx| {
@@ -1755,6 +1780,8 @@ impl AgentChatView {
             available_resources,
             transcript,
             input,
+            acp_input,
+            composer_backend: Backend::Local,
             pending_input_draft: None,
             session_draft_attachments: HashMap::new(),
             draft_session: None,
@@ -2009,10 +2036,7 @@ impl AgentChatView {
         let request = envelope.request().clone();
         // 同一时刻只留一个问题：新的顶掉旧的（旧的按取消回给它的 agent）。
         self.cancel_pending_acp_elicitations(cx);
-        let input = self.input.clone();
-        input.update(cx, |input, cx| {
-            input.set_pending_elicitation(Some(&request), cx);
-        });
+        self.composer().set_pending_elicitation(Some(&request), cx);
         self.pending_acp_elicitations
             .insert(request.request_id.clone(), envelope);
         self.request_scroll_to_bottom();
@@ -2060,9 +2084,7 @@ impl AgentChatView {
     }
 
     fn clear_elicitation_panel(&mut self, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| {
-            input.set_pending_elicitation(None, cx);
-        });
+        self.composer().set_pending_elicitation(None, cx);
     }
 
     fn spawn_public_mcp_approval_pump(
@@ -2439,9 +2461,8 @@ impl AgentChatView {
             return;
         }
         self.model_options = options.clone();
-        self.input.update(cx, |input, cx| {
-            input.set_menu_options(options, self.tool_options.clone(), cx);
-        });
+        self.composer()
+            .set_menu_options(options, self.tool_options.clone(), cx);
     }
 
     /// findbar 查询框的事件。
@@ -2526,8 +2547,7 @@ impl AgentChatView {
         self.palette_selection = 0;
         self.palette_body_hits.clear();
         self.palette_body_task = None;
-        let input = self.input.clone();
-        input.update(cx, |input, cx| input.focus_input(window, cx));
+        self.composer().focus_input(window, cx);
         cx.notify();
     }
 
@@ -2735,7 +2755,30 @@ impl AgentChatView {
 
     fn on_input_event(
         &mut self,
-        input: &Entity<AgentInput>,
+        _input: &Entity<AgentInput>,
+        event: &AgentInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_input_event(event, window, cx);
+    }
+
+    /// ACP 那份输入框的事件入口。
+    ///
+    /// 两份组件发同一个枚举（[`AgentInputEvent`]），所以处理逻辑共用一份：
+    /// 面板不懂"这个事件是哪个组件发的"，只认事件本身与当前后端。
+    fn on_acp_input_event(
+        &mut self,
+        _input: &Entity<AcpAgentInput>,
+        event: &AgentInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_input_event(event, window, cx);
+    }
+
+    fn handle_input_event(
+        &mut self,
         event: &AgentInputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2858,9 +2901,12 @@ impl AgentChatView {
                 let session_uid = self.current_session.clone();
                 if let Some(submission) = self.pending_submissions.remove_at(&session_uid, index) {
                     self.sync_pending_preview(cx);
-                    input.update(cx, |input, cx| {
-                        input.restore_to_composer(&submission.text, submission.images, window, cx);
-                    });
+                    self.composer().restore_to_composer(
+                        &submission.text,
+                        submission.images,
+                        window,
+                        cx,
+                    );
                     cx.notify();
                 }
             }
@@ -2994,9 +3040,8 @@ impl AgentChatView {
             .into_iter()
             .flat_map(|submission| submission.images)
             .collect::<Vec<_>>();
-        self.input.update(cx, |input, cx| {
-            input.restore_to_composer(&text, images, window, cx);
-        });
+        self.composer()
+            .restore_to_composer(&text, images, window, cx);
         if let Some(source) = self.composer_context_source.clone() {
             (source.report_worktree_failure)(&message, window, cx);
         }
@@ -3125,10 +3170,12 @@ impl AgentChatView {
             .collect::<Vec<_>>();
         let queue_blocked =
             !previews.is_empty() && !self.running_sessions.contains(&self.current_session);
-        self.input.update(cx, |input, cx| {
-            input.set_queued_submissions(previews, cx);
-            input.set_pending_queue_blocked(queue_blocked, cx);
-        });
+        // 队列同样是**面板**状态：两份输入框都摆上（与运行旗标同一个道理），
+        // 否则切后端后新挂的那份显示的是"没有排队"，而队列其实还在。
+        for composer in [self.composer(), self.other_composer()] {
+            composer.set_queued_submissions(previews.clone(), cx);
+            composer.set_pending_queue_blocked(queue_blocked, cx);
+        }
     }
 
     fn start_next_pending(&mut self, session_uid: &str, cx: &mut Context<Self>) -> PendingAdvance {
@@ -4673,8 +4720,7 @@ impl AgentChatView {
         }
         if session_uid == self.current_session {
             self.is_running = running;
-            self.input
-                .update(cx, |input, cx| input.set_running(running, cx));
+            self.set_composers_running(running, cx);
             self.sync_pending_preview(cx);
         }
         self.reload_sessions(cx);
@@ -4747,10 +4793,21 @@ impl AgentChatView {
             self.local_context_tokens(),
         );
         apply_composer_snapshot(&mut ctx, self.composer_snapshot(cx));
-        self.input.update(cx, |inp, cx| {
-            inp.set_slash_commands(self.composer_slash_commands(), cx);
-            inp.set_context(ctx, cx);
-        });
+        let composer = self.composer();
+        composer.set_slash_commands(self.composer_slash_commands(), cx);
+        composer.set_context(ctx, cx);
+        // ACP 那份的抬头要摆「现在是哪个 agent」：与面板头部同一个来源
+        // （`current_agent_label`），连接中显示「连接中」，避免两处叫法打架。
+        if self.backend == Backend::Acp {
+            let label = current_agent_label(
+                self.backend,
+                &self.acp_agents,
+                self.current_acp_id.as_ref(),
+                self.acp_connecting,
+            );
+            self.acp_input
+                .update(cx, |input, cx| input.set_agent_label(label, cx));
+        }
     }
 
     /// 向宿主取一次上下文栏快照；未注入数据源时给默认值（底栏只有权限级别）。
@@ -4899,9 +4956,8 @@ impl AgentChatView {
             })
             .or_else(|| options.first().cloned());
         self.model_options = options.clone();
-        self.input.update(cx, |input, cx| {
-            input.set_menu_options(options, self.tool_options.clone(), cx);
-        });
+        self.composer()
+            .set_menu_options(options, self.tool_options.clone(), cx);
         self.sync_composer(cx);
     }
 
@@ -5437,8 +5493,7 @@ impl AgentChatView {
             let transcript = std::mem::replace(&mut self.transcript, stashed);
             self.cache_agent_session_transcript(session_uid.clone(), transcript);
             self.set_session_running(&session_uid, false, cx);
-            self.input
-                .update(cx, |input, cx| input.set_running(false, cx));
+            self.set_composers_running(false, cx);
             self.trim_session_transcripts();
             self.sync_pending_preview(cx);
             let operation =
@@ -5446,8 +5501,7 @@ impl AgentChatView {
             self.transcript.clear();
             self.transcript
                 .push_system(t!("AgentUi.creating_acp_session").to_string());
-            self.input
-                .update(cx, |input, cx| input.set_running(true, cx));
+            self.set_composers_running(true, cx);
             self.sync_pending_preview(cx);
             self.request_scroll_to_bottom();
             cx.notify();
@@ -5458,8 +5512,7 @@ impl AgentChatView {
                     if !this.is_current_acp_session_transition(operation, &agent_id, &session_uid) {
                         return;
                     }
-                    this.input
-                        .update(cx, |input, cx| input.set_running(false, cx));
+                    this.set_composers_running(false, cx);
                     this.acp = Some(acp);
                     this.transcript.clear();
                     let protocol_session_id =
@@ -5611,8 +5664,7 @@ impl AgentChatView {
         // 新会话从空输入框开始（渲染时应用；文字与附件都换空的——
         // 上一会话挂在输入框里的图片不许跟过来）。
         self.pending_input_draft = Some(ComposerDraft::default());
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        self.set_composers_running(false, cx);
         self.sync_pending_preview(cx);
         self.upsert_live_summary(
             self.current_session.clone(),
@@ -5885,8 +5937,8 @@ impl AgentChatView {
         if self.closed_sessions.contains(&self.current_session) {
             return;
         }
-        let text = self.input.read(cx).composer_text(cx);
-        let images = self.input.read(cx).composer_attachments().to_vec();
+        let text = self.composer_text(cx);
+        let images = self.composer_attachments(cx);
         let has_draft = !text.trim().is_empty() || !images.is_empty();
         if let Some(session) = self
             .runtime
@@ -5962,16 +6014,15 @@ impl AgentChatView {
         self.pending_input_draft = Some(ComposerDraft { text, images });
     }
 
-    /// 渲染开头应用排队的草稿。只有切换会话会排队，平时是 no-op。
+    /// 渲染开头应用排队的草稿。只有切换会话/切换后端会排队，平时是 no-op。
     ///
     /// 文字与附件**一起**换：附件是整体替换——目标会话没有附件草稿时，
     /// 上一会话挂在输入框里的图片必须被清掉，否则会跟着新会话一起发出去。
     fn apply_pending_input_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(draft) = self.pending_input_draft.take() {
-            self.input.update(cx, |input, cx| {
-                input.set_composer_text(&draft.text, window, cx);
-                input.set_composer_attachments(draft.images, cx);
-            });
+            let composer = self.composer();
+            composer.set_composer_text(&draft.text, window, cx);
+            composer.set_composer_attachments(draft.images, cx);
         }
     }
 
@@ -5980,10 +6031,9 @@ impl AgentChatView {
     /// 直接发出去等于替用户按了发送键：起手话是给人改的草稿，不是命令。
     fn apply_starter_prompt(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = crate::empty_state::starter_prompt(index);
-        self.input.update(cx, |input, cx| {
-            input.set_composer_text(&prompt, window, cx);
-            input.focus_input(window, cx);
-        });
+        let composer = self.composer();
+        composer.set_composer_text(&prompt, window, cx);
+        composer.focus_input(window, cx);
         cx.notify();
     }
 
@@ -6023,8 +6073,8 @@ impl AgentChatView {
                 .pending_submissions
                 .items(self.current_session.as_str())
                 .is_empty()
-            && self.input.read(cx).composer_text(cx).trim().is_empty()
-            && self.input.read(cx).composer_attachments().is_empty()
+            && self.composer_text(cx).trim().is_empty()
+            && self.composer_attachments(cx).is_empty()
     }
 
     /// 离开当前会话时，若它还是白纸就记下来当「可复用的草稿会话」。
@@ -6322,8 +6372,7 @@ impl AgentChatView {
         }
         self.trim_session_transcripts();
         self.is_running = self.running_sessions.contains(uid);
-        self.input
-            .update(cx, |input, cx| input.set_running(self.is_running, cx));
+        self.set_composers_running(self.is_running, cx);
         // 人回到这条外部会话了：还在跑的那轮又回到眼前（输出上屏、停止可用）。
         if external_agent.is_some() {
             self.reclaim_foreground_turn();
@@ -6517,10 +6566,12 @@ impl AgentChatView {
             self.skills.items(),
             self.local_context_tokens(),
         );
+        // 目标选择器只有 One agent 那份有：这里照旧喂给 `input`，切到 ACP 时
+        // 它不挂载，喂了也无副作用；上下文则按后端起手送进当前那一份。
         self.input.update(cx, |input, cx| {
             input.set_target_options(target_options, cx);
-            input.set_context(ctx, cx);
         });
+        self.composer().set_context(ctx, cx);
     }
 
     /// 更新可操作资源上下文与 `@` 提及项。
@@ -6590,10 +6641,11 @@ impl AgentChatView {
         // 业务资源换了：留一份给工作区文件重新合并用（文件那份不用重扫，根没动）。
         self.resource_mentions = mentions;
         self.refresh_workspace_mentions(cx);
+        // 同 `sync_resource_targets`：目标选择器只喂 One agent 那份，上下文按后端送。
         self.input.update(cx, |input, cx| {
             input.set_target_options(target_options, cx);
-            input.set_context(ctx, cx);
         });
+        self.composer().set_context(ctx, cx);
         if self.sidebar_mode {
             self.request_scroll_to_bottom_until_layout_settles();
         } else {
@@ -6631,7 +6683,11 @@ impl AgentChatView {
 
     pub fn set_theme(&mut self, theme: Option<AgentChatTheme>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
+        // 观感是**视图**的属性，不是某一份输入框的：两份都更新，之后无论挂哪一份
+        // 都不会退回默认配色。
         self.input
+            .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
+        self.acp_input
             .update(cx, |input, cx| input.set_theme(theme, cx));
         cx.notify();
     }
@@ -7468,6 +7524,9 @@ fn unix_now_secs() -> i64 {
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 换了后端（挂了另一份输入框）时先把内容搬过去，再应用排队的草稿：
+        // 顺序反了的话，"搬过去"会盖掉会话切换那份更权威的草稿。
+        self.sync_composer_handover(cx);
         // 会话切换排队的草稿在第一帧应用（见 `pending_input_draft` 字段注释）。
         self.apply_pending_input_draft(window, cx);
         if self.auto_scroll.take_pending_for_render() {
@@ -7596,7 +7655,7 @@ impl Render for AgentChatView {
                             .min_w_0()
                             .when(self.sidebar_mode, |this| this.min_h_0().overflow_hidden())
                             .when(!self.sidebar_mode, |this| this.p_3())
-                            .child(self.input.clone()),
+                            .child(self.render_composer()),
                     ),
             );
         let auth_actions = self.render_acp_auth_actions(cx);
@@ -10995,6 +11054,93 @@ mod tests {
     }
 
     #[gpui::test]
+    fn backend_switches_which_composer_is_mounted(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        // 本地：挂 One agent 那份（它有权限档位芯片，ACP 那份没有）。
+        view.update(cx, |_, cx| cx.notify());
+        let cx: &mut VisualTestContext = cx;
+        assert!(
+            cx.debug_bounds("agent-input-permission").is_some(),
+            "本地后端应当挂载 One agent 那份输入框"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-acp-root").is_none(),
+            "本地后端不该出现 ACP 那份输入框"
+        );
+
+        // 切到 ACP：同一个位置换成 ACP 那份——One agent 的能力区整块消失。
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            cx.notify();
+        });
+        assert!(
+            cx.debug_bounds("agent-input-acp-root").is_some(),
+            "ACP 后端应当挂载 ACP 那份输入框"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-permission").is_none(),
+            "切到 ACP 后不该再出现 One agent 的能力 chip"
+        );
+    }
+
+    #[gpui::test]
+    fn switching_backend_carries_the_draft_between_composers(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        // 本地那份里留半句话 + 一张附件。
+        view.update_in(cx, |view, window, cx| {
+            view.composer()
+                .set_composer_text("切过去也不该丢的半句话", window, cx);
+            view.composer()
+                .set_composer_attachments(vec![crate::ImageAttachment::for_test("carry.png")], cx);
+        });
+
+        // 切到 ACP：两份组件各有自己的编辑器，内容靠面板在渲染时搬一次。
+        view.update_in(cx, |view, window, cx| {
+            view.backend = Backend::Acp;
+            cx.notify();
+            view.render(window, cx);
+        });
+        assert_eq!(
+            "切过去也不该丢的半句话",
+            view.read_with(cx, |view, cx| view.acp_input.read(cx).composer_text(cx)),
+            "切到 ACP 后刚打的字要跟过去"
+        );
+        assert_eq!(
+            1,
+            view.read_with(cx, |view, cx| view
+                .acp_input
+                .read(cx)
+                .composer_attachments()
+                .len()),
+            "附件也要跟着搬"
+        );
+
+        // 在 ACP 那份里改一行再切回本地：搬的是**最新**的内容，不是旧那份里的残留。
+        view.update_in(cx, |view, window, cx| {
+            view.composer()
+                .set_composer_text("在 ACP 里改过的一句", window, cx);
+            view.backend = Backend::Local;
+            cx.notify();
+            view.render(window, cx);
+        });
+        assert_eq!(
+            "在 ACP 里改过的一句",
+            view.read_with(cx, |view, cx| view.input.read(cx).composer_text(cx)),
+            "切回本地要搬 ACP 那份里的最新内容"
+        );
+    }
+
+    #[gpui::test]
     fn selecting_acp_immediately_routes_submissions_away_from_local(cx: &mut TestAppContext) {
         init_test_ui(cx);
         let agent_id = SharedString::from("codex");
@@ -11383,8 +11529,7 @@ mod tests {
             view.backend = Backend::Acp;
             view.current_acp_id = Some(agent_id.clone());
             let operation = view.begin_acp_session_transition(agent_id, session_uid.clone());
-            view.input
-                .update(cx, |input, cx| input.set_running(true, cx));
+            view.set_composers_running(true, cx);
             view.pending_submissions
                 .enqueue(&session_uid, pending_submission("cancel with new session"));
 

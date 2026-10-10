@@ -228,8 +228,7 @@ impl AgentChatView {
         }
         self.findbar_open = false;
         self.search.clear();
-        let input = self.input.clone();
-        input.update(cx, |input, cx| input.focus_input(window, cx));
+        self.composer().focus_input(window, cx);
         cx.notify();
     }
 

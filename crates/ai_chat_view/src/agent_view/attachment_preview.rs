@@ -104,30 +104,27 @@ impl AgentChatView {
         theme: &AgentChatTheme,
         cx: &App,
     ) -> Option<AnyElement> {
-        let composer = self.input.clone();
-        let (image, name) = {
-            let input = composer.read(cx);
-            let attachment = input.previewed_attachment()?;
-            (attachment.image.clone(), attachment.name.clone())
-        };
+        // 覆盖层跟着**当前挂载**的那份输入框走：ACP 那份也能点开附图放大。
+        let composer = self.composer();
+        let (image, name) = composer.previewed_attachment(cx)?;
 
         let backdrop = {
             let composer = composer.clone();
             move |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-                composer.update(cx, |input, cx| input.close_attachment_preview(cx));
+                composer.close_attachment_preview(cx);
             }
         };
         let button = {
             let composer = composer.clone();
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                composer.update(cx, |input, cx| input.close_attachment_preview(cx));
+                composer.close_attachment_preview(cx);
             }
         };
 
         Some(image_preview_overlay(
             "agent-attachment-preview",
             image,
-            Some(name.into()),
+            Some(name),
             theme,
             backdrop,
             button,
