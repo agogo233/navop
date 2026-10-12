@@ -16446,6 +16446,8 @@ mod tests {
             cx.notify();
         });
 
+        // 起手态退场靠的是「这一帧不再画它」：要一帧真重画才看得到（见 `refresh_frame`）。
+        refresh_frame(cx);
         assert!(
             cx.debug_bounds("ai-chat-empty-state").is_none(),
             "有消息之后起手态必须让位"
@@ -16589,6 +16591,8 @@ mod tests {
 
         chat.update(cx, |view, cx| view.close_usage_history(cx));
         let cx: &mut VisualTestContext = cx;
+        // 同 `empty_session_shows_the_starter_state`：关掉不等于这一帧不画它。
+        refresh_frame(cx);
         assert!(
             cx.debug_bounds("ai-chat-usage-history-layer").is_none(),
             "关掉之后覆盖层不该留着"
@@ -17467,6 +17471,16 @@ mod tests {
     fn draw_frame(cx: &mut VisualTestContext) {
         let _ = cx.debug_bounds("ai-chat-messages-scroll");
         cx.run_until_parked();
+    }
+
+    /// 逼窗口整帧重画一次，然后才断言某个选择器「没了」。
+    ///
+    /// 保留渲染会给**这一帧没重画**的区域沿用上一帧的记录，调试选择器跟着一起沿用：
+    /// 刚被移除的元素于是还挂在 `debug_bounds` 里，而场景里早没有它的图元了
+    /// （拿 `Window::painted_primitives` 比对过：图元数 0，只是记录没清）。
+    /// 所以断言「某个东西消失了」之前得先要一帧真重画，否则读到的是账面残留。
+    fn refresh_frame(cx: &mut VisualTestContext) {
+        cx.update(|window, _| window.refresh());
     }
 
     fn palette_keystroke() -> &'static str {

@@ -34,22 +34,6 @@ impl ComposerSlot {
         }
     }
 
-    pub(super) fn set_menu_options(
-        &self,
-        model_options: Vec<ComposerModelOption>,
-        mode_options: Vec<ComposerMenuOption>,
-        cx: &mut Context<AgentChatView>,
-    ) {
-        match self {
-            Self::One(entity) => entity.update(cx, |input, cx| {
-                input.set_menu_options(model_options, mode_options, cx)
-            }),
-            Self::Acp(entity) => entity.update(cx, |input, cx| {
-                input.set_menu_options(model_options, mode_options, cx)
-            }),
-        }
-    }
-
     pub(super) fn set_queued_submissions(
         &self,
         previews: Vec<QueuedPromptPreview>,
