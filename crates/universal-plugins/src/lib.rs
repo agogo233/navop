@@ -24,8 +24,16 @@ pub use extension_connection_tab::ExtensionConnectionTab;
 #[cfg(feature = "shell-plugins")]
 pub use shell_plugin_host::{
     ConnectionShellOpen, DevHostOps, GlobalDevHostOps, ShellPluginHost, gpui_shell_reexport,
-    set_dev_host_ops,
+    refresh_shell_views, set_dev_host_ops,
 };
+
+/// 无 `shell-plugins` 构建里不存在脚本视图，没有东西可刷新。
+///
+/// 保留同名函数，是为了让调用点（设置页切语言那处）不必为这个 feature 再写
+/// 一遍 `cfg` —— 那是把"哪个构建有 shell"这件事复制到调用方去。
+#[cfg(not(feature = "shell-plugins"))]
+pub fn refresh_shell_views(_cx: &mut gpui::App) {}
+
 pub use universal_plugins::{
     GlobalUniversalPluginService, UniversalPluginService, init, spawn_shutdown,
 };

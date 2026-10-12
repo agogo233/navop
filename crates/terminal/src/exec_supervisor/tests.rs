@@ -12,7 +12,7 @@ use std::time::Duration;
 
 mod ready_wait;
 
-fn request(command: &str) -> TerminalExecRequest {
+pub(crate) fn request(command: &str) -> TerminalExecRequest {
     TerminalExecRequest {
         command: command.to_string(),
         submit: true,
@@ -23,13 +23,13 @@ fn request(command: &str) -> TerminalExecRequest {
     }
 }
 
-fn ready_supervisor() -> ExecSupervisor {
+pub(crate) fn ready_supervisor() -> ExecSupervisor {
     let mut supervisor = ExecSupervisor::new();
     assert!(supervisor.on_osc(&OscEvent::InputStart).is_empty());
     supervisor
 }
 
-fn submit(supervisor: &mut ExecSupervisor, id: u64, command: &str) {
+pub(crate) fn submit(supervisor: &mut ExecSupervisor, id: u64, command: &str) {
     assert!(matches!(
         supervisor.start(id, request(command)).as_slice(),
         [ExecEffect::Write {
@@ -156,7 +156,9 @@ fn submitted_only_exec_becomes_busy_before_command_start_arrives() {
     assert_eq!(
         vec![ExecEffect::Fail {
             id: 35,
-            error: TerminalExecError::Busy,
+            error: TerminalExecError::BusyContext {
+                readiness: "SubmissionPending { command_epoch: 34 }".to_string(),
+            },
         }],
         supervisor.start(35, request("pwd"))
     );
@@ -174,7 +176,9 @@ fn running_terminal_rejects_without_writing() {
     assert_eq!(
         vec![ExecEffect::Fail {
             id: 12,
-            error: TerminalExecError::Busy,
+            error: TerminalExecError::BusyContext {
+                readiness: "SubmissionPending { command_epoch: 1 }".to_string(),
+            },
         }],
         supervisor.start(12, request("pwd"))
     );
@@ -192,7 +196,9 @@ fn init_command_submission_makes_terminal_busy() {
     assert_eq!(
         vec![ExecEffect::Fail {
             id: 30,
-            error: TerminalExecError::Busy,
+            error: TerminalExecError::BusyContext {
+                readiness: "SubmissionPending { command_epoch: 1 }".to_string(),
+            },
         }],
         supervisor.start(30, request("pwd"))
     );
@@ -464,7 +470,9 @@ fn observing_timeout_keeps_progress_and_rejects_replacement_command() {
     assert_eq!(
         vec![ExecEffect::Fail {
             id: 261,
-            error: TerminalExecError::Busy,
+            error: TerminalExecError::BusyContext {
+                readiness: "exec_in_flight CommandRunning { command_epoch: 260 }".to_string(),
+            },
         }],
         supervisor.start(261, request("echo replacement"))
     );

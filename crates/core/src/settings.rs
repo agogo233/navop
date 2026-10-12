@@ -1182,6 +1182,14 @@ pub struct AppSettings {
     pub terminal_enable_autocomplete: bool,
     #[serde(default = "default_true")]
     pub terminal_show_suggestion_popup: bool,
+    /// 命令提示 / cd 补全 / 历史搜索下拉弹层的背景不透明度。
+    ///
+    /// 弹层背景画在终端内容之上，下层文字以 (1 - α) 的权重透进弹层：0.72
+    /// 会透出 28%，与弹层自身文字的对比度同量级，亮色主题下几乎不可读
+    /// （issue #73）；1.0 则完全遮挡终端内容（issue #5）。两个诉求相反，
+    /// 因此暴露给用户自己定，默认 0.96（透出 4%）。
+    #[serde(default = "default_terminal_suggestion_popup_opacity")]
+    pub terminal_suggestion_popup_opacity: f32,
     #[serde(default = "default_true")]
     pub terminal_middle_click_paste: bool,
     #[serde(default)]
@@ -1276,6 +1284,9 @@ pub struct AppSettings {
     /// 数据表格的显示方式：网格（默认）或纵向「列：值」
     #[serde(default)]
     pub table_view_mode: TableViewMode,
+    /// 在数据表格列头下方常驻显示字段注释，默认关闭
+    #[serde(default)]
+    pub table_show_column_comment: bool,
     /// SQL 查询默认最大返回行数，0 表示不限制
     #[serde(default = "default_sql_query_max_rows")]
     pub sql_query_max_rows: u32,
@@ -1537,6 +1548,10 @@ fn default_terminal_scrollback_lines() -> usize {
     AppSettings::DEFAULT_TERMINAL_SCROLLBACK_LINES
 }
 
+fn default_terminal_suggestion_popup_opacity() -> f32 {
+    AppSettings::DEFAULT_TERMINAL_SUGGESTION_POPUP_OPACITY
+}
+
 fn default_terminal_theme() -> String {
     DEFAULT_TERMINAL_THEME.to_string()
 }
@@ -1598,6 +1613,7 @@ impl Default for AppSettings {
             terminal_auto_copy: default_true(),
             terminal_enable_autocomplete: default_true(),
             terminal_show_suggestion_popup: default_true(),
+            terminal_suggestion_popup_opacity: default_terminal_suggestion_popup_opacity(),
             terminal_middle_click_paste: default_true(),
             terminal_right_click_paste: false,
             terminal_paste_image_upload: default_true(),
@@ -1639,6 +1655,7 @@ impl Default for AppSettings {
             system_hotkey_other: default_system_hotkey_other(),
             table_row_height: default_table_row_height(),
             table_view_mode: TableViewMode::default(),
+            table_show_column_comment: false,
             sql_query_max_rows: default_sql_query_max_rows(),
             sql_export_rows_per_statement: default_sql_export_rows_per_statement(),
             sql_format: SqlFormatSettings::default(),
@@ -1702,6 +1719,10 @@ impl AppSettings {
     pub const DEFAULT_TERMINAL_SCROLLBACK_LINES: usize = 100_000;
     pub const MIN_TERMINAL_SCROLLBACK_LINES: usize = 1_000;
     pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+    /// 命令提示下拉弹层背景不透明度的默认值：透出权重 4%。
+    pub const DEFAULT_TERMINAL_SUGGESTION_POPUP_OPACITY: f32 = 0.96;
+    pub const MIN_TERMINAL_SUGGESTION_POPUP_OPACITY: f32 = 0.5;
+    pub const MAX_TERMINAL_SUGGESTION_POPUP_OPACITY: f32 = 1.0;
 
     pub fn master_key_on_startup_required(&self) -> bool {
         crate::app_paths::master_key_on_startup_required(
@@ -1756,9 +1777,22 @@ impl AppSettings {
         )
     }
 
+    pub fn normalize_terminal_suggestion_popup_opacity(opacity: f32) -> f32 {
+        if opacity.is_finite() {
+            opacity.clamp(
+                Self::MIN_TERMINAL_SUGGESTION_POPUP_OPACITY,
+                Self::MAX_TERMINAL_SUGGESTION_POPUP_OPACITY,
+            )
+        } else {
+            Self::DEFAULT_TERMINAL_SUGGESTION_POPUP_OPACITY
+        }
+    }
+
     pub fn normalize_terminal_settings(&mut self) {
         self.terminal_scrollback_lines =
             Self::normalize_terminal_scrollback_lines(self.terminal_scrollback_lines);
+        self.terminal_suggestion_popup_opacity =
+            Self::normalize_terminal_suggestion_popup_opacity(self.terminal_suggestion_popup_opacity);
         let terminal_theme = self.terminal_theme.trim();
         self.terminal_theme = if terminal_theme.is_empty() {
             default_terminal_theme()
@@ -2397,6 +2431,27 @@ mod tests {
         .expect("table_view_mode 应能从 settings.json 读回");
 
         assert_eq!(TableViewMode::Vertical, settings.table_view_mode);
+    }
+
+    #[test]
+    fn table_column_comment_is_off_by_default_and_round_trips() {
+        assert!(
+            !AppSettings::default().table_show_column_comment,
+            "列头注释行默认关闭"
+        );
+
+        let legacy: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "table_row_height": 44
+        }))
+        .expect("缺少 table_show_column_comment 的旧版 settings.json 应能读取");
+        assert!(!legacy.table_show_column_comment);
+
+        let enabled: AppSettings = serde_json::from_value(serde_json::json!({
+            "table_show_column_comment": true
+        }))
+        .expect("table_show_column_comment 应能从 settings.json 读回");
+        assert!(enabled.table_show_column_comment);
     }
 
     #[test]
@@ -3338,6 +3393,31 @@ mod tests {
         settings.terminal_scrollback_lines = 2_000_000;
         settings.normalize_terminal_settings();
         assert_eq!(1_000_000, settings.terminal_scrollback_lines);
+    }
+
+    #[test]
+    fn terminal_suggestion_popup_opacity_default_and_normalization_are_safe() {
+        let mut settings = AppSettings::default();
+
+        assert_eq!(0.96, settings.terminal_suggestion_popup_opacity);
+
+        settings.terminal_suggestion_popup_opacity = 0.05;
+        settings.normalize_terminal_settings();
+        assert_eq!(0.5, settings.terminal_suggestion_popup_opacity);
+
+        settings.terminal_suggestion_popup_opacity = 3.0;
+        settings.normalize_terminal_settings();
+        assert_eq!(1.0, settings.terminal_suggestion_popup_opacity);
+    }
+
+    #[test]
+    fn legacy_app_settings_receive_default_terminal_suggestion_popup_opacity() {
+        // issue #73：弹层不透明度是后加的字段，旧配置里没有，反序列化必须
+        // 落到 0.96（透出 4%）而不是 f32 的 0.0（弹层全透明、完全读不了）。
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({"locale": "zh-CN"}))
+            .expect("旧版设置应能反序列化");
+
+        assert_eq!(0.96, settings.terminal_suggestion_popup_opacity);
     }
 
     #[test]

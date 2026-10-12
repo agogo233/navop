@@ -614,6 +614,81 @@ fn clipboard_tsv_escapes_fields_with_separators() {
     );
 }
 
+/// 查询结果里的表名是 `库.表` 的拼接形式，复制出来的 SQL 必须逐段引用，
+/// 否则会得到 `ads.tbl` 这种被粘在一个引号对里的非法名字。
+#[test]
+fn qualified_table_name_is_quoted_per_part() {
+    let plugin = DbManager::default()
+        .get_plugin(&DatabaseType::MySQL)
+        .expect("MySQL plugin should exist");
+    let data = vec![vec![Some("4".into()), Some("值".into())]];
+    let columns = vec!["indicator_key".into(), "indicator_name".into()];
+    let metadata = TableMetadata::new("ads.ads_tb_indicator_target_fill_test")
+        .with_columns(columns.clone())
+        .with_column_meta(vec![
+            column("indicator_key", "VARCHAR(20)"),
+            column("indicator_name", "VARCHAR(50)"),
+        ])
+        .with_primary_keys(vec![0]);
+    let context = sql_context((&data, &columns, &metadata), plugin.as_ref());
+
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        concat!(
+            "INSERT INTO `ads`.`ads_tb_indicator_target_fill_test` ",
+            "(`indicator_key`, `indicator_name`) VALUES\n('4', '值');",
+        )
+    );
+
+    let context = sql_context((&data, &columns, &metadata), plugin.as_ref());
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlUpdate, context),
+        concat!(
+            "UPDATE `ads`.`ads_tb_indicator_target_fill_test` SET `indicator_name` = '值' ",
+            "WHERE `indicator_key` = '4';",
+        )
+    );
+
+    let context = sql_context((&data, &columns, &metadata), plugin.as_ref());
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlDelete, context),
+        "DELETE FROM `ads`.`ads_tb_indicator_target_fill_test` WHERE `indicator_key` = '4';"
+    );
+}
+
+#[test]
+fn qualified_table_name_is_split_for_dialectless_and_multi_part_names() {
+    let data = vec![vec![Some("1".into())]];
+    let columns = vec!["id".into()];
+
+    let metadata = TableMetadata::new("sales.orders").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        "INSERT INTO \"sales\".\"orders\" (\"id\") VALUES\n(1);"
+    );
+
+    let metadata = TableMetadata::new("warehouse.sales.orders").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        "INSERT INTO \"warehouse\".\"sales\".\"orders\" (\"id\") VALUES\n(1);"
+    );
+}
+
+#[test]
+fn unqualified_table_name_stays_a_single_identifier() {
+    let data = vec![vec![Some("1".into())]];
+    let columns = vec!["id".into()];
+    let metadata = TableMetadata::new("users").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        "INSERT INTO \"users\" (\"id\") VALUES\n(1);"
+    );
+}
+
 #[test]
 fn sql_insert_and_multicolumn_in_reject_ragged_rows() {
     let data = vec![

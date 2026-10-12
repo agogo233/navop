@@ -37,14 +37,15 @@ mod sql_editor_hover;
 mod sql_editor_signature;
 pub mod sql_editor_view;
 pub(crate) mod sql_inline_completion;
+pub mod sql_library;
 mod sql_object_details_tab;
 pub mod sql_result_tab;
-mod table_ddl;
 #[cfg(test)]
 mod sql_result_tab_tests;
 mod table_copy_menu;
 mod table_data;
 pub mod table_data_tab;
+mod table_ddl;
 pub mod table_designer_tab;
 
 pub use ai_chat_view::{AskAiButton, emit_ask_ai_event, init_ask_ai_notifier};

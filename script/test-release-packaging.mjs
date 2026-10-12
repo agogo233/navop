@@ -300,12 +300,12 @@ test("the embedded webview is an opt-in feature on every platform", () => {
     /embedded-webview = \["dep:gpui-webview", "dep:wry"\]/,
   );
   // The dependency key is `gpui-webview`; the workspace manifest pins it to
-  // upstream's pre-rename `gpui-wry` through `package = "gpui-wry"`, which is
-  // what keeps the embedded webview off GPUI Fast.
+  // the gpui-kit fork rev that ships the post-rename crate. On GPUI Fast the
+  // whole UI stack (webview included) shares the same backend.
   assert.match(cargo, /gpui-webview = \{[^}]*optional = true[^}]*\}/);
   assert.match(
     workspaceCargo,
-    /^gpui-webview = \{ package = "gpui-wry",[^}]*\}$/m,
+    /^gpui-webview = \{ git = "https:\/\/github.com\/feigeCode\/gpui-kit",[^}]*\}$/m,
   );
   assert.match(cargo, /wry = \{[^}]*optional = true[^}]*\}/);
   assert.doesNotMatch(cargo, /target_arch = "aarch64"/);

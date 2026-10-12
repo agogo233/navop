@@ -586,6 +586,11 @@ impl SettingsPanel {
                                             effective_locale_for_setting(&locale);
                                         gpui_component::set_locale(effective_locale);
                                         notes::set_markdown_editor_locale(effective_locale, cx);
+                                        // 扩展页自己带词条表，读的是宿主的语言事实
+                                        // (`navop.i18n.locale()`)；而页面描述重建不会
+                                        // 因为 set_locale 自己发生 —— 必须显式叫醒
+                                        // 它们，否则页面停在旧语言上。
+                                        universal_plugins::refresh_shell_views(cx);
                                         AppSettings::update_and_save(cx, |settings| {
                                             settings.locale = locale;
                                         });
@@ -1010,22 +1015,38 @@ impl SettingsPanel {
                     .keywords([t!("LlmProviders.title").to_string()]),
                 ),
             ),
-            // 账户设置页
-            SettingPage::new(t!("Settings.Account.title")).group(
-                SettingGroup::new().item(
-                    SettingItem::render(move |_options, window, cx| {
-                        render_account_section(window, cx)
-                    })
-                    .keywords([
-                        t!("Settings.Account.title").to_string(),
-                        t!("Settings.Account.username").to_string(),
-                        t!("Settings.Account.email").to_string(),
-                        t!("Settings.Account.not_logged_in").to_string(),
-                        t!("Auth.logout").to_string(),
-                        t!("License.import_offline").to_string(),
-                    ]),
+            // 账户设置页：账户信息与主密钥是两件独立的事——没有账户也可以有主密钥，
+// 所以拆成两个并列分组，关系与「关于 / 更新」一致。
+            SettingPage::new(t!("Settings.Account.title"))
+                .group(
+                    SettingGroup::new().title(t!("Settings.Account.title")).item(
+                        SettingItem::render(move |_options, window, cx| {
+                            render_account_section(window, cx)
+                        })
+                        .keywords([
+                            t!("Settings.Account.title").to_string(),
+                            t!("Settings.Account.username").to_string(),
+                            t!("Settings.Account.email").to_string(),
+                            t!("Settings.Account.not_logged_in").to_string(),
+                            t!("Auth.logout").to_string(),
+                            t!("License.import_offline").to_string(),
+                        ]),
+                    ),
+                )
+                .group(
+                    SettingGroup::new()
+                        .title(t!("Settings.Account.master_key_section"))
+                        .item(
+                            SettingItem::render(move |_options, _window, cx| {
+                                master_key_section(cx)
+                            })
+                            .keywords([
+                                t!("Settings.Account.master_key_section").to_string(),
+                                t!("Encryption.change_repo_password").to_string(),
+                                t!("Encryption.reset_master_key").to_string(),
+                            ]),
+                        ),
                 ),
-            ),
             // 关于页面
             SettingPage::new(t!("Settings.About.title"))
                 .group(
@@ -3065,6 +3086,53 @@ fn render_account_section(_window: &mut Window, cx: &App) -> gpui::AnyElement {
     }
 }
 
+/// 账户页的「主密钥」区块：只放修改与重置两个入口。
+///
+/// 重置时要删哪些数据是「每一次重置」的决定，不是长期配置，所以勾选项放进重置
+/// 弹窗里当场选（默认全选），设置页不再维护这份开关。
+fn master_key_section(cx: &App) -> gpui::Div {
+    v_flex()
+        .gap_3()
+        .w_full()
+        .child(
+            div()
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(t!("Settings.Account.master_key_section").to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("Settings.Account.master_key_section_desc").to_string()),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("change-master-key-button")
+                        .icon(IconName::Edit)
+                        .label(t!("Encryption.change_repo_password").to_string())
+                        .on_click(|_, window, cx| {
+                            crate::master_key_dialogs::show_change_master_key_dialog(
+                                window, cx, None,
+                            );
+                        }),
+                )
+                .child(
+                    Button::new("reset-master-key-button")
+                        .icon(IconName::Delete)
+                        .label(t!("Encryption.reset_master_key").to_string())
+                        .danger()
+                        .on_click(|_, window, cx| {
+                            crate::master_key_dialogs::show_reset_master_key_dialog(
+                                window, cx, None,
+                            );
+                        }),
+                ),
+        )
+}
+
 // ============================================================================
 // 快捷键设置页
 // ============================================================================
@@ -4291,6 +4359,30 @@ mod tests {
         assert!(locales.contains("Anyone who obtains both the application"));
         assert!(locales.contains("任何同时获得应用程序和完整 data 目录的人"));
         assert!(locales.contains("任何同時取得應用程式和完整 data 目錄的人"));
+    }
+
+    /// 切界面语言必须**叫醒已挂载的扩展页面**。
+    ///
+    /// 扩展页的文案不在宿主的 rust-i18n 目录里：页面自己带词条表，只从宿主读
+    /// 「现在是什么语言」（`navop.i18n.locale()`）。而 `gpui_component::set_locale`
+    /// 只换宿主自己的词条，**不会**让脚本重建页面描述 —— 少了这一行，界面切了、
+    /// 扩展页停在旧语言上，且不报任何错。
+    ///
+    /// 断言两件事：这行在实现里存在，且在语言下拉的 `set_locale` 之后 ——
+    /// 顺序反了会读到上一个语言值。
+    #[test]
+    fn changing_the_ui_language_reruns_mounted_extension_views() {
+        let source = implementation_source();
+        let set_locale = source
+            .find("gpui_component::set_locale(effective_locale);")
+            .expect("语言下拉里应有一处 set_locale");
+        let refresh = source
+            .find("universal_plugins::refresh_shell_views(cx)")
+            .expect("切语言后必须让扩展页重跑脚本");
+        assert!(
+            refresh > set_locale,
+            "刷新扩展页要排在 set_locale 之后，否则扩展读到的是上一个语言值"
+        );
     }
 
     #[test]

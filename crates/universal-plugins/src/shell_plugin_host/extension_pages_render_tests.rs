@@ -33,6 +33,8 @@ mod tests {
     use gpui_shell::policy::Policy;
     use gpui_shell::{HostArguments, HostModule, HostResult, HostValue, ViewLoadOptions};
 
+    use extension_runtime::extension::manifest::ShellHostModule;
+
     /// 渲染树里出现这些字样，说明页面的模板拼接漏了一个字段
     /// （`${missing}` → `undefined`、没被 `?? 0` 兜住的算术 → `NaN`、
     /// 忘了取属性的对象 → `[object Object]`）。空数据台子里页面**不该**
@@ -52,7 +54,10 @@ mod tests {
         ("mqtt/ui/subscriptions.js", &["Input", "Select"]),
         ("rocketmq/ui/overview.js", &["Tag", "Button"]),
         ("rocketmq/ui/messages.js", &["Input", "Select", "Button"]),
-        ("rocketmq/ui/send-message.js", &["Input", "Select", "Textarea"]),
+        (
+            "rocketmq/ui/send-message.js",
+            &["Input", "Select", "Textarea"],
+        ),
         ("docker/ui/log-viewer.js", &["Input"]),
         ("dev-tools/ui/workbench.js", &["Input"]),
     ];
@@ -88,7 +93,8 @@ mod tests {
         root.to_path_buf()
     }
 
-    /// 替代 `navop.workbench` / `navop.context` / `navop.dev` / `navop.log`。
+    /// 替代 `navop.workbench` / `navop.context` / `navop.dev` / `navop.log` /
+    /// `navop.i18n` / `navop.theme`。
     ///
     /// `navop.context` 必须在册:嵌入式工作台页面按 `ensure_embeddable` 的契约
     /// **必须**声明 `context` + `workbench` 两个模块,页面用 `context.current()`
@@ -125,6 +131,27 @@ mod tests {
             .function("info", null)
             .function("error", null);
 
+        // `navop.i18n` / `navop.theme` 不带任何资源访问，桩只需要回答**形状**：
+        // 语言给宿主默认值，主题给一张空表。真实模块对不认识的色名也返回
+        // `null`（而不是让整页挂掉），页面本来就该自己兜底，所以桩给空是同一
+        // 口径的弱化版，不会让"页面其实漏了兜底"混过去 —— 那种漏法由
+        // `PLACEHOLDER_TEXT` 那三条断言负责抓。
+        let locale: fn(&HostArguments) -> HostResult = |_| Ok(HostValue::Str("en".to_string()));
+        let appearance: fn(&HostArguments) -> HostResult =
+            |_| Ok(HostValue::Str("light".to_string()));
+        let revision: fn(&HostArguments) -> HostResult = |_| Ok(HostValue::Number(0.0));
+        let empty_object: fn(&HostArguments) -> HostResult = |_| Ok(HostValue::Object(Vec::new()));
+        let i18n = HostModule::new("navop.i18n")
+            .function("locale", locale)
+            .function("available", empty)
+            .function("revision", revision);
+        let theme = HostModule::new("navop.theme")
+            .function("appearance", appearance)
+            .function("names", empty)
+            .function("colors", empty_object)
+            .function("color", null)
+            .function("revision", revision);
+
         Rc::new(
             Policy::new()
                 .with_host_module(workbench)
@@ -134,7 +161,11 @@ mod tests {
                 .with_host_module(dev)
                 .expect("`navop.dev` is not a reserved specifier")
                 .with_host_module(log)
-                .expect("`navop.log` is not a reserved specifier"),
+                .expect("`navop.log` is not a reserved specifier")
+                .with_host_module(i18n)
+                .expect("`navop.i18n` is not a reserved specifier")
+                .with_host_module(theme)
+                .expect("`navop.theme` is not a reserved specifier"),
         )
     }
 
@@ -272,7 +303,10 @@ export default class Migrated extends View {
 
         let (mut context, loaded, _runtime) = load(root.path(), "main.js", cx);
         let (error, tree) = render_settled(&mut context, &loaded, "main.js");
-        assert_eq!(error, None, "元素用组件库、状态用 gpui-base 必须能渲染:\n{tree}");
+        assert_eq!(
+            error, None,
+            "元素用组件库、状态用 gpui-base 必须能渲染:\n{tree}"
+        );
         assert!(
             tree.contains("Input :aria_label(registered)"),
             "Input 必须来自组件库注册表:\n{tree}"
@@ -411,6 +445,57 @@ export default class Base extends View {
             failures.is_empty(),
             "相邻仓的扩展清单在本仓宿主 schema 下解析失败:\n{}",
             failures.join("\n")
+        );
+    }
+
+    /// 文档守卫：技能文档里那张「module 声明 ↔ 可用宿主模块」表必须覆盖宿主的
+    /// **声明面**。
+    ///
+    /// 加一个 host 模块要动四处：`ShellHostModule` 枚举、`policy.rs`、本文件的
+    /// 嵌入式白名单，以及相邻仓的那张表。前三处漏一处都会在编译期或安装期炸，
+    /// **只有文档漏了什么都不报** —— 扩展作者在文档里找不到那个模块，就不知道
+    /// 它能用。`i18n` / `theme` 这种"不碰资源"的模块尤其容易漏：它们不在
+    /// `policy.rs` 那串 `resource/job/event/...` 的直觉里。
+    ///
+    /// 相邻仓缺席时跳过，理由同 `extension_ui_root`：navop 的构建/CI 不保证
+    /// check out 它。
+    #[test]
+    fn the_skill_document_lists_every_declared_host_module() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../navop-extensions/.codex/skills/navop-shell-extension/references/manifest.md",
+        );
+        let Ok(document) = fs::read_to_string(&path) else {
+            eprintln!(
+                "SKIP the_skill_document_lists_every_declared_host_module: {} 不存在",
+                path.display()
+            );
+            return;
+        };
+
+        // 只认表格行。同一行里必须**同时**出现 specifier 与它的 manifest 拼写，
+        // 否则那行算没登记（只写一半的表格行读者也拼不出 import 语句）。
+        let rows: Vec<&str> = document
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .collect();
+        let missing: Vec<&str> = ShellHostModule::ALL
+            .iter()
+            .map(|module| module.module_specifier())
+            .filter(|specifier| {
+                let script_name = specifier.strip_prefix("navop.").expect("module specifier");
+                let declared = format!("`{script_name}`");
+                let imported = format!("`{specifier}`");
+                !rows
+                    .iter()
+                    .any(|row| row.contains(&declared) && row.contains(&imported))
+            })
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "这些 host 模块没出现在技能文档的模块表里：{}\n表在 {}",
+            missing.join(", "),
+            path.display()
         );
     }
 }

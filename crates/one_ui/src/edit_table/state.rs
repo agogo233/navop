@@ -7,9 +7,9 @@ use std::{
 
 use super::filter_state::FilterState;
 use super::find::{
-    FindHighlightElement, FindMatch, FindOutcome, HighlightSegment, SearchPanel,
-    SearchPanelEvent, find_highlight_color, mark_current_match_at, normalize_find_query,
-    resolve_find, row_highlight_ranges, row_matches, scroll_target_for_match,
+    FindHighlightElement, FindMatch, FindOutcome, HighlightSegment, SearchPanel, SearchPanelEvent,
+    find_highlight_color, mark_current_match_at, normalize_find_query, resolve_find,
+    row_highlight_ranges, row_matches, scroll_target_for_match,
 };
 use super::selection::{CellCoord, TableSelection};
 use super::tsv::{encode_tsv_rows, parse_tsv_rows};
@@ -34,6 +34,12 @@ use gpui_component::{
 };
 use one_assets::IconName;
 use rust_i18n::t;
+
+
+/// 列头行在布局测试里的 debug selector，非 test 构建为空实现。
+pub(crate) const HEAD_ROW_SELECTOR: &str = "edit-table-head-row";
+/// 数据行 debug selector 前缀，后面接行号，例如 `edit-table-row-0`。
+pub(crate) const ROW_SELECTOR_PREFIX: &str = "edit-table-row-";
 
 /// 列宽分隔线本身的宽度。
 const COLUMN_RESIZE_LINE_WIDTH: Pixels = px(1.);
@@ -257,6 +263,12 @@ pub struct EditTableState<D: EditTableDelegate> {
     right_clicked_row: Option<usize>,
     right_clicked_col: Option<usize>,
     selected_col: Option<usize>,
+    /// 「定位到某列」的标记列（`col_groups` 列坐标）。
+    ///
+    /// 与 `selected_col` 分开建模：选中列要给整列染色，而定位只要一个「在这儿」
+    /// 的提示。整列染色要按可见行数逐格绘制，列多、行多的时候滚动成本是线性的；
+    /// 标记只染表头一格。选中态一变化（点格、点头、键盘导航）即清除。
+    located_col: Option<usize>,
     selected_cell: Option<(usize, usize)>,
     resizing_col: Option<usize>,
 
@@ -333,6 +345,7 @@ where
             right_clicked_row: None,
             right_clicked_col: None,
             selected_col: None,
+            located_col: None,
             selected_cell: None,
             resizing_col: None,
             editing_cell: None,
@@ -378,6 +391,12 @@ where
                 this.on_find_panel_event(event, window, cx);
             },
         ));
+        // 行高与「列头显示字段注释」都是应用级全局，改完不会通知任何 View。
+        // 订阅全局本身，已经打开的表格才能在设置页拨动开关的当下立即重排列头。
+        this._subscriptions
+            .push(cx.observe_global::<crate::TableDisplaySettings>(|_, cx| {
+                cx.notify();
+            }));
         this.prepare_col_groups(cx);
         this
     }
@@ -552,11 +571,27 @@ where
         self.selected_col
     }
 
+    /// 定位标记当前指向的列（`col_groups` 列坐标）。
+    pub fn located_col(&self) -> Option<usize> {
+        self.located_col
+    }
+
+    /// 把某一列标成「刚定位到的列」，并保证它在视口里。
+    ///
+    /// 只改标记 + 滚动，不动选中态、不发事件：调用方（宿主视图）因此不会被
+    /// `SelectColumn` 之类的回调牵进去重绘，定位这一动作的绘制范围只有表头一格。
+    pub fn set_located_col(&mut self, col_ix: usize, cx: &mut Context<Self>) {
+        self.located_col = Some(col_ix);
+        self.ensure_col_visible(col_ix, cx);
+        cx.notify();
+    }
+
     pub fn set_selected_col(&mut self, col_ix: usize, cx: &mut Context<Self>) {
         self.selection_state = SelectionState::Column;
         self.selected_col = Some(col_ix);
         self.selected_row = None;
         self.selected_cell = None;
+        self.located_col = None;
         // 清除多选区，确保列选中和单元格选中互斥
         self.selection.clear();
         if let Some(col_ix) = self.selected_col {
@@ -571,6 +606,7 @@ where
         self.selected_row = None;
         self.selected_col = None;
         self.selected_cell = None;
+        self.located_col = None;
         // 同时清除多选区
         self.selection.clear();
         cx.notify();
@@ -878,6 +914,7 @@ where
         self.selected_cell = self.selection.active;
         self.selected_row = None;
         self.selected_col = None;
+        self.located_col = None;
 
         // 如果有活动单元格，滚动到可见
         if let Some((_, col_ix)) = self.selection.active {
@@ -1228,6 +1265,10 @@ where
     }
 
     fn prepare_col_groups(&mut self, cx: &mut Context<Self>) {
+        // 列组在这里整套重建（隐藏列、移动列、换页都会走到这儿），旧的列号
+        // 已经不指向同一字段了，留着标记就会染错表头。
+        self.located_col = None;
+
         let mut col_groups = Vec::new();
 
         if self.delegate.row_number_enabled(cx) {
@@ -1321,7 +1362,8 @@ where
             // 输入框在宿主那边，焦点只能由宿主来给。
             cx.emit(EditTableEvent::FindRequested);
         } else {
-            self.find_panel.update(cx, |panel, cx| panel.focus(window, cx));
+            self.find_panel
+                .update(cx, |panel, cx| panel.focus(window, cx));
         }
         cx.notify();
     }
@@ -1330,7 +1372,8 @@ where
     fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_open = false;
         self.find_query.clear();
-        self.find_panel.update(cx, |panel, cx| panel.clear(window, cx));
+        self.find_panel
+            .update(cx, |panel, cx| panel.clear(window, cx));
         self.clear_find_state();
         self.focus_handle.focus(window, cx);
         cx.emit(EditTableEvent::FindStateChanged);
@@ -1488,8 +1531,9 @@ where
         let query = self.find_query.clone();
         if !self.delegate.find_in_table_enabled(cx) || query.is_empty() {
             // 空查询不必扫全表，直接回到「没有命中」的状态。
-            self.find_panel
-                .update(cx, |panel, cx| panel.set_outcome(FindOutcome::default(), cx));
+            self.find_panel.update(cx, |panel, cx| {
+                panel.set_outcome(FindOutcome::default(), cx)
+            });
             cx.emit(EditTableEvent::FindStateChanged);
             cx.notify();
             return;
@@ -1900,7 +1944,12 @@ where
         self.find_previous(cx);
     }
 
-    pub(super) fn action_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn action_cancel(
+        &mut self,
+        _: &Cancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 查找面板优先吃掉 Escape：先关查找，再退回到清除选区。
         if self.find_panel_visible(cx) {
             self.close_find(window, cx);
@@ -2664,6 +2713,8 @@ where
 
         let is_editing = row_ix.is_some() && self.editing_cell == Some((row_ix.unwrap(), col_ix));
         let selection_border_color = cx.theme().table_active_border;
+        // 定位标记只染表头这一格，不染整列（见 `located_col` 字段注释）。
+        let is_located_header = row_ix.is_none() && self.located_col == Some(col_ix);
 
         let is_single_select_active =
             (is_active_cell || is_select_cell) && !is_editing && !is_multi_selection;
@@ -2693,6 +2744,8 @@ where
             .when(is_in_selection && !is_editing, |this| {
                 this.bg(cx.theme().table_active)
             })
+            // 定位标记：只给这一列的表头底色
+            .when(is_located_header, |this| this.bg(cx.theme().table_active))
             // 选区边框 - 上边界
             .when(border_top, |this| {
                 this.border_t_2().border_color(selection_border_color)
@@ -2934,7 +2987,11 @@ where
             return div().into_any_element();
         }
 
-        let row_number_offset = if self.delegate.row_number_enabled(cx) { 1 } else { 0 };
+        let row_number_offset = if self.delegate.row_number_enabled(cx) {
+            1
+        } else {
+            0
+        };
         if col_ix < row_number_offset {
             return div().into_any_element();
         }
@@ -3470,10 +3527,11 @@ where
         header
             .h_flex()
             .w_full()
-            .h(crate::table_row_height_or(
+            .h(crate::table_header_height_or(
                 cx,
                 self.options.size.table_row_height(),
             ))
+            .debug_selector(|| HEAD_ROW_SELECTOR.to_owned())
             .flex_shrink_0()
             .border_b_1()
             .border_color(cx.theme().border)
@@ -3573,6 +3631,7 @@ where
             tr.h_flex()
                 .w_full()
                 .h(row_height)
+                .debug_selector(move || format!("{ROW_SELECTOR_PREFIX}{row_ix}"))
                 .when(need_render_border, |this| {
                     this.border_b_1().border_color(cx.theme().table_row_border)
                 })
@@ -3766,7 +3825,7 @@ where
             div()
                 .occlude()
                 .absolute()
-                .top(crate::table_row_height_or(
+                .top(crate::table_header_height_or(
                     cx,
                     self.options.size.table_row_height(),
                 ))
@@ -4022,6 +4081,67 @@ mod tests {
             "Scrollbar::horizontal(&self.horizontal_scroll_handle)\n                    .mode(ScrollbarMode::Always)\n                    .viewport_from_layout()"
         ));
     }
+
+    /// 列头高度与数据行高必须分开取值：开启「列头显示字段注释」只加高列头，
+    /// 数据行仍跟随行高设置；纵向滚动条的起点也要跟着列头下移。
+    #[test]
+    fn the_header_has_its_own_height_while_rows_keep_the_row_height() {
+        let source = include_str!("state.rs").replace("\r\n", "\n");
+        let implementation = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("tests 模块起始标记")
+            .0;
+
+        let header = slice_between(
+            implementation,
+            "fn render_table_header(",
+            "\n    fn render_table_row(",
+        );
+        assert!(
+            header.contains("crate::table_header_height_or("),
+            "列头容器必须使用列头高度"
+        );
+        assert!(
+            !header.contains("crate::table_row_height_or("),
+            "列头容器不得再直接使用数据行高"
+        );
+
+        let body = slice_between(
+            implementation,
+            "fn render_table_row(",
+            "\n    fn render_vertical_scrollbar(",
+        );
+        assert!(
+            body.contains("crate::table_row_height_or("),
+            "数据行必须继续跟随行高设置"
+        );
+        assert!(
+            !body.contains("table_header_height_or("),
+            "数据行不受列头注释行影响"
+        );
+
+        let scrollbar = slice_between(
+            implementation,
+            "fn render_vertical_scrollbar(",
+            "\n    fn render_horizontal_scrollbar(",
+        );
+        assert!(
+            scrollbar.contains("crate::table_header_height_or("),
+            "纵向滚动条要从加高后的列头下方开始"
+        );
+
+        // 行高与列头注释开关都只是应用级全局，替换全局不会通知任何 View；
+        // 表格必须订阅 TableDisplaySettings，已经打开的表格才能立刻重排。
+        let constructor = slice_between(
+            implementation,
+            "pub fn new(delegate: D,",
+            "\n    pub fn delegate(",
+        );
+        assert!(
+            constructor.contains("cx.observe_global::<crate::TableDisplaySettings>"),
+            "EditTableState 必须订阅 TableDisplaySettings 并 notify"
+        );
+    }
 }
 
 impl<D> Render for EditTableState<D>
@@ -4232,14 +4352,7 @@ where
                 |_, _, _, _| {},
             ))
             .when_some(find_panel, |this, panel| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top_1()
-                        .right_3()
-                        .occlude()
-                        .child(panel),
-                )
+                this.child(div().absolute().top_1().right_3().occlude().child(panel))
             })
             .when(!window.is_inspector_picking(cx), |this| {
                 this.child(

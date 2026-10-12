@@ -254,7 +254,25 @@ fn table_identifier(context: CopyFormatContext<'_>) -> String {
     } else {
         context.metadata.table_name.as_ref()
     };
-    quote_identifier(context, table)
+    qualified_identifier(context, table)
+}
+
+/// 引用可能带限定前缀的表名（`schema.table` / `db.schema.table`）。
+///
+/// 查询结果里解析出来的表名是 `ads.ads_tb_x` 这种拼接形式，如果把整串当成
+/// 一个标识符加引号，会得到 `ads.ads_tb_x` 这种把库名和表名粘在一起的名字，
+/// 所以这里按 `.` 拆开逐段引用。
+fn qualified_identifier(context: CopyFormatContext<'_>, name: &str) -> String {
+    let parts = name
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| quote_identifier(context, part))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return quote_identifier(context, name);
+    }
+    parts.join(".")
 }
 
 fn column_identifier(context: CopyFormatContext<'_>, index: usize) -> String {

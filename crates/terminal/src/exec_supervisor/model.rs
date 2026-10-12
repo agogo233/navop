@@ -46,6 +46,11 @@ pub(crate) enum ExecPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalExecError {
     Busy,
+    /// Busy/ReadyTimeout 的上下文：拒绝瞬间的 shell readiness 快照 + 恢复指引，
+    /// 让 Agent 不必盲猜是嵌套 shell、前台 TUI 还是提交挂起。
+    BusyContext {
+        readiness: String,
+    },
     ReadinessUnknown,
     Disconnected,
     ReadyTimeout,
@@ -55,18 +60,37 @@ pub enum TerminalExecError {
     ClearInputTimeout,
 }
 
+impl TerminalExecError {
+    /// Busy 的人类可读恢复指引；readiness 快照由调用方拼入。
+    fn recovery_hint(readiness: &str) -> String {
+        let hint = format!(
+            "terminal_busy (readiness={readiness}): the visible terminal is not at an \
+             idle integrated prompt. If the user entered a nested shell (sudo -i, su) or a \
+             TUI is occupying the prompt, run terminal.read to inspect the live prompt, then \
+             call terminal.control action=reintegrate at an idle prompt to restore shell \
+             integration, wait one prompt cycle, and retry; or ask the user to exit the \
+             nested shell. To run one-off commands without readiness, use \
+             terminal.write_keys + terminal.read."
+        );
+        hint
+    }
+}
+
 impl fmt::Display for TerminalExecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Busy => "terminal_busy",
-            Self::ReadinessUnknown => "readiness_unknown",
-            Self::Disconnected => "terminal_disconnected",
-            Self::ReadyTimeout => "ready_timeout",
-            Self::ConcurrentUserInput => "concurrent_user_input",
-            Self::Cancelled => "cancelled",
-            Self::CancelledBeforeSubmit => "cancelled_before_submit",
-            Self::ClearInputTimeout => "clear_input_timeout",
-        })
+        match self {
+            Self::BusyContext { readiness } => {
+                formatter.write_str(&Self::recovery_hint(readiness))
+            }
+            Self::Busy => formatter.write_str("terminal_busy"),
+            Self::ReadinessUnknown => formatter.write_str("readiness_unknown"),
+            Self::Disconnected => formatter.write_str("terminal_disconnected"),
+            Self::ReadyTimeout => formatter.write_str("ready_timeout"),
+            Self::ConcurrentUserInput => formatter.write_str("concurrent_user_input"),
+            Self::Cancelled => formatter.write_str("cancelled"),
+            Self::CancelledBeforeSubmit => formatter.write_str("cancelled_before_submit"),
+            Self::ClearInputTimeout => formatter.write_str("clear_input_timeout"),
+        }
     }
 }
 

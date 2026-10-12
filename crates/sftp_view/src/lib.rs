@@ -12,6 +12,7 @@ mod host_key_prompt;
 mod left_credential_prompt;
 mod left_remote;
 mod left_remote_state;
+mod local_volume;
 mod ssh_config;
 
 use context_menu_handler::ContextMenuHandler;
@@ -1612,6 +1613,10 @@ pub struct SftpView {
     remote_path_editing: bool,
     local_path_input: Entity<InputState>,
     remote_path_input: Entity<InputState>,
+    /// 本地栏磁盘下拉的展开状态。
+    local_volume_popover_open: bool,
+    /// 缓存的可跳转本地卷；打开下拉时刷新，避免每帧读盘。
+    local_volumes: Vec<local_volume::LocalVolume>,
     local_favorite_popover_open: bool,
     remote_favorite_popover_open: bool,
     local_favorite_search_input: Entity<InputState>,
@@ -1923,6 +1928,8 @@ impl SftpView {
             remote_path_editing: false,
             local_path_input,
             remote_path_input,
+            local_volume_popover_open: false,
+            local_volumes: local_volume::local_volumes(),
             local_favorite_popover_open: false,
             remote_favorite_popover_open: false,
             local_favorite_search_input,
@@ -3325,14 +3332,15 @@ impl SftpView {
             return;
         }
         if !new_path.is_empty() {
-            let path = PathBuf::from(&new_path);
+            // `D:` 在 Path 语义里是「D 盘的当前目录」，必须先补成 `D:\`。
+            let path = local_volume::normalize_local_path_input(&new_path);
             if path.exists() && path.is_dir() {
                 self.local_current_path = path;
                 self.refresh_local_dir(cx);
             } else {
                 let error_msg = format!(
                     "Error: ENOENT: no such file or directory, lstat '{}'",
-                    new_path
+                    path.to_string_lossy()
                 );
                 window.open_dialog(cx, move |dialog, _, _| {
                     dialog
@@ -6690,11 +6698,11 @@ impl SftpView {
                             ))
                             .child(
                                 div()
-                                    .max_w(px(96.))
+                                    .max_w(px(one_ui::SHORT_LABEL_MAX_WIDTH))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .child(left_endpoint_title),
+                                    .child(one_ui::short_label(&left_endpoint_title)),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_left_endpoint_switcher(window, cx);
@@ -7730,6 +7738,23 @@ mod tests {
     fn root_breadcrumb_does_not_reserve_regular_item_width() {
         assert_eq!(breadcrumb_item_min_width("/"), 0.);
         assert_eq!(breadcrumb_item_min_width("home"), 35.);
+    }
+
+    /// 端点切换按钮的标题必须走共享的短标签截断，否则又会把面包屑挤窄。
+    #[test]
+    fn endpoint_switcher_uses_shared_short_label() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn render_local_panel")
+            .expect("render_local_panel 定义");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    fn ")
+            .expect("render_local_panel 之后的同级函数");
+        let body = &rest[..end];
+
+        assert!(body.contains("one_ui::short_label"));
+        assert!(body.contains("one_ui::SHORT_LABEL_MAX_WIDTH"));
     }
 
     #[test]

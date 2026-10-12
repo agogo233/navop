@@ -46,12 +46,15 @@ impl TerminalControlSessionHandle for FakeTerminalControl {
         _cancellation: tokio_util::sync::CancellationToken,
     ) -> TerminalControlFuture {
         self.requests.lock().unwrap().push(request.clone());
+        let action = request.action;
         Box::pin(async move {
             Ok(TerminalControlResult {
                 target: request.target,
-                action: request.action,
+                action,
                 sent: true,
-                readiness_before: TerminalControlReadiness::CommandRunning,
+                // 真实后端里 reintegrate 不依赖 readiness，恒为 None。
+                readiness_before: (action == TerminalControlAction::Interrupt)
+                    .then_some(TerminalControlReadiness::CommandRunning),
             })
         })
     }
@@ -91,7 +94,7 @@ fn terminal_control_descriptor_requires_interrupt_action() {
         descriptor.input_schema["required"]
     );
     assert_eq!(
-        json!(["interrupt"]),
+        json!(["interrupt", "reintegrate"]),
         descriptor.input_schema["properties"]["action"]["enum"]
     );
     assert!(
@@ -132,4 +135,45 @@ fn terminal_control_interrupt_returns_structured_result() {
     let requests = terminal.requests.lock().unwrap();
     assert_eq!(1, requests.len());
     assert_eq!(TerminalControlAction::Interrupt, requests[0].action);
+}
+
+#[test]
+fn terminal_control_reintegrate_returns_structured_result() {
+    let (registry, terminal) = registry_with_terminal();
+    let result = futures::executor::block_on(terminal_control_tool_registry(registry).call(
+        "terminal.control",
+        json!({
+            "target": "terminal-1",
+            "action": "reintegrate"
+        }),
+        ToolContext::for_adapter(ToolAdapter::Mcp),
+    ))
+    .expect("terminal.control reintegrate should run");
+
+    assert_eq!(json!(true), result.structured_content["sent"]);
+    assert_eq!(
+        json!("reintegrate"),
+        result.structured_content["action"]
+    );
+    // reintegrate 不依赖 readiness，结果里必须显式为 null，不碰巧伪装成某个运行态。
+    assert_eq!(json!(null), result.structured_content["readiness_before"]);
+    let requests = terminal.requests.lock().unwrap();
+    assert_eq!(1, requests.len());
+    assert_eq!(TerminalControlAction::Reintegrate, requests[0].action);
+}
+
+#[test]
+fn terminal_control_rejects_unknown_action() {
+    let (registry, _terminal) = registry_with_terminal();
+    let error = futures::executor::block_on(terminal_control_tool_registry(registry).call(
+        "terminal.control",
+        json!({
+            "target": "terminal-1",
+            "action": "reboot"
+        }),
+        ToolContext::for_adapter(ToolAdapter::Mcp),
+    ))
+    .expect_err("unknown action must fail");
+
+    assert!(error.to_string().contains("unsupported terminal control action"));
 }

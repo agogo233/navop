@@ -26,7 +26,7 @@ fn runtime_shell_integration_body() -> String {
     )
 }
 
-fn runtime_shell_integration_command() -> Vec<u8> {
+pub(crate) fn runtime_shell_integration_command() -> Vec<u8> {
     let body = ansi_c_quote(&runtime_shell_integration_body());
     format!(" _ONETCLI_RUNTIME_SETUP=1; : __ONETCLI_RUNTIME_SETUP_1; eval {body}\r").into_bytes()
 }

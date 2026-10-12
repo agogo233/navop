@@ -98,6 +98,69 @@ fn resolve_refresh_metadata_scope(node: &DbNode) -> RefreshMetadataScope {
     }
 }
 
+/// 从 `nodes` 里递归删掉 `node_id` 的所有后代（不含 `node_id` 自己），返回被删掉的 id。
+fn remove_descendants(nodes: &mut HashMap<String, DbNode>, node_id: &str) -> Vec<String> {
+    let child_ids: Vec<String> = match nodes.get(node_id) {
+        Some(node) => node.children.iter().map(|child| child.id.clone()).collect(),
+        None => return Vec::new(),
+    };
+
+    let mut removed = Vec::new();
+    for child_id in child_ids {
+        // 先递归处理孙辈，再删自己，保证返回的集合覆盖整棵子树。
+        removed.extend(remove_descendants(nodes, &child_id));
+        nodes.remove(&child_id);
+        removed.push(child_id);
+    }
+    removed
+}
+
+/// 把 `node` 及其整棵子树写进 `nodes`。
+fn insert_subtree(nodes: &mut HashMap<String, DbNode>, node: &DbNode) {
+    nodes.insert(node.id.clone(), node.clone());
+    for child in &node.children {
+        insert_subtree(nodes, child);
+    }
+}
+
+/// 把一次懒加载/刷新拿到的 `children` 挂到 `node_id` 上。
+///
+/// 旧子树在这里被**整体替换并回收**（先删旧后代、再挂新的，全在一次同步更新里完成），
+/// 而不是在刷新一开始就清掉：提前清空会让这个节点——以及搜索/过滤命中它子节点的
+/// 分支——在刷新期间从界面上消失一下，等懒加载回来才重新长出来（issue #362）。
+/// 先删后挂也保证被替换掉的旧节点不会留在 `db_nodes` 里变成走不到的孤儿。
+/// 返回值是**新子树里仍处于「未加载」状态的节点 id**，调用方应据此清掉自己的
+/// 「已加载」记忆。否则懒加载的节点（如表下的索引 / 外键文件夹）在刷新后，会带着
+/// 旧的「已加载」标记被换成空节点，于是再也查不出来，一直显示为空白。
+fn install_loaded_children(
+    nodes: &mut HashMap<String, DbNode>,
+    node_id: &str,
+    children: &[DbNode],
+) -> Vec<String> {
+    remove_descendants(nodes, node_id);
+    if let Some(node) = nodes.get_mut(node_id) {
+        node.children = children.to_vec();
+        node.children_loaded = true;
+    }
+    for child in children {
+        insert_subtree(nodes, child);
+    }
+
+    let mut unloaded = Vec::new();
+    collect_unloaded_node_ids(children, &mut unloaded);
+    unloaded
+}
+
+/// 收集子树里 `children_loaded == false` 的节点 id（含嵌套层级）。
+fn collect_unloaded_node_ids(nodes: &[DbNode], out: &mut Vec<String>) {
+    for node in nodes {
+        if !node.children_loaded {
+            out.push(node.id.clone());
+        }
+        collect_unloaded_node_ids(&node.children, out);
+    }
+}
+
 fn sync_selected_databases_for_connection(
     selected_databases: &mut HashMap<String, Option<HashSet<String>>>,
     connection: &StoredConnection,
@@ -1594,10 +1657,13 @@ impl DbTreeView {
     /// 刷新指定节点及其子节点
     ///
     /// 这个方法会：
-    /// 1. 清除节点的子节点缓存
-    /// 2. 递归清除所有后代节点
-    /// 3. 重新加载子节点
+    /// 1. 取消节点的「已加载」标记，让它重新拉一次子节点（**不清空**已有子节点）
+    /// 2. 使该节点相关的元数据缓存失效
+    /// 3. 重新加载子节点，新数据到达时整体替换旧子树
     /// 4. 如果节点已展开，保持展开状态
+    ///
+    /// 之所以不提前清空：清空会让这个节点——以及搜索/过滤命中它子节点的分支——
+    /// 在刷新期间从界面上先消失一下再长回来（issue #362）。
     pub fn refresh_tree(&mut self, node_id: String, cx: &mut Context<Self>) {
         let refresh_node_id = self
             .db_nodes
@@ -1614,9 +1680,11 @@ impl DbTreeView {
 
         let should_reload_children = self.expanded_nodes.contains(&refresh_node_id);
         let refresh_node = self.db_nodes.get(&refresh_node_id).cloned();
-        self.clear_node_descendants(&refresh_node_id);
+        // 刷新期间**保留**已经显示出来的子树：这里只清掉「已加载」标记让下面重新拉一次，
+        // 不清空子节点。提前清空会让这个节点——以及搜索/过滤命中它子节点的分支——在刷新
+        // 的瞬间从界面上消失，等懒加载回来才重新长出来（issue #362）。
+        // 旧子树会在新数据到达时由 `install_loaded_children` 整体替换并回收。
         self.clear_node_loading_state(&refresh_node_id);
-        self.reset_node_children(&refresh_node_id);
         self.rebuild_tree(cx);
 
         let Some(refresh_node) = refresh_node else {
@@ -1680,6 +1748,16 @@ impl DbTreeView {
         self.error_nodes.remove(node_id);
     }
 
+    /// 把「新子树里仍未加载」的节点从已加载记忆里剔除。
+    ///
+    /// 刷新会整体换掉子树，新数据里仍是懒加载状态的节点（表下的索引 / 外键文件夹等）
+    /// 必须重新可查，否则会被 `lazy_load_children` 当成已加载直接跳过，一直是空的。
+    fn forget_unloaded_nodes(&mut self, unloaded_ids: &[String]) {
+        for unloaded_id in unloaded_ids {
+            self.loaded_children.remove(unloaded_id);
+        }
+    }
+
     /// 清理节点的所有状态（包含展开状态）
     fn clear_node_all_state(&mut self, node_id: &str) {
         self.clear_node_loading_state(node_id);
@@ -1735,15 +1813,7 @@ impl DbTreeView {
     /// 应该独立于节点数据。如果节点被删除，展开状态自然不会生效；
     /// 如果节点仍然存在（刷新后重新加载），展开状态应该被保留。
     fn clear_node_descendants(&mut self, node_id: &str) {
-        let child_ids: Vec<String> = if let Some(node) = self.db_nodes.get(node_id) {
-            node.children.iter().map(|c| c.id.clone()).collect()
-        } else {
-            return;
-        };
-
-        for child_id in child_ids {
-            self.clear_node_descendants(&child_id);
-            self.db_nodes.remove(&child_id);
+        for child_id in remove_descendants(&mut self.db_nodes, node_id) {
             self.clear_node_loading_state(&child_id);
         }
     }
@@ -1811,30 +1881,19 @@ impl DbTreeView {
                             }
                         }
 
-                        // 更新节点的子节点
-                        if let Some(parent_node) = this.db_nodes.get_mut(&clone_node_id) {
-                            parent_node.children = children.clone();
-                            parent_node.children_loaded = true;
-                            // 子节点加载完成后，如果该节点是当前选中节点，重新触发选中事件以刷新对象页签
-                            if this.selected_node_id.as_ref().is_some_and(|id| id == &clone_node_id) {
-                                cx.emit(DbTreeViewEvent::NodeSelected{node_id: clone_node_id.clone()})
-                            }
-                        }
-
-                        // 递归地将所有子节点及其后代添加到 db_nodes
-                        fn insert_nodes_recursive(
-                            db_nodes: &mut HashMap<String, DbNode>,
-                            node: &DbNode,
-                        ) {
-                            db_nodes.insert(node.id.clone(), node.clone());
-                            for child in &node.children {
-                                insert_nodes_recursive(db_nodes, child);
-                            }
-                        }
-
+                        // 新数据到达：用它整体替换这个节点的子树，顺带回收被替换掉的旧后代。
+                        // 替换发生在这里（而不是刷新发起时），所以刷新期间界面一直有内容显示。
+                        let unloaded_ids =
+                            install_loaded_children(&mut this.db_nodes, &clone_node_id, &children);
+                        // 新子树里没加载过的节点不能再算「已加载」：否则刷新之后展开它们时
+                        // 会被 `lazy_load_children` 直接跳过，永远停在空白状态。
+                        this.forget_unloaded_nodes(&unloaded_ids);
                         for child in &children {
                             trace!("DbTreeView lazy_load_children: adding child: {} (type: {:?})", child.id, child.node_type);
-                            insert_nodes_recursive(&mut this.db_nodes, child);
+                        }
+                        // 子节点加载完成后，如果该节点是当前选中节点，重新触发选中事件以刷新对象页签
+                        if this.selected_node_id.as_ref().is_some_and(|id| id == &clone_node_id) {
+                            cx.emit(DbTreeViewEvent::NodeSelected{node_id: clone_node_id.clone()})
                         }
 
                         // 检查子节点是否在 expanded_nodes 中，如果是，递归加载它们的子节点
@@ -3717,6 +3776,151 @@ mod tests {
 
     /// 构造一个「连接 → 数据库 → 表目录 → 表 → 列目录」的搜索测试树。
     /// 除连接外都带上父上下文，保证只有连接是根节点；
+    fn search_fixture_map() -> HashMap<String, DbNode> {
+        search_fixture_nodes()
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect()
+    }
+
+    fn sorted_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut ids: Vec<String> = ids.into_iter().map(|id| id.to_string()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// 刷新一个被过滤的表目录时，命中的表不能先消失一下（issue #362）。
+    #[gpui::test]
+    fn refreshing_a_filtered_node_keeps_the_matching_table_visible(cx: &mut TestAppContext) {
+        // 刷新收尾时会去取全局状态；这里给一个默认值，免得真的去连数据库。
+        cx.update(|cx| cx.set_global(GlobalDbState::default()));
+        let (view, visual) = search_fixture_view(cx);
+
+        // 过滤命中 users：连接 → 库 → 表目录 → users 都在列表里。
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh_tree("tables-folder".to_string(), cx)
+            });
+        });
+
+        // 刷新发起之后、新数据回来之前，命中的表必须还在树上：
+        // 提前清空子树会让它（以及它下面的列目录）先"消失"一下。
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+        assert!(visual.read(|cx| view.read(cx).db_nodes.contains_key("node-users")));
+        assert!(visual.read(|cx| view.read(cx).db_nodes.contains_key("columns-folder")));
+    }
+
+    /// 新数据到达时才回收旧子树：不能留下从根节点走不到的孤儿节点。
+    #[test]
+    fn installing_new_children_recycles_the_replaced_subtree() {
+        let mut nodes = search_fixture_map();
+        let orders = nodes.get("node-orders").expect("orders 节点").clone();
+
+        install_loaded_children(&mut nodes, "tables-folder", &[orders]);
+
+        // 被替换掉的表及其后代都被回收。
+        assert!(!nodes.contains_key("node-users"));
+        assert!(!nodes.contains_key("columns-folder"));
+        // 新数据挂上了，节点标记为已加载。
+        assert!(nodes.contains_key("node-orders"));
+        assert!(nodes["tables-folder"].children_loaded);
+        assert_eq!(
+            vec!["node-orders".to_string()],
+            nodes["tables-folder"]
+                .children
+                .iter()
+                .map(|child| child.id.clone())
+                .collect::<Vec<_>>()
+        );
+        // 替换只发生在这一棵子树内，连接与库不受影响。
+        assert!(nodes.contains_key("conn-1"));
+        assert!(nodes.contains_key("db-app"));
+    }
+
+    /// 刷新换掉子树后，新子树里「未加载」的节点必须被报告出来。
+    ///
+    /// 表展开现在只带列目录，索引 / 外键目录是懒加载的空节点；刷新后必须能认出
+    /// 它们「还没加载」，否则会被当成已加载跳过，永久显示空白。
+    #[test]
+    fn install_loaded_children_reports_deferred_nodes_as_unloaded() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "node-orders".to_string(),
+            build_node(DbNodeType::Table, "orders", &[]),
+        );
+
+        let columns_folder =
+            build_node(DbNodeType::ColumnsFolder, "columns_folder", &[]).with_children_loaded(true);
+        let indexes_folder = build_node(DbNodeType::IndexesFolder, "indexes_folder", &[]);
+
+        let unloaded =
+            install_loaded_children(&mut nodes, "node-orders", &[columns_folder, indexes_folder]);
+
+        assert_eq!(
+            vec!["node-indexes_folder".to_string()],
+            unloaded,
+            "已加载的列目录不该被报告，未加载的索引目录必须被报告"
+        );
+    }
+
+    /// 报告出来的未加载节点要真的把「已加载」记忆清掉，已加载的则不受影响。
+    #[gpui::test]
+    fn forgetting_unloaded_nodes_only_drops_their_loaded_memory(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(GlobalDbState::default()));
+        let (view, visual) = search_fixture_view(cx);
+
+        visual.update(|_window, cx| {
+            view.update(cx, |view, _cx| {
+                view.loaded_children.insert("kept".to_string());
+                view.loaded_children.insert("stale".to_string());
+
+                view.forget_unloaded_nodes(&["stale".to_string()]);
+
+                assert!(
+                    view.loaded_children.contains("kept"),
+                    "已加载的节点不该被顺手清掉，否则每次刷新都会白跑一遍请求"
+                );
+                assert!(
+                    !view.loaded_children.contains("stale"),
+                    "新子树里未加载的节点必须重新变得可查"
+                );
+            });
+        });
+    }
+
+    /// 递归回收必须一路挖到孙辈，同时保留节点自己。
+    #[test]
+    fn removing_descendants_reaches_grandchildren_and_keeps_the_node_itself() {
+        let mut nodes = search_fixture_map();
+
+        let removed = remove_descendants(&mut nodes, "tables-folder");
+
+        assert_eq!(
+            vec![
+                "columns-folder".to_string(),
+                "node-orders".to_string(),
+                "node-users".to_string()
+            ],
+            sorted_ids(removed.iter().map(String::as_str))
+        );
+        assert!(nodes.contains_key("tables-folder"));
+        assert!(!nodes.contains_key("node-users"));
+        // 孙辈（列目录）也要跟着走。
+        assert!(!nodes.contains_key("columns-folder"));
+        assert!(!nodes.contains_key("node-orders"));
+        // 子树之外的连接与库不受影响。
+        assert!(nodes.contains_key("conn-1"));
+        assert!(nodes.contains_key("db-app"));
+    }
+
     /// 「列目录」的名字与任何搜索词都不匹配，用来验证主动展开的行为。
     fn search_fixture_nodes() -> Vec<DbNode> {
         let fixture_node = |id: &str, name: &str, node_type: DbNodeType| {

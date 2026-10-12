@@ -48,7 +48,10 @@ use one_core::connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifie
 use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
 use one_core::settings::AppSettings;
-use one_core::storage::{DatabaseType, QueryDirectoryScope, default_query_directory};
+use one_core::storage::{
+    DatabaseType, QueryDirectoryScope, SqlFileNameError, default_query_directory,
+    sql_file_path_for_name,
+};
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
 use one_ui::resize_handle::{ResizePanel, resize_handle};
@@ -121,65 +124,20 @@ enum QueryFileNameError {
     ReadDirectory(String),
 }
 
-fn query_file_path_for_name(directory: &Path, name: &str) -> Result<PathBuf, QueryFileNameError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(QueryFileNameError::Empty);
-    }
-    if is_invalid_query_file_name(name) {
-        return Err(QueryFileNameError::Invalid);
-    }
-
-    let file_name = if Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
-    {
-        name.to_owned()
-    } else {
-        format!("{name}.sql")
-    };
-    if file_name.eq_ignore_ascii_case(".sql") {
-        return Err(QueryFileNameError::Invalid);
-    }
-
-    match std::fs::read_dir(directory) {
-        Ok(entries) => {
-            if entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&file_name)
-            }) {
-                return Err(QueryFileNameError::AlreadyExists);
-            }
+impl From<SqlFileNameError> for QueryFileNameError {
+    fn from(error: SqlFileNameError) -> Self {
+        match error {
+            SqlFileNameError::Empty => Self::Empty,
+            SqlFileNameError::Invalid => Self::Invalid,
+            SqlFileNameError::AlreadyExists => Self::AlreadyExists,
+            SqlFileNameError::ReadDirectory(message) => Self::ReadDirectory(message),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(QueryFileNameError::ReadDirectory(error.to_string())),
     }
-
-    Ok(directory.join(file_name))
 }
 
-fn is_invalid_query_file_name(name: &str) -> bool {
-    const INVALID_CHARACTERS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    const RESERVED_NAMES: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-
-    if matches!(name, "." | "..")
-        || name.chars().any(char::is_control)
-        || name
-            .chars()
-            .any(|character| INVALID_CHARACTERS.contains(&character))
-    {
-        return true;
-    }
-    let base_name = name.split('.').next().unwrap_or(name);
-    RESERVED_NAMES
-        .iter()
-        .any(|reserved| base_name.eq_ignore_ascii_case(reserved))
+/// 查询文件名解析统一走 `one_core::storage::sql_library`，避免两套校验漂移。
+fn query_file_path_for_name(directory: &Path, name: &str) -> Result<PathBuf, QueryFileNameError> {
+    sql_file_path_for_name(directory, name).map_err(QueryFileNameError::from)
 }
 
 fn write_sql_file(file_path: &Path, sql: &str) -> io::Result<()> {
@@ -1152,9 +1110,7 @@ fn transaction_liveness(probe: &anyhow::Result<Vec<db::SqlResult>>) -> Transacti
     // 复用 PR #272 的会话级 ping 超时：死连接的探测有界返回 Err。
     match probe {
         Err(_) => TransactionLiveness::Dead,
-        Ok(results) if results.iter().any(db::SqlResult::is_error) => {
-            TransactionLiveness::Dead
-        }
+        Ok(results) if results.iter().any(db::SqlResult::is_error) => TransactionLiveness::Dead,
         Ok(_) => TransactionLiveness::Alive,
     }
 }
@@ -3858,8 +3814,7 @@ impl SqlEditorTab {
                             t!("Query.transaction_terminated_by_disconnect").to_string(),
                         );
                         // 死会话不再可复用，丢弃；失败只记日志不阻断收尾。
-                        if let Err(error) =
-                            global_state.close_session(cx, session_id.clone()).await
+                        if let Err(error) = global_state.close_session(cx, session_id.clone()).await
                         {
                             error!(
                                 "Failed to close dead manual transaction session {}: {:?}",

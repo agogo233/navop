@@ -4730,6 +4730,9 @@ impl AgentChatView {
             self.sync_pending_preview(cx);
         }
         self.reload_sessions(cx);
+        // is_running/running_sessions shape this view's own render (activity
+        // strip, sidebar spinners); notify so retained rendering redraws it.
+        cx.notify();
     }
 
     fn push_system_to_session(&mut self, session_uid: &str, message: String) {

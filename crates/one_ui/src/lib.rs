@@ -19,6 +19,7 @@ pub mod resize_handle;
 #[cfg(test)]
 mod resize_handle_tests;
 mod settings;
+pub mod short_label;
 pub mod signature_help;
 pub mod status_bar;
 mod time;
@@ -27,7 +28,7 @@ pub use content_state::{ContentState, ContentStateKind};
 pub use edit_table::{
     CellCoord, CellEditor, CellRange, Column, ColumnFixed, ColumnSort, EditTable,
     EditTableDelegate, EditTableEvent, EditTableState, FilterState, FilterValue, FindOutcome,
-    SearchPanel, SearchPanelEvent, ScrollbarVisible, SelectNextColumn, SelectPrevColumn,
+    ScrollbarVisible, SearchPanel, SearchPanelEvent, SelectNextColumn, SelectPrevColumn,
     TableKeybindings, TableOptions, TableSelection, TableVisibleRange, refresh_keybindings,
 };
 use gpui::App;
@@ -40,9 +41,11 @@ pub use large_text_editor::{
 pub use panel_header::{PanelHeader, PanelHeaderVariant};
 pub use picker_dialog::{PickerDialogLabels, PickerEntry, open_picker_dialog};
 pub use settings::{
-    TableDisplaySettings, init_table_display_settings, set_table_row_height, table_row_height,
+    TableDisplaySettings, init_table_display_settings, set_table_column_comment_in_header,
+    set_table_row_height, table_column_comment_in_header, table_header_height_or, table_row_height,
     table_row_height_or,
 };
+pub use short_label::{SHORT_LABEL_MAX_CHARS, SHORT_LABEL_MAX_WIDTH, short_label};
 pub use signature_help::{ExtendedEditor, ExtendedEditorState, SignatureHelpProvider};
 pub use status_bar::{StatusBar, StatusBarColors, StatusPresentation};
 pub use time::datetime_picker::{DateTimePicker, DateTimePickerEvent, DateTimePickerState};

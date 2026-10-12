@@ -154,6 +154,8 @@ fn validate_backends(
 fn validate_modules(view: &ShellViewContrib) -> Result<(), ShellViewValidationError> {
     let mut modules = HashSet::new();
     for module in &view.modules {
+        // 这张表是**宿主支持面**的清单：新增一个 host 模块必须在这里显式登记，
+        // 否则声明了它的扩展在**安装期**就被拒（而不是装上了、用到才发现）。
         if !matches!(
             module,
             ShellHostModule::Context
@@ -165,6 +167,8 @@ fn validate_modules(view: &ShellViewContrib) -> Result<(), ShellViewValidationEr
                 | ShellHostModule::Runtime
                 | ShellHostModule::Dev
                 | ShellHostModule::Workbench
+                | ShellHostModule::I18n
+                | ShellHostModule::Theme
         ) {
             return Err(error(
                 shell_field(view, "modules"),

@@ -818,7 +818,7 @@ mod tests {
                     target: request.target,
                     action: request.action,
                     sent: true,
-                    readiness_before: TerminalControlReadiness::CommandRunning,
+                    readiness_before: Some(TerminalControlReadiness::CommandRunning),
                 })
             })
         }

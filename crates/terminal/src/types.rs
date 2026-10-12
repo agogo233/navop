@@ -16,6 +16,10 @@ pub enum TerminalControlReadiness {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalControlAction {
     Interrupt,
+    /// 向当前可见终端注入运行时 shell integration 脚本，恢复 OSC 事件流。
+    /// 用于嵌套 shell（`sudo -i` / `su`）丢失集成的场景；调用方必须确认
+    /// 提示符空闲，注入字节会被前台 TUI 当输入消费。
+    Reintegrate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,7 +31,8 @@ pub struct TerminalControlRequest {
 pub struct TerminalControlOutput {
     pub action: TerminalControlAction,
     pub sent: bool,
-    pub readiness_before: TerminalControlReadiness,
+    /// 仅 `Interrupt` 有意义（动作前的运行态）；`Reintegrate` 不依赖 readiness 判定，恒为 `None`。
+    pub readiness_before: Option<TerminalControlReadiness>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +42,8 @@ pub enum TerminalControlError {
     ReadinessUnknown,
     Disconnected,
     Cancelled,
+    /// 后端不支持该 control 动作（如本地终端的 reintegrate 注入）。
+    Unsupported,
 }
 
 impl std::fmt::Display for TerminalControlError {
@@ -47,6 +54,7 @@ impl std::fmt::Display for TerminalControlError {
             Self::ReadinessUnknown => "readiness_unknown",
             Self::Disconnected => "terminal_disconnected",
             Self::Cancelled => "cancelled",
+            Self::Unsupported => "terminal_control_unsupported",
         })
     }
 }
@@ -392,7 +400,7 @@ mod tests {
                 Ok(TerminalControlOutput {
                     action: request.action,
                     sent: true,
-                    readiness_before: TerminalControlReadiness::CommandRunning,
+                    readiness_before: Some(TerminalControlReadiness::CommandRunning),
                 })
             })
         });

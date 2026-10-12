@@ -655,6 +655,8 @@ pub enum TerminalSidebarEvent {
     AutocompleteChanged(bool),
     /// 弹框候选词开关
     SuggestionPopupChanged(bool),
+    /// 弹框候选词背景不透明度（0.5–1.0）
+    SuggestionPopupOpacityChanged(f32),
     /// 中键粘贴开关
     MiddleClickPasteChanged(bool),
     /// 右键快速粘贴开关
@@ -1131,6 +1133,9 @@ impl TerminalSidebar {
                 settings_panel::SettingsPanelEvent::SuggestionPopupChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::SuggestionPopupChanged(*enabled));
                 }
+                settings_panel::SettingsPanelEvent::SuggestionPopupOpacityChanged(opacity) => {
+                    cx.emit(TerminalSidebarEvent::SuggestionPopupOpacityChanged(*opacity));
+                }
                 settings_panel::SettingsPanelEvent::MiddleClickPasteChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::MiddleClickPasteChanged(*enabled));
                 }
@@ -1568,6 +1573,17 @@ impl TerminalSidebar {
     pub fn set_autocomplete_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings_panel.update(cx, |panel, cx| {
             panel.set_autocomplete_enabled(enabled, cx);
+        });
+    }
+
+    pub fn set_suggestion_popup_opacity(
+        &mut self,
+        opacity: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_panel.update(cx, |panel, cx| {
+            panel.set_suggestion_popup_opacity(opacity, window, cx);
         });
     }
 

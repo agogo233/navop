@@ -47,6 +47,9 @@ impl ShellPageHostAdapter {
         {
             return Err(ShellMountError::ModuleUnavailable("workbench".into()));
         }
+        // 这里是**黑名单**：只有碰后端的原始模块被挡。`i18n` / `theme` 读的是
+        // 宿主自己的两个事实（界面语言、组件主题），不带任何资源访问，嵌入页面
+        // 本来就应该能用它们 —— 所以**故意不在这张表里**，别"顺手补上"。
         if view.modules.iter().any(|module| {
             matches!(
                 module,

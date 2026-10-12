@@ -1,14 +1,17 @@
 mod column;
 mod delegate;
-pub mod find;
 pub mod filter_panel;
 mod filter_state;
+pub mod find;
 pub(crate) mod loading;
 #[cfg(test)]
 mod resize_handle_tests;
 pub mod selection;
 mod state;
 pub mod tsv;
+
+#[cfg(test)]
+mod header_height_tests;
 
 use std::collections::HashSet;
 

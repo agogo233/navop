@@ -2754,6 +2754,18 @@ TableDataGrid:
     en: (unnamed field)
     zh-CN: （未命名字段）
     zh-HK: （未命名欄位）
+  locate_column:
+    en: Locate field
+    zh-CN: 定位字段
+    zh-HK: 定位欄位
+  locate_column_hint:
+    en: Click a field to scroll it into view.
+    zh-CN: 点击字段即可把它带到眼前。
+    zh-HK: 點擊欄位即可帶到眼前。
+  locate_column_hidden:
+    en: hidden
+    zh-CN: 已隐藏
+    zh-HK: 已隱藏
   large_text_editor:
     en: Large Text Editor
     zh-CN: 大文本编辑器
@@ -3427,6 +3439,99 @@ SqlWorkflow:
     en: "Streaming error: %{error}"
     zh-CN: "流式生成错误: %{error}"
     zh-HK: "串流生成錯誤: %{error}"
+SqlLibrary:
+  title:
+    en: SQL Library
+    zh-CN: SQL 库
+    zh-HK: SQL 庫
+  new_file:
+    en: New SQL File
+    zh-CN: 新建 SQL 文件
+    zh-HK: 新增 SQL 檔案
+  new_file_in:
+    en: "New SQL file in %{path}"
+    zh-CN: "在 %{path} 中新建 SQL 文件"
+    zh-HK: "在 %{path} 中新增 SQL 檔案"
+  new_folder_in:
+    en: "New folder in %{path}"
+    zh-CN: "在 %{path} 中新建目录"
+    zh-HK: "在 %{path} 中新增目錄"
+  file_name:
+    en: File name (.sql optional)
+    zh-CN: 文件名（可省略 .sql）
+    zh-HK: 檔案名稱（可省略 .sql）
+  file_created:
+    en: SQL file created
+    zh-CN: SQL 文件已创建
+    zh-HK: SQL 檔案已建立
+  create_file_failed:
+    en: "Failed to create SQL file: %{error}"
+    zh-CN: "新建 SQL 文件失败：%{error}"
+    zh-HK: "新增 SQL 檔案失敗：%{error}"
+  create_folder_failed:
+    en: "Failed to create folder: %{error}"
+    zh-CN: "新建目录失败：%{error}"
+    zh-HK: "新增目錄失敗：%{error}"
+  rename:
+    en: Rename
+    zh-CN: 重命名
+    zh-HK: 重新命名
+  rename_folder:
+    en: Rename Folder
+    zh-CN: 重命名目录
+    zh-HK: 重新命名目錄
+  rename_placeholder:
+    en: New name
+    zh-CN: 新名称
+    zh-HK: 新名稱
+  renamed:
+    en: Renamed
+    zh-CN: 已重命名
+    zh-HK: 已重新命名
+  rename_failed:
+    en: "Failed to rename: %{error}"
+    zh-CN: "重命名失败：%{error}"
+    zh-HK: "重新命名失敗：%{error}"
+  delete_confirm:
+    en: "Delete \"%{name}\"?"
+    zh-CN: "确定删除「%{name}」？"
+    zh-HK: "確定刪除「%{name}」？"
+  deleted:
+    en: Deleted
+    zh-CN: 已删除
+    zh-HK: 已刪除
+  delete_failed:
+    en: "Failed to delete: %{error}"
+    zh-CN: "删除失败：%{error}"
+    zh-HK: "刪除失敗：%{error}"
+  unmount:
+    en: Remove from Library
+    zh-CN: 从库中移除
+    zh-HK: 從庫中移除
+  unmount_confirm:
+    en: "Remove \"%{name}\" from the SQL library? Files stay on disk."
+    zh-CN: "确定从 SQL 库中移除「%{name}」？磁盘上的文件不会被删除。"
+    zh-HK: "確定從 SQL 庫中移除「%{name}」？磁碟上的檔案不會被刪除。"
+  unmounted:
+    en: Removed from SQL library
+    zh-CN: 已从 SQL 库中移除
+    zh-HK: 已從 SQL 庫中移除
+  unmount_failed:
+    en: "Failed to remove directory: %{error}"
+    zh-CN: "移除目录失败：%{error}"
+    zh-HK: "移除目錄失敗：%{error}"
+  empty:
+    en: No SQL directory is available yet
+    zh-CN: 还没有可用的 SQL 目录
+    zh-HK: 還沒有可用的 SQL 目錄
+  load_failed:
+    en: "Failed to read the SQL library: %{error}"
+    zh-CN: "读取 SQL 库失败：%{error}"
+    zh-HK: "讀取 SQL 庫失敗：%{error}"
+  no_connection:
+    en: Select a database connection before running a library script
+    zh-CN: 请先在左侧选择一个数据库连接
+    zh-HK: 請先在左側選擇一個資料庫連線
 DatabaseTab:
   insert_editor:
     en: Insert into Editor

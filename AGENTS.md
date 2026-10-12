@@ -460,6 +460,13 @@
 - **验证方式**：覆盖 running/submission-pending 允许、ready/awaiting-prompt not-running、busy/unknown/disconnected 零写入、预取消零入队、control 后 observer 仍由真实终态完成；验证 Agent prompt 区分 `terminal_exec`、`terminal_control` 与取消按钮。
 - **适用范围**：`crates/terminal/src/exec_supervisor/*`、`crates/terminal/src/ssh_backend.rs`、`crates/terminal_view/src/public_mcp.rs`、Public MCP terminal control 工具与 Agent prompt。
 
+- **标题**：嵌套 shell 卡死 terminal_busy 用 reintegrate 注入恢复，不要尝试 Ctrl+C
+- **触发信号**：用户在可见 SSH 终端里进入 `sudo -i`、`su` 等嵌套 shell 后，`terminal.exec` 持续报 busy，且 `terminal.control action=interrupt` 发过 ETX 仍不恢复；滚屏看是空闲 root 提示符，session state 正常 connected。
+- **根因 / 约束**：shell integration 是登录时一次 eval 注入，不写 rc 文件，嵌套 shell 不继承；root shell 的提示符不再发 OSC 133/OSC 7，supervisor readiness 卡死在 `SubmissionPending`/`CommandRunning` 瞬态（cwd 也停在上报值）。ETX 对无集成 shell 无意义——空提示符上只回显 `^C` 重画提示符，不产生 OSC 事件，readiness 不会翻转；`on_input` 只在 `Ready` 态处理用户回车，手动按回车也救不回来。
+- **正确做法**：`terminal.control action=reintegrate`（High 风险显式动作）：actor 校验无 exec 在途且未断连（`ExecSupervisor::reintegrate_shell`，卡在瞬态 readiness 时放行），向 PTY 写 `runtime_shell_integration_command()`（幂等守卫已剥，root login shell 重置了环境变量，eval 必然生效）。注入后新提示符的 OSC `InputStart` 无条件把 readiness 翻回 Ready，状态机零改动自愈；Agent 等 1-2 秒后重试 exec。Busy 错误必须带 `BusyContext{readiness}` 富化文案引导 Agent 走 read→reintegrate→retry 链路，不要裸字符串。本地终端 reintegrate 返回 `terminal_control_unsupported`（本地集成形态不同，POSIX eval 注入体不适用），未来支持时在 local actor 接对应注入体。
+- **验证方式**：`cargo test -p terminal --lib reintegrate`（门控 fail-closed、瞬态放行、端到端自愈、SSH actor 注入 contract、local Unsupported contract）+ `cargo test -p public_mcp --test terminal_control`（schema enum、parse、reintegrate 结果 readiness_before=null、未知 action 拒绝）+ 三 crate 全量回归与 clippy。
+- **适用范围**：`crates/terminal/src/exec_supervisor/*`、`crates/terminal/src/ssh_backend.rs`、`crates/terminal/src/pty_backend.rs`、`crates/public_mcp/src/tools/terminal_control.rs`、Agent terminal 工具 prompt 与错误文案。
+
 - **标题**：Agent Auto 模式不进行工具审批，High/Critical 也直接执行
 - **触发信号**：Auto 模式下出现 `NeedUserInput` 工具确认卡，或 Agent→tool_runtime 映射仍把 high-risk policy 设为 `Ask`。
 - **根因 / 约束**：`ToolExecutionMode::Auto` 表达用户已授权 Agent 自主执行当前暴露工具；风险等级仍用于展示、审计和 Manual 模式审批，但不能在 Auto 模式再次暂停。`ReadOnly` 仍通过工具暴露过滤保证只读，不能用 Auto 的放行规则扩大其工具集合。
@@ -473,6 +480,13 @@
 - **正确做法**：在“手动确认/安全确认”模式的 ACP 权限卡中明确说明：允许 ACP 后，实际工具执行还会弹出一次安全确认窗口；如不需要二次审批，可将 MCP 权限模式切换为“自动执行”。Public MCP Ask 统一进入全局 Dialog，不再通过 ACP 一次性路由替换成第二张可操作消息卡。自动执行模式不显示上述提示，且 High/Critical 一并直接执行。
 - **验证方式**：覆盖手动确认卡片包含“安全确认、二次审批、自动执行”说明，自动执行卡片不含误导提示，ACP 后续 Public MCP 请求进入 Dialog 队列并展示完整脱敏参数，以及 Auto High/Critical 直接执行。
 - **适用范围**：`crates/ai_chat_view/src/acp/*`、`agent_transcript.rs`、`agent_view.rs`、`crates/public_mcp/src/permissions.rs`、`main/src/public_mcp_approval*`。
+
+- **标题**：Public MCP 的线上工具名必须净化，内部工具 id 保持带点分层
+- **触发信号**：Grok 这类 OpenAI 兼容客户端已经连上 Public MCP，却一个工具都列不出来（工具数为 0）；或新增带点工具 id 后，同一个工具在 ACP 与 MCP 两个入口显示成不同的名字。
+- **根因 / 约束**：Grok 注册函数时只接受 `[A-Za-z0-9_-]`，而 Navop 内部工具 id 用 `.` 分层（`ssh.command.poll`），带点的名字会在客户端注册阶段被整批丢弃；同时 Claude 等客户端接受 `.`，线上名字不能只按一种客户端的偏好来定。ACP 侧早已由 `ToolName` / `ToolNameAllocator` 完成净化，两条路各写一套会让同一工具在两个入口名字不一致。
+- **正确做法**：内部 id 一律不改（避免污染审批、审计与大量引用）；把 `PublicMcpToolRegistry::client_tools()` / `client_tool()` / `resolve_client_tool_name()` 作为唯一对外汇合点，复用 `agent_runtime::tools::{ToolName, ToolNameAllocator}`，并保持「先按内部 id 排序」的分配顺序，冲突（`sample.echo` 与 `sample_echo`）才会可复现且与 ACP 同名；`tools/call` 同时接受净化名与内部 id。对外暴露工具时不要直接读 `tools()`。
+- **验证方式**：协议层用例断言 `tools/list` 返回的每个名字都落在 `[A-Za-z0-9_-]` 内、且用净化名能成功执行 `tools/call`；单元用例覆盖 `sample.echo` / `sample_echo` 的冲突消解、对照表排序与双向解析；带点的内部 id 调用保持可用。
+- **适用范围**：`crates/public_mcp/src/tools/registry.rs`、`crates/public_mcp/src/protocol.rs`、`crates/agent_runtime/src/tools/spec.rs`、`crates/public_mcp/src/tools/agent_runtime_adapter.rs`。
 
 - **标题**：macOS 自定义标题栏中的可拖元素必须由应用显式接管标题栏拖动
 - **触发信号**：透明标题栏或 tab 栏中，按钮、输入框或 tab 的拖动被解释为窗口移动；为了规避问题出现 `allow_tab_drag = !is_macos` 一类平台禁用逻辑。
@@ -758,6 +772,13 @@
 - **正确做法**：热区宽度取「分隔线 + 两侧各 `edge_padding`」（`geometry::Resize::hit_area()`），用负边距跨到边界另一侧（`right_0() + mr(-pad)` / `left_0() + ml(-pad)` / `top_0() + mt(-pad)`），细线再用 `justify_center` / `items_center` 留在原位（实测 `right_0().mr(-4).w(9)` ⇒ 盒子 `[边界-5, 边界+4]`、线仍在 `[边界-1, 边界]`，视觉零变化）。相邻单元格紧贴的表头不能靠单个元素跨列：右侧单元格可能带 `overflow_hidden`，跨列的绝对定位会被裁掉，而且后画的兄弟节点先拿到鼠标 ⇒ 由左右两个单元格各渲染一半（各 4px、都留在自己单元格内），合计 8px 跨边界。`render_*_resize_handles` 要返回 `Vec<AnyElement>` 给调用方 `.children(...)`，不能套一层尺寸为零的 wrapper（`top_0`/`bottom_0` 按直接父节点解析，套一层热区高度会变 0）。
 - **验证方式**：`cargo test -p one-ui --lib resize_handle_tests`、`cargo test -p redis_view --lib value_table_columns_resize_tests`（在 `#[gpui::test]` 里用 `debug_bounds` 量热区和细线的真实 bounds：边界两侧各铺够、细线停在边界、从边界左右按下都能拖动同一列；含变异验证：负边距改成 0、抓取区退回单边 6px、去掉右列那一半，对应用例都转红）。回归面：`cargo test -p one-ui --lib`（117）、`cargo test -p redis_view --lib`（77）、`cargo clippy -p one-ui -p redis_view --all-targets`、`cargo check -p main --all-targets`。
 - **适用范围**：`crates/one_ui/src/resize_handle.rs`（面板分隔条：SQL 结果面板、数据库／Mongo／Redis 侧边栏、终端工具坞共用）、`crates/redis_view/src/value_table_columns.rs`、`crates/db_view/src/{database_table_columns,table_designer_tab}.rs`、`crates/db_view/src/table_data/cell_preview_host.rs`。**故意没改的两处**（不是漏改）：`crates/core/src/tab_container.rs` 的侧边栏手柄已经是 9px（`theme_geometry().resize.hit_area()`），它挂在带 `overflow_hidden` 的面板上，跨出去的那半会被裁掉，面板内侧 9px 已经够宽；`crates/terminal_view/src/view/command_bar/render.rs` 的命令栏手柄是 6px 通栏、不锚定某条边界、两侧对称，加高会吃掉终端内容和输入框的点击。要动这两处得先把手柄搬到不裁剪的父层，属于结构改动。
+
+- **标题**：标签页鼠标动作要复用 `close_tab` 入口；gpui-component 的 `TabBar` 无法在仓内加挂鼠标钩子
+- **触发信号**：给标签栏加中键关闭（或任何新的鼠标按键动作）时，考虑在渲染层再判一次 `closeable && !is_locked`；或想把同样的手势接到工作区文件编辑器、远程文件编辑器的二级页签上。
+- **根因 / 约束**：`TabContainer::close_tab` 已经负责 `closeable` 拒绝、`is_locked` 通知、`closing_tabs` 去重和 `try_close`（未保存确认），渲染层重复判断只会产生两套守卫漂移。实测中键 down+up 不会触发该标签自己的 `on_click`（判别场景：活动标签在前、中键点最后一个背景标签，活动标签仍是它），所以既不需要在 `on_click` 里排除中键，也不能顺手加一个「中键也切激活」的分支——那是不会执行的代码。二级页签侧：`gpui_component::tab::TabBar::child(impl Into<Tab>)` 只接受 `Tab`，不能塞进带 `on_mouse_down` 的 `div` 包装层，`Tab` 自身也没有中键/关闭回调，所以 `workspace_explorer/src/editor/render.rs` 与 `remote_file_editor/src/editor_window.rs` 的页签无法在本仓加中键，只能改 gpui-kit fork。
+- **正确做法**：手势直接调 `close_tab(idx)`；固定（pinned）标签没有 × 且 `remove_pinned_tab_by_id` 会绕过 `try_close`，不要把它当中键目标。测试锚点用 `.id(...)` 后接 `.debug_selector(move || format!("tab-container.tab-{idx}"))`（`debug_bounds` 收 `&'static str`，测试里写 `"tab-container.tab-1"` 字面量）。判别「不抢激活」的场景必须是**活动标签在前、中键点最后一个背景标签**——点中间标签时 `active_index` 钳位会恰好落回原活动标签，断言空跑。
+- **验证方式**：`cargo test -p one-core --lib middle_click`（`middle_click_closes_a_tab_without_hitting_the_close_button` 覆盖只关光标下的标签且不抢激活；`middle_click_respects_uncloseable_tabs_and_leaves_left_click_alone` 覆盖不可关闭标签、固定标签与左键仍只切换）；变异验证：把 `close_tab(idx)` 改成 `close_tab(idx + 99)` 后第一条用例必须转红。回归面：`cargo test -p one-core --lib`、`cargo clippy -p one-core --all-targets`、`cargo check -p main --all-targets`。
+- **适用范围**：`crates/core/src/tab_container.rs` 的标签栏手势，以及任何想给 gpui-component `TabBar` 页签加鼠标动作的站点。
 
 ### 执行原则
 
