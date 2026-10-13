@@ -62,7 +62,6 @@ pub(crate) struct AcpSessionState {
     available_modes: Vec<SessionMode>,
     config_options: Vec<SessionConfigOption>,
     title: Option<String>,
-    updated_at: Option<String>,
     usage: Option<AcpUsage>,
     /// 这次连接实际怎么打开会话的；连接还没走到开会话时为 `None`。
     session_continuity: Option<AcpSessionContinuity>,
@@ -200,10 +199,6 @@ impl AcpSessionState {
         self.title.as_deref()
     }
 
-    pub(crate) fn updated_at(&self) -> Option<&str> {
-        self.updated_at.as_deref()
-    }
-
     pub(crate) fn usage(&self) -> Option<&AcpUsage> {
         self.usage.as_ref()
     }
@@ -258,7 +253,6 @@ impl AcpSessionState {
             }
             SessionUpdate::SessionInfoUpdate(update) => {
                 update.title.clone().update_to(&mut self.title);
-                update.updated_at.clone().update_to(&mut self.updated_at);
             }
             SessionUpdate::UsageUpdate(update) => {
                 self.usage = Some(AcpUsage {
@@ -454,7 +448,6 @@ mod tests {
             state.current_mode_id().map(|id| id.0.as_ref())
         );
         assert_eq!(Some("ACP title"), state.title());
-        assert_eq!(Some("2026-06-28T00:00:00Z"), state.updated_at());
         assert_eq!(
             Some((42, 100)),
             state.usage().map(|usage| (usage.used, usage.size))

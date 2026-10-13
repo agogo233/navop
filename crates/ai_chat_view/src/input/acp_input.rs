@@ -1099,12 +1099,12 @@ impl AcpAgentInput {
     fn render_agent_header_body(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
         let row_gap = sp(8.0);
-        let session_title = self
-            .context
-            .target
-            .as_ref()
-            .map(|target| target.label.clone())
-            .unwrap_or_else(|| SharedString::from(t!("AgentUi.acp_session").to_string()));
+        // 会话标题是 agent 自己报上来的（`AcpSessionState::title`）；没报就用占位。
+        let session_title = if self.context.session_title.is_empty() {
+            SharedString::from(t!("AgentUi.acp_session").to_string())
+        } else {
+            self.context.session_title.clone()
+        };
         let capabilities = self.context.capabilities.clone();
 
         let mut body = v_flex()

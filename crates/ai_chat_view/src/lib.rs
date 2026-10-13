@@ -143,9 +143,9 @@ pub use find_shortcut::{
 };
 pub use input::{
     AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption, ComposerBranchOption,
-    ComposerMenuOption, ComposerModel, ComposerModelOption, ComposerPlanItem, ComposerScope,
-    ComposerTarget, ComposerWorkspaceInfo, ComposerWorkspaceOption, ComposerWorktreeState,
-    ImageAttachment, MentionCompletionProvider, MentionItem, SlashCommandItem,
+    ComposerMenuOption, ComposerModel, ComposerModelOption, ComposerWorkspaceInfo,
+    ComposerWorkspaceOption, ComposerWorktreeState, ImageAttachment, MentionCompletionProvider,
+    MentionItem, SlashCommandItem,
 };
 pub use message::{
     ChatMessageUI, ChatMessageUIGeneric, ChatRole, MESSAGE_RENDER_LIMIT, MESSAGE_RENDER_STEP,

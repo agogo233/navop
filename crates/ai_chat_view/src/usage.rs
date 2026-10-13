@@ -56,17 +56,6 @@ pub fn model_context_window(model: &str) -> Option<u64> {
         .map(|(_, window)| *window)
 }
 
-/// 本地用量文案:`used/window tokens`;窗口未知时只有 `used tokens`。
-///
-/// 与 ACP 侧的 `format_acp_usage` 同款裸数字格式(不做 k/m 缩写),两边
-/// 摆在同一个 chip 位置时观感一致。
-pub fn format_local_usage(tokens: u64, window: Option<u64>) -> String {
-    match window {
-        Some(window) if window > 0 => format!("{}/{} tokens", tokens, window),
-        _ => format!("{tokens} tokens"),
-    }
-}
-
 /// 上下文用量的一次读数,供 composer 里的圆环 gauge 使用。
 ///
 /// 两个数据源共用这一种形状:本地后端从 runtime session 的
@@ -189,21 +178,6 @@ mod tests {
     fn unknown_model_reports_no_window() {
         assert_eq!(model_context_window("my-private-finetune"), None);
         assert_eq!(model_context_window(""), None);
-    }
-
-    #[test]
-    fn format_shows_the_window_when_known() {
-        assert_eq!(
-            format_local_usage(1500, Some(128_000)),
-            "1500/128000 tokens"
-        );
-    }
-
-    #[test]
-    fn format_falls_back_to_tokens_without_a_window() {
-        assert_eq!(format_local_usage(1500, None), "1500 tokens");
-        // 窗口为 0 视同未知——避免除零式的误导百分比。
-        assert_eq!(format_local_usage(1500, Some(0)), "1500 tokens");
     }
 
     #[test]

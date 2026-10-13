@@ -1,22 +1,7 @@
 use super::*;
 use std::collections::HashMap;
 
-pub(super) fn composer_agent_options(
-    backend: Backend,
-    acp_agents: &[AcpAgentEntry],
-    current_acp_id: Option<&SharedString>,
-    acp_connecting: bool,
-) -> Vec<ComposerAgentOption> {
-    composer_agent_options_with_status(
-        backend,
-        acp_agents,
-        current_acp_id,
-        acp_connecting,
-        &HashMap::new(),
-    )
-}
-
-/// 同 [`composer_agent_options`]，但允许用探测状态替换每个 ACP agent 的副标题。
+/// 面板抬头 Agent 切换器的选项：允许用探测状态替换每个 ACP agent 的副标题。
 ///
 /// 状态由调用方提供，`None` 表示尚未探测、保持默认副标题。这样探测能力不渗进
 /// 输入框的数据模型。
