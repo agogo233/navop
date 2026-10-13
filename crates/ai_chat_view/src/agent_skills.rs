@@ -1,6 +1,12 @@
-use agent_runtime::{SkillCatalog, SkillContext, SkillRef, SkillSummary};
+use agent_runtime::{
+    SkillCatalog, SkillContext, SkillImportError, SkillMetadata, SkillRef, SkillSummary,
+    import_skill_dir,
+};
+use gpui::SharedString;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::input::{ComposerSkillItem, ComposerSkillSummary};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentSkillState {
@@ -47,10 +53,48 @@ impl AgentSkillState {
         }
     }
 
-    /// 上报给宿主与输入框的技能摘要。
-    ///
-    /// 本地输入框已经不摆 Skill 入口（那份只留模型与权限档位），选中集合不再有人改；
-    /// 但**可用的技能清单**仍要随会话送进运行时，提示词里才引用得到。
+    pub(crate) fn import_skill(&mut self, source: &Path) -> Result<(), SkillImportError> {
+        let dest_root = default_import_root();
+        let imported = import_skill_dir(source, &dest_root)?;
+        if !self.roots.contains(&dest_root) {
+            self.roots.push(dest_root);
+        }
+        self.reload();
+        self.selected_paths.insert(imported.path);
+        Ok(())
+    }
+
+    pub(crate) fn toggle(&mut self, id: &str) -> bool {
+        let Some(skill) = self.skill_by_id(id) else {
+            return false;
+        };
+        let path = skill.path.clone();
+        if !self.selected_paths.remove(&path) {
+            self.selected_paths.insert(path);
+        }
+        true
+    }
+
+    pub(crate) fn summary(&self) -> ComposerSkillSummary {
+        ComposerSkillSummary::new(self.catalog.skills.len(), self.selected_paths.len())
+    }
+
+    pub(crate) fn items(&self) -> Vec<ComposerSkillItem> {
+        self.catalog
+            .skills
+            .iter()
+            .map(|skill| {
+                ComposerSkillItem::new(
+                    skill_id(skill),
+                    skill.name.clone(),
+                    skill.description.clone(),
+                    skill.path.display().to_string(),
+                    true,
+                    self.selected_paths.contains(&skill.path),
+                )
+            })
+            .collect()
+    }
 
     pub(crate) fn selected_context(&self) -> SkillContext {
         let mut context = SkillContext::new();
@@ -84,6 +128,24 @@ impl AgentSkillState {
             .collect::<HashSet<_>>();
         self.selected_paths.retain(|path| available.contains(path));
     }
+
+    fn skill_by_id(&self, id: &str) -> Option<&SkillMetadata> {
+        self.catalog
+            .skills
+            .iter()
+            .find(|skill| skill_id(skill).as_ref() == id)
+    }
+}
+
+fn skill_id(skill: &SkillMetadata) -> SharedString {
+    SharedString::from(skill.path.display().to_string())
+}
+
+fn default_import_root() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".codex")
+        .join("skills")
 }
 
 fn home_dir() -> Option<PathBuf> {

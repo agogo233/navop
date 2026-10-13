@@ -17,8 +17,8 @@ use agent_client_protocol::schema::v1::{
     AvailableCommandInput, ContentBlock, ImageContent, TextContent,
 };
 use agent_runtime::{
-    AgentResourceScope, HistoryItem, ResourceCatalog, ResourceContext, ResourceId, ResourceRef,
-    Runtime, RuntimeEvent, RuntimeEventReceiver, SessionId, TaskKind, ToolCallId,
+    AgentResourceScope, HistoryItem, ResourceCatalog, ResourceContext, ResourceId, ResourceKind,
+    ResourceRef, Runtime, RuntimeEvent, RuntimeEventReceiver, SessionId, TaskKind, ToolCallId,
     ToolExecutionMode, ToolRegistry, TurnId, UserInput,
 };
 use gpui::prelude::FluentBuilder;
@@ -61,7 +61,7 @@ use crate::acp::{
     AcpError, AcpErrorKind, AcpModelInfo, AcpPendingConnection, AcpPermissionEnvelope,
     AcpPermissionMessage, AcpPermissionOutcome, AcpPromptStartError, AcpPublicMcpApprovalEnvelope,
     AcpPublicMcpApprovalMessage, AcpPublicMcpApprovalOutcome, AcpPublicMcpApprovalProvider,
-    AcpRecoveryAction, AcpSessionContinuity, AcpSessionState, AcpSessionSummary,
+    AcpRecoveryAction, AcpSessionContinuity, AcpSessionState, AcpSessionSummary, AcpUsage,
     acp_elicitation_channel, acp_permission_channel, acp_public_mcp_approval_channel,
     acp_session_list_supported, acp_session_summaries, acquire_acp_permission_grant,
     build_acp_agent_entries, current_acp_tool_mode, detail_session_id_for, is_detail_session_id,
@@ -69,8 +69,8 @@ use crate::acp::{
 };
 use crate::acp_agent_config::{AcpAgentConfigEvent, acp_agent_config_notifier};
 use crate::agent_cards::{
-    ApproveToolCall, OpenFileInReview, OpenSubagentDetail, RejectToolCall,
-    SelectAcpPermissionOption,
+    ApproveToolCall, OpenFileInReview, OpenSubagentDetail, PlanCardData, RejectToolCall,
+    SelectAcpPermissionOption, SubAgentCardData,
 };
 use crate::agent_skills::AgentSkillState;
 use crate::agent_transcript::AgentTranscript;
@@ -87,9 +87,11 @@ use crate::find_shortcut::{
 };
 use crate::input::{
     AcpAgentInput, AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption,
-    ComposerBranchOption, ComposerMenuOption, ComposerModelOption, ComposerWorkspaceInfo,
-    ComposerWorkspaceOption, ComposerWorktreeState, MentionItem, QueuedPromptPreview,
-    SlashCommandItem,
+    ComposerBranchOption, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
+    ComposerResourcePoolItem, ComposerResourcePoolSummary, ComposerResourceSourceOption,
+    ComposerResourceTypeFilter, ComposerScope, ComposerSkillItem, ComposerSkillSummary,
+    ComposerSubAgentItem, ComposerTarget, ComposerWorkspaceInfo, ComposerWorkspaceOption,
+    ComposerWorktreeState, MentionItem, QueuedPromptPreview, SlashCommandItem,
 };
 use crate::message::ChatMessageUI;
 use crate::message_turn_view::{
@@ -98,6 +100,7 @@ use crate::message_turn_view::{
 use crate::message_view::{MessageListLayout, render_running_activity};
 use crate::pending_submission::{PendingSubmission, PendingSubmissions};
 use crate::persistence;
+use crate::resource_display::first_visible_alias;
 use crate::session_shortcut::{NavigateSessionBack, NavigateSessionForward, ToggleSessionSwitcher};
 use crate::session_sidebar::{self, SessionRowStyle, SessionSummary};
 use crate::theme::{AgentChatTheme, resolve_agent_chat_theme, sp};
@@ -107,7 +110,7 @@ use crate::transcript_selection::{
     ClearTranscriptSelection, CopyTranscriptSelection, TranscriptSelectionHandle,
 };
 use crate::turn::{TurnOutcome, TurnTimings};
-use crate::usage::{ContextUsage, model_context_window};
+use crate::usage::{ContextUsage, format_local_usage, model_context_window};
 
 mod acp_options;
 pub(crate) mod acp_sessions;
@@ -121,7 +124,10 @@ mod selection;
 mod session_navigation;
 mod session_switcher;
 
-use acp_options::{agent_option_disabled, composer_agent_options_with_status, current_agent_label};
+use acp_options::{
+    agent_option_disabled, composer_agent_options, composer_agent_options_with_status,
+    current_agent_label,
+};
 use acp_sessions::{acp_session_placeholder, acp_session_row, acp_session_section_header};
 use acp_ui::AcpConnectOperation;
 use session_navigation::SessionNavigation;
@@ -1664,14 +1670,29 @@ impl AgentChatView {
 
         let skills = AgentSkillState::load_for_workspace(&workspace_root);
         let init_ctx = build_composer_context(
+            &resources,
             ExecutionSelection::new(task_kind, tool_execution_mode),
             selected_model.as_ref(),
-            Backend::Local,
             None,
+            &[],
+            Backend::Local,
+            &acp_agents,
+            None,
+            false,
+            None,
+            &available_resources,
+            skills.summary(),
+            skills.items(),
             // 构造时还没有任何模型采样,计量自然为空;之后的 sync_composer 会带上。
             None,
         );
+        let target_options: Vec<ComposerTarget> = resources
+            .resources
+            .iter()
+            .map(target_from_resource)
+            .collect();
         input.update(cx, |inp, cx| {
+            inp.set_target_options(target_options, cx);
             inp.set_menu_options(model_options.clone(), tool_options.clone(), cx);
             inp.set_context(init_ctx.clone(), cx);
         });
@@ -2782,6 +2803,37 @@ impl AgentChatView {
                 self.submit_with_window(text, mentions, images, window, cx);
             }
             AgentInputEvent::Stop => self.stop(cx),
+            AgentInputEvent::SelectTarget { id } => {
+                if !self.is_running {
+                    self.select_target(&id, cx);
+                }
+            }
+            AgentInputEvent::AddResourceToPool { id } => {
+                if !self.is_running {
+                    self.add_resource_to_pool(&id, cx);
+                }
+            }
+            AgentInputEvent::RemoveResourceFromPool { id } => {
+                if !self.is_running {
+                    self.remove_resource_from_pool(&id, cx);
+                }
+            }
+            AgentInputEvent::SelectResourceSource { id } => {
+                if !self.is_running {
+                    self.select_resource_source(&id, cx);
+                }
+            }
+            AgentInputEvent::ToggleSkill { id } => {
+                if !self.is_running {
+                    self.toggle_skill(&id, cx);
+                }
+            }
+            AgentInputEvent::ImportSkill { path } => {
+                if !self.is_running {
+                    self.import_skill(&path, cx);
+                }
+            }
+            AgentInputEvent::PickScope { key: _ } => {}
             AgentInputEvent::SelectModel {
                 id,
                 provider_id,
@@ -4734,10 +4786,19 @@ impl AgentChatView {
             .and_then(|acp| acp_model_option(&acp.state(), self.current_acp_id.as_ref()))
             .or_else(|| self.selected_model.clone());
         let mut ctx = build_composer_context(
+            &self.resources,
             self.execution_selection(),
             model.as_ref(),
+            self.transcript.latest_plan(),
+            self.transcript.active_subagents(),
             self.backend,
+            &self.acp_agents,
+            self.current_acp_id.as_ref(),
+            self.acp_connecting,
             self.acp.as_ref().map(|acp| acp.state()),
+            &self.available_resources,
+            self.skills.summary(),
+            self.skills.items(),
             self.local_context_tokens(),
         );
         apply_composer_snapshot(&mut ctx, self.composer_snapshot(cx));
@@ -5091,9 +5152,67 @@ impl AgentChatView {
         )
     }
 
+    /// 在目标下拉中选中某个资源:设为当前目标并同步给会话与输入框。
+    fn select_target(&mut self, id: &str, cx: &mut Context<Self>) {
+        let rid = ResourceId::new(id.to_string());
+        if self.resources.get(&rid).is_none() {
+            return;
+        }
+        self.resources.current = Some(rid);
+        self.sync_session_resources();
+        self.sync_resource_targets(cx);
+        cx.notify();
+    }
+
+    fn add_resource_to_pool(&mut self, id: &str, cx: &mut Context<Self>) {
+        if add_resource_to_pool(&mut self.resources, &self.available_resources, id) {
+            self.sync_session_resources();
+            self.sync_resource_targets(cx);
+            cx.notify();
+        }
+    }
+
+    fn remove_resource_from_pool(&mut self, id: &str, cx: &mut Context<Self>) {
+        if remove_resource_from_pool(&mut self.resources, id) {
+            self.sync_session_resources();
+            self.sync_resource_targets(cx);
+            cx.notify();
+        }
+    }
+
+    fn toggle_skill(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.skills.toggle(id) {
+            self.sync_session_skills();
+            self.sync_composer(cx);
+            cx.notify();
+        }
+    }
+
+    fn import_skill(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match self.skills.import_skill(path) {
+            Ok(()) => {
+                self.sync_session_skills();
+                self.sync_composer(cx);
+            }
+            Err(error) => {
+                self.transcript
+                    .push_system(t!("AgentUi.import_skill_failed", error = error).to_string());
+            }
+        }
+        cx.notify();
+    }
+
     fn sync_session_skills(&self) {
         if let Some(session) = self.runtime.session(&self.session_id) {
             session.set_skills(self.skills.selected_context());
+        }
+    }
+
+    fn select_resource_source(&mut self, id: &str, cx: &mut Context<Self>) {
+        if apply_resource_source(&mut self.resources, &self.available_resources, id) {
+            self.sync_session_resources();
+            self.sync_resource_targets(cx);
+            cx.notify();
         }
     }
 
@@ -6443,13 +6562,33 @@ impl AgentChatView {
 
     fn sync_resource_targets(&mut self, cx: &mut Context<Self>) {
         self.transcript.set_resource_context(&self.resources);
+        let target_options: Vec<ComposerTarget> = self
+            .resources
+            .resources
+            .iter()
+            .map(target_from_resource)
+            .collect();
         let ctx = build_composer_context(
+            &self.resources,
             self.execution_selection(),
             self.selected_model.as_ref(),
+            self.transcript.latest_plan(),
+            self.transcript.active_subagents(),
             self.backend,
+            &self.acp_agents,
+            self.current_acp_id.as_ref(),
+            self.acp_connecting,
             self.acp.as_ref().map(|acp| acp.state()),
+            &self.available_resources,
+            self.skills.summary(),
+            self.skills.items(),
             self.local_context_tokens(),
         );
+        // 目标选择器只有 One agent 那份有：这里照旧喂给 `input`，切到 ACP 时
+        // 它不挂载，喂了也无副作用；上下文则按后端起手送进当前那一份。
+        self.input.update(cx, |input, cx| {
+            input.set_target_options(target_options, cx);
+        });
         self.composer().set_context(ctx, cx);
     }
 
@@ -6495,16 +6634,35 @@ impl AgentChatView {
         self.resources = resources.clone();
         self.transcript.set_resource_context(&self.resources);
         self.sync_session_resources();
+        let target_options: Vec<ComposerTarget> = self
+            .resources
+            .resources
+            .iter()
+            .map(target_from_resource)
+            .collect();
         let ctx = build_composer_context(
+            &self.resources,
             self.execution_selection(),
             self.selected_model.as_ref(),
+            self.transcript.latest_plan(),
+            self.transcript.active_subagents(),
             self.backend,
+            &self.acp_agents,
+            self.current_acp_id.as_ref(),
+            self.acp_connecting,
             self.acp.as_ref().map(|acp| acp.state()),
+            &self.available_resources,
+            self.skills.summary(),
+            self.skills.items(),
             self.local_context_tokens(),
         );
         // 业务资源换了：留一份给工作区文件重新合并用（文件那份不用重扫，根没动）。
         self.resource_mentions = mentions;
         self.refresh_workspace_mentions(cx);
+        // 同 `sync_resource_targets`：目标选择器只喂 One agent 那份，上下文按后端送。
+        self.input.update(cx, |input, cx| {
+            input.set_target_options(target_options, cx);
+        });
         self.composer().set_context(ctx, cx);
         if self.sidebar_mode {
             self.request_scroll_to_bottom_until_layout_settles();
@@ -7768,13 +7926,30 @@ fn apply_composer_snapshot(context: &mut AgentComposerContext, snapshot: Compose
 }
 
 fn build_composer_context(
+    resources: &ResourceContext,
     selection: ExecutionSelection,
     model: Option<&ComposerModelOption>,
+    plan: Option<&PlanCardData>,
+    subagents: &[SubAgentCardData],
     backend: Backend,
+    acp_agents: &[AcpAgentEntry],
+    current_acp_id: Option<&SharedString>,
+    acp_connecting: bool,
     acp_state: Option<AcpSessionState>,
+    available_resources: &[ResourceRef],
+    skill_summary: ComposerSkillSummary,
+    skill_items: Vec<ComposerSkillItem>,
     local_context_tokens: Option<u64>,
 ) -> AgentComposerContext {
-    let mut context = build_context(selection, model);
+    let mut context = build_context(resources, selection, model);
+    context.resource_source_options = resource_source_options(resources, available_resources);
+    context.resource_pool_items = resource_pool_items(resources, available_resources);
+    context.skill_summary = skill_summary;
+    context.skill_items = skill_items;
+    context.plan_items = composer_plan_items(plan);
+    context.subagent_items = composer_subagent_items(subagents);
+    context.agent_options =
+        composer_agent_options(backend, acp_agents, current_acp_id, acp_connecting);
     if backend == Backend::Acp {
         apply_acp_state_to_context(&mut context, acp_state.as_ref());
         // ACP 的「执行模式」是 agent 自己声明的会话模式（如 codex 的 read-only /
@@ -7796,6 +7971,11 @@ fn build_composer_context(
         // 本地后端:模型报了计量才展示;窗口大小按模型名尽力解析,查不到就
         // 只显示 token 数,不猜百分比。
         let window = model.and_then(|option| model_context_window(&option.model));
+        context.scopes.push(ComposerScope::new(
+            "local-usage",
+            t!("AgentUi.usage").to_string(),
+            format_local_usage(tokens, window),
+        ));
         context.context_usage = Some(ContextUsage::new(tokens, window));
     }
     context
@@ -7805,16 +7985,61 @@ fn apply_acp_state_to_context(
     context: &mut AgentComposerContext,
     acp_state: Option<&AcpSessionState>,
 ) {
-    context.session_title = acp_state
-        .and_then(AcpSessionState::title)
-        .map(|title| SharedString::from(title.to_string()))
-        .unwrap_or_default();
+    context.target = Some(ComposerTarget::new(
+        "acp-session",
+        acp_state
+            .and_then(AcpSessionState::title)
+            .map(str::to_string)
+            .unwrap_or_else(|| t!("AgentUi.acp_session").to_string()),
+        "AI",
+        "ACP",
+        "Agent Client Protocol",
+    ));
+    context.scopes = acp_state.map(acp_scopes).unwrap_or_default();
     context.capabilities = acp_state.map(acp_capabilities).unwrap_or_else(|| {
         vec![
             SharedString::from("ACP"),
             SharedString::from(t!("AgentUi.connecting").to_string()),
         ]
     });
+}
+
+fn acp_scopes(state: &AcpSessionState) -> Vec<ComposerScope> {
+    let mut scopes = Vec::new();
+    if let Some(mode) = acp_mode_label(state) {
+        scopes.push(ComposerScope::new(
+            "acp-mode",
+            t!("AgentUi.mode").to_string(),
+            mode,
+        ));
+    }
+    if let Some(updated_at) = state.updated_at() {
+        scopes.push(ComposerScope::new(
+            "acp-updated",
+            t!("AgentUi.updated").to_string(),
+            updated_at,
+        ));
+    }
+    if let Some(usage) = state.usage() {
+        scopes.push(ComposerScope::new(
+            "acp-usage",
+            t!("AgentUi.usage").to_string(),
+            format_acp_usage(usage),
+        ));
+    }
+    scopes
+}
+
+/// 用量文案：`used/size tokens`，agent 报了费用就在后面追加。
+///
+/// 货币代码原样透传（协议给什么写什么，不自己拼符号）；小数位先按 4 位截掉尾随零，
+/// 免得到处是 `0.0120`。
+fn format_acp_usage(usage: &AcpUsage) -> String {
+    let mut text = format!("{}/{} tokens", usage.used, usage.size);
+    if let Some(cost) = usage.cost.as_ref() {
+        text.push_str(&format!(" · {}", format_acp_cost(cost)));
+    }
+    text
 }
 
 /// 费用文案:`0.0124 USD`。货币代码原样透传(协议给什么写什么,不自己拼
@@ -7891,15 +8116,91 @@ fn acp_mode_label(state: &AcpSessionState) -> Option<String> {
     state.current_mode_label()
 }
 
-/// 由执行选择与模型构建输入框展示用上下文。
+/// 由资源上下文构建输入框展示用上下文。
 fn build_context(
+    resources: &ResourceContext,
     selection: ExecutionSelection,
     model: Option<&ComposerModelOption>,
 ) -> AgentComposerContext {
+    let current = resources.current();
+    let target = current.map(target_from_resource);
+    let scopes = current
+        .map(|r| {
+            r.scopes
+                .iter()
+                .map(|scope| ComposerScope::new(&scope.key, &scope.label, &scope.value))
+                .collect()
+        })
+        .unwrap_or_default();
+    let capabilities = current
+        .map(|r| {
+            vec![
+                SharedString::from(t!("AgentUi.target").to_string()),
+                SharedString::from(r.kind.as_str().to_string()),
+            ]
+        })
+        .unwrap_or_default();
     AgentComposerContext {
+        target,
+        resource_pool: resource_pool_summary(resources),
+        resource_type_filters: resource_type_filters(resources),
+        resource_source_options: Vec::new(),
+        resource_pool_items: Vec::new(),
+        skill_summary: Default::default(),
+        skill_items: Vec::new(),
+        scopes,
+        capabilities,
+        plan_items: Vec::new(),
+        subagent_items: Vec::new(),
+        agent_options: Vec::new(),
         model: model.map(ComposerModelOption::to_composer_model),
         execution_mode_label: SharedString::from(selection.label()),
-        ..Default::default()
+        workspace: Default::default(),
+        workspace_options: Vec::new(),
+        branch_options: Vec::new(),
+        worktree: Default::default(),
+        context_usage: None,
+    }
+}
+
+fn composer_plan_items(plan: Option<&PlanCardData>) -> Vec<ComposerPlanItem> {
+    plan.map(|plan| {
+        plan.steps
+            .iter()
+            .map(|step| {
+                ComposerPlanItem::new(step.title.clone(), step.status.clone()).with_details(
+                    step.description.clone(),
+                    step.risk.clone(),
+                    step.tool.clone().map(SharedString::from),
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn composer_subagent_items(subagents: &[SubAgentCardData]) -> Vec<ComposerSubAgentItem> {
+    subagents
+        .iter()
+        .map(|subagent| {
+            ComposerSubAgentItem::new(
+                subagent.subagent_id.clone(),
+                subagent.name.clone(),
+                subagent.task.clone(),
+                subagent_status_for_composer(subagent),
+            )
+            .with_summary(subagent.summary.clone())
+        })
+        .collect()
+}
+
+fn subagent_status_for_composer(subagent: &SubAgentCardData) -> &'static str {
+    if subagent.running {
+        "running"
+    } else if subagent.success == Some(false) {
+        "failed"
+    } else {
+        "completed"
     }
 }
 
@@ -8037,6 +8338,197 @@ fn current_agent_icon_for_option(agent: &ComposerAgentOption) -> Icon {
     }
 }
 
+fn resource_pool_summary(resources: &ResourceContext) -> ComposerResourcePoolSummary {
+    let current = resources.current();
+    ComposerResourcePoolSummary::new(
+        current.map(|resource| SharedString::from(resource.id.as_str().to_string())),
+        current
+            .map(|resource| resource.label.clone())
+            .unwrap_or_else(|| t!("AgentUi.no_default_target").to_string()),
+        resources.resources.len(),
+    )
+}
+
+fn resource_type_filters(resources: &ResourceContext) -> Vec<ComposerResourceTypeFilter> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for resource in &resources.resources {
+        *counts
+            .entry(resource.kind.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    let mut filters = vec![ComposerResourceTypeFilter::new(
+        "all",
+        t!("AgentUi.all").to_string(),
+        resources.resources.len(),
+        true,
+    )];
+    filters.extend(counts.into_iter().map(|(kind, count)| {
+        ComposerResourceTypeFilter::new(kind.clone(), kind.to_uppercase(), count, false)
+    }));
+    filters
+}
+
+fn resource_source_options(
+    pool: &ResourceContext,
+    catalog: &[ResourceRef],
+) -> Vec<ComposerResourceSourceOption> {
+    let pool_ids = resource_id_set(&pool.resources);
+    let catalog_ids = resource_id_set(catalog);
+    let current_selected = pool.resources.len() == 1
+        && pool
+            .current
+            .as_ref()
+            .is_some_and(|current| Some(current) == pool.resources.first().map(|r| &r.id));
+    let all_selected = !current_selected && !catalog_ids.is_empty() && pool_ids == catalog_ids;
+    let ssh_ids = source_ids(catalog, |kind| matches!(kind, ResourceKind::Ssh));
+    let db_ids = source_ids(catalog, is_database_kind);
+    let redis_ids = source_ids(catalog, |kind| matches!(kind, ResourceKind::Redis));
+    let terminal_ids = source_ids(catalog, |kind| matches!(kind, ResourceKind::Terminal));
+    let source_selected = |ids: &std::collections::HashSet<ResourceId>| {
+        !current_selected && !all_selected && !ids.is_empty() && pool_ids == *ids
+    };
+    let type_selected = source_selected(&ssh_ids)
+        || source_selected(&db_ids)
+        || source_selected(&redis_ids)
+        || source_selected(&terminal_ids);
+    let manual_selected = !current_selected && !all_selected && !type_selected;
+
+    vec![
+        ComposerResourceSourceOption::new(
+            "current",
+            t!("AgentUi.current").to_string(),
+            current_count(pool),
+            current_selected,
+        ),
+        ComposerResourceSourceOption::new(
+            "pool",
+            t!("AgentUi.resource_pool").to_string(),
+            pool.resources.len(),
+            false,
+        ),
+        ComposerResourceSourceOption::new(
+            "all",
+            t!("AgentUi.all").to_string(),
+            catalog.len(),
+            all_selected,
+        ),
+        ComposerResourceSourceOption::new("ssh", "SSH", ssh_ids.len(), source_selected(&ssh_ids)),
+        ComposerResourceSourceOption::new("db", "DB", db_ids.len(), source_selected(&db_ids)),
+        ComposerResourceSourceOption::new(
+            "redis",
+            "Redis",
+            redis_ids.len(),
+            source_selected(&redis_ids),
+        ),
+        ComposerResourceSourceOption::new(
+            "terminal",
+            "Terminal",
+            terminal_ids.len(),
+            source_selected(&terminal_ids),
+        ),
+        ComposerResourceSourceOption::new(
+            "manual",
+            t!("AgentUi.manual").to_string(),
+            pool.resources.len(),
+            manual_selected,
+        ),
+        ComposerResourceSourceOption::new(
+            "workspace",
+            t!("AgentUi.workspace").to_string(),
+            0,
+            false,
+        )
+        .disabled(t!("AgentUi.no_workspace_source").to_string()),
+        ComposerResourceSourceOption::new("tag", t!("AgentUi.tag").to_string(), 0, false)
+            .disabled(t!("AgentUi.no_tag_source").to_string()),
+    ]
+}
+
+fn resource_id_set(resources: &[ResourceRef]) -> std::collections::HashSet<ResourceId> {
+    resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect()
+}
+
+fn source_ids(
+    catalog: &[ResourceRef],
+    predicate: fn(&ResourceKind) -> bool,
+) -> std::collections::HashSet<ResourceId> {
+    catalog
+        .iter()
+        .filter(|resource| predicate(&resource.kind))
+        .map(|resource| resource.id.clone())
+        .collect()
+}
+
+fn is_database_kind(kind: &ResourceKind) -> bool {
+    matches!(
+        kind,
+        ResourceKind::Mysql | ResourceKind::Postgres | ResourceKind::Sqlite | ResourceKind::Mongo
+    )
+}
+
+fn current_count(pool: &ResourceContext) -> usize {
+    usize::from(pool.current().is_some())
+}
+
+fn resource_pool_items(
+    pool: &ResourceContext,
+    catalog: &[ResourceRef],
+) -> Vec<ComposerResourcePoolItem> {
+    let pool_ids = pool
+        .resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let default_id = pool.current.clone();
+
+    catalog
+        .iter()
+        .map(|resource| {
+            let in_pool = pool_ids.contains(&resource.id);
+            let is_default = default_id.as_ref() == Some(&resource.id);
+            ComposerResourcePoolItem::new(
+                resource.id.as_str().to_string(),
+                resource.label.clone(),
+                kind_icon(&resource.kind),
+                resource.kind.as_str().to_string(),
+                resource_primary_meta(resource),
+                resource_pool_status(in_pool),
+                resource_default_reason(is_default),
+                resource.capabilities.len(),
+                in_pool,
+                is_default,
+            )
+        })
+        .collect()
+}
+
+fn resource_primary_meta(resource: &ResourceRef) -> String {
+    first_visible_alias(&resource.aliases)
+        .or_else(|| {
+            resource
+                .scopes
+                .first()
+                .map(|scope| format!("{}: {}", scope.label, scope.value))
+        })
+        .unwrap_or_else(|| resource.kind.as_str().to_string())
+}
+
+fn resource_pool_status(in_pool: bool) -> String {
+    if in_pool {
+        t!("AgentUi.joined").to_string()
+    } else {
+        t!("AgentUi.available_to_add").to_string()
+    }
+}
+
+fn resource_default_reason(is_default: bool) -> Option<String> {
+    is_default.then(|| t!("AgentUi.default_target").to_string())
+}
+
 fn refresh_pool_resource_metadata(pool: &mut ResourceContext, catalog: &[ResourceRef]) -> bool {
     let mut changed = false;
     for resource in &mut pool.resources {
@@ -8053,6 +8545,21 @@ fn refresh_pool_resource_metadata(pool: &mut ResourceContext, catalog: &[Resourc
         }
     }
     changed
+}
+
+fn add_resource_to_pool(pool: &mut ResourceContext, catalog: &[ResourceRef], id: &str) -> bool {
+    let rid = ResourceId::new(id.to_string());
+    if pool.get(&rid).is_some() {
+        return false;
+    }
+    let Some(resource) = catalog.iter().find(|resource| resource.id == rid).cloned() else {
+        return false;
+    };
+    pool.resources.push(resource);
+    if pool.current.is_none() {
+        pool.current = Some(rid);
+    }
+    true
 }
 
 fn apply_mentioned_resources(
@@ -8082,6 +8589,96 @@ fn apply_mentioned_resources(
         }
     }
     changed
+}
+
+fn remove_resource_from_pool(pool: &mut ResourceContext, id: &str) -> bool {
+    let rid = ResourceId::new(id.to_string());
+    let before = pool.resources.len();
+    pool.resources.retain(|resource| resource.id != rid);
+    if pool.resources.len() == before {
+        return false;
+    }
+    if pool.current.as_ref() == Some(&rid) {
+        pool.current = pool.resources.first().map(|resource| resource.id.clone());
+    }
+    true
+}
+
+fn apply_resource_source(pool: &mut ResourceContext, catalog: &[ResourceRef], id: &str) -> bool {
+    let resources = match id {
+        "current" => pool.current().cloned().map(|resource| vec![resource]),
+        "all" => Some(catalog.to_vec()),
+        "ssh" => Some(resources_matching(catalog, |kind| {
+            matches!(kind, ResourceKind::Ssh)
+        })),
+        "db" => Some(resources_matching(catalog, is_database_kind)),
+        "redis" => Some(resources_matching(catalog, |kind| {
+            matches!(kind, ResourceKind::Redis)
+        })),
+        "terminal" => Some(resources_matching(catalog, |kind| {
+            matches!(kind, ResourceKind::Terminal)
+        })),
+        "pool" | "manual" | "workspace" | "tag" => None,
+        _ => None,
+    };
+    let Some(resources) = resources else {
+        return false;
+    };
+    replace_pool_resources(pool, resources)
+}
+
+fn resources_matching(
+    catalog: &[ResourceRef],
+    predicate: fn(&ResourceKind) -> bool,
+) -> Vec<ResourceRef> {
+    catalog
+        .iter()
+        .filter(|resource| predicate(&resource.kind))
+        .cloned()
+        .collect()
+}
+
+fn replace_pool_resources(pool: &mut ResourceContext, resources: Vec<ResourceRef>) -> bool {
+    if resources.is_empty() {
+        return false;
+    }
+    let next_current = pool
+        .current
+        .clone()
+        .filter(|id| resources.iter().any(|resource| resource.id == *id))
+        .or_else(|| resources.first().map(|resource| resource.id.clone()));
+    let changed = pool.resources != resources || pool.current != next_current;
+    if changed {
+        pool.resources = resources;
+        pool.current = next_current;
+    }
+    changed
+}
+
+fn target_from_resource(r: &ResourceRef) -> ComposerTarget {
+    ComposerTarget::new(
+        r.id.as_str().to_string(),
+        r.label.clone(),
+        kind_icon(&r.kind),
+        r.kind.as_str().to_string(),
+        format!("{} · {}", r.kind.as_str(), r.id),
+    )
+}
+
+fn kind_icon(kind: &ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Mysql | ResourceKind::Postgres | ResourceKind::Sqlite => "DB",
+        ResourceKind::Ssh => "SH",
+        ResourceKind::Redis => "RD",
+        ResourceKind::Mongo => "MG",
+        ResourceKind::Terminal => "TM",
+        ResourceKind::Other(kind) => match kind.as_str() {
+            "rdp" => "RD",
+            "vnc" => "VN",
+            "port-forwarding" => "PF",
+            _ => "OT",
+        },
+    }
 }
 
 /// 「问答」是一个任务类型而不是工具策略，两者共用同一个下拉 id 空间。
@@ -8381,8 +8978,8 @@ mod tests {
     use agent_runtime::tools::ToolInvocation;
     use agent_runtime::tools::builtin::EchoTool;
     use agent_runtime::{
-        ObservationData, ResourceKind, RiskLevel, Tool, ToolError, ToolName, ToolObservation,
-        ToolRegistry, ToolRouter, ToolSpec,
+        ObservationData, RiskLevel, Tool, ToolError, ToolName, ToolObservation, ToolRegistry,
+        ToolRouter, ToolSpec,
     };
     use async_trait::async_trait;
     use gpui::{
@@ -9483,6 +10080,15 @@ mod tests {
     }
 
     #[test]
+    fn target_maps_label_kind_icon() {
+        let r = ResourceRef::new("c1", ResourceKind::Redis, "prod-redis");
+        let t = target_from_resource(&r);
+        assert_eq!(t.label.as_ref(), "prod-redis");
+        assert_eq!(t.kind.as_ref(), "redis");
+        assert_eq!(t.icon.as_ref(), "RD");
+    }
+
+    #[test]
     fn auto_scroll_state_consumes_pending_scroll_in_render() {
         let mut state = AutoScrollState::default();
 
@@ -9552,6 +10158,102 @@ mod tests {
             view.on_sidebar_shown(cx);
             assert_eq!(5, view.auto_scroll.pending_bottom_scroll_frames);
         });
+    }
+
+    #[test]
+    fn build_context_without_target_is_empty() {
+        let ctx = build_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+        );
+        assert!(ctx.target.is_none());
+        assert!(ctx.scopes.is_empty());
+        assert!(ctx.capabilities.is_empty());
+        assert_eq!(
+            ctx.execution_mode_label.as_ref(),
+            t!("AgentUi.auto").as_ref()
+        );
+    }
+
+    #[test]
+    fn build_context_with_target_fills_scopes_and_caps() {
+        let resources = ResourceContext::new().with_resource(
+            ResourceRef::new("c1", ResourceKind::Mysql, "prod-mysql")
+                .with_scope(agent_runtime::ResourceScope::new(
+                    "database", "Database", "ai_app",
+                ))
+                .with_scope(agent_runtime::ResourceScope::new(
+                    "schema", "Schema", "public",
+                )),
+        );
+        let ctx = build_context(
+            &resources,
+            ExecutionSelection::tool(ToolExecutionMode::ReadOnly),
+            Some(&ComposerModelOption::new(
+                "openai:gpt-4.1",
+                "openai",
+                "OpenAI",
+                "gpt-4.1",
+            )),
+        );
+        assert_eq!(ctx.target.unwrap().label.as_ref(), "prod-mysql");
+        assert_eq!(ctx.scopes.len(), 2);
+        assert_eq!(ctx.scopes[0].value.as_ref(), "ai_app");
+        assert_eq!(ctx.scopes[1].value.as_ref(), "public");
+        assert_eq!(
+            ctx.execution_mode_label.as_ref(),
+            t!("AgentUi.readonly").as_ref()
+        );
+    }
+
+    #[test]
+    fn build_context_marks_current_resource_as_default_target() {
+        let resources = ResourceContext::new()
+            .with_resource(ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"))
+            .with_resource(ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"));
+
+        let context = build_context(
+            &resources,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+        );
+
+        assert_eq!(context.resource_pool.total_resources, 2);
+        assert_eq!(
+            context
+                .resource_pool
+                .default_target_id
+                .as_ref()
+                .map(|id| id.as_ref()),
+            Some("ssh-a")
+        );
+        assert_eq!(context.resource_pool.default_label.as_ref(), "prod-a");
+    }
+
+    #[test]
+    fn build_context_counts_resource_types_for_filters() {
+        let resources = ResourceContext::new()
+            .with_resource(ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"))
+            .with_resource(ResourceRef::new("db-a", ResourceKind::Postgres, "prod-db"))
+            .with_resource(ResourceRef::new("redis-a", ResourceKind::Redis, "cache"));
+
+        let context = build_context(
+            &resources,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+        );
+
+        let filters = context
+            .resource_type_filters
+            .iter()
+            .map(|filter| (filter.id.as_ref(), filter.count))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![("all", 3), ("postgres", 1), ("redis", 1), ("ssh", 1)],
+            filters
+        );
     }
 
     #[test]
@@ -12737,6 +13439,161 @@ mod tests {
     }
 
     #[test]
+    fn resource_pool_items_mark_pool_membership_and_default_target() {
+        let pool = ResourceContext::new().with_resource(ResourceRef::new(
+            "ssh-a",
+            ResourceKind::Ssh,
+            "prod-a",
+        ));
+        let catalog = vec![
+            ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"),
+            ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"),
+        ];
+
+        let items = resource_pool_items(&pool, &catalog);
+
+        assert_eq!(2, items.len());
+        assert_eq!(items[0].id.as_ref(), "ssh-a");
+        assert!(items[0].in_pool);
+        assert!(items[0].is_default);
+        assert_eq!(items[1].id.as_ref(), "ssh-b");
+        assert!(!items[1].in_pool);
+        assert!(!items[1].is_default);
+    }
+
+    #[test]
+    fn resource_pool_item_primary_meta_does_not_fallback_to_uuid() {
+        let resource = ResourceRef::new(
+            "fa9476d8-de90-4f7d-9b63-6f4783594211",
+            ResourceKind::Other("rdp".into()),
+            "a82 bi 服务",
+        );
+
+        assert_eq!(resource_primary_meta(&resource), "rdp");
+    }
+
+    #[test]
+    fn resource_pool_item_primary_meta_skips_uuid_alias() {
+        let resource = ResourceRef::new("rdp-a", ResourceKind::Other("rdp".into()), "a82 bi 服务")
+            .with_alias("abfcee0a-2827-4588-9f6-587a7a95d1e9")
+            .with_alias("10.1.131.181");
+
+        assert_eq!(resource_primary_meta(&resource), "10.1.131.181");
+    }
+
+    #[test]
+    fn resource_pool_item_uses_specific_icons_for_known_other_kinds() {
+        assert_eq!(kind_icon(&ResourceKind::Other("rdp".into())), "RD");
+        assert_eq!(kind_icon(&ResourceKind::Other("vnc".into())), "VN");
+        assert_eq!(
+            kind_icon(&ResourceKind::Other("port-forwarding".into())),
+            "PF"
+        );
+    }
+
+    #[test]
+    fn resource_source_options_mark_all_when_pool_matches_catalog() {
+        let pool = ResourceContext::new()
+            .with_resource(ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"))
+            .with_resource(ResourceRef::new("redis-a", ResourceKind::Redis, "cache"));
+        let catalog = pool.resources.clone();
+
+        let options = resource_source_options(&pool, &catalog);
+
+        assert!(source_option(&options, "all").selected);
+        assert_eq!(source_option(&options, "all").count, 2);
+        assert!(!source_option(&options, "current").selected);
+    }
+
+    #[test]
+    fn resource_source_options_mark_manual_for_mixed_subset() {
+        let pool = ResourceContext::new()
+            .with_resource(ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"))
+            .with_resource(ResourceRef::new("redis-a", ResourceKind::Redis, "cache"));
+        let catalog = vec![
+            ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"),
+            ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"),
+            ResourceRef::new("redis-a", ResourceKind::Redis, "cache"),
+        ];
+
+        let options = resource_source_options(&pool, &catalog);
+
+        assert!(source_option(&options, "manual").selected);
+        assert_eq!(source_option(&options, "ssh").count, 2);
+        assert_eq!(source_option(&options, "redis").count, 1);
+    }
+
+    fn source_option<'a>(
+        options: &'a [ComposerResourceSourceOption],
+        id: &str,
+    ) -> &'a ComposerResourceSourceOption {
+        options
+            .iter()
+            .find(|option| option.id.as_ref() == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_resource_source_all_replaces_pool_with_catalog() {
+        let mut pool = ResourceContext::new().with_resource(ResourceRef::new(
+            "ssh-a",
+            ResourceKind::Ssh,
+            "prod-a",
+        ));
+        let catalog = vec![
+            ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"),
+            ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"),
+        ];
+
+        assert!(apply_resource_source(&mut pool, &catalog, "all"));
+        assert_eq!(2, pool.resources.len());
+        assert_eq!(
+            Some("prod-a"),
+            pool.current().map(|resource| resource.label.as_str())
+        );
+    }
+
+    #[test]
+    fn apply_resource_source_ssh_selects_only_ssh_resources() {
+        let mut pool = ResourceContext::new().with_resource(ResourceRef::new(
+            "redis-a",
+            ResourceKind::Redis,
+            "cache",
+        ));
+        let catalog = vec![
+            ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"),
+            ResourceRef::new("redis-a", ResourceKind::Redis, "cache"),
+        ];
+
+        assert!(apply_resource_source(&mut pool, &catalog, "ssh"));
+        assert_eq!(1, pool.resources.len());
+        assert_eq!(
+            Some("prod-a"),
+            pool.current().map(|resource| resource.label.as_str())
+        );
+    }
+
+    #[test]
+    fn add_resource_to_pool_uses_catalog_resource() {
+        let mut pool = ResourceContext::new().with_resource(ResourceRef::new(
+            "ssh-a",
+            ResourceKind::Ssh,
+            "prod-a",
+        ));
+        let catalog = vec![
+            ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"),
+            ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"),
+        ];
+
+        assert!(add_resource_to_pool(&mut pool, &catalog, "ssh-b"));
+        assert_eq!(2, pool.resources.len());
+        assert_eq!(
+            Some("prod-a"),
+            pool.current().map(|resource| resource.label.as_str())
+        );
+    }
+
+    #[test]
     fn mentioned_catalog_resources_are_added_to_pool_and_set_default() {
         let mut pool = ResourceContext::new().with_resource(ResourceRef::new(
             "db-a",
@@ -12763,6 +13620,20 @@ mod tests {
             pool.resources
                 .iter()
                 .any(|resource| resource.label == "prod-b")
+        );
+    }
+
+    #[test]
+    fn remove_default_resource_reassigns_default_target() {
+        let mut pool = ResourceContext::new()
+            .with_resource(ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"))
+            .with_resource(ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"));
+
+        assert!(remove_resource_from_pool(&mut pool, "ssh-a"));
+        assert_eq!(1, pool.resources.len());
+        assert_eq!(
+            Some("prod-b"),
+            pool.current().map(|resource| resource.label.as_str())
         );
     }
 
@@ -12931,6 +13802,140 @@ mod tests {
     }
 
     #[test]
+    fn composer_context_includes_plan_items_for_local_and_acp_backends() {
+        let plan = PlanCardData {
+            goal: "上线检查".to_string(),
+            status: "running".to_string(),
+            steps: vec![crate::agent_cards::PlanStepData {
+                title: "检查连接".to_string(),
+                description: "确认服务可达".to_string(),
+                status: "running".to_string(),
+                risk: "只读".to_string(),
+                tool: Some("ping".to_string()),
+            }],
+        };
+        let acp_id = SharedString::from("codex");
+        let acp_agents = vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+            acp_id.clone(),
+            "Codex ACP",
+            "codex",
+        ))];
+
+        let local = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+            Some(&plan),
+            &[],
+            Backend::Local,
+            &acp_agents,
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            None,
+        );
+        let acp = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+            Some(&plan),
+            &[],
+            Backend::Acp,
+            &acp_agents,
+            Some(&acp_id),
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(local.plan_items, acp.plan_items);
+        assert_eq!(local.plan_items[0].title.as_ref(), "检查连接");
+        assert_eq!(local.plan_items[0].description.as_ref(), "确认服务可达");
+        assert_eq!(local.plan_items[0].risk.as_ref(), "只读");
+        assert_eq!(
+            local.plan_items[0].tool.as_ref().map(|s| s.as_ref()),
+            Some("ping")
+        );
+        assert!(local.agent_options[0].selected);
+        assert!(acp.agent_options[1].selected);
+    }
+
+    #[test]
+    fn local_backend_option_is_not_named_after_a_specific_cli() {
+        let ctx = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+            None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(ctx.agent_options[0].label.as_ref(), "One Agent");
+    }
+
+    #[test]
+    fn composer_context_includes_running_subagents() {
+        let subagents = vec![
+            SubAgentCardData {
+                subagent_id: "sub_1".into(),
+                name: "reviewer".into(),
+                task: "检查事件流".into(),
+                running: true,
+                success: None,
+                summary: "正在读取事件".into(),
+            },
+            SubAgentCardData {
+                subagent_id: "sub_2".into(),
+                name: "done".into(),
+                task: "已完成任务".into(),
+                running: false,
+                success: Some(true),
+                summary: "完成".into(),
+            },
+        ];
+
+        let ctx = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+            None,
+            &subagents,
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(ctx.subagent_items.len(), 2);
+        assert_eq!(ctx.subagent_items[0].name.as_ref(), "reviewer");
+        assert_eq!(ctx.subagent_items[0].task.as_ref(), "检查事件流");
+        assert_eq!(ctx.subagent_items[0].summary.as_ref(), "正在读取事件");
+        assert_eq!(ctx.subagent_items[0].status.as_ref(), "running");
+        assert_eq!(ctx.subagent_items[1].name.as_ref(), "done");
+        assert_eq!(ctx.subagent_items[1].status.as_ref(), "completed");
+    }
+
+    #[test]
     fn header_agent_switcher_lists_and_labels_multiple_acp_agents() {
         let codex_id = SharedString::from("codex");
         let opencode_id = SharedString::from("opencode");
@@ -12943,13 +13948,7 @@ mod tests {
             )),
         ];
 
-        let options = composer_agent_options_with_status(
-            Backend::Acp,
-            &acp_agents,
-            Some(&opencode_id),
-            false,
-            &Default::default(),
-        );
+        let options = composer_agent_options(Backend::Acp, &acp_agents, Some(&opencode_id), false);
         let labels = options
             .iter()
             .map(|option| option.label.as_ref())
@@ -12968,13 +13967,7 @@ mod tests {
         let diagnostic = AcpConfigDiagnostic::new("缺少环境变量 OPENAI_API_KEY");
         let entries = vec![AcpAgentEntry::invalid("codex", "Codex", diagnostic.clone())];
 
-        let options = composer_agent_options_with_status(
-            Backend::Local,
-            &entries,
-            None,
-            false,
-            &Default::default(),
-        );
+        let options = composer_agent_options(Backend::Local, &entries, None, false);
 
         assert_eq!(2, options.len());
         assert_eq!("Codex", options[1].label.as_ref());
@@ -13028,12 +14021,11 @@ mod tests {
         });
 
         let labels = view.read_with(cx, |view, _| {
-            composer_agent_options_with_status(
+            composer_agent_options(
                 view.backend,
                 &view.acp_agents,
                 view.current_acp_id.as_ref(),
                 view.acp_connecting,
-                &Default::default(),
             )
             .iter()
             .map(|option| option.label.as_ref().to_string())
@@ -13048,13 +14040,7 @@ mod tests {
         let acp_agents = vec![AcpAgentEntry::ready(AcpAgentConfig::new(
             "codex", "Codex", "codex",
         ))];
-        let options = composer_agent_options_with_status(
-            Backend::Local,
-            &acp_agents,
-            None,
-            true,
-            &Default::default(),
-        );
+        let options = composer_agent_options(Backend::Local, &acp_agents, None, true);
 
         assert!(!agent_option_disabled(&options[0]));
         assert!(agent_option_disabled(&options[1]));
@@ -13096,16 +14082,25 @@ mod tests {
         state.apply_session_update(&SessionUpdate::UsageUpdate(UsageUpdate::new(42, 100)));
 
         let ctx = build_composer_context(
+            &ResourceContext::new(),
             ExecutionSelection::tool(ToolExecutionMode::Auto),
             None,
+            None,
+            &[],
             Backend::Acp,
+            &[],
+            None,
+            false,
             Some(state),
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
             None,
         );
 
-        assert_eq!(ctx.session_title.as_ref(), "ACP 工作会话");
-        let usage = ctx.context_usage.expect("agent 报了用量就该有读数");
-        assert_eq!((usage.used, usage.window), (42, Some(100)));
+        assert_eq!(ctx.target.unwrap().label.as_ref(), "ACP 工作会话");
+        assert_eq!(ctx.scopes[0].value.as_ref(), "Code");
+        assert_eq!(ctx.scopes[1].value.as_ref(), "42/100 tokens");
         assert!(ctx.capabilities.contains(&SharedString::from("ACP")));
         assert!(
             ctx.capabilities
@@ -13126,19 +14121,61 @@ mod tests {
             "deepseek-chat",
         );
         let ctx = build_composer_context(
+            &ResourceContext::new(),
             ExecutionSelection::tool(ToolExecutionMode::Auto),
             Some(&model),
-            Backend::Local,
             None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
             Some(1500),
         );
 
-        let usage = ctx.context_usage.expect("本地会话报过计量就该有读数");
-        assert_eq!((usage.used, usage.window), (1500, Some(128_000)));
+        let usage = ctx
+            .scopes
+            .iter()
+            .find(|scope| scope.key == "local-usage")
+            .expect("本地会话报过计量就应有用量 scope");
+        assert_eq!(usage.value.as_ref(), "1500/128000 tokens");
     }
 
     #[test]
-    fn context_usage_is_absent_until_the_model_reports_something() {
+    fn local_usage_without_a_known_window_shows_tokens_only() {
+        let model =
+            ComposerModelOption::new("custom-option", "custom", "Custom", "my-private-finetune");
+        let ctx = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            Some(&model),
+            None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            Some(1500),
+        );
+
+        let usage = ctx
+            .scopes
+            .iter()
+            .find(|scope| scope.key == "local-usage")
+            .expect("窗口未知也应展示 token 数");
+        assert_eq!(usage.value.as_ref(), "1500 tokens");
+    }
+
+    #[test]
+    fn local_usage_scope_is_absent_until_the_model_reports_something() {
         let model = ComposerModelOption::new(
             "deepseek-chat-option",
             "deepseek",
@@ -13146,16 +14183,25 @@ mod tests {
             "deepseek-chat",
         );
         let ctx = build_composer_context(
+            &ResourceContext::new(),
             ExecutionSelection::tool(ToolExecutionMode::Auto),
             Some(&model),
-            Backend::Local,
             None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
             None,
         );
 
         assert!(
-            ctx.context_usage.is_none(),
-            "模型还没报过计量,不该装作测过(留白比假数据好)"
+            !ctx.scopes.iter().any(|scope| scope.key == "local-usage"),
+            "模型还没报过计量,不该装作测过(空 chip 比假数据好)"
         );
     }
 
@@ -13192,6 +14238,32 @@ mod tests {
         assert_eq!(None, items[0].input_hint);
         assert_eq!(Some("what to research"), items[1].input_hint.as_deref());
         assert_eq!("/research ", items[1].insert_text());
+    }
+
+    #[test]
+    fn usage_scope_appends_cost_when_the_agent_reports_one() {
+        use agent_client_protocol::schema::v1::Cost;
+
+        let unbilled = AcpUsage {
+            used: 42,
+            size: 100,
+            cost: None,
+        };
+        assert_eq!("42/100 tokens", format_acp_usage(&unbilled));
+
+        let billed = AcpUsage {
+            used: 42,
+            size: 100,
+            cost: Some(Cost::new(0.0123, "USD")),
+        };
+        assert_eq!("42/100 tokens · 0.0123 USD", format_acp_usage(&billed));
+
+        let fractional = AcpUsage {
+            used: 1,
+            size: 2,
+            cost: Some(Cost::new(2.5, "EUR")),
+        };
+        assert_eq!("1/2 tokens · 2.5 EUR", format_acp_usage(&fractional));
     }
 
     #[gpui::test]

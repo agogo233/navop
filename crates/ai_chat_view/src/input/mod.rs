@@ -8,6 +8,7 @@ mod context;
 mod history;
 mod mention;
 mod model_picker;
+mod skill;
 mod slash;
 
 pub use acp_input::AcpAgentInput;
@@ -16,9 +17,12 @@ pub use attachment::ImageAttachment;
 pub(crate) use attachment::prepare_input_images;
 pub use context::{
     AgentComposerContext, ComposerAgentOption, ComposerBranchOption, ComposerMenuOption,
-    ComposerModel, ComposerModelOption, ComposerWorkspaceInfo, ComposerWorkspaceOption,
-    ComposerWorktreeState,
+    ComposerModel, ComposerModelOption, ComposerPlanItem, ComposerResourcePoolItem,
+    ComposerResourcePoolSummary, ComposerResourceSourceOption, ComposerResourceTypeFilter,
+    ComposerScope, ComposerSubAgentItem, ComposerTarget, ComposerWorkspaceInfo,
+    ComposerWorkspaceOption, ComposerWorktreeState,
 };
 pub(crate) use history::PromptHistory;
 pub use mention::{MentionCompletionProvider, MentionItem};
+pub use skill::{ComposerSkillItem, ComposerSkillSummary};
 pub use slash::SlashCommandItem;

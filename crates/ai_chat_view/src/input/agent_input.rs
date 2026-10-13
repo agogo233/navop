@@ -1,19 +1,21 @@
-//! 本地 One agent 的输入框:多行输入 + `@` 提及 + 图片附件 + 底部一行「模型 + 权限档位 + 发送」。
+//! 本地 One agent 的输入框:顶部能力区 + 多行输入 + `@` 提及 + 图片附件 + 底部发送栏。
 //!
-//! 只装**本地运行时自己的东西**,而且只留两个控件:上层注入的**模型下拉**与**权限档位**
-//!(即 ACP 那套工具执行模式)。计划 / 子代理 / 上下文资源 / 目标选择器 / Skill 入口 /
-//! 工作区·分支·Worktree / 用量圆环都不在这里——那些要么归 ACP 那份输入框
-//! ([`crate::input::AcpAgentInput`]),要么已经随本次精简撤掉。
+//! 只装**本地运行时自己的东西**:目标 / 计划 / 子代理 / 上下文资源 / Skill / 权限档位 /
+//! 工作区·分支·Worktree / `@` 提及。ACP agent 那两样——它声明的 `/` 命令与它会提出的
+//! 「agent 提问」——属于 [`crate::input::AcpAgentInput`],不在这份里:那份输入框才认识
+//! agent 声明了什么,也才需要替它收集答案。
 //!
-//! 布局:
+//! 布局参考 `agent-composer-design.html`:
+//! - **顶部能力区**:计划 / 子代理 / 上下文资源 / Skill;
 //! - **附件条**:编辑器顶部的附件入口 + 图片缩略图(粘贴 / 附加);
 //! - **编辑器**:基于 [`EditorState`] 的多行输入,注入 [`MentionCompletionProvider`] 实现 `@` 提及;
-//! - **底部一行**:附件 / 模型 / 权限档位 / 发送·停止。
+//! - **底部发送栏**:权限档位 / 工作区·分支·Worktree / 模式 / 模型 / 用量 / 发送。
 //!
 //! 设计原则:输入框是"哑组件",只接收 [`AgentComposerContext`] 做展示并在交互时 emit
-//! [`AgentInputEvent`];模型与执行模式都用上层注入的选项渲染内置下拉。
+//! [`AgentInputEvent`];目标用上层注入的列表渲染内置 popover(选中 emit `SelectTarget`),
+//! scope 仅 emit `PickScope` 交上层;模型 / 执行模式同样用注入选项渲染内置下拉。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,11 +24,13 @@ use gpui::{
     App, AppContext, Context, Entity, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, InteractiveElement, IntoElement, Modifiers, ParentElement, PathPromptOptions,
     Pixels, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
-    Subscription, Window, div, img, prelude::FluentBuilder, px,
+    Subscription, Window, div, img, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Editor, EditorState, InputEvent};
+use gpui_component::checkbox::Checkbox;
+use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
+use gpui_component::progress::ProgressCircle;
 use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{Select, SelectEvent, SelectGroup, SelectState};
 use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, h_flex, v_flex};
@@ -37,10 +41,17 @@ use serde_json::Value;
 use crate::input::PromptHistory;
 use crate::input::attachment::ImageAttachment;
 use crate::input::completion::ComposerCompletionProvider;
-use crate::input::context::{AgentComposerContext, ComposerMenuOption, ComposerModelOption};
+use crate::input::context::{
+    AgentComposerContext, ComposerBranchOption, ComposerMenuOption, ComposerModelOption,
+    ComposerPlanItem, ComposerResourcePoolItem, ComposerResourceSourceOption,
+    ComposerResourceTypeFilter, ComposerScope, ComposerSubAgentItem, ComposerTarget,
+    ComposerWorkspaceOption,
+};
 use crate::input::mention::{MentionCompletionProvider, MentionItem};
 use crate::input::model_picker::{ModelChoice, model_groups, selected_model_index};
-use crate::theme::{AgentChatTheme, sp};
+use crate::input::skill::{render_skill_mode_content, skill_trigger_label};
+use crate::theme::{AgentChatTheme, active_agent_chat_theme, sp};
+use crate::usage::{ContextUsage, UsagePressure, format_token_count};
 
 /// AgentInput 对外事件。
 #[derive(Clone, Debug)]
@@ -57,9 +68,19 @@ pub enum AgentInputEvent {
     /// 用户请求停止当前运行。
     Stop,
     /// 在顶部目标下拉中选择了目标。
+    SelectTarget { id: SharedString },
     /// 将资源加入本会话资源池。
+    AddResourceToPool { id: SharedString },
     /// 将资源移出本会话资源池。
+    RemoveResourceFromPool { id: SharedString },
     /// 选择资源池来源预设。
+    SelectResourceSource { id: SharedString },
+    /// 切换某个 Skill 是否注入本会话。
+    ToggleSkill { id: SharedString },
+    /// 从本地目录导入一个 Codex-style Skill。
+    ImportSkill { path: PathBuf },
+    /// 点击某个派生上下文 chip —— 上层据 `key` 弹出对应选择器。
+    PickScope { key: SharedString },
     /// 在内置下拉中选择了模型。
     SelectModel {
         id: SharedString,
@@ -93,6 +114,22 @@ pub enum AgentInputEvent {
     /// 附件变化不产生编辑器的 `InputEvent::Change`（图片不走文本编辑），
     /// 所以两头都要发：只挂在文字上，加完图直接关应用就会丢草稿。
     DraftChanged,
+}
+
+/// 内置下拉的种类(用于受控开合状态)。
+///
+/// 模型下拉不在这里:它交给组件库的 `Select`,开合由组件自己管。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerMenuKind {
+    Target,
+    Skill,
+    Plan,
+    SubAgent,
+    Mode,
+    /// 底部上下文栏的工作区下拉。
+    Workspace,
+    /// 底部上下文栏的分支下拉。
+    Branch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,21 +172,33 @@ impl QueuedPromptPreview {
     }
 }
 
+const CONTEXT_POPOVER_WIDTH: f32 = 400.0;
+const CONTEXT_TARGET_LIST_MAX_HEIGHT: f32 = 320.0;
+const CONTEXT_KIND_MAX_WIDTH: f32 = 92.0;
 const COMPOSER_EDITOR_MIN_ROWS: usize = 3;
 const COMPOSER_EDITOR_MAX_ROWS: usize = 10;
 const COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT: f32 = 20.0;
 const COMPOSER_EDITOR_VERTICAL_PADDING: f32 = 12.0;
 /// 底部工具栏操作按钮(发送 / 排队 / 停止)的边长,同时也是工具栏控件高度。
 const TOOLBAR_ACTION_BUTTON_SIZE: f32 = 32.0;
-/// 底部那一行里权限档位 chip 的固定高度。
+/// 工具栏右侧上下文用量圆环的直径。
 ///
-/// 与发送 / 附件按钮同高：整行只有一种控件高度，并排时不会参差。
+/// 取 20:比 32 的按钮小一号,不跟发送键抢视线,又能把百分比读出来。
+const USAGE_GAUGE_DIAMETER: f32 = 20.0;
+/// 底部那一行里上下文档位 chip 的固定高度。
+///
+/// 与发送 / 附件按钮同高：整行只有一种控件高度，7 项并排时不会参差。
 const COMPOSER_CHIP_HEIGHT: f32 = TOOLBAR_ACTION_BUTTON_SIZE;
-/// 权限档位 chip 收缩到的最小宽度（标签走省略号）。
+/// 上下文档位 chip 收缩到的最小宽度（标签走省略号）。
 ///
-/// 窄侧栏里模型与权限档位仍要在同一行：宽度不足靠 `flex_shrink` + `truncate` 消化，
-/// 完整内容在点击后弹出的菜单里。
+/// 侧栏被拖窄时 7 项仍要在同一行：宽度不足靠 `flex_shrink` + `truncate` 消化，
+/// 每项的完整内容在点击后弹出的菜单 / 弹层里。
 const COMPOSER_CHIP_MIN_WIDTH: f32 = 44.0;
+/// 上下文档位 chip 的自然宽度上限。
+///
+/// 工作区目录名、分支名都可能很长；不设上限的话一项就能吃掉整行，
+/// 把其余 chip 挤到只剩省略号。
+const COMPOSER_CHIP_MAX_WIDTH: f32 = 220.0;
 /// 下拉触发器里除文字外的固定占位:左右内边距 + 箭头 + 间距。
 const TRIGGER_CHROME_WIDTH: f32 = 48.0;
 /// 模型触发器在这一行里能被压到的最小宽度。
@@ -199,6 +248,16 @@ fn composer_chip_label(icon: IconName, label: SharedString) -> impl IntoElement 
         .child(Icon::new(IconName::ChevronDown).xsmall().flex_shrink_0())
 }
 
+/// 上下文档位 chip 的自然宽度:按标签估算后夹在区间内。
+///
+/// 这一行固定 7 项(`[附件][工作区][分支][模型][Worktree][权限][发送]`),
+/// 谁都不能无条件铺满:这里给的是「内容想要的宽度」,空间不够时由容器的
+/// `flex_shrink` + 标签 `truncate` 消化,而不是让某一项独占整行。
+fn composer_chip_width(label: &str) -> gpui::Rems {
+    sp((estimated_label_width(label) + TRIGGER_CHROME_WIDTH)
+        .clamp(COMPOSER_CHIP_MIN_WIDTH, COMPOSER_CHIP_MAX_WIDTH))
+}
+
 /// 模型下拉弹层的宽度:按最长的选项估,保证点开能读到完整的 `provider / model`。
 ///
 /// 不能沿用组件库默认值(那是「触发器多宽弹层多宽」,见 [`MODEL_MENU_MIN_WIDTH`]),
@@ -218,6 +277,13 @@ fn model_menu_width(options: &[ComposerModelOption]) -> gpui::Rems {
         })
         .fold(0.0_f32, f32::max);
     sp((longest + MODEL_MENU_CHROME_WIDTH).clamp(MODEL_MENU_MIN_WIDTH, MODEL_MENU_MAX_WIDTH))
+}
+
+fn menu_state_after_open_change(
+    requested_open: bool,
+    menu: ComposerMenuKind,
+) -> Option<ComposerMenuKind> {
+    requested_open.then_some(menu)
 }
 
 fn current_execution_mode_label(label: &SharedString) -> SharedString {
@@ -275,6 +341,7 @@ pub struct AgentInput {
     input_state: Entity<EditorState>,
     /// 可被 `@` 引用的条目(同时用于补全 provider 与提交时解析)。
     mentions: Arc<Vec<MentionItem>>,
+    /// 可被 `/` 补全的命令；来源是 ACP agent 推送的 `available_commands`。
     /// 当前图片附件。
     attachments: Vec<ImageAttachment>,
     /// 正在放大预览的附件 id。
@@ -290,21 +357,41 @@ pub struct AgentInput {
     pending_queue_blocked: bool,
     /// 是否正在运行(运行中显示「停止」)。
     is_running: bool,
-    /// 上层注入的展示上下文（模型与权限档位的当前文案）。
+    /// 上层注入的展示上下文(目标 / scope / 能力 / 模型 / 模式文案)。
     context: AgentComposerContext,
+    /// 目标下拉选项(上层注入)。
+    target_options: Vec<ComposerTarget>,
     /// 模型下拉选项(上层注入)。
     model_options: Vec<ComposerModelOption>,
     /// 模型下拉的组件库状态。
     ///
     /// 选项的注入点只有 `Context`、拿不到窗口，而 `SelectState` 的更新需要窗口；
-    /// 所以注入时只置脏标记，真正的同步在 `render`(持有窗口)时做。
+    /// 所以注入时只置脏标记，真正的同步在 `render`(持有窗口)时做 ——
+    /// 与 `context_search_needs_reset` 同一个套路。
     model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>>,
     /// 见 `model_select`:注入新选项后置位,`render` 消费后清掉。
     model_select_dirty: bool,
-    /// 权限档位下拉的选项(上层注入)。
+    /// 工具执行模式下拉选项(上层注入)。
     execution_mode_options: Vec<ComposerMenuOption>,
-    /// 权限档位下拉的开合(受控)。
-    mode_menu_open: bool,
+    /// 上下文面板的目标搜索框(与顶部输入框分离,避免抢焦点 / 拦截回车提交)。
+    context_search_input: Entity<InputState>,
+    /// 上下文面板当前搜索关键字(每次打开面板时重置为空)。
+    context_search_query: SharedString,
+    /// 当前资源类型筛选。`all` 表示显示全部资源。
+    selected_resource_kind_filter: SharedString,
+    /// 打开上下文面板时置位,下次 render 时据此清空搜索框(需 &mut Window)。
+    context_search_needs_reset: bool,
+    /// 当前展开的下拉(受控开合)。
+    open_menu: Option<ComposerMenuKind>,
+    /// 用量详情 popover 的开合。
+    ///
+    /// 单独一个 bool 而不是塞进 `open_menu`：它是**受控**的——点「查看历史」要
+    /// 顺手把它收起来，让用量历史浮层不被自己的 popover 压住。
+    usage_detail_open: bool,
+    /// 顶部计划面板中已展开的只读计划项。
+    expanded_plan_items: HashSet<String>,
+    /// 是否折叠顶部计划 / Agent / 上下文能力区。
+    top_capabilities_collapsed: bool,
     /// 可选的局部聊天主题。终端侧边栏会注入终端主题,普通 Agent tab 继续使用应用主题。
     theme: Option<AgentChatTheme>,
     edge_to_edge: bool,
@@ -410,6 +497,27 @@ impl AgentInput {
             }
         });
 
+        let context_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("AgentUi.search_targets").to_string())
+                .clean_on_escape()
+        });
+        let context_search_sub = cx.subscribe_in(
+            &context_search_input,
+            window,
+            |this: &mut Self,
+             input: &Entity<InputState>,
+             event: &InputEvent,
+             _window,
+             cx: &mut Context<Self>| {
+                if let InputEvent::Change = event {
+                    let query = input.read(cx).text().to_string();
+                    this.context_search_query = SharedString::from(query);
+                    cx.notify();
+                }
+            },
+        );
+
         // 模型下拉交给组件库的 `Select`(自带搜索框、虚拟滚动与键盘导航)。
         // 选项这里先留空:它由 `set_menu_options` 置脏、`render` 里带窗口灌进去。
         let model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>> =
@@ -451,14 +559,28 @@ impl AgentInput {
             pending_queue_blocked: false,
             is_running: false,
             context: AgentComposerContext::default(),
+            target_options: Vec::new(),
             model_options: Vec::new(),
             model_select,
             model_select_dirty: false,
             execution_mode_options: Vec::new(),
-            mode_menu_open: false,
+            context_search_input,
+            context_search_query: SharedString::default(),
+            selected_resource_kind_filter: SharedString::from("all"),
+            context_search_needs_reset: false,
+            open_menu: None,
+            usage_detail_open: false,
+            expanded_plan_items: HashSet::new(),
+            top_capabilities_collapsed: false,
             theme: None,
             edge_to_edge: false,
-            _subscriptions: vec![enter_sub, paste_sub, history_sub, model_select_sub],
+            _subscriptions: vec![
+                enter_sub,
+                paste_sub,
+                history_sub,
+                context_search_sub,
+                model_select_sub,
+            ],
         }
     }
 
@@ -510,6 +632,15 @@ impl AgentInput {
         cx.notify();
     }
 
+    /// 注入顶部目标下拉的选项。
+    pub fn set_target_options(&mut self, options: Vec<ComposerTarget>, cx: &mut Context<Self>) {
+        if options.is_empty() {
+            self.selected_resource_kind_filter = SharedString::from("all");
+        }
+        self.target_options = options;
+        cx.notify();
+    }
+
     /// 注入底部模型与工具执行模式下拉的选项。
     pub fn set_menu_options(
         &mut self,
@@ -526,18 +657,12 @@ impl AgentInput {
         cx.notify();
     }
 
-    /// 运行旗标（测试断言用）。
-    #[cfg(test)]
-    pub(crate) fn is_running(&self) -> bool {
-        self.is_running
-    }
-
     /// 设置运行状态(决定显示「发送」还是「停止」)。
     pub fn set_running(&mut self, running: bool, cx: &mut Context<Self>) {
         if self.is_running != running {
             self.is_running = running;
             if running {
-                self.mode_menu_open = false;
+                self.open_menu = None;
             }
             cx.notify();
         }
@@ -778,6 +903,16 @@ impl AgentInput {
         .detach();
     }
 
+    pub(super) fn toggle_skill(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        if !self.is_running {
+            cx.emit(AgentInputEvent::ToggleSkill { id });
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.is_running
+    }
+
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
         self.attachments.retain(|a| a.id != id);
         cx.emit(AgentInputEvent::DraftChanged);
@@ -788,13 +923,276 @@ impl AgentInput {
         cx.notify();
     }
 
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .when(!self.top_capabilities_collapsed, |this| {
+                this.border_b_1()
+                    .border_color(theme.border)
+                    .child(self.render_mode_tabs(cx))
+            })
+    }
+
+    fn render_mode_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+        v_flex().w_full().px_3().pt_2().pb_1p5().child(
+            h_flex()
+                .w_full()
+                .h(sp(38.0))
+                .items_center()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.panel)
+                .child(self.render_plan_mode_tab(cx))
+                .child(self.render_mode_separator(cx))
+                .child(self.render_subagent_mode_tab(cx))
+                .child(self.render_mode_separator(cx))
+                .child(self.render_context_mode_tab(cx))
+                .child(self.render_mode_separator(cx))
+                .child(self.render_skill_mode_tab(cx)),
+        )
+    }
+
+    fn render_plan_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(ComposerMenuKind::Plan);
+        let plan_items = self.context.plan_items.clone();
+        let expanded_items = self.expanded_plan_items.clone();
+        let trigger_label = plan_trigger_label(&plan_items);
+
+        Popover::new("agent-plan-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        this.open_menu = menu_state_after_open_change(open, ComposerMenuKind::Plan);
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(self.render_capability_trigger(
+                "agent-plan-trigger",
+                trigger_label,
+                IconName::Check,
+                cx,
+            ))
+            .content({
+                let view = view.clone();
+                move |_state, _window, cx| {
+                    render_plan_mode_content(
+                        view.clone(),
+                        plan_items.clone(),
+                        expanded_items.clone(),
+                        cx,
+                    )
+                }
+            })
+    }
+
+    fn render_subagent_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(ComposerMenuKind::SubAgent);
+        let subagents = self.context.subagent_items.clone();
+        let trigger_label = subagent_trigger_label(&subagents);
+
+        Popover::new("agent-subagents-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        this.open_menu =
+                            menu_state_after_open_change(open, ComposerMenuKind::SubAgent);
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(self.render_capability_trigger(
+                "agent-subagents-trigger",
+                trigger_label,
+                IconName::Bot,
+                cx,
+            ))
+            .content({
+                move |_state, _window, cx| render_subagent_mode_content(subagents.clone(), cx)
+            })
+    }
+
+    fn render_capability_trigger(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        icon: IconName,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let label = label.into();
+        let theme = self.local_theme(cx);
+        Button::new(id)
+            .debug_selector(move || id.to_string())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .ghost()
+            .small()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(icon).xsmall())
+                    .child(div().text_sm().truncate().child(label)),
+            )
+    }
+
+    fn render_context_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(ComposerMenuKind::Target);
+        let options = self.target_options.clone();
+        let current = self.context.target.clone();
+        let scopes = self.context.scopes.clone();
+        let pool_items = self.context.resource_pool_items.clone();
+        let source_options = self.context.resource_source_options.clone();
+        let search_input = self.context_search_input.clone();
+        let search_query = self.context_search_query.clone();
+        let selected_kind = self.selected_resource_kind_filter.clone();
+        let filters = self
+            .context
+            .resource_type_filters
+            .iter()
+            .cloned()
+            .map(|mut filter| {
+                filter.selected = filter.id == selected_kind;
+                filter
+            })
+            .collect::<Vec<_>>();
+
+        Popover::new("agent-context-mode-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        let became_open =
+                            menu_state_after_open_change(open, ComposerMenuKind::Target);
+                        this.open_menu = became_open;
+                        // 标记在下次 render 时重置搜索框(render 持有 &mut Window,可安全 set_value)。
+                        if became_open.is_some() {
+                            this.context_search_needs_reset = true;
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(self.render_context_mode_trigger(cx))
+            .content({
+                let view = view.clone();
+                move |_state, _window, cx| {
+                    render_context_mode_content(
+                        view.clone(),
+                        options.clone(),
+                        current.clone(),
+                        scopes.clone(),
+                        pool_items.clone(),
+                        source_options.clone(),
+                        filters.clone(),
+                        selected_kind.clone(),
+                        search_input.clone(),
+                        search_query.clone(),
+                        cx,
+                    )
+                }
+            })
+    }
+
+    fn render_context_mode_trigger(&self, cx: &mut Context<Self>) -> Button {
+        let theme = self.local_theme(cx);
+        let fg = if self.context.target.is_some() {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        Button::new("agent-context-mode")
+            .debug_selector(|| "agent-context-mode".to_string())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .ghost()
+            .small()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .text_color(fg)
+                    .child(Icon::new(IconName::File).xsmall())
+                    .child(
+                        div()
+                            .text_sm()
+                            .truncate()
+                            .child(resource_pool_trigger_label(&self.context)),
+                    ),
+            )
+    }
+
+    fn render_skill_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(ComposerMenuKind::Skill);
+        let summary = self.context.skill_summary.clone();
+        let items = self.context.skill_items.clone();
+
+        Popover::new("agent-skill-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        this.open_menu =
+                            menu_state_after_open_change(open, ComposerMenuKind::Skill);
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(self.render_capability_trigger(
+                "agent-skill-trigger",
+                skill_trigger_label(&summary),
+                IconName::BookOpen,
+                cx,
+            ))
+            .content({
+                move |_state, _window, cx| {
+                    render_skill_mode_content(view.clone(), summary.clone(), items.clone(), cx)
+                }
+            })
+    }
+
+    fn render_mode_separator(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+        div().h(sp(20.0)).w(px(1.0)).bg(theme.border)
+    }
+
     /// 底部那一行的「权限级别」下拉。
     ///
     /// 承载的仍是 ACP 工具执行模式(自动 / 只读 / 手动确认):状态、选项与回调都与
     /// 原先工具栏里的那个下拉一致,只是收成了 chip 形态。
     fn render_permission_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let view = cx.entity();
-        let is_open = self.mode_menu_open;
+        let is_open = self.open_menu == Some(ComposerMenuKind::Mode);
         let label = current_execution_mode_label(&self.context.execution_mode_label);
         let data = ModeContentData {
             execution_mode_label: label.clone(),
@@ -833,7 +1231,11 @@ impl AgentInput {
                         move |open, _window, cx| {
                             let open = *open;
                             view.update(cx, |this, cx| {
-                                this.mode_menu_open = open && !this.is_running;
+                                this.open_menu = if open && !this.is_running {
+                                    Some(ComposerMenuKind::Mode)
+                                } else {
+                                    None
+                                };
                                 cx.notify();
                             });
                         }
@@ -849,19 +1251,212 @@ impl AgentInput {
             )
     }
 
-    /// 底部那一行里「附件 / 模型与权限 / 操作按钮」三段中的中间段。
+    /// 底部那一行的「分支」下拉。
     ///
-    /// 本地 agent 的下拉只有两个：**模型**与**权限档位**。工作区 / 分支 / Worktree /
-    /// 目标选择器、用量圆环都不在这里——那些是 ACP 那份输入框的事（见
-    /// [`crate::input::AcpAgentInput`]）。
+    /// 选项由上层注入(见 [`AgentComposerContext::branch_options`]);选中后只 emit
+    /// [`AgentInputEvent::SelectBranch`],真正的切分支动作交给宿主。
+    fn render_branch_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(ComposerMenuKind::Branch);
+        let current = self
+            .context
+            .branch_options
+            .iter()
+            .find(|branch| branch.current)
+            .map(|branch| branch.name.clone())
+            .unwrap_or_else(|| SharedString::from(t!("AgentUi.composer_branch").to_string()));
+        let options = self.context.branch_options.clone();
+
+        let theme = self.local_theme(cx);
+        let trigger = themed_outline_button(
+            Button::new("agent-branch")
+                .debug_selector(|| "agent-input-branch".to_string())
+                .small()
+                .w_full()
+                .h(sp(COMPOSER_CHIP_HEIGHT))
+                .justify_between()
+                .outline()
+                .disabled(self.is_running)
+                .child(composer_chip_label(IconName::GitBranch, current.clone())),
+            &theme,
+        );
+
+        div()
+            .w(composer_chip_width(&current))
+            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .flex_shrink(1.0)
+            .h(sp(COMPOSER_CHIP_HEIGHT))
+            .overflow_hidden()
+            .child(
+                Popover::new("agent-branch-popover")
+                    .p_0()
+                    .open(is_open)
+                    .trigger_style(StyleRefinement::default().w_full())
+                    .on_open_change({
+                        let view = view.clone();
+                        move |open, _window, cx| {
+                            let open = *open;
+                            view.update(cx, |this, cx| {
+                                this.open_menu = if open && !this.is_running {
+                                    Some(ComposerMenuKind::Branch)
+                                } else {
+                                    None
+                                };
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .trigger(trigger)
+                    .content({
+                        let view = view.clone();
+                        let theme = theme.clone();
+                        move |_state, _window, cx| {
+                            render_branch_content(view.clone(), options.clone(), &theme, cx)
+                        }
+                    }),
+            )
+    }
+
+    /// 底部那一行的「工作区」下拉。
     ///
-    /// 这一组独占剩余宽度：空间不足时先由本组自己的 `overflow_hidden` 兜底，
-    /// 绝不把右侧的发送按钮挤出可视区。
+    /// 候选由上层注入(见 [`AgentComposerContext::workspace_options`])，与左侧会话
+    /// 导航里的工作区下拉同源。这里不自行实现选择逻辑：选中只 emit
+    /// [`AgentInputEvent::SelectWorkspace`]，「会话已有消息则在新工作区开新对话」的
+    /// 判定留在宿主。
+    fn render_workspace_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(ComposerMenuKind::Workspace);
+        let label = if self.context.workspace.label.is_empty() {
+            SharedString::from(t!("AgentUi.composer_pick_workspace").to_string())
+        } else {
+            self.context.workspace.label.clone()
+        };
+        let options = self.context.workspace_options.clone();
+        let current_path = self.context.workspace.path.clone();
+
+        let theme = self.local_theme(cx);
+        let trigger = themed_outline_button(
+            Button::new("agent-workspace")
+                .debug_selector(|| "agent-input-workspace".to_string())
+                .small()
+                .w_full()
+                .h(sp(COMPOSER_CHIP_HEIGHT))
+                .justify_between()
+                .outline()
+                .disabled(self.is_running)
+                .tooltip(
+                    current_path
+                        .clone()
+                        .map(|path| path.to_string())
+                        .unwrap_or_else(|| t!("AgentUi.composer_pick_workspace").to_string()),
+                )
+                .child(composer_chip_label(IconName::Workspace, label.clone())),
+            &theme,
+        );
+
+        div()
+            .w(composer_chip_width(&label))
+            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .flex_shrink(1.0)
+            .h(sp(COMPOSER_CHIP_HEIGHT))
+            .overflow_hidden()
+            .child(
+                Popover::new("agent-workspace-popover")
+                    .p_0()
+                    .open(is_open)
+                    .trigger_style(StyleRefinement::default().w_full())
+                    .on_open_change({
+                        let view = view.clone();
+                        move |open, _window, cx| {
+                            let open = *open;
+                            view.update(cx, |this, cx| {
+                                this.open_menu = if open && !this.is_running {
+                                    Some(ComposerMenuKind::Workspace)
+                                } else {
+                                    None
+                                };
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .trigger(trigger)
+                    .content({
+                        let view = view.clone();
+                        let theme = theme.clone();
+                        move |_state, _window, cx| {
+                            render_workspace_content(
+                                view.clone(),
+                                options.clone(),
+                                current_path.clone(),
+                                &theme,
+                                cx,
+                            )
+                        }
+                    }),
+            )
+    }
+
+    /// 底部那一行的「Worktree」勾选。
+    ///
+    /// 勾选态来自 [`ComposerWorktreeState::enabled`];切换只 emit
+    /// [`AgentInputEvent::ToggleWorktree`],建/切 worktree 由宿主完成。
+    ///
+    /// 勾选后不会立刻创建:宿主只记下意图,等本会话第一次发送时才建
+    /// (见 `ComposerWorktreeState::pending`)。所以待创建阶段的 tooltip
+    /// 要改成「首次对话时创建」,否则用户会以为勾完就已经建好了。
+    fn render_worktree_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let label = self
+            .context
+            .worktree
+            .label
+            .clone()
+            .unwrap_or_else(|| SharedString::from(t!("AgentUi.composer_worktree").to_string()));
+        let checked = self.context.worktree.enabled;
+        let hint = if self.context.worktree.pending {
+            t!("AgentUi.composer_worktree_pending").to_string()
+        } else {
+            t!("AgentUi.composer_worktree_hint").to_string()
+        };
+
+        div()
+            .debug_selector(|| "agent-input-worktree".to_string())
+            .w(composer_chip_width(&label))
+            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .flex_shrink(1.0)
+            .h(sp(COMPOSER_CHIP_HEIGHT))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .child(
+                Checkbox::new("agent-worktree-toggle")
+                    .checked(checked)
+                    .disabled(self.is_running)
+                    .tooltip(hint)
+                    .label(label)
+                    .on_click(move |checked, _window, cx| {
+                        let enabled = *checked;
+                        view.update(cx, |this, cx| {
+                            this.open_menu = None;
+                            cx.emit(AgentInputEvent::ToggleWorktree { enabled });
+                            cx.notify();
+                        });
+                    }),
+            )
+    }
+
+    /// 底部那一行里「附件 / 上下文档位 / 操作按钮」三段中的中间段。
+    ///
+    /// 顺序:`[工作区][分支][模型][Worktree][权限]`(非 Git 工作区里分支与 Worktree 隐藏)。
+    /// 这一组独占剩余宽度:空间不足时先在组内 `flex_shrink` + `truncate` 消化,
+    /// 由本组自己的 `overflow_hidden` 兜底,绝不把右侧的发送按钮挤出可视区。
     fn render_context_group(
         &self,
         cx: &mut Context<Self>,
         row_gap: gpui::Rems,
     ) -> impl IntoElement + use<> {
+        let is_git_repo =
+            self.context.workspace.is_git_repo || !self.context.branch_options.is_empty();
         let model_label = match &self.context.model {
             Some(m) if m.model_only => m.model.clone(),
             Some(m) => SharedString::from(format!("{} / {}", m.provider, m.model)),
@@ -876,9 +1471,7 @@ impl AgentInput {
         let model_menu_width = model_menu_width(&self.model_options);
         let action_button_size = sp(TOOLBAR_ACTION_BUTTON_SIZE);
 
-        // 模型用 `flex_1` 吸收整行余量:它是唯一需要「搜索 + 滚动 + 键盘导航」的控件,
-        // 权限 chip 保持内容宽度。
-        h_flex()
+        let mut group = h_flex()
             .debug_selector(|| "agent-input-context-group".to_string())
             .flex_1()
             .min_w_0()
@@ -886,16 +1479,25 @@ impl AgentInput {
             .items_center()
             .gap(row_gap)
             .text_color(self.local_theme(cx).foreground)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(sp(model_min_width))
-                    .h(action_button_size)
-                    .overflow_hidden()
-                    .child(self.render_model_menu(model_label, model_menu_width))
-                    .debug_selector(|| "agent-input-model-control".to_string()),
-            )
-            .child(self.render_permission_menu(cx))
+            .child(self.render_workspace_menu(cx));
+        if is_git_repo {
+            group = group.child(self.render_branch_menu(cx));
+        }
+        // 模型留在这一行中间:它是唯一需要「搜索 + 滚动 + 键盘导航」的控件,
+        // 用 `flex_1` 吸收整行余量,其余项保持内容宽度。
+        group = group.child(
+            div()
+                .flex_1()
+                .min_w(sp(model_min_width))
+                .h(action_button_size)
+                .overflow_hidden()
+                .child(self.render_model_menu(model_label, model_menu_width))
+                .debug_selector(|| "agent-input-model-control".to_string()),
+        );
+        if is_git_repo {
+            group = group.child(self.render_worktree_toggle(cx));
+        }
+        group.child(self.render_permission_menu(cx))
     }
 
     /// 模型下拉:交给组件库的 `Select` —— 搜索框、滚动、键盘导航都由它提供。
@@ -1085,8 +1687,9 @@ impl AgentInput {
         )
     }
 
-    fn render_editor_top_bar(&self) -> impl IntoElement + use<> {
-        // 附件入口在底部 chips 行（render_toolbar）；顶栏只剩撤销，靠右排布。
+    fn render_editor_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        // Finch 式改版：附件入口迁到底部 chips 行（render_toolbar），顶栏只留
+        // 能力折叠与撤销，靠右排布。
         h_flex()
             .w_full()
             .items_center()
@@ -1095,12 +1698,97 @@ impl AgentInput {
             .pt_2()
             .pb_1()
             .child(
+                Button::new("agent-editor-menu")
+                    .icon(if self.top_capabilities_collapsed {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .ghost()
+                    .small()
+                    .tooltip(t!("AgentUi.collapse_capabilities").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.top_capabilities_collapsed = !this.top_capabilities_collapsed;
+                        if this.top_capabilities_collapsed {
+                            this.open_menu = None;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
                 Button::new("agent-editor-undo")
                     .icon(IconName::Undo)
                     .ghost()
                     .small()
                     .tooltip(t!("AgentUi.undo").to_string()),
             )
+    }
+
+    /// 底部工具栏右侧的上下文用量圆环。
+    ///
+    /// 数据来自 [`AgentComposerContext::context_usage`](crate::input::context::AgentComposerContext);
+    /// 本地后端与 ACP 侧走同一条通路。没有读数时整块不渲染,不留空位——
+    /// 没数据就不占地方摆一个空圈。
+    ///
+    /// 颜色随占用分档:常规 accent、70% 起转 warning、90% 起转 danger。
+    /// 圆环本身是按钮:点开看完整读数（已用 / 上限 / 剩余 / 费用）。
+    fn render_usage_gauge(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let usage = self.context.context_usage.clone()?;
+        let theme = self.local_theme(cx);
+        let color = usage_color(&usage, &theme);
+        let percent = usage.percent().unwrap_or(0.0);
+        let label = usage.gauge_label();
+        let detail = usage.detail_text();
+        let view = cx.entity();
+        let trigger = Button::new("agent-input-usage-gauge")
+            .debug_selector(|| "agent-input-usage-gauge".to_string())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(sp(6.0))
+                    .child(
+                        div().size(sp(USAGE_GAUGE_DIAMETER)).child(
+                            ProgressCircle::new("agent-input-usage")
+                                .value(percent)
+                                .color(color)
+                                .accessibility_label(detail),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    ),
+            )
+            .ghost()
+            .small()
+            .px_0();
+        Some(
+            Popover::new("agent-usage-popover")
+                // 触发只有 Button 实现了 `Selectable`；圆环与百分比作为按钮内容。
+                .trigger(trigger)
+                // 受控开合：详情里的「查看历史」要能把它关上。
+                .open(self.usage_detail_open)
+                .on_open_change({
+                    let view = view.clone();
+                    move |open, _window, cx| {
+                        let open = *open;
+                        view.update(cx, |this, cx| {
+                            if this.usage_detail_open != open {
+                                this.usage_detail_open = open;
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .content({
+                    let view = view.clone();
+                    move |_state, _window, _cx| render_usage_detail(&usage, &theme, view.clone())
+                }),
+        )
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1132,7 +1820,7 @@ impl AgentInput {
             )
             .child(div().h(sp(18.0)).w(px(1.0)).bg(theme.border));
 
-        // 中段:模型 + 权限档位。
+        // 中段:工作区 / 分支 / 模型 / Worktree / 权限。
         let context_group = self.render_context_group(cx, row_gap);
 
         let mut toolbar = h_flex()
@@ -1148,7 +1836,8 @@ impl AgentInput {
             .overflow_hidden()
             .flex_shrink_0()
             .child(attach_group)
-            .child(context_group);
+            .child(context_group)
+            .children(self.render_usage_gauge(cx));
 
         if queue_mode {
             toolbar = toolbar
@@ -1266,16 +1955,6 @@ struct ModeOptionRow {
     selected: bool,
 }
 
-fn context_group_label(label: impl Into<SharedString>, theme: &AgentChatTheme) -> gpui::AnyElement {
-    div()
-        .px_2()
-        .py_1()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(label.into())
-        .into_any_element()
-}
-
 fn render_mode_content(
     view: Entity<AgentInput>,
     data: ModeContentData,
@@ -1347,7 +2026,7 @@ fn mode_option_row(
                 if this.is_running {
                     return;
                 }
-                this.mode_menu_open = false;
+                this.open_menu = None;
                 cx.emit(AgentInputEvent::SelectExecutionMode { id });
                 cx.notify();
             });
@@ -1356,6 +2035,1225 @@ fn mode_option_row(
 }
 
 /// 工作区下拉的菜单内容。
+fn render_workspace_content(
+    view: Entity<AgentInput>,
+    options: Vec<ComposerWorkspaceOption>,
+    current_path: Option<SharedString>,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let mut col = v_flex()
+        .p_1()
+        .gap(sp(2.0))
+        .min_w(sp(260.0))
+        .bg(theme.background)
+        .text_color(theme.foreground);
+
+    col = col.child(context_group_label(
+        t!("AgentUi.workspace").to_string(),
+        theme,
+    ));
+
+    if options.is_empty() {
+        col = col.child(
+            div()
+                .px_2()
+                .py_2()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(t!("AgentUi.composer_workspace_empty").to_string()),
+        );
+    } else {
+        for option in options {
+            let current = current_path.as_deref() == Some(option.path.as_ref());
+            col = col.child(workspace_option_row(
+                view.clone(),
+                option,
+                current,
+                theme,
+                cx,
+            ));
+        }
+    }
+
+    // 与候选列表之间加一条分隔线：下面这项是「打开新目录」，不是同级候选。
+    col.child(div().my_1().h(px(1.0)).w_full().bg(theme.border))
+        .child(browse_workspace_row(view, theme, cx))
+        .into_any_element()
+}
+
+/// 工作区下拉里的一行候选。
+fn workspace_option_row(
+    view: Entity<AgentInput>,
+    option: ComposerWorkspaceOption,
+    current: bool,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let muted = theme.muted_foreground;
+    let hover_bg = theme.hover_background();
+    let selected_bg = theme.selection_background();
+    let accent = theme.accent;
+
+    h_flex()
+        .id(option.element_id())
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .rounded(cx.theme().radius)
+        .cursor_pointer()
+        .when(current, |this| this.bg(selected_bg))
+        .hover(move |this| this.bg(hover_bg))
+        .child(Icon::new(IconName::Folder).xsmall().flex_shrink_0())
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.0))
+                .child(div().text_sm().truncate().child(option.label.clone()))
+                // 完整路径作为副标题：重名目录靠它区分。
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(option.path.clone()),
+                ),
+        )
+        .when(current, |this| {
+            this.child(Icon::new(IconName::Check).xsmall().text_color(accent))
+        })
+        .on_click(move |_, _, cx| {
+            let path = option.path.clone();
+            view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                this.open_menu = None;
+                cx.emit(AgentInputEvent::SelectWorkspace { path });
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+/// 工作区下拉里的「选择其它目录…」：交给宿主弹目录选择器。
+fn browse_workspace_row(
+    view: Entity<AgentInput>,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let hover_bg = theme.hover_background();
+
+    h_flex()
+        .id("composer-workspace-browse")
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .rounded(cx.theme().radius)
+        .cursor_pointer()
+        .hover(move |this| this.bg(hover_bg))
+        .child(Icon::new(IconName::Plus).xsmall().flex_shrink_0())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .truncate()
+                .child(t!("AgentUi.composer_browse_workspace").to_string()),
+        )
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                this.open_menu = None;
+                cx.emit(AgentInputEvent::BrowseWorkspace);
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+/// 分支下拉的菜单内容。
+fn render_branch_content(
+    view: Entity<AgentInput>,
+    options: Vec<ComposerBranchOption>,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let mut col = v_flex()
+        .p_1()
+        .gap(sp(2.0))
+        .min_w(sp(260.0))
+        .bg(theme.background)
+        .text_color(theme.foreground);
+
+    col = col.child(context_group_label(
+        t!("AgentUi.composer_branch").to_string(),
+        theme,
+    ));
+
+    if options.is_empty() {
+        return col
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("AgentUi.composer_branch_empty").to_string()),
+            )
+            .into_any_element();
+    }
+
+    for option in options {
+        col = col.child(branch_option_row(view.clone(), option, theme, cx));
+    }
+
+    col.into_any_element()
+}
+
+/// 分支下拉里的一行。
+fn branch_option_row(
+    view: Entity<AgentInput>,
+    option: ComposerBranchOption,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let muted = theme.muted_foreground;
+    let hover_bg = theme.hover_background();
+    let selected_bg = theme.selection_background();
+    let selected_fg = theme.accent;
+    let current = option.current;
+    let remote = option.remote;
+    let name = option.name.clone();
+    let row_id = option.element_id();
+
+    let mut inner = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap(px(1.0))
+        .child(div().text_sm().truncate().child(name.clone()));
+    if remote {
+        inner = inner.child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(t!("AgentUi.composer_branch_remote").to_string()),
+        );
+    }
+
+    h_flex()
+        .id(row_id)
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .rounded(cx.theme().radius)
+        .cursor_pointer()
+        .when(current, |this| {
+            this.bg(selected_bg).text_color(theme.foreground)
+        })
+        .hover(move |this| this.bg(hover_bg))
+        .child(inner)
+        .when(current, |this| {
+            this.child(Icon::new(IconName::Check).xsmall().text_color(selected_fg))
+        })
+        .on_click(move |_, _window, cx| {
+            let name = name.clone();
+            view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                this.open_menu = None;
+                cx.emit(AgentInputEvent::SelectBranch { name });
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+fn render_plan_mode_content(
+    view: Entity<AgentInput>,
+    items: Vec<ComposerPlanItem>,
+    expanded_items: HashSet<String>,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let theme = active_agent_chat_theme(cx);
+    let muted = theme.muted_foreground;
+    let border = theme.border;
+    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(320.0));
+
+    col = col.child(context_group_label(
+        t!("AgentUi.plan_todo").to_string(),
+        &theme,
+    ));
+    if items.is_empty() {
+        return col
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(t!("AgentUi.no_plan").to_string()),
+            )
+            .into_any_element();
+    }
+
+    for (ix, item) in items.into_iter().enumerate() {
+        let key = plan_item_key(ix, &item);
+        let expanded = expanded_items.contains(&key);
+        col = col.child(plan_item_row(
+            view.clone(),
+            item,
+            key,
+            expanded,
+            muted,
+            border,
+            &theme,
+            cx,
+        ));
+    }
+    col.into_any_element()
+}
+
+fn plan_trigger_label(items: &[ComposerPlanItem]) -> SharedString {
+    if items.is_empty() {
+        return SharedString::from(t!("AgentUi.plan").to_string());
+    }
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|item| is_completed_plan_status(item.status.as_ref()))
+        .count();
+    let label = if completed == total {
+        t!("AgentUi.completed").to_string()
+    } else if items
+        .iter()
+        .any(|item| is_running_plan_status(item.status.as_ref()))
+    {
+        t!("AgentUi.in_progress").to_string()
+    } else {
+        t!("AgentUi.pending").to_string()
+    };
+    SharedString::from(format!("{completed}/{total} {label}"))
+}
+
+fn is_completed_plan_status(status: &str) -> bool {
+    status == "completed"
+}
+
+fn is_running_plan_status(status: &str) -> bool {
+    matches!(status, "running" | "in_progress")
+}
+
+fn plan_item_row(
+    view: Entity<AgentInput>,
+    item: ComposerPlanItem,
+    key: String,
+    expanded: bool,
+    muted: gpui::Hsla,
+    border: gpui::Hsla,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let icon = match item.status.as_ref() {
+        "completed" => IconName::CircleCheck,
+        "running" | "in_progress" => IconName::LoaderCircle,
+        _ => IconName::CircleCheck,
+    };
+    let icon_color = match item.status.as_ref() {
+        "completed" => cx.theme().success,
+        "running" | "in_progress" => cx.theme().warning,
+        _ => muted,
+    };
+
+    let has_details = item.has_details();
+    let hover_bg = theme.hover_background();
+    let radius = cx.theme().radius;
+    let row_id = SharedString::from(format!("agent-plan-item-{key}"));
+    let row = h_flex()
+        .id(row_id)
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .border_b_1()
+        .border_color(border)
+        .when(has_details, |this| {
+            this.cursor_pointer()
+                .rounded(radius)
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_, _window, cx| {
+                    let key = key.clone();
+                    view.update(cx, |this, cx| {
+                        if !this.expanded_plan_items.insert(key.clone()) {
+                            this.expanded_plan_items.remove(&key);
+                        }
+                        cx.notify();
+                    });
+                })
+        })
+        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .truncate()
+                .child(item.title.clone()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(plan_status_label(item.status.as_ref())),
+        )
+        .when(has_details, |this| {
+            this.child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall()
+                .text_color(muted),
+            )
+        });
+
+    let mut wrapper = v_flex().w_full().child(row);
+    if expanded {
+        wrapper = wrapper.child(plan_item_details(item, muted, cx));
+    }
+    wrapper.into_any_element()
+}
+
+fn plan_item_key(index: usize, item: &ComposerPlanItem) -> String {
+    format!("{index}:{}:{}", item.title, item.status)
+}
+
+fn plan_item_details(
+    item: ComposerPlanItem,
+    muted: gpui::Hsla,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let mut details = v_flex()
+        .w_full()
+        .gap(sp(2.0))
+        .px_2()
+        .pb_2()
+        .pl_7()
+        .border_b_1()
+        .border_color(cx.theme().border);
+
+    if !item.description.is_empty() {
+        details = details.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().foreground)
+                .child(item.description),
+        );
+    }
+    if !item.risk.is_empty() {
+        details = details.child(plan_detail_line(
+            t!("AgentUi.risk").to_string(),
+            item.risk,
+            muted,
+        ));
+    }
+    if let Some(tool) = item.tool {
+        details = details.child(plan_detail_line(
+            t!("AgentUi.tool").to_string(),
+            tool,
+            muted,
+        ));
+    }
+    details.into_any_element()
+}
+
+fn plan_detail_line(
+    label: impl Into<SharedString>,
+    value: SharedString,
+    muted: gpui::Hsla,
+) -> gpui::AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .text_xs()
+        .child(div().flex_shrink_0().text_color(muted).child(label.into()))
+        .child(div().flex_1().min_w_0().truncate().child(value))
+        .into_any_element()
+}
+
+fn plan_status_label(status: &str) -> String {
+    match status {
+        "completed" => t!("AgentUi.completed_state").to_string(),
+        "running" | "in_progress" => t!("AgentUi.in_progress").to_string(),
+        "failed" => t!("AgentUi.failed").to_string(),
+        "cancelled" => t!("AgentUi.cancelled").to_string(),
+        _ => t!("AgentUi.pending").to_string(),
+    }
+}
+
+fn render_subagent_mode_content(
+    subagents: Vec<ComposerSubAgentItem>,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let theme = active_agent_chat_theme(cx);
+    let muted = theme.muted_foreground;
+    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(300.0));
+
+    col = col.child(context_group_label(
+        t!("AgentUi.subagents").to_string(),
+        &theme,
+    ));
+    if subagents.is_empty() {
+        col = col.child(
+            div()
+                .px_2()
+                .py_2()
+                .text_sm()
+                .text_color(muted)
+                .child(t!("AgentUi.no_subagents").to_string()),
+        );
+    }
+    for subagent in subagents {
+        col = col.child(subagent_item_row(subagent, muted, cx));
+    }
+    col.into_any_element()
+}
+
+fn subagent_trigger_label(subagents: &[ComposerSubAgentItem]) -> SharedString {
+    if subagents.is_empty() {
+        SharedString::from(t!("AgentUi.subagents").to_string())
+    } else {
+        SharedString::from(t!("AgentUi.subagent_count", count = subagents.len()).to_string())
+    }
+}
+
+fn resource_pool_trigger_label(context: &AgentComposerContext) -> SharedString {
+    if context.resource_pool.total_resources == 0 {
+        return SharedString::from(t!("AgentUi.resource_pool").to_string());
+    }
+    SharedString::from(
+        t!(
+            "AgentUi.resource_pool_count",
+            count = context.resource_pool.total_resources
+        )
+        .to_string(),
+    )
+}
+
+fn subagent_item_row(
+    item: ComposerSubAgentItem,
+    muted: gpui::Hsla,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let (icon, icon_color) = subagent_item_status_style(item.status.as_ref(), muted, cx);
+    h_flex()
+        .id(SharedString::from(format!(
+            "agent-running-subagent-{}",
+            item.id
+        )))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.0))
+                .child(div().text_sm().truncate().child(item.name))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(t!("AgentUi.purpose", value = item.task).to_string()),
+                )
+                .when(!item.summary.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(t!("AgentUi.progress", value = item.summary).to_string()),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(plan_status_label(item.status.as_ref())),
+        )
+        .into_any_element()
+}
+
+fn subagent_item_status_style(
+    status: &str,
+    muted: gpui::Hsla,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> (IconName, gpui::Hsla) {
+    match status {
+        "completed" => (IconName::CircleCheck, cx.theme().success),
+        "failed" => (IconName::CircleX, cx.theme().danger),
+        "running" | "in_progress" => (IconName::LoaderCircle, cx.theme().warning),
+        _ => (IconName::Bot, muted),
+    }
+}
+
+fn render_context_mode_content(
+    view: Entity<AgentInput>,
+    options: Vec<ComposerTarget>,
+    current: Option<ComposerTarget>,
+    scopes: Vec<ComposerScope>,
+    pool_items: Vec<ComposerResourcePoolItem>,
+    source_options: Vec<ComposerResourceSourceOption>,
+    filters: Vec<ComposerResourceTypeFilter>,
+    selected_kind: SharedString,
+    search_input: Entity<InputState>,
+    search_query: SharedString,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let theme = active_agent_chat_theme(cx);
+    let muted = theme.muted_foreground;
+    let border = theme.border;
+    let mut col = v_flex()
+        .debug_selector(|| "agent-context-popover-content".to_string())
+        .w(sp(CONTEXT_POPOVER_WIDTH))
+        .min_w(sp(CONTEXT_POPOVER_WIDTH))
+        .overflow_x_hidden();
+
+    if let Some(target) = current {
+        col = col
+            .px_1()
+            .pt_1()
+            .child(context_group_label(
+                t!("AgentUi.default_target").to_string(),
+                &theme,
+            ))
+            .child(context_summary_row(target, muted, &theme));
+    }
+    let has_database_scope = scopes.iter().any(|scope| scope.key.as_ref() == "database");
+    if !scopes.is_empty() {
+        col = col
+            .px_1()
+            .child(context_group_label(t!("AgentUi.scope").to_string(), &theme));
+        for scope in scopes {
+            col = col.child(context_scope_row(
+                view.clone(),
+                scope,
+                muted,
+                border,
+                &theme,
+                cx,
+            ));
+        }
+        if has_database_scope {
+            col = col.child(context_database_hint(muted, cx));
+        }
+    }
+
+    if !source_options.is_empty() {
+        col = col.child(render_resource_source_options(
+            view.clone(),
+            source_options,
+            &theme,
+            cx,
+        ));
+    }
+
+    if !filters.is_empty() {
+        col = col.child(render_resource_type_filters(
+            view.clone(),
+            filters,
+            &theme,
+            cx,
+        ));
+    }
+
+    // 搜索框:固定在列表上方,不参与滚动,避免长列表里输入框被滚出可视区。
+    col = col.child(
+        div()
+            .debug_selector(|| "context-target-search".to_string())
+            .w_full()
+            .min_w_0()
+            .px_1()
+            .pb_1()
+            .child(
+                Input::new(&search_input)
+                    .prefix(Icon::new(IconName::Search).text_color(muted))
+                    .cleanable(true)
+                    .small()
+                    .w_full(),
+            ),
+    );
+
+    // 按类型和关键字过滤资源(label / subtitle / kind 不区分大小写)。
+    let needle = normalize_target_search_query(search_query.as_ref());
+    let filtered_pool_items = filter_pool_items(pool_items, selected_kind.as_ref(), &needle);
+    let filtered_targets = if filtered_pool_items.is_empty() {
+        let kind_filtered = filter_targets_by_kind(options, selected_kind.as_ref());
+        kind_filtered
+            .into_iter()
+            .filter(|opt| needle.is_empty() || target_matches(opt, &needle))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let filtered_count = if filtered_pool_items.is_empty() {
+        filtered_targets.len()
+    } else {
+        filtered_pool_items.len()
+    };
+
+    col = col.child(
+        div()
+            .w_full()
+            .min_w_0()
+            .px_1()
+            .text_xs()
+            .text_color(muted)
+            .child(filter_result_label(filtered_count, &search_query)),
+    );
+
+    // 列表区:限定最大高度并内部滚动,避免目标多时撑爆 popover。
+    let mut list = v_flex()
+        .id("context-target-list")
+        .w_full()
+        .px_1()
+        .pb_1()
+        .gap(sp(2.0))
+        .max_h(sp(CONTEXT_TARGET_LIST_MAX_HEIGHT))
+        .overflow_x_hidden()
+        .overflow_y_scroll();
+    if filtered_pool_items.is_empty() && filtered_targets.is_empty() {
+        let empty_message = if search_query.is_empty() {
+            t!("AgentUi.resource_pool_empty").to_string()
+        } else {
+            t!("AgentUi.no_matching_resources").to_string()
+        };
+        list = list.child(
+            div()
+                .px_2()
+                .py_2()
+                .text_sm()
+                .text_color(muted)
+                .child(empty_message),
+        );
+    }
+    if filtered_pool_items.is_empty() {
+        for opt in filtered_targets {
+            list = list.child(context_target_option(view.clone(), opt, muted, &theme, cx));
+        }
+    } else {
+        for item in filtered_pool_items {
+            list = list.child(resource_pool_item_row(
+                view.clone(),
+                item,
+                muted,
+                &theme,
+                cx,
+            ));
+        }
+    }
+
+    col = col.child(list);
+    col.into_any_element()
+}
+
+fn render_resource_source_options(
+    view: Entity<AgentInput>,
+    options: Vec<ComposerResourceSourceOption>,
+    theme: &AgentChatTheme,
+    _cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let selected_bg = theme.selection_background();
+    let selected_fg = theme.foreground;
+    let muted = theme.muted_foreground;
+    let hover_bg = theme.hover_background();
+    let mut row = h_flex().w_full().px_1().pb_1().gap(sp(4.0)).flex_wrap();
+
+    for option in options.into_iter().filter(|option| option.enabled) {
+        let id = option.id.clone();
+        let selected = option.selected;
+        let enabled = option.enabled;
+        let label = resource_source_option_label(&option);
+        let view = view.clone();
+        row = row.child(
+            h_flex()
+                .id(option.element_id())
+                .items_center()
+                .gap(sp(4.0))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_xs()
+                .when(selected, |this| {
+                    this.bg(selected_bg).text_color(selected_fg)
+                })
+                .when(!selected, |this| this.text_color(muted))
+                .when(enabled && !selected, |this| {
+                    this.cursor_pointer().hover(move |s| s.bg(hover_bg))
+                })
+                .when(!enabled, |this| this.opacity(0.5))
+                .child(label)
+                .when(enabled, |this| {
+                    this.on_click(move |_, _window, cx| {
+                        let id = id.clone();
+                        view.update(cx, |this, cx| {
+                            if this.is_running {
+                                return;
+                            }
+                            cx.emit(AgentInputEvent::SelectResourceSource { id });
+                            cx.notify();
+                        });
+                    })
+                }),
+        );
+    }
+
+    row.into_any_element()
+}
+
+fn render_resource_type_filters(
+    view: Entity<AgentInput>,
+    filters: Vec<ComposerResourceTypeFilter>,
+    theme: &AgentChatTheme,
+    _cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let hover_bg = theme.hover_background();
+    let selected_bg = theme.selection_background();
+    let selected_fg = theme.foreground;
+    let muted = theme.muted_foreground;
+    let mut row = h_flex().w_full().px_1().pb_1().gap(sp(4.0));
+
+    for filter in filters {
+        let id = filter.id.clone();
+        let selected = filter.selected;
+        let view = view.clone();
+        row = row.child(
+            h_flex()
+                .id(filter.element_id())
+                .items_center()
+                .gap(sp(4.0))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_xs()
+                .when(selected, |this| {
+                    this.bg(selected_bg).text_color(selected_fg)
+                })
+                .when(!selected, |this| {
+                    this.text_color(muted).hover(move |s| s.bg(hover_bg))
+                })
+                .child(filter.label)
+                .child(format!("{}", filter.count))
+                .on_click(move |_, _window, cx| {
+                    let id = id.clone();
+                    view.update(cx, |this, cx| {
+                        this.selected_resource_kind_filter = id;
+                        cx.notify();
+                    });
+                }),
+        );
+    }
+
+    row.into_any_element()
+}
+
+fn resource_pool_item_row(
+    view: Entity<AgentInput>,
+    item: ComposerResourcePoolItem,
+    muted: gpui::Hsla,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let hover_bg = theme.hover_background();
+    let radius = cx.theme().radius;
+    let id = item.id.clone();
+    let action_id = item.id.clone();
+    let action_label = resource_pool_action_label(&item);
+    let action_view = view.clone();
+    let add_action_id = action_id.clone();
+    let add_action_view = action_view.clone();
+    let in_pool = item.in_pool;
+    let action_button = Button::new(SharedString::from(format!(
+        "resource-pool-action-{}",
+        action_id
+    )))
+    .ghost()
+    .xsmall()
+    .label(action_label)
+    .disabled(resource_pool_action_disabled(&item));
+    let action_button = if in_pool {
+        action_button.on_click(move |_, _window, cx| {
+            let id = action_id.clone();
+            action_view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                cx.emit(AgentInputEvent::RemoveResourceFromPool { id });
+                cx.notify();
+            });
+        })
+    } else if !in_pool {
+        action_button.on_click(move |_, _window, cx| {
+            let id = add_action_id.clone();
+            add_action_view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                cx.emit(AgentInputEvent::AddResourceToPool { id });
+                cx.notify();
+            });
+        })
+    } else {
+        action_button
+    };
+
+    h_flex()
+        .id(item.element_id())
+        .debug_selector(|| "agent-resource-pool-row".to_string())
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap(sp(8.0))
+        .px_2()
+        .py_1()
+        .rounded(radius)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .on_click(move |_, _window, cx| {
+            let id = id.clone();
+            view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                if in_pool {
+                    this.open_menu = None;
+                    cx.emit(AgentInputEvent::SelectTarget { id });
+                } else {
+                    cx.emit(AgentInputEvent::AddResourceToPool { id });
+                }
+                cx.notify();
+            });
+        })
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .size(sp(24.0))
+                .rounded(radius)
+                .bg(hover_bg)
+                .text_xs()
+                .child(item.icon),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(sp(2.0))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap(sp(4.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .truncate()
+                                .child(item.label),
+                        )
+                        .when(item.is_default, |this| {
+                            this.child(resource_pool_badge(
+                                SharedString::from(t!("AgentUi.default").to_string()),
+                                theme.selection_background(),
+                                theme.foreground,
+                            ))
+                        })
+                        .child(resource_pool_badge(item.status.clone(), theme.panel, muted)),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(item.primary_meta),
+                ),
+        )
+        .child(action_button)
+        .into_any_element()
+}
+
+fn resource_pool_badge(
+    label: SharedString,
+    background: gpui::Hsla,
+    foreground: gpui::Hsla,
+) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .max_w(sp(CONTEXT_KIND_MAX_WIDTH))
+        .px_1()
+        .py(px(1.0))
+        .rounded_sm()
+        .bg(background)
+        .text_xs()
+        .text_color(foreground)
+        .truncate()
+        .child(label)
+}
+
+/// 目标是否匹配搜索关键字(子串匹配,忽略大小写)。
+fn target_matches(opt: &ComposerTarget, needle: &str) -> bool {
+    let needle = normalize_target_search_query(needle);
+    opt.label.to_lowercase().contains(&needle)
+        || opt.subtitle.to_lowercase().contains(&needle)
+        || opt.kind.to_lowercase().contains(&needle)
+}
+
+fn normalize_target_search_query(query: &str) -> String {
+    query.trim().to_lowercase()
+}
+
+fn filter_targets_by_kind(targets: Vec<ComposerTarget>, kind: &str) -> Vec<ComposerTarget> {
+    if kind == "all" {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|target| target.kind.as_ref() == kind)
+        .collect()
+}
+
+fn filter_pool_items(
+    items: Vec<ComposerResourcePoolItem>,
+    kind: &str,
+    needle: &str,
+) -> Vec<ComposerResourcePoolItem> {
+    items
+        .into_iter()
+        .filter(|item| kind == "all" || item.kind.as_ref() == kind)
+        .filter(|item| {
+            needle.is_empty()
+                || item.label.to_lowercase().contains(needle)
+                || item.primary_meta.to_lowercase().contains(needle)
+                || item.kind.to_lowercase().contains(needle)
+        })
+        .collect()
+}
+
+fn resource_pool_action_label(item: &ComposerResourcePoolItem) -> &'static str {
+    if item.in_pool { "-" } else { "+" }
+}
+
+fn resource_pool_action_disabled(_item: &ComposerResourcePoolItem) -> bool {
+    false
+}
+
+fn resource_source_option_label(option: &ComposerResourceSourceOption) -> SharedString {
+    if !option.enabled {
+        return option
+            .hint
+            .as_ref()
+            .map(|hint| format!("{} · {}", option.label, hint))
+            .unwrap_or_else(|| option.label.to_string())
+            .into();
+    }
+    SharedString::from(format!("{} {}", option.label, option.count))
+}
+
+/// 列表结果计数文案:有关键字时展示匹配数,无关键字时展示总数。
+fn filter_result_label(filtered_count: usize, query: &SharedString) -> SharedString {
+    if query.is_empty() {
+        return SharedString::default();
+    }
+    SharedString::from(t!("AgentUi.matching_resources", count = filtered_count).to_string())
+}
+
+fn context_database_hint(
+    muted: gpui::Hsla,
+    _cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    div()
+        .px_2()
+        .py_1()
+        .text_xs()
+        .text_color(muted)
+        .child(t!("AgentUi.switch_database_hint").to_string())
+        .into_any_element()
+}
+
+fn context_group_label(label: impl Into<SharedString>, theme: &AgentChatTheme) -> gpui::AnyElement {
+    div()
+        .px_2()
+        .pt_1()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(label.into())
+        .into_any_element()
+}
+
+fn context_summary_row(
+    target: ComposerTarget,
+    muted: gpui::Hsla,
+    theme: &AgentChatTheme,
+) -> gpui::AnyElement {
+    context_target_row(target, muted, theme, true)
+        .debug_selector(|| "context-current-summary".to_string())
+        .into_any_element()
+}
+
+fn context_target_row(
+    opt: ComposerTarget,
+    muted: gpui::Hsla,
+    theme: &AgentChatTheme,
+    selected: bool,
+) -> gpui::Div {
+    let hover_bg = theme.hover_background();
+    let selected_bg = theme.selection_background();
+
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap(sp(8.0))
+        .px_2()
+        .py_1()
+        .rounded(sp(6.0))
+        .when(selected, |this| this.bg(selected_bg))
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .size(sp(24.0))
+                .rounded(sp(6.0))
+                .bg(hover_bg)
+                .text_xs()
+                .child(opt.icon),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_sm()
+                        .truncate()
+                        .child(opt.label),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(opt.subtitle),
+                ),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w(sp(CONTEXT_KIND_MAX_WIDTH))
+                .text_xs()
+                .text_color(muted)
+                .truncate()
+                .child(opt.kind),
+        )
+}
+
+fn context_scope_row(
+    view: Entity<AgentInput>,
+    scope: ComposerScope,
+    muted: gpui::Hsla,
+    border: gpui::Hsla,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let key = scope.key.clone();
+    let hover_bg = theme.hover_background();
+    let radius = cx.theme().radius;
+
+    h_flex()
+        .id(SharedString::from(format!("context-scope-{key}")))
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded(radius)
+        .border_b_1()
+        .border_color(border)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .child(div().text_xs().text_color(muted).child(scope.label))
+        .child(div().text_xs().child(scope.value))
+        .on_click(move |_, _window, cx| {
+            let key = key.clone();
+            view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                this.open_menu = None;
+                cx.emit(AgentInputEvent::PickScope { key });
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+fn context_target_option(
+    view: Entity<AgentInput>,
+    opt: ComposerTarget,
+    muted: gpui::Hsla,
+    theme: &AgentChatTheme,
+    _cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let sel = opt.id.clone();
+    let row_id = SharedString::from(format!("context-target-opt-{}", opt.id));
+    let hover_bg = theme.hover_background();
+
+    context_target_row(opt, muted, theme, false)
+        .id(row_id)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .on_click(move |_, _window, cx| {
+            let sel = sel.clone();
+            view.update(cx, |this, cx| {
+                if this.is_running {
+                    return;
+                }
+                this.open_menu = None;
+                cx.emit(AgentInputEvent::SelectTarget { id: sel });
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
 impl Focusable for AgentInput {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1364,13 +3262,22 @@ impl Focusable for AgentInput {
 
 impl Render for AgentInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 模型下拉换了选项 / 选中项时,趁手里有窗口把最新的灌进组件库的 state。
+        // 打开上下文面板时,在 render 时(持有 &mut Window)清空搜索框。
+        if self.context_search_needs_reset {
+            self.context_search_input.update(cx, |state, cx| {
+                state.set_value("", _window, cx);
+            });
+            self.context_search_query = SharedString::default();
+            self.context_search_needs_reset = false;
+        }
+        // 模型下拉换了选项 / 选中项:同一套路,趁手里有窗口时灌进组件库的 state。
         if self.model_select_dirty {
             self.sync_model_select(_window, cx);
             self.model_select_dirty = false;
         }
+        let context_bar = self.render_context_bar(cx);
         let attachments = self.render_attachments(cx);
-        let editor_top_bar = self.render_editor_top_bar();
+        let editor_top_bar = self.render_editor_top_bar(cx);
         let queued_submissions = self.render_queued_submissions(cx);
         let toolbar = self.render_toolbar(cx);
         let theme = self.local_theme(cx);
@@ -1382,7 +3289,8 @@ impl Render for AgentInput {
         let drop_wash = theme.accent.opacity(0.08);
         let drop_ring = theme.accent;
 
-        // 输入卡片：带边框的那一块（模型、权限与附件、发送按钮同处卡片底部的**同一行**）。
+        // 输入卡片：带边框的那一块（工作区 / 分支 / 模型 / Worktree / 权限
+        // 与附件、发送按钮同处卡片底部的**同一行**）。
         let card = v_flex()
             .debug_selector(|| "agent-input-card".to_string())
             .w_full()
@@ -1403,6 +3311,8 @@ impl Render for AgentInput {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_dropped_paths(paths.paths(), window, cx);
             }))
+            // 顶部：计划 / Agent / 上下文入口
+            .child(context_bar)
             // 附件预览（如果有）
             .children(attachments)
             .child(editor_top_bar)
@@ -1438,7 +3348,7 @@ impl Render for AgentInput {
                             ),
                     ),
             )
-            // 底部：附件 / 模型 / 权限 / 发送，一整行
+            // 底部：附件 / 工作区 / 分支 / 模型 / Worktree / 权限 / 发送，一整行
             .child(toolbar);
 
         v_flex()
@@ -1455,17 +3365,154 @@ impl Render for AgentInput {
     }
 }
 
+/// 占用分档 → 圆环颜色。
+///
+/// 三档共用同一套语义槽：常规、70% 起警告、90% 起危险。
+fn usage_color(usage: &ContextUsage, theme: &AgentChatTheme) -> gpui::Hsla {
+    match usage.pressure() {
+        UsagePressure::Calm => theme.gauge,
+        UsagePressure::Elevated => theme.gauge_warning,
+        UsagePressure::Critical => theme.gauge_danger,
+    }
+}
+
+/// 用量详情面板：点圆环展开的完整读数。
+///
+/// 只展示**手上真实有**的数：没有窗口大小就不编造上限与百分比，
+/// 没有费用就不摆一行空值。
+fn render_usage_detail(
+    usage: &ContextUsage,
+    theme: &AgentChatTheme,
+    view: Entity<AgentInput>,
+) -> impl IntoElement + use<> {
+    let accent = usage_color(usage, theme);
+    let rows = usage_detail_rows(usage)
+        .into_iter()
+        .map(|(label, value)| usage_detail_row(label, value, theme))
+        .collect::<Vec<_>>();
+
+    v_flex()
+        .debug_selector(|| "agent-usage-detail".to_string())
+        .w(sp(220.0))
+        .gap_2()
+        .p_3()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(t!("AgentUi.usage_title").to_string()),
+        )
+        .children(match usage.percent() {
+            Some(percent) => Some(usage_percent_bar(percent, accent, theme)),
+            None => None,
+        })
+        .children(rows)
+        .child(
+            div().pt_2().border_t_1().border_color(theme.border).child(
+                Button::new("agent-usage-history-open")
+                    .small()
+                    .ghost()
+                    .label(t!("AgentUi.usage_history_open").to_string())
+                    .on_click(move |_event, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.usage_detail_open = false;
+                            cx.emit(AgentInputEvent::OpenUsageHistory);
+                            cx.notify();
+                        });
+                    }),
+            ),
+        )
+}
+
+/// 详情面板里的「标签 / 数值」列表。
+///
+/// 抽成纯函数便于断言：哪些行会出现、顺序如何、窗口未知时怎么退化。
+fn usage_detail_rows(usage: &ContextUsage) -> Vec<(String, String)> {
+    let mut rows = vec![(
+        t!("AgentUi.usage_used").to_string(),
+        format_token_count(usage.used),
+    )];
+    match usage.window.filter(|window| *window > 0) {
+        Some(window) => {
+            rows.push((
+                t!("AgentUi.usage_limit").to_string(),
+                format_token_count(window),
+            ));
+            rows.push((
+                t!("AgentUi.usage_remaining").to_string(),
+                format_token_count(window.saturating_sub(usage.used)),
+            ));
+        }
+        None => rows.push((
+            t!("AgentUi.usage_limit").to_string(),
+            t!("AgentUi.usage_unknown").to_string(),
+        )),
+    }
+    if let Some(cost) = usage.cost.as_deref() {
+        rows.push((t!("AgentUi.usage_cost").to_string(), cost.to_string()));
+    }
+    rows
+}
+
+/// 用量详情里的一行：左标签、右数值。
+fn usage_detail_row(
+    label: String,
+    value: String,
+    theme: &AgentChatTheme,
+) -> impl IntoElement + use<> {
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_xs()
+                .text_color(theme.foreground)
+                .child(value),
+        )
+}
+
+/// 占用比例条：轨道走 `inset`，已完成部分走当前档位色。
+fn usage_percent_bar(
+    percent: f32,
+    accent: gpui::Hsla,
+    theme: &AgentChatTheme,
+) -> impl IntoElement + use<> {
+    div()
+        .w_full()
+        .h(sp(6.0))
+        .rounded_full()
+        .bg(theme.inset)
+        .child(
+            div()
+                .h_full()
+                .w(relative((percent / 100.0).clamp(0.0, 1.0)))
+                .rounded_full()
+                .bg(accent),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::context::ComposerModel;
+    use crate::input::context::{ComposerModel, ComposerWorkspaceInfo, ComposerWorktreeState};
     use gpui::{Modifiers, Pixels, TestAppContext, VisualTestContext, size};
 
-    /// 底栏（附件、模型、权限、发送）全部放下的最小宽度。
+    /// 一行 7 项全部放下、不触发裁剪的最小宽度。
     ///
-    /// 底栏固定是 `[附件][计数][模型][权限][发送]`：附件组与发送按钮不参与收缩，
-    /// 模型与权限各自还有可读性下限；再窄就轮到中段的 `overflow_hidden` 裁尾巴了
-    /// （发送按钮始终保留）。布局类测试一律以它为「窄」的下限。
+    /// 底部那一行固定是 `[附件][计数][工作区][分支][模型][Worktree][权限][发送]`：
+    /// 附件组与发送按钮不参与收缩，中段 5 项各自还有可读性下限，加起来约 520px；
+    /// 再窄就轮到中段的 `overflow_hidden` 裁尾巴了（发送按钮始终保留）。
+    /// 布局类测试一律以它为「窄」的下限，低于它就不再声称「都看得到」。
     const NARROW_USABLE_WIDTH: f32 = 620.0;
 
     struct AgentInputLayoutRoot {
@@ -1481,6 +3528,45 @@ mod tests {
 
         fn wide(window: &mut Window, cx: &mut Context<Self>) -> Self {
             Self::with_width(px(900.0), window, cx)
+        }
+
+        fn with_resource_pool(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let root = Self::with_width(px(420.0), window, cx);
+            root.input.update(cx, |input, cx| {
+                input.set_context(
+                    AgentComposerContext {
+                        resource_pool_items: vec![
+                            ComposerResourcePoolItem::new(
+                                "ssh-a",
+                                "production-ssh-with-a-long-readable-name",
+                                "SH",
+                                "ssh",
+                                "10.2.4.54",
+                                "已加入",
+                                Some("默认目标"),
+                                3,
+                                true,
+                                true,
+                            ),
+                            ComposerResourcePoolItem::new(
+                                "db-a",
+                                "analytics-postgres-primary",
+                                "DB",
+                                "postgres",
+                                "Database: ai_app",
+                                "可添加",
+                                None::<&str>,
+                                4,
+                                false,
+                                false,
+                            ),
+                        ],
+                        ..AgentComposerContext::default()
+                    },
+                    cx,
+                );
+            });
+            root
         }
 
         fn running_with_queue(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1512,18 +3598,49 @@ mod tests {
             root
         }
 
-        /// 注入一个特别长的权限文案，用于底栏截断测试。
+        /// 注入工作区 / 分支 / Worktree 数据，用于底栏渲染与截断测试。
         fn with_composer_context(
             width: Pixels,
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Self {
+            const LONG_WORKSPACE: &str = "an-extremely-long-workspace-directory-name";
             let root = Self::with_width(width, window, cx);
             root.input.update(cx, |input, cx| {
-                let mut context = input.context.clone();
-                context.execution_mode_label =
-                    SharedString::from("允许完全访问并自动应用所有工具调用");
-                input.set_context(context, cx);
+                input.set_context(
+                    AgentComposerContext {
+                        model: Some(ComposerModel::new(
+                            "Very Long Provider Name",
+                            "extremely-long-model-name-with-large-context",
+                        )),
+                        execution_mode_label: SharedString::from("允许完全访问"),
+                        workspace: ComposerWorkspaceInfo::new(
+                            LONG_WORKSPACE,
+                            Some("/Users/someone/projects/an-extremely-long-workspace-directory-name"),
+                        )
+                        .with_git_repo(true),
+                        workspace_options: vec![
+                            ComposerWorkspaceOption::new(
+                                LONG_WORKSPACE,
+                                "/Users/someone/projects/an-extremely-long-workspace-directory-name",
+                                true,
+                            ),
+                            ComposerWorkspaceOption::new("navop", "/Users/someone/navop", false),
+                        ],
+                        branch_options: vec![
+                            ComposerBranchOption::new(
+                                "feature/composer-footer-relayout",
+                                true,
+                                false,
+                            ),
+                            ComposerBranchOption::new("main", false, false),
+                            ComposerBranchOption::new("origin/main", false, true),
+                        ],
+                        worktree: ComposerWorktreeState::new(true, Some("navop-1a2b3c4d")),
+                        ..AgentComposerContext::default()
+                    },
+                    cx,
+                );
             });
             root
         }
@@ -1565,6 +3682,20 @@ mod tests {
                 height: px(220.0),
             }
         }
+
+        /// 同 [`Self::with_width`],额外注入一条上下文用量读数。
+        fn with_usage(
+            used: u64,
+            window_size: Option<u64>,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            let root = Self::with_width(px(900.0), window, cx);
+            root.input.update(cx, |input, _cx| {
+                input.context.context_usage = Some(ContextUsage::new(used, window_size));
+            });
+            root
+        }
     }
 
     impl Render for AgentInputLayoutRoot {
@@ -1576,15 +3707,83 @@ mod tests {
         }
     }
 
-    /// 附件、模型、权限、发送都在输入卡片底部的**同一行**。
-    /// 侧栏被拖窄时它们仍留在同一行：靠收缩 + 截断消化，绝不把发送按钮挤出卡片。
+    /// 七项都在输入卡片底部的**同一行**，并按 工作区→分支→模型→Worktree→权限→发送 排布。
+    #[gpui::test]
+    fn composer_row_keeps_context_chips_on_one_line(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            AgentInputLayoutRoot::with_composer_context(px(1100.0), window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let card = cx
+            .debug_bounds("agent-input-card")
+            .expect("input card should render");
+        let group = cx
+            .debug_bounds("agent-input-context-group")
+            .expect("context group should render");
+        let workspace = cx
+            .debug_bounds("agent-input-workspace")
+            .expect("workspace chip should render");
+        let branch = cx
+            .debug_bounds("agent-input-branch")
+            .expect("branch chip should render");
+        let model = cx
+            .debug_bounds("agent-input-model-control")
+            .expect("model control should render");
+        let worktree = cx
+            .debug_bounds("agent-input-worktree")
+            .expect("worktree toggle should render");
+        let permission = cx
+            .debug_bounds("agent-input-permission")
+            .expect("permission chip should render");
+        let send = cx
+            .debug_bounds("agent-input-send-control")
+            .expect("send control should render");
+
+        assert!(
+            workspace.origin.x < branch.origin.x
+                && branch.origin.x < model.origin.x
+                && model.origin.x < worktree.origin.x
+                && worktree.origin.x < permission.origin.x
+                && permission.origin.x < send.origin.x,
+            "chips must be ordered workspace → branch → model → worktree → permission → send: \
+             workspace={workspace:?}, branch={branch:?}, model={model:?}, \
+             worktree={worktree:?}, permission={permission:?}, send={send:?}"
+        );
+        // 七项共处一行：纵向偏差只可能来自边框/内边距的取整。
+        let row_y = workspace.origin.y;
+        for bounds in [branch, model, worktree, permission, send] {
+            assert!(
+                (bounds.origin.y - row_y).abs() <= px(2.0),
+                "all controls must share one row: rows differ at {bounds:?} (row_y={row_y:?})"
+            );
+        }
+        // 而且这一行在输入卡片内部，不再有卡片外的第二行。
+        for bounds in [workspace, branch, model, worktree, permission, send] {
+            assert!(
+                bounds.origin.y >= card.origin.y
+                    && bounds.origin.y + bounds.size.height <= card.origin.y + card.size.height,
+                "every control must stay inside the input card: {bounds:?}, card={card:?}"
+            );
+        }
+        assert!(
+            group.origin.x + group.size.width <= send.origin.x,
+            "the context group must not overlap the send button: group={group:?}, send={send:?}"
+        );
+    }
+
+    /// 侧栏被拖窄时七项仍留在同一行：靠收缩 + 截断消化，绝不把发送按钮挤出卡片。
     #[gpui::test]
     fn composer_row_truncates_instead_of_pushing_the_send_button_out(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::init(cx);
         });
-        const NARROW: f32 = 300.0;
+        const NARROW: f32 = 620.0;
         let (_, cx) = cx.add_window_view(|window, cx| {
             AgentInputLayoutRoot::with_composer_context(px(NARROW), window, cx)
         });
@@ -1593,9 +3792,15 @@ mod tests {
         let card = cx
             .debug_bounds("agent-input-card")
             .expect("input card should render");
-        let model = cx
-            .debug_bounds("agent-input-model-control")
-            .expect("model control should render");
+        let workspace = cx
+            .debug_bounds("agent-input-workspace")
+            .expect("workspace chip should render");
+        let branch = cx
+            .debug_bounds("agent-input-branch")
+            .expect("branch chip should render");
+        let worktree = cx
+            .debug_bounds("agent-input-worktree")
+            .expect("worktree toggle should render");
         let permission = cx
             .debug_bounds("agent-input-permission")
             .expect("permission chip should render");
@@ -1608,17 +3813,22 @@ mod tests {
             send.origin.x + send.size.width <= card.origin.x + card.size.width,
             "send control must stay inside the card: send={send:?}, card={card:?}"
         );
-        // 权限档位是内容宽控件，窄宽度下不能被压到读不出字。
         assert!(
-            permission.size.width >= px(COMPOSER_CHIP_MIN_WIDTH),
-            "permission chip must not shrink below the readable floor: {permission:?}"
+            workspace.size.width < px(COMPOSER_CHIP_MAX_WIDTH),
+            "a long workspace name must shrink instead of hogging the row: workspace={workspace:?}"
         );
+        for bounds in [workspace, branch, worktree, permission] {
+            assert!(
+                bounds.size.width >= px(COMPOSER_CHIP_MIN_WIDTH),
+                "chips must not shrink below the readable floor: {bounds:?}"
+            );
+        }
         // 收缩之后仍然是同一行。
-        let row_y = model.origin.y;
-        for bounds in [permission, send] {
+        let row_y = workspace.origin.y;
+        for bounds in [branch, worktree, permission, send] {
             assert!(
                 (bounds.origin.y - row_y).abs() <= px(2.0),
-                "controls must stay on one row at narrow width: {bounds:?} (row_y={row_y:?})"
+                "chips must stay on one row at narrow width: {bounds:?} (row_y={row_y:?})"
             );
         }
     }
@@ -1737,16 +3947,13 @@ mod tests {
             gpui_component::init(cx);
             crate::init(cx);
         });
-        // 底栏只剩模型与权限两项，620px 的窗口里模型根本不会被挤；要触发下限
-        // 必须把卡片收到更窄——这里直接给到只剩两项也放不下的宽度。
-        const SQUEEZED: f32 = 300.0;
         let (_, cx) = cx.add_window_view(|window, cx| {
-            AgentInputLayoutRoot::with_composer_context(px(SQUEEZED), window, cx)
+            AgentInputLayoutRoot::with_composer_context(px(NARROW_USABLE_WIDTH), window, cx)
         });
         let cx: &mut VisualTestContext = cx;
         // 默认测试窗口比输入卡宽,320px 的弹层随便放、不会触发右缘收敛;
         // 收窄到同宽,「放不下」才真的发生。
-        cx.simulate_resize(size(px(SQUEEZED), px(400.0)));
+        cx.simulate_resize(size(px(NARROW_USABLE_WIDTH), px(400.0)));
 
         let trigger = cx
             .debug_bounds("agent-input-model-control")
@@ -1811,13 +4018,122 @@ mod tests {
     }
 
     /// 有上下文用量读数时,工具栏右侧多一个圆环,且排在发送按钮左边。
+    #[gpui::test]
+    fn toolbar_shows_the_context_usage_gauge_next_to_the_send_button(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            AgentInputLayoutRoot::with_usage(50_000, Some(200_000), window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let gauge = cx
+            .debug_bounds("agent-input-usage-gauge")
+            .expect("有读数时应该渲染圆环");
+        let send = cx
+            .debug_bounds("agent-send-button")
+            .expect("发送按钮应该渲染");
+        assert!(
+            gauge.right() <= send.left(),
+            "圆环应排在发送按钮左侧: gauge={gauge:?} send={send:?}"
+        );
+    }
+
     /// 没有读数时不渲染圆环——不摆一个空圈占位。
+    #[gpui::test]
+    fn toolbar_omits_the_context_usage_gauge_without_a_reading(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx
+            .add_window_view(|window, cx| AgentInputLayoutRoot::with_width(px(900.0), window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        assert!(
+            cx.debug_bounds("agent-input-usage-gauge").is_none(),
+            "没有用量读数就不该占位"
+        );
+    }
+
     /// 窗口已知时详情面板给四行：已用 / 上限 / 剩余 / 费用。
     ///
     /// 标签用同一批 `t!` 钥拼出来：测试环境不确定当前 locale，
     /// 这里真正要卡的是「哪几行、什么顺序、数值怎么格式化」。
+    #[test]
+    fn usage_detail_rows_cover_used_limit_remaining_and_cost() {
+        let usage = ContextUsage::new(50_000, Some(200_000)).with_cost(Some("$0.12"));
+        assert_eq!(
+            usage_detail_rows(&usage),
+            vec![
+                (t!("AgentUi.usage_used").to_string(), "50.0k".to_string()),
+                (t!("AgentUi.usage_limit").to_string(), "200.0k".to_string()),
+                (
+                    t!("AgentUi.usage_remaining").to_string(),
+                    "150.0k".to_string()
+                ),
+                (t!("AgentUi.usage_cost").to_string(), "$0.12".to_string()),
+            ]
+        );
+    }
+
     /// 窗口未知时不编造上限与剩余：只报已用，并明说上限未知。
+    #[test]
+    fn usage_detail_rows_degrade_when_the_window_is_unknown() {
+        let unknown = vec![
+            (t!("AgentUi.usage_used").to_string(), "12.3k".to_string()),
+            (
+                t!("AgentUi.usage_limit").to_string(),
+                t!("AgentUi.usage_unknown").to_string(),
+            ),
+        ];
+        assert_eq!(usage_detail_rows(&ContextUsage::new(12_345, None)), unknown);
+        // 窗口为 0 等同于未知，不能除零也不能报一个 0/0。
+        assert_eq!(
+            usage_detail_rows(&ContextUsage::new(12_345, Some(0))),
+            unknown
+        );
+    }
+
     /// 点圆环展开详情面板；再点一次收起。
+    #[gpui::test]
+    fn clicking_the_gauge_opens_and_closes_the_usage_detail(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            AgentInputLayoutRoot::with_usage(50_000, Some(200_000), window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        assert!(
+            cx.debug_bounds("agent-usage-detail").is_none(),
+            "初始应该是收起的"
+        );
+        let gauge = cx
+            .debug_bounds("agent-input-usage-gauge")
+            .expect("有读数时应该渲染圆环");
+        cx.simulate_click(gauge.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("agent-usage-detail").is_some(),
+            "点圆环应该展开用量详情"
+        );
+
+        let gauge = cx
+            .debug_bounds("agent-input-usage-gauge")
+            .expect("圆环仍然在");
+        cx.simulate_click(gauge.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("agent-usage-detail").is_none(),
+            "再点一次应该收起"
+        );
+    }
+
     /// 工具栏一行内同时有「附件 + 上下文档位 + 发送」；发送按钮仍是 32x32。
     #[gpui::test]
     fn toolbar_keeps_action_button_square_and_permission_in_the_same_row(cx: &mut TestAppContext) {
@@ -1933,6 +4249,66 @@ mod tests {
     }
 
     #[gpui::test]
+    fn plan_and_subagent_triggers_stay_and_permission_is_a_single_footer_control(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(AgentInputLayoutRoot::new);
+        let cx: &mut VisualTestContext = cx;
+
+        assert!(
+            cx.debug_bounds("agent-plan-trigger").is_some(),
+            "plan should stay as a top capability trigger"
+        );
+        assert!(
+            cx.debug_bounds("agent-subagents-trigger").is_some(),
+            "subagents should be a top capability trigger"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-permission").is_some(),
+            "permission level should render as the single control in the composer footer"
+        );
+        assert!(
+            cx.debug_bounds("agent-task-mode").is_none(),
+            "task mode should no longer render"
+        );
+        assert!(
+            cx.debug_bounds("agent-tool-mode").is_none(),
+            "tool mode should not render as a separate legacy toolbar control"
+        );
+    }
+
+    #[gpui::test]
+    fn resource_pool_rows_keep_stable_compact_height(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(AgentInputLayoutRoot::with_resource_pool);
+        let cx: &mut VisualTestContext = cx;
+
+        let trigger = cx
+            .debug_bounds("agent-context-mode")
+            .expect("context trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+
+        let root = cx
+            .debug_bounds("agent-input-root")
+            .expect("input root should render");
+        let row = cx
+            .debug_bounds("agent-resource-pool-row")
+            .expect("resource row should render");
+
+        assert!(
+            row.size.width <= root.size.width,
+            "resource row should stay within input width: row={row:?}, root={root:?}"
+        );
+    }
+
+    #[gpui::test]
     fn mention_completion_popup_stays_above_bottom_toolbar(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -1985,6 +4361,127 @@ mod tests {
             "只读",
             current_execution_mode_label(&SharedString::from("只读")).as_ref()
         );
+    }
+
+    #[test]
+    fn plan_trigger_label_is_default_when_empty() {
+        assert_eq!(
+            plan_trigger_label(&[]).as_ref(),
+            t!("AgentUi.plan").as_ref()
+        );
+    }
+
+    #[test]
+    fn plan_trigger_label_shows_running_progress() {
+        let items = vec![
+            ComposerPlanItem::new("完成项", "completed"),
+            ComposerPlanItem::new("执行项", "running"),
+            ComposerPlanItem::new("待执行项", "pending"),
+        ];
+
+        assert_eq!(
+            plan_trigger_label(&items).as_ref(),
+            format!("1/3 {}", t!("AgentUi.in_progress"))
+        );
+    }
+
+    #[test]
+    fn plan_trigger_label_shows_completed_progress() {
+        let items = vec![
+            ComposerPlanItem::new("一", "completed"),
+            ComposerPlanItem::new("二", "completed"),
+        ];
+
+        assert_eq!(
+            plan_trigger_label(&items).as_ref(),
+            format!("2/2 {}", t!("AgentUi.completed"))
+        );
+    }
+
+    #[test]
+    fn plan_trigger_label_shows_pending_progress() {
+        let items = vec![
+            ComposerPlanItem::new("一", "pending"),
+            ComposerPlanItem::new("二", "failed"),
+        ];
+
+        assert_eq!(
+            plan_trigger_label(&items).as_ref(),
+            format!("0/2 {}", t!("AgentUi.pending"))
+        );
+    }
+
+    #[test]
+    fn subagent_trigger_label_shows_running_subagent_count() {
+        assert_eq!(
+            subagent_trigger_label(&[]).as_ref(),
+            t!("AgentUi.subagents").as_ref()
+        );
+
+        let items = vec![ComposerSubAgentItem::new(
+            "sub_1",
+            "reviewer",
+            "检查事件流",
+            "running",
+        )];
+
+        assert_eq!(
+            subagent_trigger_label(&items).as_ref(),
+            t!("AgentUi.subagent_count", count = 1).as_ref()
+        );
+    }
+
+    #[test]
+    fn resource_pool_trigger_label_uses_pool_wording() {
+        let context = AgentComposerContext {
+            resource_pool: crate::input::context::ComposerResourcePoolSummary::new(
+                Some(SharedString::from("ssh-a")),
+                "prod-a",
+                3,
+            ),
+            ..AgentComposerContext::default()
+        };
+
+        assert_eq!(
+            resource_pool_trigger_label(&context).as_ref(),
+            t!("AgentUi.resource_pool_count", count = 3).as_ref()
+        );
+    }
+
+    #[test]
+    fn resource_pool_trigger_label_handles_empty_pool() {
+        assert_eq!(
+            resource_pool_trigger_label(&AgentComposerContext::default()).as_ref(),
+            t!("AgentUi.resource_pool").as_ref()
+        );
+    }
+
+    #[test]
+    fn target_search_matches_label_subtitle_and_kind_case_insensitively() {
+        let opt = ComposerTarget::new(
+            "prod-pg",
+            "Prod PostgreSQL",
+            "DB",
+            "database",
+            "PostgreSQL · 10.0.0.8:5432",
+        );
+
+        assert!(target_matches(&opt, "prod"));
+        assert!(target_matches(&opt, "postgresql"));
+        assert!(target_matches(&opt, "DATABASE"));
+    }
+
+    #[test]
+    fn target_search_query_ignores_surrounding_whitespace() {
+        let opt = ComposerTarget::new(
+            "prod-pg",
+            "Prod PostgreSQL",
+            "DB",
+            "database",
+            "PostgreSQL · 10.0.0.8:5432",
+        );
+
+        assert!(target_matches(&opt, "  prod  "));
     }
 
     #[test]
@@ -2070,6 +4567,105 @@ mod tests {
             text,
             text.len() - "行".len()
         ));
+    }
+
+    #[test]
+    fn resource_type_filter_keeps_all_resources_for_all() {
+        let targets = vec![
+            ComposerTarget::new("ssh-a", "prod-a", "SH", "ssh", "ssh · ssh-a"),
+            ComposerTarget::new("db-a", "prod-db", "DB", "postgres", "postgres · db-a"),
+        ];
+
+        let filtered = filter_targets_by_kind(targets.clone(), "all");
+
+        assert_eq!(filtered, targets);
+    }
+
+    #[test]
+    fn resource_type_filter_matches_target_kind() {
+        let targets = vec![
+            ComposerTarget::new("ssh-a", "prod-a", "SH", "ssh", "ssh · ssh-a"),
+            ComposerTarget::new("db-a", "prod-db", "DB", "postgres", "postgres · db-a"),
+        ];
+
+        let filtered = filter_targets_by_kind(targets, "ssh");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id.as_ref(), "ssh-a");
+    }
+
+    #[test]
+    fn resource_pool_action_labels_match_membership() {
+        let add = ComposerResourcePoolItem::new(
+            "ssh-b",
+            "prod-b",
+            "SH",
+            "ssh",
+            "ssh-b",
+            "可添加",
+            None::<&str>,
+            0,
+            false,
+            false,
+        );
+        let remove = ComposerResourcePoolItem::new(
+            "ssh-a",
+            "prod-a",
+            "SH",
+            "ssh",
+            "ssh-a",
+            "已加入",
+            None::<&str>,
+            0,
+            true,
+            false,
+        );
+        let default = ComposerResourcePoolItem::new(
+            "ssh-a",
+            "prod-a",
+            "SH",
+            "ssh",
+            "ssh-a",
+            "已加入",
+            Some("默认目标"),
+            0,
+            true,
+            true,
+        );
+
+        assert_eq!(resource_pool_action_label(&add), "+");
+        assert_eq!(resource_pool_action_label(&remove), "-");
+        assert_eq!(resource_pool_action_label(&default), "-");
+        assert!(!resource_pool_action_disabled(&default));
+    }
+
+    #[test]
+    fn resource_source_option_label_includes_count_or_disabled_hint() {
+        let enabled = ComposerResourceSourceOption::new("all", "全部", 3, true);
+        let disabled = ComposerResourceSourceOption::new("workspace", "工作区", 0, false)
+            .disabled("暂无工作区资源来源");
+
+        assert_eq!(resource_source_option_label(&enabled).as_ref(), "全部 3");
+        assert_eq!(
+            resource_source_option_label(&disabled).as_ref(),
+            "工作区 · 暂无工作区资源来源"
+        );
+    }
+
+    #[test]
+    fn top_capability_menus_can_open_while_agent_is_running() {
+        assert_eq!(
+            Some(ComposerMenuKind::Plan),
+            menu_state_after_open_change(true, ComposerMenuKind::Plan)
+        );
+        assert_eq!(
+            Some(ComposerMenuKind::SubAgent),
+            menu_state_after_open_change(true, ComposerMenuKind::SubAgent)
+        );
+        assert_eq!(
+            None,
+            menu_state_after_open_change(false, ComposerMenuKind::Target)
+        );
     }
 
     #[test]
