@@ -24,12 +24,11 @@ use gpui::{
     App, AppContext, Context, Entity, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, InteractiveElement, IntoElement, Modifiers, ParentElement, PathPromptOptions,
     Pixels, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
-    Subscription, Window, div, img, prelude::FluentBuilder, px, relative,
+    Subscription, Window, div, img, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
-use gpui_component::progress::ProgressCircle;
 use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{Select, SelectEvent, SelectGroup, SelectState};
 use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, h_flex, v_flex};
@@ -49,7 +48,6 @@ use crate::input::mention::{MentionCompletionProvider, MentionItem};
 use crate::input::model_picker::{ModelChoice, model_groups, selected_model_index};
 use crate::input::skill::{render_skill_mode_content, skill_trigger_label};
 use crate::theme::{AgentChatTheme, active_agent_chat_theme, sp};
-use crate::usage::{ContextUsage, UsagePressure, format_token_count};
 
 /// AgentInput 对外事件。
 #[derive(Clone, Debug)]
@@ -178,7 +176,6 @@ const TOOLBAR_ACTION_BUTTON_SIZE: f32 = 32.0;
 /// 工具栏右侧上下文用量圆环的直径。
 ///
 /// 取 20:比 32 的按钮小一号,不跟发送键抢视线,又能把百分比读出来。
-const USAGE_GAUGE_DIAMETER: f32 = 20.0;
 /// 底部那一行里上下文档位 chip 的固定高度。
 ///
 /// 与发送 / 附件按钮同高：整行只有一种控件高度，7 项并排时不会参差。
@@ -366,7 +363,6 @@ pub struct AgentInput {
     ///
     /// 单独一个 bool 而不是塞进 `open_menu`：它是**受控**的——点「查看历史」要
     /// 顺手把它收起来，让用量历史浮层不被自己的 popover 压住。
-    usage_detail_open: bool,
     /// 顶部计划面板中已展开的只读计划项。
     expanded_plan_items: HashSet<String>,
     /// 是否折叠顶部计划 / Agent / 上下文能力区。
@@ -548,7 +544,6 @@ impl AgentInput {
             selected_resource_kind_filter: SharedString::from("all"),
             context_search_needs_reset: false,
             open_menu: None,
-            usage_detail_open: false,
             expanded_plan_items: HashSet::new(),
             top_capabilities_collapsed: false,
             theme: None,
@@ -1502,73 +1497,6 @@ impl AgentInput {
             )
     }
 
-    /// 底部工具栏右侧的上下文用量圆环。
-    ///
-    /// 数据来自 [`AgentComposerContext::context_usage`](crate::input::context::AgentComposerContext);
-    /// 本地后端与 ACP 侧走同一条通路。没有读数时整块不渲染,不留空位——
-    /// 没数据就不占地方摆一个空圈。
-    ///
-    /// 颜色随占用分档:常规 accent、70% 起转 warning、90% 起转 danger。
-    /// 圆环本身是按钮:点开看完整读数（已用 / 上限 / 剩余 / 费用）。
-    fn render_usage_gauge(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let usage = self.context.context_usage.clone()?;
-        let theme = self.local_theme(cx);
-        let color = usage_color(&usage, &theme);
-        let percent = usage.percent().unwrap_or(0.0);
-        let label = usage.gauge_label();
-        let detail = usage.detail_text();
-        let view = cx.entity();
-        let trigger = Button::new("agent-input-usage-gauge")
-            .debug_selector(|| "agent-input-usage-gauge".to_string())
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(sp(6.0))
-                    .child(
-                        div().size(sp(USAGE_GAUGE_DIAMETER)).child(
-                            ProgressCircle::new("agent-input-usage")
-                                .value(percent)
-                                .color(color)
-                                .accessibility_label(detail),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(label),
-                    ),
-            )
-            .ghost()
-            .small()
-            .px_0();
-        Some(
-            Popover::new("agent-usage-popover")
-                // 触发只有 Button 实现了 `Selectable`；圆环与百分比作为按钮内容。
-                .trigger(trigger)
-                // 受控开合：详情里的「查看历史」要能把它关上。
-                .open(self.usage_detail_open)
-                .on_open_change({
-                    let view = view.clone();
-                    move |open, _window, cx| {
-                        let open = *open;
-                        view.update(cx, |this, cx| {
-                            if this.usage_detail_open != open {
-                                this.usage_detail_open = open;
-                                cx.notify();
-                            }
-                        });
-                    }
-                })
-                .content({
-                    let view = view.clone();
-                    move |_state, _window, _cx| render_usage_detail(&usage, &theme, view.clone())
-                }),
-        )
-    }
-
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
         let running = self.is_running;
@@ -1614,8 +1542,7 @@ impl AgentInput {
             .overflow_hidden()
             .flex_shrink_0()
             .child(attach_group)
-            .child(context_group)
-            .children(self.render_usage_gauge(cx));
+            .child(context_group);
 
         if queue_mode {
             toolbar = toolbar
@@ -2899,142 +2826,6 @@ impl Render for AgentInput {
     }
 }
 
-/// 占用分档 → 圆环颜色。
-///
-/// 三档共用同一套语义槽：常规、70% 起警告、90% 起危险。
-fn usage_color(usage: &ContextUsage, theme: &AgentChatTheme) -> gpui::Hsla {
-    match usage.pressure() {
-        UsagePressure::Calm => theme.gauge,
-        UsagePressure::Elevated => theme.gauge_warning,
-        UsagePressure::Critical => theme.gauge_danger,
-    }
-}
-
-/// 用量详情面板：点圆环展开的完整读数。
-///
-/// 只展示**手上真实有**的数：没有窗口大小就不编造上限与百分比，
-/// 没有费用就不摆一行空值。
-fn render_usage_detail(
-    usage: &ContextUsage,
-    theme: &AgentChatTheme,
-    view: Entity<AgentInput>,
-) -> impl IntoElement + use<> {
-    let accent = usage_color(usage, theme);
-    let rows = usage_detail_rows(usage)
-        .into_iter()
-        .map(|(label, value)| usage_detail_row(label, value, theme))
-        .collect::<Vec<_>>();
-
-    v_flex()
-        .debug_selector(|| "agent-usage-detail".to_string())
-        .w(sp(220.0))
-        .gap_2()
-        .p_3()
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(t!("AgentUi.usage_title").to_string()),
-        )
-        .children(match usage.percent() {
-            Some(percent) => Some(usage_percent_bar(percent, accent, theme)),
-            None => None,
-        })
-        .children(rows)
-        .child(
-            div().pt_2().border_t_1().border_color(theme.border).child(
-                Button::new("agent-usage-history-open")
-                    .small()
-                    .ghost()
-                    .label(t!("AgentUi.usage_history_open").to_string())
-                    .on_click(move |_event, _window, cx| {
-                        view.update(cx, |this, cx| {
-                            this.usage_detail_open = false;
-                            cx.emit(AgentInputEvent::OpenUsageHistory);
-                            cx.notify();
-                        });
-                    }),
-            ),
-        )
-}
-
-/// 详情面板里的「标签 / 数值」列表。
-///
-/// 抽成纯函数便于断言：哪些行会出现、顺序如何、窗口未知时怎么退化。
-fn usage_detail_rows(usage: &ContextUsage) -> Vec<(String, String)> {
-    let mut rows = vec![(
-        t!("AgentUi.usage_used").to_string(),
-        format_token_count(usage.used),
-    )];
-    match usage.window.filter(|window| *window > 0) {
-        Some(window) => {
-            rows.push((
-                t!("AgentUi.usage_limit").to_string(),
-                format_token_count(window),
-            ));
-            rows.push((
-                t!("AgentUi.usage_remaining").to_string(),
-                format_token_count(window.saturating_sub(usage.used)),
-            ));
-        }
-        None => rows.push((
-            t!("AgentUi.usage_limit").to_string(),
-            t!("AgentUi.usage_unknown").to_string(),
-        )),
-    }
-    if let Some(cost) = usage.cost.as_deref() {
-        rows.push((t!("AgentUi.usage_cost").to_string(), cost.to_string()));
-    }
-    rows
-}
-
-/// 用量详情里的一行：左标签、右数值。
-fn usage_detail_row(
-    label: String,
-    value: String,
-    theme: &AgentChatTheme,
-) -> impl IntoElement + use<> {
-    h_flex()
-        .w_full()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(label),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .text_xs()
-                .text_color(theme.foreground)
-                .child(value),
-        )
-}
-
-/// 占用比例条：轨道走 `inset`，已完成部分走当前档位色。
-fn usage_percent_bar(
-    percent: f32,
-    accent: gpui::Hsla,
-    theme: &AgentChatTheme,
-) -> impl IntoElement + use<> {
-    div()
-        .w_full()
-        .h(sp(6.0))
-        .rounded_full()
-        .bg(theme.inset)
-        .child(
-            div()
-                .h_full()
-                .w(relative((percent / 100.0).clamp(0.0, 1.0)))
-                .rounded_full()
-                .bg(accent),
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3191,20 +2982,6 @@ mod tests {
                 width,
                 height: px(220.0),
             }
-        }
-
-        /// 同 [`Self::with_width`],额外注入一条上下文用量读数。
-        fn with_usage(
-            used: u64,
-            window_size: Option<u64>,
-            window: &mut Window,
-            cx: &mut Context<Self>,
-        ) -> Self {
-            let root = Self::with_width(px(900.0), window, cx);
-            root.input.update(cx, |input, _cx| {
-                input.context.context_usage = Some(ContextUsage::new(used, window_size));
-            });
-            root
         }
     }
 
@@ -3506,123 +3283,6 @@ mod tests {
             model_menu_width(&[short, long]),
             sp(MODEL_MENU_MAX_WIDTH),
             "超长标签要收在上限内,否则浮层会被窗口边缘收敛"
-        );
-    }
-
-    /// 有上下文用量读数时,工具栏右侧多一个圆环,且排在发送按钮左边。
-    #[gpui::test]
-    fn toolbar_shows_the_context_usage_gauge_next_to_the_send_button(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::init(cx);
-        });
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            AgentInputLayoutRoot::with_usage(50_000, Some(200_000), window, cx)
-        });
-        let cx: &mut VisualTestContext = cx;
-
-        let gauge = cx
-            .debug_bounds("agent-input-usage-gauge")
-            .expect("有读数时应该渲染圆环");
-        let send = cx
-            .debug_bounds("agent-send-button")
-            .expect("发送按钮应该渲染");
-        assert!(
-            gauge.right() <= send.left(),
-            "圆环应排在发送按钮左侧: gauge={gauge:?} send={send:?}"
-        );
-    }
-
-    /// 没有读数时不渲染圆环——不摆一个空圈占位。
-    #[gpui::test]
-    fn toolbar_omits_the_context_usage_gauge_without_a_reading(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::init(cx);
-        });
-        let (_, cx) = cx
-            .add_window_view(|window, cx| AgentInputLayoutRoot::with_width(px(900.0), window, cx));
-        let cx: &mut VisualTestContext = cx;
-
-        assert!(
-            cx.debug_bounds("agent-input-usage-gauge").is_none(),
-            "没有用量读数就不该占位"
-        );
-    }
-
-    /// 窗口已知时详情面板给四行：已用 / 上限 / 剩余 / 费用。
-    ///
-    /// 标签用同一批 `t!` 钥拼出来：测试环境不确定当前 locale，
-    /// 这里真正要卡的是「哪几行、什么顺序、数值怎么格式化」。
-    #[test]
-    fn usage_detail_rows_cover_used_limit_remaining_and_cost() {
-        let usage = ContextUsage::new(50_000, Some(200_000)).with_cost(Some("$0.12"));
-        assert_eq!(
-            usage_detail_rows(&usage),
-            vec![
-                (t!("AgentUi.usage_used").to_string(), "50.0k".to_string()),
-                (t!("AgentUi.usage_limit").to_string(), "200.0k".to_string()),
-                (
-                    t!("AgentUi.usage_remaining").to_string(),
-                    "150.0k".to_string()
-                ),
-                (t!("AgentUi.usage_cost").to_string(), "$0.12".to_string()),
-            ]
-        );
-    }
-
-    /// 窗口未知时不编造上限与剩余：只报已用，并明说上限未知。
-    #[test]
-    fn usage_detail_rows_degrade_when_the_window_is_unknown() {
-        let unknown = vec![
-            (t!("AgentUi.usage_used").to_string(), "12.3k".to_string()),
-            (
-                t!("AgentUi.usage_limit").to_string(),
-                t!("AgentUi.usage_unknown").to_string(),
-            ),
-        ];
-        assert_eq!(usage_detail_rows(&ContextUsage::new(12_345, None)), unknown);
-        // 窗口为 0 等同于未知，不能除零也不能报一个 0/0。
-        assert_eq!(
-            usage_detail_rows(&ContextUsage::new(12_345, Some(0))),
-            unknown
-        );
-    }
-
-    /// 点圆环展开详情面板；再点一次收起。
-    #[gpui::test]
-    fn clicking_the_gauge_opens_and_closes_the_usage_detail(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::init(cx);
-        });
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            AgentInputLayoutRoot::with_usage(50_000, Some(200_000), window, cx)
-        });
-        let cx: &mut VisualTestContext = cx;
-
-        assert!(
-            cx.debug_bounds("agent-usage-detail").is_none(),
-            "初始应该是收起的"
-        );
-        let gauge = cx
-            .debug_bounds("agent-input-usage-gauge")
-            .expect("有读数时应该渲染圆环");
-        cx.simulate_click(gauge.center(), Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("agent-usage-detail").is_some(),
-            "点圆环应该展开用量详情"
-        );
-
-        let gauge = cx
-            .debug_bounds("agent-input-usage-gauge")
-            .expect("圆环仍然在");
-        cx.simulate_click(gauge.center(), Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("agent-usage-detail").is_none(),
-            "再点一次应该收起"
         );
     }
 
