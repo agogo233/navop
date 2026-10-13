@@ -9,7 +9,9 @@
 //!   `AgentConfig.available_resources`、后者来自工作区扫描，ACP 侧没有对应输入源。
 //!
 //! 位置的取舍同理由"谁声明"决定：模式与模型是"这次怎么跑"，跟底栏走；身份与能力栏
-//! 是"这是谁、在干什么"，留在顶部。
+//! 是"这是谁、在干什么"，留在顶部。工作区 / 分支 / Worktree 是本地下拉里长大的那套
+//! 东西，ACP 侧照旧留在底栏；但分支名又长又杂，与模型一样改用组件库 `Select`，
+//! 可搜可滚，不再是只能肉眼翻的自绘列表。
 //!
 //! 两份共用的是**数据类型**（[`AgentComposerContext`] 视图模型、[`AgentInputEvent`]
 //! 事件、[`ImageAttachment`] 附件、[`PromptHistory`] 历史）—— 事件枚举共用是有意的：
@@ -32,9 +34,9 @@ use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::progress::ProgressCircle;
 use gpui_component::searchable_list::SearchableVec;
-use gpui_component::select::{Select, SelectEvent, SelectGroup, SelectState};
+use gpui_component::select::{Select, SelectEvent, SelectGroup, SelectItem, SelectState};
 use gpui_component::switch::Switch;
-use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Icon, IndexPath, Sizable, h_flex, v_flex};
 use one_assets::IconName;
 use rust_i18n::t;
 use serde_json::Value;
@@ -83,17 +85,21 @@ const MODEL_TRIGGER_MIN_WIDTH: f32 = 140.0;
 const MODEL_MENU_MIN_WIDTH: f32 = 320.0;
 const MODEL_MENU_MAX_WIDTH: f32 = 400.0;
 const MODEL_MENU_CHROME_WIDTH: f32 = 56.0;
+/// 分支下拉弹层的宽度区间：分支名长短差别很大（`main` 到 `feature/xxx-yyy`），
+/// 按最长的那个估，保证点开能读到完整的名字。
+const BRANCH_MENU_MIN_WIDTH: f32 = 260.0;
+const BRANCH_MENU_MAX_WIDTH: f32 = 420.0;
+const BRANCH_MENU_CHROME_WIDTH: f32 = 56.0;
 
-/// ACP 能力栏里受控开合的面板种类。
+/// ACP 输入框里受控开合的面板种类。
 ///
-/// 模型不在这里：它交给组件库的 `Select`，开合由组件自己管。
+/// 模型与分支不在这里：两者都交给组件库的 `Select`，开合与搜索由组件自己管。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcpComposerMenu {
     Plan,
     SubAgent,
     Mode,
     Workspace,
-    Branch,
 }
 
 /// 编辑器高度：按行数在 3~10 行之间自适应。
@@ -246,6 +252,8 @@ pub struct AcpAgentInput {
     /// 模型下拉的组件库状态；注入点时拿不到窗口，置脏后在 `render` 里灌。
     model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>>,
     model_select_dirty: bool,
+    branch_select: Entity<SelectState<SearchableVec<BranchChoice>>>,
+    branch_select_dirty: bool,
     /// 会话模式候选（agent 声明的 modes，id 已带 `acp-mode:` 前缀）。
     mode_options: Vec<ComposerMenuOption>,
     /// 当前展开的下拉（受控开合）。
@@ -365,6 +373,30 @@ impl AcpAgentInput {
             },
         );
 
+        let branch_select: Entity<SelectState<SearchableVec<BranchChoice>>> = cx.new(|cx| {
+            SelectState::<SearchableVec<BranchChoice>>::new(
+                SearchableVec::new(Vec::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let branch_select_sub = cx.subscribe(
+            &branch_select,
+            |_this: &mut Self,
+             _state: Entity<SelectState<SearchableVec<BranchChoice>>>,
+             event: &SelectEvent<SearchableVec<BranchChoice>>,
+             cx: &mut Context<Self>| {
+                let SelectEvent::Confirm(Some(option)) = event else {
+                    return;
+                };
+                cx.emit(AgentInputEvent::SelectBranch {
+                    name: option.name.clone(),
+                });
+            },
+        );
+
         Self {
             focus_handle: cx.focus_handle(),
             input_state,
@@ -381,13 +413,21 @@ impl AcpAgentInput {
             model_options: Vec::new(),
             model_select,
             model_select_dirty: false,
+            branch_select,
+            branch_select_dirty: false,
             mode_options: Vec::new(),
             open_menu: None,
             usage_detail_open: false,
             header_collapsed: false,
             theme: None,
             edge_to_edge: false,
-            _subscriptions: vec![enter_sub, paste_sub, history_sub, model_select_sub],
+            _subscriptions: vec![
+                enter_sub,
+                paste_sub,
+                history_sub,
+                model_select_sub,
+                branch_select_sub,
+            ],
         }
     }
 
@@ -431,6 +471,10 @@ impl AcpAgentInput {
 
     /// 注入展示上下文（会话标题 / 模式文案 / 用量 / 工作区 / 分支）。
     pub fn set_context(&mut self, context: AgentComposerContext, cx: &mut Context<Self>) {
+        if self.context.branch_options != context.branch_options {
+            // 同模型那份：`SelectState` 要窗口才能更新，这里只有 `Context`。
+            self.branch_select_dirty = true;
+        }
         self.context = context;
         cx.notify();
     }
@@ -687,6 +731,31 @@ impl AcpAgentInput {
         let selected = selected_model_index(&self.model_options, self.context.model.as_ref());
         self.model_select.update(cx, |state, cx| {
             state.set_items(groups, window, cx);
+            state.set_selected_index(selected, window, cx);
+        });
+    }
+
+    /// 把分支候选与当前分支灌进组件库的 `Select`（与模型那份同一套收敛方式）。
+    ///
+    /// 选中项按 `current` 反查下标：上下文里没有"当前分支"时宁可置空，
+    /// 也不能顺手选中列表里的第一条。
+    fn sync_branch_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = SearchableVec::new(
+            self.context
+                .branch_options
+                .iter()
+                .cloned()
+                .map(BranchChoice::new)
+                .collect::<Vec<_>>(),
+        );
+        let selected = self
+            .context
+            .branch_options
+            .iter()
+            .position(|branch| branch.current)
+            .map(IndexPath::new);
+        self.branch_select.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
             state.set_selected_index(selected, window, cx);
         });
     }
@@ -1483,9 +1552,11 @@ impl AcpAgentInput {
     }
 
     /// 底部那一行的「分支」下拉。
-    fn render_branch_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let view = cx.entity();
-        let is_open = self.open_menu == Some(AcpComposerMenu::Branch);
+    ///
+    /// 与模型同一套控件（组件库 `Select`）：长名字能搜、能滚、键盘能导航——
+    /// 分支名动辄 `feature/xxx-yyy`，靠肉眼在下拉里翻比搜索慢得多。
+    /// 宽度仍按当前分支名估（夹在 chip 区间里），不抢旁边的控件。
+    fn render_branch_menu(&self) -> impl IntoElement + use<> {
         let current = self
             .context
             .branch_options
@@ -1493,55 +1564,25 @@ impl AcpAgentInput {
             .find(|branch| branch.current)
             .map(|branch| branch.name.clone())
             .unwrap_or_else(|| SharedString::from(t!("AgentUi.composer_branch").to_string()));
-        let options = self.context.branch_options.clone();
-        let theme = self.local_theme(cx);
-
-        let trigger = Button::new("acp-branch")
-            .debug_selector(|| "agent-input-branch".to_string())
-            .small()
-            .w_full()
-            .h(sp(COMPOSER_CHIP_HEIGHT))
-            .justify_between()
-            .outline()
-            .disabled(self.is_running)
-            .bg(theme.panel)
-            .border_color(theme.border)
-            .text_color(theme.foreground)
-            .child(composer_chip_label(IconName::GitBranch, current.clone()));
 
         div()
+            .debug_selector(|| "agent-input-branch".to_string())
             .w(composer_chip_width(&current))
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
             .flex_shrink(1.0)
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .overflow_hidden()
             .child(
-                Popover::new("acp-branch-popover")
-                    .p_0()
-                    .open(is_open)
-                    .trigger_style(StyleRefinement::default().w_full())
-                    .on_open_change({
-                        let view = view.clone();
-                        move |open, _window, cx| {
-                            let open = *open;
-                            view.update(cx, |this, cx| {
-                                this.open_menu = if open && !this.is_running {
-                                    Some(AcpComposerMenu::Branch)
-                                } else {
-                                    None
-                                };
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .trigger(trigger)
-                    .content({
-                        let view = view.clone();
-                        let theme = theme.clone();
-                        move |_state, _window, cx| {
-                            render_branch_content(view.clone(), options.clone(), &theme, cx)
-                        }
-                    }),
+                Select::new(&self.branch_select)
+                    .id("acp-branch")
+                    .w_full()
+                    .h(sp(32.0))
+                    .small()
+                    .placeholder(current)
+                    .search_placeholder(t!("AgentUi.search_branch").to_string())
+                    .menu_width(branch_menu_width(&self.context.branch_options))
+                    .menu_max_h(sp(320.0))
+                    .disabled(self.is_running),
             )
     }
 
@@ -1842,7 +1883,7 @@ impl AcpAgentInput {
             .child(self.render_workspace_menu(cx));
         if is_git_repo {
             context_group = context_group
-                .child(self.render_branch_menu(cx))
+                .child(self.render_branch_menu())
                 .child(self.render_worktree_toggle(cx));
         }
         context_group = context_group
@@ -2181,6 +2222,10 @@ impl Render for AcpAgentInput {
             self.sync_model_select(window, cx);
             self.model_select_dirty = false;
         }
+        if self.branch_select_dirty {
+            self.sync_branch_select(window, cx);
+            self.branch_select_dirty = false;
+        }
 
         let header = self.render_agent_header(cx);
         let attachments = self.render_attachments(cx);
@@ -2509,103 +2554,63 @@ fn browse_workspace_row(
         .into_any_element()
 }
 
-/// 分支下拉的菜单内容。
-fn render_branch_content(
-    view: Entity<AcpAgentInput>,
-    options: Vec<ComposerBranchOption>,
-    theme: &AgentChatTheme,
-    cx: &mut Context<gpui_component::popover::PopoverState>,
-) -> gpui::AnyElement {
-    let mut col = v_flex()
-        .p_1()
-        .gap(sp(2.0))
-        .min_w(sp(260.0))
-        .bg(theme.background)
-        .text_color(theme.foreground);
-
-    col = col.child(context_group_label(
-        t!("AgentUi.composer_branch").to_string(),
-        theme,
-    ));
-
-    if options.is_empty() {
-        return col
-            .child(
-                div()
-                    .px_2()
-                    .py_2()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(t!("AgentUi.composer_branch_empty").to_string()),
-            )
-            .into_any_element();
-    }
-
-    for option in options {
-        col = col.child(branch_option_row(view.clone(), option, theme, cx));
-    }
-
-    col.into_any_element()
+/// 分支下拉的列表项。
+///
+/// 值直接就是 [`ComposerBranchOption`]：选中回调拿到的就是完整选项（含「是不是远端」），
+/// 不用再对着名字反查。
+#[derive(Clone, Debug)]
+struct BranchChoice {
+    option: ComposerBranchOption,
 }
 
-fn branch_option_row(
-    view: Entity<AcpAgentInput>,
-    option: ComposerBranchOption,
-    theme: &AgentChatTheme,
-    cx: &mut Context<gpui_component::popover::PopoverState>,
-) -> gpui::AnyElement {
-    let muted = theme.muted_foreground;
-    let hover_bg = theme.hover_background();
-    let selected_bg = theme.selection_background();
-    let selected_fg = theme.accent;
-    let current = option.current;
-    let remote = option.remote;
-    let name = option.name.clone();
-    let row_id = option.element_id();
+impl BranchChoice {
+    fn new(option: ComposerBranchOption) -> Self {
+        Self { option }
+    }
+}
 
-    let mut inner = v_flex()
-        .flex_1()
-        .min_w_0()
-        .gap(px(1.0))
-        .child(div().text_sm().truncate().child(name.clone()));
-    if remote {
-        inner = inner.child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(t!("AgentUi.composer_branch_remote").to_string()),
-        );
+impl SelectItem for BranchChoice {
+    type Value = ComposerBranchOption;
+
+    fn title(&self) -> SharedString {
+        self.option.name.clone()
     }
 
-    h_flex()
-        .id(row_id)
-        .w_full()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1p5()
-        .rounded(cx.theme().radius)
-        .cursor_pointer()
-        .when(current, |this| {
-            this.bg(selected_bg).text_color(theme.foreground)
-        })
-        .hover(move |this| this.bg(hover_bg))
-        .child(inner)
-        .when(current, |this| {
-            this.child(Icon::new(IconName::Check).xsmall().text_color(selected_fg))
-        })
-        .on_click(move |_, _window, cx| {
-            let name = name.clone();
-            view.update(cx, |this, cx| {
-                if this.is_running {
-                    return;
-                }
-                this.open_menu = None;
-                cx.emit(AgentInputEvent::SelectBranch { name });
-                cx.notify();
-            });
-        })
-        .into_any_element()
+    fn value(&self) -> &Self::Value {
+        &self.option
+    }
+
+    /// 分支名常常很长，按子串不区分大小写匹配；空查询视为全命中。
+    fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        query.is_empty() || self.option.name.to_lowercase().contains(&query)
+    }
+
+    fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let mut row = v_flex()
+            .gap(px(1.0))
+            .debug_selector(|| "agent-branch-option".to_string())
+            .child(div().text_sm().truncate().child(self.option.name.clone()));
+        if self.option.remote {
+            row = row.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(t!("AgentUi.composer_branch_remote").to_string()),
+            );
+        }
+        row
+    }
+}
+
+/// 分支下拉弹层的宽度：按最长的分支名估，保证点开能读到完整的名字。
+fn branch_menu_width(options: &[ComposerBranchOption]) -> gpui::Rems {
+    let widest = options
+        .iter()
+        .map(|option| estimated_label_width(option.name.as_ref()))
+        .fold(0.0_f32, f32::max);
+    sp((widest + BRANCH_MENU_CHROME_WIDTH).clamp(BRANCH_MENU_MIN_WIDTH, BRANCH_MENU_MAX_WIDTH))
 }
 
 /// 计划栏的触发标签：`0/3 进行中`。计数比单独的"计划"更能说明该不该点开。
@@ -3003,6 +3008,47 @@ mod tests {
         assert_eq!(
             acp_subagent_trigger_label(&items).as_ref(),
             t!("AgentUi.subagent_count", count = 1).as_ref()
+        );
+    }
+
+    /// 分支下拉的搜索：按名字子串、不区分大小写；空查询不把候选滤空。
+    #[test]
+    fn branch_search_matches_the_name_case_insensitively() {
+        let choice = BranchChoice::new(ComposerBranchOption::new("feature/Impl-AI", false, false));
+
+        assert!(choice.matches("impl"));
+        assert!(choice.matches("FEATURE"), "大小写不该影响命中");
+        assert!(choice.matches("ature/impl-ai"));
+        assert!(choice.matches("   "), "空查询=全部命中，不能把列表滤空");
+        assert!(choice.matches(""));
+        assert!(!choice.matches("main"));
+    }
+
+    /// 弹层宽度跟最长的分支名走，并夹在区间里：短名字不拖一个太空的层。
+    #[test]
+    fn branch_menu_width_tracks_the_widest_name_within_bounds() {
+        let narrow = branch_menu_width(&[ComposerBranchOption::new("main", true, false)]);
+        let wide = branch_menu_width(&[ComposerBranchOption::new(
+            "feature/a-very-long-branch-name-for-the-test",
+            true,
+            false,
+        )]);
+        assert!(
+            wide.0 > narrow.0,
+            "最长的名字越宽，弹层越宽：{narrow:?} vs {wide:?}"
+        );
+        assert!(
+            narrow.0 >= sp(BRANCH_MENU_MIN_WIDTH).0,
+            "再短也不低于下限：{narrow:?}"
+        );
+        assert!(
+            branch_menu_width(&[ComposerBranchOption::new(
+                "feature/".repeat(20),
+                true,
+                false
+            )])
+            .0 <= sp(BRANCH_MENU_MAX_WIDTH).0,
+            "再长也不超过上限"
         );
     }
 }

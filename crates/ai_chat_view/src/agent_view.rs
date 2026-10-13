@@ -11217,6 +11217,82 @@ mod tests {
         );
     }
 
+    /// ACP 的分支选择与模型同一套控件（组件库 `Select`）：点开列出候选，
+    /// 选中一条走原有的 `SelectBranch` 事件交给宿主（与旧的自绘列表同一条回路）。
+    ///
+    /// 搜索框是组件自带的，能搜的前提在 `BranchChoice::matches` 那侧（含单测）；
+    /// 这里盯的是「换成组件下拉之后，开关与选中都还能跑通」。
+    #[gpui::test]
+    fn acp_branch_select_lists_options_and_reports_the_pick(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let picked = Arc::new(Mutex::new(Vec::new()));
+        let picked_for_source = picked.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let source = ComposerContextSource {
+            snapshot: Arc::new(|_: &mut gpui::App| ComposerContextSnapshot {
+                branches: vec![ComposerBranchOption::new("main", true, false)],
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(move |name: &SharedString, _: &mut gpui::App| {
+                picked_for_source.lock().unwrap().push(name.clone());
+            }),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+
+        let branch = cx
+            .debug_bounds("agent-input-branch")
+            .expect("分支选择应当渲染");
+        assert!(
+            branch.size.width > px(0.0),
+            "分支选择不能被挤成零宽：{branch:?}"
+        );
+        assert!(
+            cx.debug_bounds("agent-branch-option").is_none(),
+            "没点开之前不该有候选"
+        );
+
+        cx.simulate_click(branch.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("agent-branch-option").is_some(),
+            "点开应当出现组件下拉的候选行"
+        );
+
+        let option = cx
+            .debug_bounds("agent-branch-option")
+            .expect("候选行应当在");
+        cx.simulate_click(option.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert_eq!(
+            picked.lock().unwrap().as_slice(),
+            [SharedString::from("main")],
+            "选中必须原样报给宿主"
+        );
+        assert!(
+            cx.debug_bounds("agent-branch-option").is_none(),
+            "选完应当收起"
+        );
+    }
+
     #[gpui::test]
     fn switching_backend_carries_the_draft_between_composers(cx: &mut TestAppContext) {
         init_test_ui(cx);
