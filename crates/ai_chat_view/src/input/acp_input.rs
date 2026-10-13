@@ -3,9 +3,13 @@
 //! 与 [`AgentInput`](super::AgentInput) 是**两份独立的组件**，不是同一个组件换皮：
 //! - One agent（本地运行时）那份是"驾驶舱"：计划 / 子代理 / 上下文资源 / Skill
 //!   四张能力面板、资源池、目标与权限档位，全都围绕本地运行时自己的概念；
-//! - ACP 那份是"对讲机"：只摆 agent 自己声明的会话模式、模型与 `/` 命令，
-//!   加上必需要的输入 / 附件 / 用量与工作区归属。ACP 侧没有"计划步骤""子代理
-//!   卡片""资源池"这些概念，把它们摆出来只会让用户以为 navop 在替 agent 做决策。
+//! - ACP 那份是"对讲机"：会话模式、模型与 `/` 命令都是 agent 自己声明的，能力栏
+//!   只留计划与子代理两栏 —— ACP 的 `Plan` 更新同样落进计划栏，那是 agent 自己的
+//!   待办，不是 navop 替它排的。上下文资源池与 Skill 才是本地专属：前者来自
+//!   `AgentConfig.available_resources`、后者来自工作区扫描，ACP 侧没有对应输入源。
+//!
+//! 位置的取舍同理由"谁声明"决定：模式与模型是"这次怎么跑"，跟底栏走；身份与能力栏
+//! 是"这是谁、在干什么"，留在顶部。
 //!
 //! 两份共用的是**数据类型**（[`AgentComposerContext`] 视图模型、[`AgentInputEvent`]
 //! 事件、[`ImageAttachment`] 附件、[`PromptHistory`] 历史）—— 事件枚举共用是有意的：
@@ -44,7 +48,7 @@ use crate::input::attachment::ImageAttachment;
 use crate::input::completion::ComposerCompletionProvider;
 use crate::input::context::{
     AgentComposerContext, ComposerBranchOption, ComposerMenuOption, ComposerModelOption,
-    ComposerWorkspaceOption,
+    ComposerPlanItem, ComposerSubAgentItem, ComposerWorkspaceOption,
 };
 use crate::input::model_picker::{ModelChoice, model_groups, selected_model_index};
 use crate::input::slash::{SlashCommandItem, SlashCompletionProvider};
@@ -71,18 +75,22 @@ const TRIGGER_CHROME_WIDTH: f32 = 48.0;
 /// 长短差别很大，固定宽要么空一片要么被截断。
 const MODE_TRIGGER_MIN_WIDTH: f32 = 92.0;
 const MODE_TRIGGER_MAX_WIDTH: f32 = 190.0;
-/// ACP 头部里模型选择器能被压到的最小宽度。
+/// 能力栏（计划 / 子代理）的高度：与 One agent 那份的能力栏取同一个值。
+const CAPABILITY_TABS_HEIGHT: f32 = 38.0;
+/// 底栏里模型选择器能被压到的最小宽度。
 const MODEL_TRIGGER_MIN_WIDTH: f32 = 140.0;
 /// 模型下拉弹层的宽度区间（弹层不跟着被挤扁的触发器缩）。
 const MODEL_MENU_MIN_WIDTH: f32 = 320.0;
 const MODEL_MENU_MAX_WIDTH: f32 = 400.0;
 const MODEL_MENU_CHROME_WIDTH: f32 = 56.0;
 
-/// ACP 头部里受控开合的面板种类。
+/// ACP 能力栏里受控开合的面板种类。
 ///
 /// 模型不在这里：它交给组件库的 `Select`，开合由组件自己管。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcpComposerMenu {
+    Plan,
+    SubAgent,
     Mode,
     Workspace,
     Branch,
@@ -1079,26 +1087,23 @@ impl AcpAgentInput {
 // ---------------------------------------------------------------------------
 
 impl AcpAgentInput {
-    /// ACP 头部：agent 名字 + 会话标题 + agent 声明的模式与模型。
+    /// ACP 头部：agent 名字 + 会话标题 + agent 声明的能力清单。
     ///
-    /// 这里刻意**不**放计划 / 子代理 / 上下文资源 / Skill：那些是本地运行时的概念，
-    /// agent 自己并不声明它们，摆出来等于替 agent 许诺它做不到的事。
+    /// 身份行**始终**在：折叠收起的是能力栏（见 [`Self::render_capability_bar`]），
+    /// 用户任何时候都该看得见"现在在对讲的是哪个 agent、哪个会话"。
     fn render_agent_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
 
         v_flex()
             .w_full()
             .flex_shrink_0()
-            .when(!self.header_collapsed, |this| {
-                this.border_b_1()
-                    .border_color(theme.border)
-                    .child(self.render_agent_header_body(cx))
-            })
+            .border_b_1()
+            .border_color(theme.border)
+            .child(self.render_agent_header_body(cx))
     }
 
     fn render_agent_header_body(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
-        let row_gap = sp(8.0);
         let session_title = self
             .context
             .target
@@ -1111,10 +1116,10 @@ impl AcpAgentInput {
             .debug_selector(|| "agent-input-acp-header".to_string())
             .w_full()
             .min_w_0()
-            .gap(sp(6.0))
+            .gap(sp(4.0))
             .px_3()
-            .pt_2()
-            .pb_1p5()
+            .pt_1p5()
+            .pb_1()
             .child(
                 h_flex()
                     .w_full()
@@ -1143,18 +1148,9 @@ impl AcpAgentInput {
                             .text_color(theme.muted_foreground)
                             .child(session_title),
                     ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap(row_gap)
-                    .child(self.render_mode_chip(cx))
-                    .child(self.render_model_menu(cx)),
             );
 
-        if !capabilities.is_empty() {
+        if !self.header_collapsed && !capabilities.is_empty() {
             let summary = capabilities
                 .iter()
                 .map(|capability| capability.to_string())
@@ -1173,6 +1169,157 @@ impl AcpAgentInput {
         }
 
         body
+    }
+
+    /// 能力栏：计划 / 子代理两栏 + 右侧的折叠开关。
+    ///
+    /// 折叠开关跟这一行走，而不是另起一行：它必须**始终**可见（折起来之后还得能
+    /// 展开），所以它留在被折叠的内容之外；顺带省掉一整行的高度。
+    fn render_capability_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .pt_1p5()
+            .pb_1()
+            .when(self.header_collapsed, |this| this.justify_end())
+            .when(!self.header_collapsed, |this| {
+                this.child(self.render_capability_tabs(cx))
+            })
+            .child(self.render_header_toggle(cx))
+    }
+
+    /// 两栏能力面板：计划 / 子代理。
+    ///
+    /// 只这两栏：上下文资源池与 Skill 是本地运行时自己的概念，ACP 侧没有输入源
+    /// （见模块头）。计划栏接的是 agent 报上来的 `Plan` 更新；子代理栏接的是子代理
+    /// 卡片，ACP 目前不把 `Task` 工具调用换算成子代理，所以通常是空态。
+    fn render_capability_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .h(sp(CAPABILITY_TABS_HEIGHT))
+            .items_center()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.panel)
+            .child(self.render_plan_tab(cx))
+            .child(self.render_capability_separator(cx))
+            .child(self.render_subagent_tab(cx))
+    }
+
+    fn render_capability_separator(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+        div().h(sp(20.0)).w(px(1.0)).bg(theme.border)
+    }
+
+    /// 计划栏：agent 报上来的待办（ACP 的 `Plan` 更新）。
+    fn render_plan_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(AcpComposerMenu::Plan);
+        let items = self.context.plan_items.clone();
+        let label = acp_plan_trigger_label(&items);
+
+        Popover::new("acp-plan-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        this.open_menu = open.then_some(AcpComposerMenu::Plan);
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(self.render_capability_trigger("acp-plan-trigger", label, IconName::Check, cx))
+            .content(move |_state, _window, cx| render_acp_plan_content(items.clone(), cx))
+    }
+
+    /// 子代理栏：当前会话的子代理卡片。
+    fn render_subagent_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let is_open = self.open_menu == Some(AcpComposerMenu::SubAgent);
+        let subagents = self.context.subagent_items.clone();
+        let label = acp_subagent_trigger_label(&subagents);
+
+        Popover::new("acp-subagents-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        this.open_menu = open.then_some(AcpComposerMenu::SubAgent);
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(self.render_capability_trigger(
+                "acp-subagents-trigger",
+                label,
+                IconName::Bot,
+                cx,
+            ))
+            .content(move |_state, _window, cx| render_acp_subagent_content(subagents.clone(), cx))
+    }
+
+    fn render_capability_trigger(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        icon: IconName,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let label = label.into();
+        let theme = self.local_theme(cx);
+        Button::new(id)
+            .debug_selector(move || id.to_string())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .ghost()
+            .small()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(icon).xsmall())
+                    .child(div().text_sm().truncate().child(label)),
+            )
+    }
+
+    /// 能力栏右侧的折叠开关：折起来之后这一行就只剩它。
+    fn render_header_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        Button::new("acp-header-toggle")
+            .debug_selector(|| "agent-input-acp-header-toggle".to_string())
+            .icon(if self.header_collapsed {
+                IconName::ChevronUp
+            } else {
+                IconName::ChevronDown
+            })
+            .ghost()
+            .small()
+            .flex_shrink_0()
+            .tooltip(t!("AgentUi.collapse_capabilities").to_string())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.header_collapsed = !this.header_collapsed;
+                if this.header_collapsed {
+                    this.open_menu = None;
+                }
+                cx.notify();
+            }))
     }
 
     /// 模式 chip：选中后 emit `SelectExecutionMode`，id 里带着 `acp-mode:` 前缀，
@@ -1590,36 +1737,6 @@ impl AcpAgentInput {
         )
     }
 
-    /// 编辑器上方的右侧按钮条：只留头部折叠开关。
-    fn render_editor_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        h_flex()
-            .w_full()
-            .items_center()
-            .justify_end()
-            .px_3()
-            .pt_2()
-            .pb_1()
-            .child(
-                Button::new("acp-editor-header-toggle")
-                    .debug_selector(|| "agent-input-acp-header-toggle".to_string())
-                    .icon(if self.header_collapsed {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .ghost()
-                    .small()
-                    .tooltip(t!("AgentUi.collapse_capabilities").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.header_collapsed = !this.header_collapsed;
-                        if this.header_collapsed {
-                            this.open_menu = None;
-                        }
-                        cx.notify();
-                    })),
-            )
-    }
-
     /// 底部工具栏右侧的用量圆环：ACP 的读数来自 agent 上报的 usage。
     fn render_usage_gauge(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let usage = self.context.context_usage.clone()?;
@@ -1679,10 +1796,10 @@ impl AcpAgentInput {
         )
     }
 
-    /// 底部那一行：`[附件][计数] │ [工作区][分支][Worktree] … [用量] [发送 / 停止]`。
+    /// 底部那一行：`[附件][计数] │ [工作区][分支][Worktree] [模型] [模式] … [用量] [发送 / 停止]`。
     ///
-    /// 模式与模型不在这里：它们是 agent 自己声明的东西，放在头部（见
-    /// [`Self::render_agent_header`]），底栏只留"这次对话在哪个目录里跑"。
+    /// 模型用 `flex_1` 吸收整行余量：它是唯一需要"搜索 + 滚动 + 键盘导航"的控件，
+    /// 也最该拿宽度；其余项保持内容宽度。模式跟在模型右边，与 One agent 那份同序。
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
         let running = self.is_running;
@@ -1728,6 +1845,9 @@ impl AcpAgentInput {
                 .child(self.render_branch_menu(cx))
                 .child(self.render_worktree_toggle(cx));
         }
+        context_group = context_group
+            .child(self.render_model_menu(cx))
+            .child(self.render_mode_chip(cx));
 
         let mut toolbar = h_flex()
             .debug_selector(|| "agent-input-toolbar".to_string())
@@ -2064,7 +2184,7 @@ impl Render for AcpAgentInput {
 
         let header = self.render_agent_header(cx);
         let attachments = self.render_attachments(cx);
-        let editor_top_bar = self.render_editor_top_bar(cx);
+        let capability_bar = self.render_capability_bar(cx);
         let queued_submissions = self.render_queued_submissions(cx);
         self.ensure_elicitation_inputs(window, cx);
         let pending_elicitation = self.render_pending_elicitation(cx);
@@ -2098,10 +2218,11 @@ impl Render for AcpAgentInput {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_dropped_paths(paths.paths(), window, cx);
             }))
-            // 顶部：agent 自己的身份与能力（模式 / 模型）
+            // 顶部：agent 自己的身份与能力清单；能力栏（计划 / 子代理）紧随其后，
+            // 折叠开关就在那一行的尾端。
             .child(header)
             .children(attachments)
-            .child(editor_top_bar)
+            .child(capability_bar)
             .when_some(queued_submissions, |this, queued| this.child(queued))
             // agent 提问：放在输入框正上方，答完才收起
             .when_some(pending_elicitation, |this, pending| this.child(pending))
@@ -2136,7 +2257,7 @@ impl Render for AcpAgentInput {
                             ),
                     ),
             )
-            // 底部：附件 / 工作区 / 分支 / Worktree / 用量 / 发送，一整行
+            // 底部：附件 / 工作区 / 分支 / Worktree / 模型 / 模式 / 用量 / 发送，一整行
             .child(toolbar);
 
         v_flex()
@@ -2487,6 +2608,220 @@ fn branch_option_row(
         .into_any_element()
 }
 
+/// 计划栏的触发标签：`0/3 进行中`。计数比单独的"计划"更能说明该不该点开。
+fn acp_plan_trigger_label(items: &[ComposerPlanItem]) -> SharedString {
+    if items.is_empty() {
+        return SharedString::from(t!("AgentUi.plan").to_string());
+    }
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|item| item.status.as_ref() == "completed")
+        .count();
+    let label = if completed == total {
+        t!("AgentUi.completed").to_string()
+    } else if items
+        .iter()
+        .any(|item| matches!(item.status.as_ref(), "running" | "in_progress"))
+    {
+        t!("AgentUi.in_progress").to_string()
+    } else {
+        t!("AgentUi.pending").to_string()
+    };
+    SharedString::from(format!("{completed}/{total} {label}"))
+}
+
+/// 子代理栏的触发标签：空的时候写名字，有内容时写数量。
+fn acp_subagent_trigger_label(subagents: &[ComposerSubAgentItem]) -> SharedString {
+    if subagents.is_empty() {
+        SharedString::from(t!("AgentUi.subagents").to_string())
+    } else {
+        SharedString::from(t!("AgentUi.subagent_count", count = subagents.len()).to_string())
+    }
+}
+
+fn acp_plan_status_label(status: &str) -> String {
+    match status {
+        "completed" => t!("AgentUi.completed_state").to_string(),
+        "running" | "in_progress" => t!("AgentUi.in_progress").to_string(),
+        "failed" => t!("AgentUi.failed").to_string(),
+        "cancelled" => t!("AgentUi.cancelled").to_string(),
+        _ => t!("AgentUi.pending").to_string(),
+    }
+}
+
+/// 计划面板：agent 自己报上来的待办。
+///
+/// 比 One agent 那份简：那份的每一行能展开看工具、风险与细节，这里只列标题 /
+/// 说明 / 状态——ACP 报上来的 `Plan` 本来就只有这几项，展开了也是空的。
+fn render_acp_plan_content(
+    items: Vec<ComposerPlanItem>,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let theme = active_agent_chat_theme(cx);
+    let muted = theme.muted_foreground;
+    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(320.0));
+
+    col = col.child(context_group_label(
+        t!("AgentUi.plan_todo").to_string(),
+        &theme,
+    ));
+    if items.is_empty() {
+        return col
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(t!("AgentUi.no_plan").to_string()),
+            )
+            .into_any_element();
+    }
+
+    for (index, item) in items.into_iter().enumerate() {
+        col = col.child(acp_plan_item_row(index, item, &theme, cx));
+    }
+    col.into_any_element()
+}
+
+fn acp_plan_item_row(
+    index: usize,
+    item: ComposerPlanItem,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let muted = theme.muted_foreground;
+    let success = cx.theme().success;
+    let warning = cx.theme().warning;
+    let (icon, icon_color) = match item.status.as_ref() {
+        "completed" => (IconName::CircleCheck, success),
+        "running" | "in_progress" => (IconName::LoaderCircle, warning),
+        _ => (IconName::CircleCheck, muted),
+    };
+
+    let mut inner = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap(px(1.0))
+        .child(div().text_sm().truncate().child(item.title));
+    if !item.description.is_empty() {
+        inner = inner.child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .truncate()
+                .child(item.description),
+        );
+    }
+
+    h_flex()
+        .id(SharedString::from(format!("acp-plan-item-{index}")))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .child(inner)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(muted)
+                .child(acp_plan_status_label(item.status.as_ref())),
+        )
+        .into_any_element()
+}
+
+/// 子代理面板：当前会话的子代理卡片。
+fn render_acp_subagent_content(
+    subagents: Vec<ComposerSubAgentItem>,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let theme = active_agent_chat_theme(cx);
+    let muted = theme.muted_foreground;
+    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(300.0));
+
+    col = col.child(context_group_label(
+        t!("AgentUi.subagents").to_string(),
+        &theme,
+    ));
+    if subagents.is_empty() {
+        col = col.child(
+            div()
+                .px_2()
+                .py_2()
+                .text_sm()
+                .text_color(muted)
+                .child(t!("AgentUi.no_subagents").to_string()),
+        );
+    }
+    for subagent in subagents {
+        col = col.child(acp_subagent_item_row(subagent, &theme, cx));
+    }
+    col.into_any_element()
+}
+
+fn acp_subagent_item_row(
+    item: ComposerSubAgentItem,
+    theme: &AgentChatTheme,
+    cx: &mut Context<gpui_component::popover::PopoverState>,
+) -> gpui::AnyElement {
+    let muted = theme.muted_foreground;
+    let (icon, icon_color) = match item.status.as_ref() {
+        "completed" => (IconName::CircleCheck, cx.theme().success),
+        "failed" => (IconName::CircleX, cx.theme().danger),
+        "running" | "in_progress" => (IconName::LoaderCircle, cx.theme().warning),
+        _ => (IconName::Bot, muted),
+    };
+
+    h_flex()
+        .id(SharedString::from(format!(
+            "acp-running-subagent-{}",
+            item.id
+        )))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.0))
+                .child(div().text_sm().truncate().child(item.name))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(t!("AgentUi.purpose", value = item.task).to_string()),
+                )
+                .when(!item.summary.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(t!("AgentUi.progress", value = item.summary).to_string()),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(muted)
+                .child(acp_plan_status_label(item.status.as_ref())),
+        )
+        .into_any_element()
+}
+
 fn context_group_label(label: impl Into<SharedString>, theme: &AgentChatTheme) -> gpui::AnyElement {
     div()
         .px_2()
@@ -2623,4 +2958,51 @@ fn usage_percent_bar(
                 .rounded_full()
                 .bg(accent),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_item(status: &str) -> ComposerPlanItem {
+        ComposerPlanItem::new("步骤", status)
+    }
+
+    /// 计划栏的标签把「做完了几步」写在最前面，一眼看得出该不该点开。
+    #[test]
+    fn plan_trigger_label_counts_steps() {
+        assert_eq!(
+            acp_plan_trigger_label(&[]).as_ref(),
+            t!("AgentUi.plan").as_ref(),
+            "没有计划时只写名字"
+        );
+
+        let items = [plan_item("completed"), plan_item("running")];
+        let label = acp_plan_trigger_label(&items);
+        assert!(label.starts_with("1/2"), "计数写在前面：{label}");
+
+        let done = [plan_item("completed"), plan_item("completed")];
+        let label = acp_plan_trigger_label(&done);
+        assert!(label.starts_with("2/2"), "{label}");
+    }
+
+    /// 子代理栏空的时候写名字，有内容时写数量。
+    #[test]
+    fn subagent_trigger_label_reports_the_count() {
+        assert_eq!(
+            acp_subagent_trigger_label(&[]).as_ref(),
+            t!("AgentUi.subagents").as_ref()
+        );
+
+        let items = [ComposerSubAgentItem::new(
+            "id-1",
+            "审阅者",
+            "看事件流",
+            "running",
+        )];
+        assert_eq!(
+            acp_subagent_trigger_label(&items).as_ref(),
+            t!("AgentUi.subagent_count", count = 1).as_ref()
+        );
+    }
 }

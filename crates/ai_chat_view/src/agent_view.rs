@@ -11106,6 +11106,117 @@ mod tests {
         );
     }
 
+    /// ACP 的"怎么跑"跟底栏走：模式与模型都在工具栏那一行，抬头只剩下身份与能力。
+    #[gpui::test]
+    fn acp_composer_keeps_mode_and_model_on_the_bottom_row(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let toolbar = cx
+            .debug_bounds("agent-input-toolbar")
+            .expect("底栏应当渲染");
+        let header = cx
+            .debug_bounds("agent-input-acp-header")
+            .expect("ACP 抬头应当渲染");
+        let mode = cx
+            .debug_bounds("agent-input-acp-mode")
+            .expect("模式 chip 应当渲染");
+        let model = cx
+            .debug_bounds("agent-input-acp-model-control")
+            .expect("模型下拉应当渲染");
+
+        let header_bottom = header.origin.y + header.size.height;
+        let toolbar_bottom = toolbar.origin.y + toolbar.size.height;
+        for control in [mode, model] {
+            assert!(
+                control.origin.y >= toolbar.origin.y
+                    && control.origin.y + control.size.height <= toolbar_bottom,
+                "模式与模型必须落在底栏那一行：control={control:?}, toolbar={toolbar:?}"
+            );
+            assert!(
+                control.origin.y >= header_bottom,
+                "抬头里不该再放模式与模型：control={control:?}, header={header:?}"
+            );
+        }
+    }
+
+    /// ACP 的能力栏：计划与子代理两栏 + 同一行尾端的折叠开关；折起来只剩开关。
+    #[gpui::test]
+    fn acp_composer_keeps_plan_and_subagent_tabs(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let header = cx
+            .debug_bounds("agent-input-acp-header")
+            .expect("ACP 抬头应当渲染");
+        let plan = cx.debug_bounds("acp-plan-trigger").expect("计划栏应当渲染");
+        let subagents = cx
+            .debug_bounds("acp-subagents-trigger")
+            .expect("子代理栏应当渲染");
+        let toggle = cx
+            .debug_bounds("agent-input-acp-header-toggle")
+            .expect("折叠开关应当渲染");
+
+        assert!(
+            plan.origin.x < subagents.origin.x && subagents.origin.x < toggle.origin.x,
+            "顺序应为 计划 → 子代理 → 折叠开关：plan={plan:?}, subagents={subagents:?}, \
+             toggle={toggle:?}"
+        );
+        // 三样高度不同（两栏是整行高的按钮，折叠开关矮一号），所以比的是中线：
+        // 中线对上了就是同一行。
+        let row_center = plan.origin.y + plan.size.height / 2.0;
+        let header_bottom = header.origin.y + header.size.height;
+        for bounds in [plan, subagents, toggle] {
+            let center = bounds.origin.y + bounds.size.height / 2.0;
+            assert!(
+                (center - row_center).abs() <= px(2.0),
+                "计划栏、子代理栏与折叠开关必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
+            );
+            assert!(
+                bounds.origin.y >= header_bottom,
+                "能力栏在抬头之下：{bounds:?}, header={header:?}"
+            );
+        }
+
+        // 折起来：两栏收起，开关留着——否则展开不回去。
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("acp-plan-trigger").is_none(),
+            "折起来之后计划栏应当收起"
+        );
+        assert!(
+            cx.debug_bounds("acp-subagents-trigger").is_none(),
+            "折起来之后子代理栏应当收起"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-acp-header-toggle").is_some(),
+            "折叠开关必须留着"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-acp-header").is_some(),
+            "身份行始终可见"
+        );
+    }
+
     #[gpui::test]
     fn switching_backend_carries_the_draft_between_composers(cx: &mut TestAppContext) {
         init_test_ui(cx);
