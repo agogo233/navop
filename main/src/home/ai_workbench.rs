@@ -172,6 +172,9 @@ pub(crate) fn build_ai_workbench_shell(
     // 另一条分支：Explorer 里点开文件/变更 → 审阅面板就地切到前台。
     let chat_for_root = chat.clone();
     let shell_for_root = shell.clone();
+    // 轮末把当轮 diff 摆到审阅面板也要用 Explorer（打开文档需要窗口，得晚一帧再取），
+    // 这里先克隆一份——它必须早于下面那个 `move` 闭包存在。
+    let explorer_for_reviews = explorer.clone();
     let root_subscription: Subscription =
         cx.subscribe(&explorer, move |_, event: &WorkspaceExplorerEvent, cx| {
             match event {
@@ -195,6 +198,48 @@ pub(crate) fn build_ai_workbench_shell(
                 WorkspaceExplorerEvent::DocumentRequested => {
                     shell_for_root.update(cx, |shell, cx| {
                         shell.reveal_panel(WorkbenchPanelKind::Review, cx);
+                    });
+                }
+                // 某一轮留下了整轮 diff：把「哪些轮有审阅入口」的全量列表转给聊天
+                // 面板，它据此决定轮次页脚要不要摆「查看改动」。
+                WorkspaceExplorerEvent::ReviewsChanged {
+                    session_id,
+                    turn_ids,
+                } => {
+                    let turn_ids = turn_ids.iter().cloned().collect();
+                    chat_for_root.update(cx, |panel, cx| {
+                        panel.set_reviewed_turns(session_id.clone(), turn_ids, cx);
+                    });
+                }
+                // 刚才那一轮改完了，且真的算出了 diff：把它摆到审阅面板。
+                //
+                // 这里由宿主驱动而不是 Explorer 自己在 render 里打开：Explorer 只在它
+                // 自己的面板被渲染时才有 render，用户把文件面板关掉时那一刻就永远不会
+                // 发生。打开失败（该轮没快照）则不折腾面板，避免空开一下又没内容。
+                WorkspaceExplorerEvent::TurnReviewCaptured {
+                    session_id,
+                    turn_id,
+                } => {
+                    let session_id = session_id.clone();
+                    let turn_id = turn_id.clone();
+                    let explorer = explorer_for_reviews.clone();
+                    let shell = shell_for_root.clone();
+                    cx.defer(move |cx| {
+                        let Some(window) = crate::app_init::resolve_navop_window(cx) else {
+                            tracing::warn!(turn = %turn_id, "no window for turn review open");
+                            return;
+                        };
+                        let opened = window.update(cx, |_, window, cx| {
+                            explorer.update(cx, |explorer, cx| {
+                                explorer
+                                    .open_turn_review(&session_id, &turn_id, window, cx)
+                            })
+                        });
+                        if opened {
+                            shell.update(cx, |shell, cx| {
+                                shell.reveal_panel(WorkbenchPanelKind::Review, cx);
+                            });
+                        }
                     });
                 }
                 // 快照锚定成功 / 回滚截断后，Explorer 会送上该会话最新的可回滚轮次；
@@ -282,6 +327,36 @@ pub(crate) fn build_ai_workbench_shell(
                                 )
                             });
                         });
+                    });
+                }
+                // 用户在本轮页脚点了「查看改动」：把这一轮**所有文件**的 diff 摆到
+                // 审阅面板（点单个文件名只开那一个文件那段）。
+                // 与 `OpenFileInReview` 同理推迟到下一帧取窗口；区别是打开失败时
+                // **不**把面板扯到前台——那一轮压根没有 diff，切过去只有一片空白。
+                DefaultAgentChatPanelEvent::OpenTurnReview {
+                    session_id,
+                    turn_id,
+                } => {
+                    let session_id = session_id.clone();
+                    let turn_id = turn_id.clone();
+                    let explorer = explorer_for_files.clone();
+                    let shell = shell_for_open.clone();
+                    cx.defer(move |cx| {
+                        let Some(window) = crate::app_init::resolve_navop_window(cx) else {
+                            tracing::warn!(turn = %turn_id, "no window for turn review open");
+                            return;
+                        };
+                        let opened = window.update(cx, |_, window, cx| {
+                            explorer.update(cx, |explorer, cx| {
+                                explorer
+                                    .open_turn_review(&session_id, &turn_id, window, cx)
+                            })
+                        });
+                        if opened {
+                            shell.update(cx, |shell, cx| {
+                                shell.reveal_panel(WorkbenchPanelKind::Review, cx);
+                            });
+                        }
                     });
                 }
                 _ => {}

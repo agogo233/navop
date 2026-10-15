@@ -169,6 +169,14 @@ pub enum AgentChatViewEvent {
         path: String,
         turn_id: Option<String>,
     },
+    /// 用户点了本轮改动摘要里的「查看改动」：把**这一轮所有文件**的 diff 摆到审阅面板。
+    ///
+    /// 与 [`Self::OpenFileInReview`] 分开：那个只要某一个文件那一段，这个要整轮。
+    /// 视图只转发轮次 id —— 快照在 Explorer 手里，裁哪一份由它决定。
+    OpenTurnReview {
+        session_id: String,
+        turn_id: String,
+    },
     /// 用户点了子代理卡片上的「查看推理过程」：请求宿主把子代理详情面板切到前台。
     ///
     /// 视图只转发请求，面板建在哪、怎么开由宿主决定（与 [`Self::OpenFileInReview`] 同理）。
@@ -1353,6 +1361,11 @@ pub struct AgentChatView {
     /// 宿主推送。按会话分桶是为了切换会话时不会把上一会话的轮次当成可回滚——那会渲染
     /// 出一个点了没反应的按钮。
     restorable_turns: HashMap<String, HashSet<String>>,
+    /// 每个会话留下了整轮 diff 的轮次（宿主注入，key = session id）。
+    ///
+    /// 与 `restorable_turns` 分开存：回滚入口只对锚定成功的轮次出现，审阅入口只要
+    /// diff 真算出来了就该在。两者依据不同，合成一份会互相带累。
+    reviewed_turns: HashMap<String, HashSet<String>>,
     /// 决策栏里**显式展开详情**的那一项 id；`None` 表示全部收起。
     ///
     /// 详情展开是纯展示动作，不取键盘焦点——绝不让「用户正在打字」时 Enter 变成「允许」。
@@ -1815,6 +1828,7 @@ impl AgentChatView {
             expansion: ExpansionState::default(),
             turn_timings: TurnTimings::new(),
             restorable_turns: HashMap::new(),
+            reviewed_turns: HashMap::new(),
             decision_details: None,
             search: TranscriptSearch::new(),
             search_revision: 0,
@@ -4574,6 +4588,12 @@ impl AgentChatView {
                     turn_id,
                 });
             }
+            MessageListAction::OpenTurnReview { turn_id } => {
+                cx.emit(AgentChatViewEvent::OpenTurnReview {
+                    session_id: self.current_session.clone(),
+                    turn_id,
+                });
+            }
         }
         cx.notify();
     }
@@ -7131,6 +7151,25 @@ impl AgentChatView {
         }
         cx.notify();
     }
+
+    /// 宿主同步「某会话里哪些轮次留下了整轮 diff」。
+    ///
+    /// 与 [`Self::set_restorable_turns`] 同一套约定（宿主推全量，视图不自行推断），
+    /// 但判定依据不同：这里只算**有实质 diff** 的轮次——页脚据此决定要不要摆
+    /// 「查看改动」，摆了却点开一片空白等于没有入口。
+    pub fn set_reviewed_turns(
+        &mut self,
+        session_id: String,
+        turn_ids: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if turn_ids.is_empty() {
+            self.reviewed_turns.remove(&session_id);
+        } else {
+            self.reviewed_turns.insert(session_id, turn_ids);
+        }
+        cx.notify();
+    }
     /// 内建侧栏是否已被工作台外壳接管。
     pub fn sidebar_suppressed(&self) -> bool {
         self.sidebar_suppressed
@@ -7674,6 +7713,7 @@ impl Render for AgentChatView {
                     .with_selection_bar(selection_bar)
                     .with_empty_state(empty_state)
                     .with_restorable_turns(self.restorable_turns.get(&self.current_session))
+                    .with_reviewed_turns(self.reviewed_turns.get(&self.current_session))
                     .with_scroll_to_latest(show_scroll_to_latest),
                 window,
                 cx,
@@ -10693,6 +10733,181 @@ mod tests {
             vec![("src/lib.rs".to_string(), Some("turn-3".to_string()))],
             seen.lock().unwrap().clone(),
             "视图只发路径与轮次，落到哪个面板、裁哪一份快照由宿主决定"
+        );
+    }
+
+    /// 造一轮「改了这几个文件」的对话。
+    ///
+    /// 走 `TurnStarted` 开轮而不是直接给消息打标：`push_message` 会用 transcript
+    /// 当前轮覆盖消息自带的轮次，只按消息打标会得到一轮没有身份的对话。
+    fn push_turn_with_edits(
+        view: &mut AgentChatView,
+        session_id: &str,
+        turn_id: &str,
+        files: &[(&str, u32, u32)],
+    ) {
+        view.transcript.apply(&RuntimeEvent::TurnStarted {
+            session_id: agent_runtime::SessionId::from(session_id),
+            turn_id: agent_runtime::TurnId::from_string(turn_id),
+        });
+        view.transcript
+            .push_message(crate::ChatMessageUI::user("改一下"));
+        for (index, (path, added, removed)) in files.iter().enumerate() {
+            view.transcript.push_message(crate::ChatMessageUI::card(
+                TOOL_CARD,
+                ToolCardData {
+                    call_id: format!("call-{index}"),
+                    tool_name: "Edit".to_string(),
+                    action: agent_runtime::ToolAction::Edit,
+                    target_id: None,
+                    target_label: None,
+                    input_summary: String::new(),
+                    input_json: String::new(),
+                    running: false,
+                    success: Some(true),
+                    summary: String::new(),
+                    data_text: String::new(),
+                    file_changes: vec![crate::agent_diff::FileChangeSummary {
+                        path: (*path).to_string(),
+                        added: *added,
+                        removed: *removed,
+                        created: false,
+                        rows: Vec::new(),
+                        hidden: 0,
+                    }],
+                    duration_ms: None,
+                }
+                .to_json(),
+            ));
+        }
+        view.transcript
+            .push_message(crate::ChatMessageUI::assistant("改完了"));
+    }
+
+    /// 「查看改动」入口只在**确有整轮 diff** 的轮次出现，点它发的是整轮请求。
+    #[gpui::test]
+    fn the_turn_review_entry_appears_only_for_turns_with_a_diff(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_subscribe = seen.clone();
+        cx.update(|_window: &mut gpui::Window, cx: &mut gpui::App| {
+            cx.subscribe(&view, move |_, event: &AgentChatViewEvent, _cx| {
+                if let AgentChatViewEvent::OpenTurnReview {
+                    session_id,
+                    turn_id,
+                } = event
+                {
+                    seen_for_subscribe
+                        .lock()
+                        .unwrap()
+                        .push((session_id.clone(), turn_id.clone()));
+                }
+            })
+            .detach();
+        });
+
+        view.update(cx, |view, cx| {
+            let session_id = view.current_session.clone();
+            push_turn_with_edits(
+                view,
+                &session_id,
+                "turn-edit",
+                &[("src/a.rs", 12, 3), ("src/b.rs", 4, 0)],
+            );
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ai-chat-turn-changes").is_some(),
+            "这一轮改了文件就该有摘要"
+        );
+        assert!(
+            cx.debug_bounds("ai-chat-turn-review").is_none(),
+            "还没捕获到快照的轮次不给入口：点了只会开出一片空白"
+        );
+
+        let session_id = view.read_with(cx, |view, _| view.current_session.clone());
+        view.update(cx, |view, cx| {
+            view.set_reviewed_turns(
+                session_id.clone(),
+                std::iter::once("turn-edit".to_string()).collect(),
+                cx,
+            );
+        });
+        refresh_frame(cx);
+
+        let review = cx
+            .debug_bounds("ai-chat-turn-review")
+            .expect("真有 diff 的轮次要给入口");
+        assert!(seen.lock().unwrap().is_empty(), "只是出现，还没点过");
+        cx.simulate_click(review.center(), Modifiers::default());
+        refresh_frame(cx);
+
+        assert_eq!(
+            vec![(session_id, "turn-edit".to_string())],
+            seen.lock().unwrap().clone(),
+            "整轮审阅只认用户点的那一轮，且宿主靠会话 + 轮次定位"
+        );
+    }
+
+    /// 文件多了就在原地展开，不弹窗、不跳页。
+    #[gpui::test]
+    fn the_turn_changes_list_expands_in_place(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let session_id = view.current_session.clone();
+            push_turn_with_edits(
+                view,
+                &session_id,
+                "turn-many",
+                &[
+                    ("src/a.rs", 1, 0),
+                    ("src/b.rs", 2, 1),
+                    ("src/c.rs", 3, 2),
+                    ("src/d.rs", 4, 3),
+                    ("src/e.rs", 5, 4),
+                ],
+            );
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ai-chat-turn-change-overflow").is_none(),
+            "默认只列前几个：页脚是导航不是清单"
+        );
+        let toggle = cx
+            .debug_bounds("ai-chat-turn-changes-toggle")
+            .expect("多出来的文件要有展开入口");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-turn-change-overflow").is_some(),
+            "展开后剩下的文件就在原地长出来"
+        );
+
+        let toggle = cx
+            .debug_bounds("ai-chat-turn-changes-toggle")
+            .expect("展开后仍能收起");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-turn-change-overflow").is_none(),
+            "收起后回到只列前几个"
         );
     }
 

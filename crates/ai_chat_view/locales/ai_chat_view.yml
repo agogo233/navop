@@ -1131,6 +1131,18 @@ AgentUi:
     en: Review changes
     zh-CN: 查看改动
     zh-HK: 查看改動
+  turn_show_more_files:
+    en: "Show %{count} more file(s)"
+    zh-CN: "再显示 %{count} 个文件"
+    zh-HK: "再顯示 %{count} 個檔案"
+  turn_hide_more_files:
+    en: Hide the file list
+    zh-CN: 收起文件列表
+    zh-HK: 收起檔案列表
+  turn_showing_first_files:
+    en: "Only the first %{count}/%{total} shown"
+    zh-CN: "只显示前 %{count}/%{total} 个"
+    zh-HK: "只顯示前 %{count}/%{total} 個"
   turn_started_at:
     en: "Started %{time}"
     zh-CN: "开始于 %{time}"

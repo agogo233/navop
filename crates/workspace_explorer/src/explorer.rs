@@ -63,8 +63,6 @@ pub struct WorkspaceExplorer {
     turn_reviews: Vec<WorktreeReviewSnapshot>,
     /// 每个会话已捕获的逐轮快照，按轮次先后排列（key = session id）。
     turn_checkpoints: HashMap<String, Vec<TurnCheckpoint>>,
-    /// 捕获完成、等待下一帧打开 Review 的 diff。
-    pending_review_open: bool,
     /// 提交信息生成中（按钮防重复触发）。
     commit_message_generating: bool,
     /// 宿主注入的最近工作区根目录，最近在前。
@@ -154,7 +152,6 @@ impl WorkspaceExplorer {
             last_checkpoint: None,
             turn_reviews: Vec::new(),
             turn_checkpoints: HashMap::new(),
-            pending_review_open: false,
             commit_message_generating: false,
             recent_roots: Vec::new(),
             changes_expanded: true,
@@ -219,13 +216,6 @@ impl WorkspaceExplorer {
         &self.recent_roots
     }
 
-    /// 最近一轮的审阅快照：每轮结束时自动把这一轮的 diff 摆到审阅面板。
-    ///
-    /// 「点某个改动文件」不走这里 —— 那要找的是用户点的那一轮，见 [`review_for_open`]。
-    fn latest_review(&self) -> Option<&WorktreeReviewSnapshot> {
-        self.turn_reviews.last()
-    }
-
     /// 在 turn 结束时捕获工作区快照，并与上一轮结束快照比较。
     ///
     /// 捕获使用临时 index，不会修改用户暂存区。首轮没有基线时只保存快照，
@@ -276,12 +266,20 @@ impl WorkspaceExplorer {
                         this.emit_restorable_turns(&session_id, cx);
                     }
                     this.turn_reviews.push(WorktreeReviewSnapshot {
-                        session_id,
-                        turn_id,
-                        diff,
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        diff: diff.clone(),
                         success,
                     });
-                    this.pending_review_open = true;
+                    // 两件事分开通知：① 那些轮的「查看改动」入口变了；② 刚刚这一轮
+                    // 的 diff 要摆到审阅面板（打开它需要窗口，Explorer 手里没有）。
+                    this.emit_reviews_changed(&session_id, cx);
+                    if !diff.trim().is_empty() {
+                        cx.emit(WorkspaceExplorerEvent::TurnReviewCaptured {
+                            session_id,
+                            turn_id,
+                        });
+                    }
                 }
                 cx.notify();
             });
@@ -313,6 +311,57 @@ impl WorkspaceExplorer {
         });
     }
 
+    /// 某个会话里留下了整轮审阅 diff 的轮次（按轮次先后）。
+    ///
+    /// 只算**有实质 diff** 的轮次：首轮没有基线（快照算出来是空的）、或这一轮
+    /// 压根没改文件时，轮次页脚就不该出现「查看改动」——点开只有一份空 diff，
+    /// 那和没有入口一样，还多欠用户一次失望。
+    pub fn reviewed_turn_ids(&self, session_id: &str) -> Vec<String> {
+        reviewed_turn_ids_of(&self.turn_reviews, session_id)
+    }
+
+    /// 把某个会话当前有审阅 diff 的轮次**全量**通知宿主。
+    ///
+    /// 与 [`Self::emit_restorable_turns`] 同一套约定：入口只在宿主手里有依据时出现。
+    fn emit_reviews_changed(&self, session_id: &str, cx: &mut Context<Self>) {
+        cx.emit(WorkspaceExplorerEvent::ReviewsChanged {
+            session_id: session_id.to_string(),
+            turn_ids: self.reviewed_turn_ids(session_id),
+        });
+    }
+
+    /// 把某一轮的整轮 diff 摆到审阅面板。
+    ///
+    /// 只认**用户点的那一轮**：那一轮没有快照（非 Git 目录、捕获失败、首轮没基线）
+    /// 或 diff 为空时返回 `false`，**不**退到最近一轮——页脚上写的是「本轮改动」，
+    /// 拿别的轮次冒充就是答非所问。宿主据此决定要不要把面板带到前台。
+    ///
+    /// 打开文档需要窗口，所以调用方只能是宿主（见
+    /// [`WorkspaceExplorerEvent::TurnReviewCaptured`] 与聊天面板的「查看改动」）。
+    pub fn open_turn_review(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(review) = openable_review(&self.turn_reviews, session_id, turn_id) else {
+            return false;
+        };
+        let display_name = t!(
+            "WorkspaceExplorer.editor.review_turn_tab",
+            turn = review.turn_id.as_str()
+        )
+        .to_string();
+        let diff = review.diff.clone();
+        self.editor.update(cx, |editor, cx| {
+            editor.open_snapshot_diff(display_name, diff, window, cx);
+        });
+        cx.emit(WorkspaceExplorerEvent::DocumentRequested);
+        cx.notify();
+        true
+    }
+
     /// 把工作区恢复到某一轮结束时的状态。
     ///
     /// 恢复到第 N 轮后，第 N 轮之后的快照不再指向这条时间线，一并丢弃；但**先恢复、
@@ -339,7 +388,7 @@ impl WorkspaceExplorer {
                         // 恢复后的现场就是目标快照，基线随之对齐。
                         this.last_checkpoint = Some(restore.target);
                         this.drop_reviews_after(&session_id, &turn_id);
-                        this.pending_review_open = false;
+                        this.emit_reviews_changed(&session_id, cx);
                         this.git_error = None;
                         let dropped = this.truncate_turns_after(&session_id, &turn_id);
                         if !dropped.is_empty() {
@@ -669,10 +718,21 @@ impl WorkspaceExplorer {
         self.root = root;
         // 旧根下锚定的快照 ref 与新根无关，随记录一起作废；逐会话发一条空列表，
         // 免得宿主视图里留着点了没反应的「回到这一轮」入口。
-        let dropped_sessions: Vec<String> = self.turn_checkpoints.keys().cloned().collect();
+        // 审阅与回滚两份记录一起清掉了：两者都要把「哪些轮还有入口」的全量列表
+        // 重发一遍，否则页脚上会留着指向已经不存在快照的按钮。会话 id 取两份的并集。
+        let mut dropped_sessions: Vec<String> = self.turn_checkpoints.keys().cloned().collect();
+        for review in &self.turn_reviews {
+            if !dropped_sessions.contains(&review.session_id) {
+                dropped_sessions.push(review.session_id.clone());
+            }
+        }
         self.reset_workspace_state();
         for session_id in dropped_sessions {
             cx.emit(WorkspaceExplorerEvent::RestorableTurnsChanged {
+                session_id: session_id.clone(),
+                turn_ids: Vec::new(),
+            });
+            cx.emit(WorkspaceExplorerEvent::ReviewsChanged {
                 session_id,
                 turn_ids: Vec::new(),
             });
@@ -695,7 +755,6 @@ impl WorkspaceExplorer {
         self.last_checkpoint = None;
         self.turn_reviews.clear();
         self.turn_checkpoints.clear();
-        self.pending_review_open = false;
         self.ignore_matcher = None;
         self.git_loading = false;
         self.git_refresh_pending = false;
@@ -1058,6 +1117,33 @@ fn review_for_turn<'a>(
         .iter()
         .rev()
         .find(|review| review.session_id == session_id && review.turn_id == turn_id)
+}
+
+/// 某一轮能不能摆出「查看改动」：既要真的属于这一轮，也要有非空 diff。
+///
+/// 两个条件分属两层：`review_for_turn` 保证「不拿别的轮冒充」，这里再筛掉
+/// **空 diff**——首轮没有基线、或这一轮压根没改文件时快照算出来是空的，
+/// 入口摆出来点开只有一片空白，不如不摆。抽成自由函数是为了能不开窗口就测掉。
+fn openable_review<'a>(
+    reviews: &'a [WorktreeReviewSnapshot],
+    session_id: &str,
+    turn_id: &str,
+) -> Option<&'a WorktreeReviewSnapshot> {
+    review_for_turn(reviews, session_id, turn_id).filter(|review| !review.diff.trim().is_empty())
+}
+
+/// 某个会话里可以摆出「查看改动」入口的轮次（按捕获先后）。
+///
+/// 审阅入口与回滚入口依据不同：回滚要有锚得住的 git ref，审阅只要 diff 真算出来
+/// （见 [`openable_review`]）。两者共用一份过滤的话，某一轮锚定失败就会连带把
+/// 「查看改动」一起吞掉。
+fn reviewed_turn_ids_of(reviews: &[WorktreeReviewSnapshot], session_id: &str) -> Vec<String> {
+    reviews
+        .iter()
+        .filter(|review| review.session_id == session_id)
+        .filter(|review| !review.diff.trim().is_empty())
+        .map(|review| review.turn_id.clone())
+        .collect()
 }
 
 /// 丢掉第 `turn_id` 轮**之后**的审阅快照，第 `turn_id` 轮自己留着。

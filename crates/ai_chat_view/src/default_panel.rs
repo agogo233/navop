@@ -57,6 +57,11 @@ pub enum DefaultAgentChatPanelEvent {
         path: String,
         turn_id: Option<String>,
     },
+    /// 用户点了「查看改动」。宿主据此把**这一轮所有文件**的 diff 摆到审阅面板。
+    OpenTurnReview {
+        session_id: String,
+        turn_id: String,
+    },
     /// 用户点了子代理卡片上的「查看推理过程」。宿主据此把子代理详情面板切到前台。
     SubagentDetailRequested {
         acp_session_id: String,
@@ -144,6 +149,8 @@ pub struct DefaultAgentChatPanel {
     /// 各会话当前可回滚的轮次。与 `workbench_toggles` 同理：内层视图可能还不存在，
     /// 或者被 provider 事件整块重建过，所以这里留一份权威副本，建视图时重放。
     restorable_turns: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// 每个会话留下了整轮 diff 的轮次；与 `restorable_turns` 一样由宿主推送。
+    reviewed_turns: std::collections::HashMap<String, std::collections::HashSet<String>>,
     error: Option<String>,
 }
 
@@ -296,6 +303,7 @@ impl DefaultAgentChatPanel {
             workbench_toggles: None,
             composer_context_source: None,
             restorable_turns: std::collections::HashMap::new(),
+            reviewed_turns: std::collections::HashMap::new(),
             error: None,
         };
         panel.subscribe_connection_events(cx);
@@ -342,6 +350,28 @@ impl DefaultAgentChatPanel {
         if let Some(view) = &self.view {
             view.update(cx, |view, cx| {
                 view.set_restorable_turns(session_id, turn_ids, cx);
+            });
+        }
+    }
+
+    /// 宿主（工作区浏览器）同步「某会话里哪些轮次留下了整轮 diff」。
+    ///
+    /// 与 [`Self::set_restorable_turns`] 同样的两道存储：本层副本 + 内层视图。
+    pub fn set_reviewed_turns(
+        &mut self,
+        session_id: String,
+        turn_ids: std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if turn_ids.is_empty() {
+            self.reviewed_turns.remove(&session_id);
+        } else {
+            self.reviewed_turns
+                .insert(session_id.clone(), turn_ids.clone());
+        }
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_reviewed_turns(session_id, turn_ids, cx);
             });
         }
     }
@@ -841,6 +871,15 @@ impl DefaultAgentChatPanel {
                                                 turn_id: turn_id.clone(),
                                             });
                                         }
+                                        AgentChatViewEvent::OpenTurnReview {
+                                            session_id,
+                                            turn_id,
+                                        } => {
+                                            cx.emit(DefaultAgentChatPanelEvent::OpenTurnReview {
+                                                session_id: session_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                            });
+                                        }
                                         AgentChatViewEvent::SubagentDetailRequested { acp_session_id, title } => {
                                             cx.emit(
                                                 DefaultAgentChatPanelEvent::SubagentDetailRequested {
@@ -909,6 +948,12 @@ impl DefaultAgentChatPanel {
                             for (session_id, turn_ids) in panel.restorable_turns.clone() {
                                 view.update(cx, |view, cx| {
                                     view.set_restorable_turns(session_id.clone(), turn_ids.clone(), cx);
+                                });
+                            }
+                            // 「查看改动」入口同理，重建一次就丢的话页脚会静悄悄地少一栏。
+                            for (session_id, turn_ids) in panel.reviewed_turns.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_reviewed_turns(session_id.clone(), turn_ids.clone(), cx);
                                 });
                             }
                             if std::mem::take(&mut panel.pending_sidebar_shown) {

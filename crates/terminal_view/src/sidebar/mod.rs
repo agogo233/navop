@@ -1134,7 +1134,9 @@ impl TerminalSidebar {
                     cx.emit(TerminalSidebarEvent::SuggestionPopupChanged(*enabled));
                 }
                 settings_panel::SettingsPanelEvent::SuggestionPopupOpacityChanged(opacity) => {
-                    cx.emit(TerminalSidebarEvent::SuggestionPopupOpacityChanged(*opacity));
+                    cx.emit(TerminalSidebarEvent::SuggestionPopupOpacityChanged(
+                        *opacity,
+                    ));
                 }
                 settings_panel::SettingsPanelEvent::MiddleClickPasteChanged(enabled) => {
                     cx.emit(TerminalSidebarEvent::MiddleClickPasteChanged(*enabled));
@@ -1215,6 +1217,7 @@ impl TerminalSidebar {
                 | DefaultAgentChatPanelEvent::TurnFinished { .. }
                 | DefaultAgentChatPanelEvent::RestoreTurn { .. }
                 | DefaultAgentChatPanelEvent::OpenFileInReview { .. }
+                | DefaultAgentChatPanelEvent::OpenTurnReview { .. }
                 | DefaultAgentChatPanelEvent::SubagentDetailRequested { .. }
                 | DefaultAgentChatPanelEvent::SubagentDetailUpdated { .. } => {}
             },
@@ -1255,6 +1258,9 @@ impl TerminalSidebar {
                     WorkspaceExplorerEvent::DocumentRequested => {}
                     // 回滚入口只出现在 AI 工作台的轮次页脚，终端侧栏不渲染它。
                     WorkspaceExplorerEvent::RestorableTurnsChanged { .. } => {}
+                    // 「查看改动」入口与轮末自动摆 diff 同理：只有工作台外壳接得住。
+                    WorkspaceExplorerEvent::ReviewsChanged { .. }
+                    | WorkspaceExplorerEvent::TurnReviewCaptured { .. } => {}
                 },
             );
             subs.push(explorer_sub);

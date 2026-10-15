@@ -1,4 +1,4 @@
-use super::{WorkspaceExplorer, WorkspaceExplorerEvent};
+use super::WorkspaceExplorer;
 use crate::git::{GitChange, GitChangeKind};
 use crate::model::{ExplorerRow, visible_rows};
 use gpui::{
@@ -256,37 +256,6 @@ impl Render for WorkspaceExplorer {
                     super::branches::BranchManager::new(repository, explorer, theme, window, cx)
                 }));
             }
-        }
-        // Review 面板刷新：上一轮 diff 已捕获时，下一帧打开（defer 避免渲染期重入）。
-        if self.pending_review_open {
-            self.pending_review_open = false;
-            let editor = self.editor.clone();
-            let review = self.latest_review().cloned();
-            // 打开文档之后要广播 `DocumentRequested`，否则宿主不知道审阅面板该
-            // 被带到前台——上一轮 diff 就只会静静地落进一个没打开的面板里。
-            // `open_change` / `open_file` 走的是同一条约定。
-            let explorer = cx.entity().downgrade();
-            window.defer(cx, move |window, cx| {
-                if let Some(review) = review {
-                    editor.update(cx, |editor, cx| {
-                        editor.open_snapshot_diff(
-                            t!(
-                                "WorkspaceExplorer.editor.last_turn_tab",
-                                turn = review.turn_id.as_str()
-                            )
-                            .to_string(),
-                            review.diff,
-                            window,
-                            cx,
-                        );
-                    });
-                    if let Some(explorer) = explorer.upgrade() {
-                        explorer.update(cx, |_, cx| {
-                            cx.emit(WorkspaceExplorerEvent::DocumentRequested);
-                        });
-                    }
-                }
-            });
         }
         v_flex()
             .key_context(WORKSPACE_EXPLORER_KEY_CONTEXT)

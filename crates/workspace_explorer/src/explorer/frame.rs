@@ -38,6 +38,26 @@ pub enum WorkspaceExplorerEvent {
         session_id: String,
         turn_ids: Vec<String>,
     },
+    /// 某个会话「留下了整轮审阅 diff」的轮次列表发生变化。
+    ///
+    /// 与 [`Self::RestorableTurnsChanged`] **分开**：回滚入口只对锚定成功的轮次出现，
+    /// 审阅入口只要 diff 真算出来了就该在——轮次 id 不合规导致 ref 锚不上时，
+    /// 「回到这一轮」不该出现，但「查看改动」没有理由跟着一起消失。
+    ///
+    /// 同样送全量列表：快照由 Explorer 独占，宿主不用维护可能漂移的镜像。
+    ReviewsChanged {
+        session_id: String,
+        turn_ids: Vec<String>,
+    },
+    /// 刚才那一轮的整轮 diff 已捕获，请宿主把它摆到审阅面板。
+    ///
+    /// 由**宿主**驱动而不是 Explorer 自己在 render 里打开：Explorer 只在它自己的
+    /// 面板被渲染时才有 render，用户把文件面板关掉时，那一刻的自动打开永远不会
+    /// 发生——渲染不到就发不出事件，等于谁都没动。
+    TurnReviewCaptured {
+        session_id: String,
+        turn_id: String,
+    },
 }
 
 impl EventEmitter<WorkspaceExplorerEvent> for WorkspaceExplorer {}

@@ -178,6 +178,55 @@ fn restoring_a_turn_drops_only_later_reviews_of_the_same_session() {
 }
 
 #[test]
+fn only_turns_with_a_real_diff_offer_a_review_entry() {
+    let reviews = vec![
+        review("session-a", "turn-1", "   \n"),
+        review("session-a", "turn-2", "diff-for-2"),
+        review("session-b", "turn-1", "diff-for-b-1"),
+        review("session-a", "turn-3", "\t"),
+    ];
+
+    assert_eq!(
+        vec!["turn-2".to_string()],
+        reviewed_turn_ids_of(&reviews, "session-a"),
+        "首轮没基线、或这一轮没改文件时 diff 是空的：入口摆出来点开只有一片空白，不如不摆"
+    );
+    assert_eq!(
+        vec!["turn-1".to_string()],
+        reviewed_turn_ids_of(&reviews, "session-b"),
+        "轮次 id 按会话隔离"
+    );
+    assert!(reviewed_turn_ids_of(&reviews, "session-unknown").is_empty());
+}
+
+#[test]
+fn opening_a_turn_review_never_falls_back_to_another_turn() {
+    let reviews = vec![
+        review("session-a", "turn-1", ""),
+        review("session-a", "turn-2", "diff-for-2"),
+    ];
+
+    assert_eq!(
+        Some("diff-for-2"),
+        openable_review(&reviews, "session-a", "turn-2").map(|r| r.diff.as_str()),
+        "点的那一轮有 diff 就打开它"
+    );
+    assert_eq!(
+        None,
+        openable_review(&reviews, "session-a", "turn-1").map(|r| r.diff.as_str()),
+        "那一轮的 diff 是空的就认下「没有」，不能拿第 2 轮冒充：页脚写的是「本轮改动」"
+    );
+    assert!(
+        openable_review(&reviews, "session-a", "turn-9").is_none(),
+        "压根没有的轮次更不该退到最近一轮（单文件的 `review_for_open` 才允许退）"
+    );
+    assert!(
+        openable_review(&reviews, "session-b", "turn-2").is_none(),
+        "别的会话的同号轮次不算数"
+    );
+}
+
+#[test]
 fn dropping_reviews_for_an_unknown_turn_is_a_no_op() {
     let mut reviews = vec![review("session-a", "turn-1", "a-1")];
 

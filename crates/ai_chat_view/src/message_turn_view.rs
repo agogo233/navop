@@ -70,6 +70,12 @@ pub enum MessageListAction {
         path: String,
         turn_id: Option<String>,
     },
+    /// 用户点了本轮改动摘要里的「查看改动」：把**这一轮所有文件**的 diff 一起
+    /// 摆到审阅面板。
+    ///
+    /// 与 [`Self::OpenFileInReview`]（单文件）分开：这里要的是这一轮的完整画面，
+    /// 不是某一个文件那一段。
+    OpenTurnReview { turn_id: String },
 }
 
 pub type MessageListActionHandler = Rc<dyn Fn(MessageListAction, &mut Window, &mut App)>;
@@ -107,6 +113,13 @@ pub struct MessageListContext<'a> {
     /// `None` = 这次渲染不支持回滚，页脚的「回到这一轮」入口不出现——宁可没有，
     /// 也不给一个点了没反应的控件。
     pub restorable_turns: Option<&'a HashSet<String>>,
+    /// **留下了整轮 diff** 的轮次 id（宿主查过工作区快照后注入）。
+    ///
+    /// 与 [`Self::restorable_turns`] 同一套约定，但依据不同：那份看的是「快照
+    /// 锁定成功了没」（回滚要用 git ref），这份看的是「这一轮的 diff 真算出来了
+    /// 没」。首轮没有基线、或这一轮没改文件时 diff 是空的，此时页脚不摆「查看
+    /// 改动」——点开只有一份空 diff，和没有入口一样。
+    pub reviewed_turns: Option<&'a HashSet<String>>,
 }
 
 impl<'a> MessageListContext<'a> {
@@ -126,6 +139,7 @@ impl<'a> MessageListContext<'a> {
             selection: None,
             selection_bar: None,
             restorable_turns: None,
+            reviewed_turns: None,
             empty_state: None,
         }
     }
@@ -197,6 +211,11 @@ impl<'a> MessageListContext<'a> {
 
     pub fn with_restorable_turns(mut self, turns: Option<&'a HashSet<String>>) -> Self {
         self.restorable_turns = turns;
+        self
+    }
+
+    pub fn with_reviewed_turns(mut self, turns: Option<&'a HashSet<String>>) -> Self {
+        self.reviewed_turns = turns;
         self
     }
 }
@@ -673,6 +692,13 @@ fn render_turn_foot(
 
     // 只有拿到该轮快照 id 的轮次才给入口；点击后交给宿主决定怎么恢复。
     let restorable_turn = restorable_turn_id(turn.turn_id.as_deref(), context.restorable_turns);
+    // 「查看改动」同理，但依据是「这一轮的整轮 diff 真算出来了没」——与回滚入口
+    // 分开判定：ref 锚不上不该连带把审阅入口一并吞掉。
+    let reviewed_turn = turn.turn_id.as_deref().filter(|turn_id| {
+        context
+            .reviewed_turns
+            .is_some_and(|turns| turns.contains(*turn_id))
+    });
     let changed_files = turn.changed_files();
 
     v_flex()
@@ -720,6 +746,7 @@ fn render_turn_foot(
             this.child(render_turn_changes(
                 &changed_files,
                 turn.turn_id.as_deref(),
+                reviewed_turn,
                 theme,
                 context,
                 cx,
@@ -728,36 +755,55 @@ fn render_turn_foot(
         .into_any_element()
 }
 
-/// 一行的改动摘要：「本轮改动 N 个文件」+ 前几个文件名(可点开) + 合计增删。
+/// 本轮改动的摘要与入口。
 ///
-/// 只列前几个文件：页脚是导航，不是清单。剩下的交给审阅面板——逐个列全只会把
-/// 页脚变成一堵墙。
-/// 本轮的改动文件行。
+/// 头一行给结论：改了几个文件、增删合计、以及「查看改动」入口（把**整轮**的 diff
+/// 摆到审阅面板）。下面是逐个文件的一行，各自带自己的 `+n/−m` 并可点开——点文件名
+/// 看的是那一个文件的 diff，点「查看改动」看的是这一轮的全貌。
 ///
-/// `turn_id` 跟着每个文件按钮一起发出去：同一个文件在第 2 轮和第 5 轮改出来的
-/// 不是同一份 diff，审阅面板得知道该裁哪一轮的快照。
+/// 文件默认只列前几个：页脚是导航，不是清单。剩下的原地展开，不弹窗、不跳页。
+///
+/// `turn_id` 跟着每个入口一起发出去：同一个文件在第 2 轮和第 5 轮改出来的不是
+/// 同一份 diff，审阅面板得知道该裁哪一轮的快照。
 fn render_turn_changes(
     changed_files: &[FileChangeSummary],
     turn_id: Option<&str>,
+    reviewed_turn: Option<&str>,
     theme: &AgentChatTheme,
     context: &MessageListContext<'_>,
     cx: &mut App,
 ) -> AnyElement {
-    const MAX_LISTED: usize = 3;
+    /// 收起时列几个文件。
+    const PREVIEW_LIMIT: usize = 3;
+    /// 展开后的上限；再多也只在审阅面板里看。
+    const EXPANDED_LIMIT: usize = 12;
+
     let added: u32 = changed_files.iter().map(|change| change.added).sum();
     let removed: u32 = changed_files.iter().map(|change| change.removed).sum();
-    let hidden = changed_files.len().saturating_sub(MAX_LISTED);
     let on_action = context.on_action.clone();
     let turn_id = turn_id.map(str::to_owned);
+    // 展开态走与过程区同一张覆盖表；key 带前缀，不会和过程区的 `turn.key` 撞上。
+    let expand_key = turn_id
+        .as_deref()
+        .map(|turn_id| format!("changed-files:{turn_id}"));
+    let expanded = expand_key
+        .as_deref()
+        .zip(context.expansion)
+        .map(|(key, state)| state.is_expanded(key, false))
+        .unwrap_or(false);
+    let limit = if expanded {
+        EXPANDED_LIMIT
+    } else {
+        PREVIEW_LIMIT
+    };
+    let visible = changed_files.len().min(limit);
+    let hidden = changed_files.len() - visible;
 
-    h_flex()
-        .debug_selector(|| "ai-chat-turn-changes".to_string())
+    let header = h_flex()
         .w_full()
         .min_w_0()
         .items_center()
         .gap_2()
-        .px_2()
-        .pb_1()
         .child(
             div()
                 .flex_shrink_0()
@@ -765,38 +811,6 @@ fn render_turn_changes(
                 .text_color(theme.muted_foreground)
                 .child(t!("AgentUi.turn_changed_files", count = changed_files.len()).to_string()),
         )
-        .children(changed_files.iter().take(MAX_LISTED).map(|change| {
-            let label = compact_path(&change.path);
-            let path = change.path.clone();
-            let on_action = on_action.clone();
-            let turn_id = turn_id.clone();
-            Button::new(SharedString::from(format!("turn-change-{path}")))
-                .ghost()
-                .xsmall()
-                .label(label)
-                .debug_selector(|| "ai-chat-turn-change".to_string())
-                .on_click(move |_, window, cx| {
-                    if let Some(on_action) = on_action.as_ref() {
-                        on_action(
-                            MessageListAction::OpenFileInReview {
-                                path: path.clone(),
-                                turn_id: turn_id.clone(),
-                            },
-                            window,
-                            cx,
-                        );
-                    }
-                })
-        }))
-        .when(hidden > 0, |this| {
-            this.child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("+{hidden}")),
-            )
-        })
         .child(
             div()
                 .flex_shrink_0()
@@ -813,6 +827,158 @@ fn render_turn_changes(
                     .child(format!("−{removed}")),
             )
         })
+        .child(div().flex_1())
+        .when_some(reviewed_turn, |this, turn_id| {
+            let on_action = on_action.clone();
+            let turn_id = turn_id.to_string();
+            this.child(
+                Button::new(SharedString::from(format!("turn-review-{turn_id}")))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("AgentUi.turn_review_changes").to_string())
+                    .debug_selector(|| "ai-chat-turn-review".to_string())
+                    .on_click(move |_, window, cx| {
+                        if let Some(on_action) = on_action.as_ref() {
+                            on_action(
+                                MessageListAction::OpenTurnReview {
+                                    turn_id: turn_id.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+            )
+        });
+
+    let rows =
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .children(
+                changed_files
+                    .iter()
+                    .take(visible)
+                    .enumerate()
+                    .map(|(index, change)| {
+                        let label = compact_path(&change.path);
+                        let path = change.path.clone();
+                        let on_action = on_action.clone();
+                        let turn_id = turn_id.clone();
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(SharedString::from(format!("turn-change-{path}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .label(label)
+                                    .debug_selector(|| "ai-chat-turn-change".to_string())
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(on_action) = on_action.as_ref() {
+                                            on_action(
+                                                MessageListAction::OpenFileInReview {
+                                                    path: path.clone(),
+                                                    turn_id: turn_id.clone(),
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().success)
+                                    .child(format!("+{}", change.added)),
+                            )
+                            .when(change.removed > 0, |this| {
+                                this.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(cx.theme().danger)
+                                        .child(format!("−{}", change.removed)),
+                                )
+                            })
+                            // 声明在预览上限之外的那几行：`debug_bounds` 对同名选择器只留最后一个，
+                            // 数不了行数，这个记号只用来验证「展开确实在原地长出了东西」。
+                            .when(index >= PREVIEW_LIMIT, |this| {
+                                this.debug_selector(|| "ai-chat-turn-change-overflow".to_string())
+                            })
+                    }),
+            );
+
+    // 展开/收起开关：多出来的文件不弹窗，就在原地长出来；展开到上限时
+    // 如实补一句「只显示前 N/total 个」，剩下的去审阅面板看。
+    let toggle = expand_key.and_then(|key| {
+        (changed_files.len() > PREVIEW_LIMIT).then(|| {
+            let on_action = on_action.clone();
+            let label = if expanded {
+                t!("AgentUi.turn_hide_more_files").to_string()
+            } else {
+                t!("AgentUi.turn_show_more_files", count = hidden).to_string()
+            };
+            let clipped = expanded && changed_files.len() > EXPANDED_LIMIT;
+            let button = Button::new(SharedString::from(format!("turn-change-toggle-{key}")))
+                .ghost()
+                .xsmall()
+                .label(label)
+                .debug_selector(|| "ai-chat-turn-changes-toggle".to_string())
+                .on_click(move |_, window, cx| {
+                    if let Some(handler) = on_action.as_ref() {
+                        handler(
+                            MessageListAction::SetProcessExpanded {
+                                key: key.clone(),
+                                expanded: !expanded,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(button)
+                .when(clipped, |this| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(
+                                t!(
+                                    "AgentUi.turn_showing_first_files",
+                                    count = EXPANDED_LIMIT,
+                                    total = changed_files.len()
+                                )
+                                .to_string(),
+                            ),
+                    )
+                })
+                .into_any_element()
+        })
+    });
+
+    v_flex()
+        .debug_selector(|| "ai-chat-turn-changes".to_string())
+        .w_full()
+        .min_w_0()
+        .gap_0p5()
+        .px_2()
+        .pb_1()
+        .child(header)
+        .child(rows)
+        .children(toggle)
         .into_any_element()
 }
 
