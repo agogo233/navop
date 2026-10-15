@@ -151,6 +151,17 @@ async fn run_agent_loop(ctx: AgentLoopContext, cancellation: CancellationToken) 
         if cancellation.is_cancelled() {
             return TaskOutcome::Cancelled;
         }
+        // steering：运行中到达的用户输入在下一轮采样前注入历史，模型尽早看到。
+        // 含图片的插话不注入（同轮多批图片会叠加 token / 请求体），留给轮次结束后重开。
+        for input in ctx.session.take_pending_inputs() {
+            let images = input.images();
+            if images.is_empty() {
+                ctx.session
+                    .record_steering_message(input.as_text().to_string());
+            } else {
+                ctx.session.queue_input(input);
+            }
+        }
         match compact_session_context_if_needed(
             &ctx.session,
             &ctx.turn_id,

@@ -171,6 +171,10 @@ AgentUi:
     en: Message sent while a turn is running (steer); it will join the current turn
     zh-CN: 消息已插入正在进行的轮次（插话），将并入当前轮处理
     zh-HK: 訊息已插入正在進行的輪次（插話），將併入當前輪處理
+  local_steer_sent:
+    en: Message sent while the agent is working (steer); it will join the current turn before the next step
+    zh-CN: 消息已插入正在运行的任务（插话），将在下一步前生效
+    zh-HK: 訊息已插入正在執行的任務（插話），將於下一步前生效
   acp_unsupported_auth_method:
     en: "ACP Agent does not support authentication method %{method}"
     zh-CN: "ACP Agent 不支持鉴权方式 %{method}"

@@ -139,6 +139,17 @@ impl Runtime {
         }
     }
 
+    /// 运行中插话(steering)：入队后由当前轮在下一轮采样前注入历史。
+    ///
+    /// 会话空闲时不开新轮——调用方(UI)自己决定何时 `start_turn`，runtime 不抢调度。
+    /// 返回 `false` 表示会话不存在或当前无运行中轮次（挂起等审批也不算）。
+    pub fn steer(&self, session_id: &SessionId, input: UserInput) -> bool {
+        let Some(session) = self.session(session_id) else {
+            return false;
+        };
+        session.steer(input)
+    }
+
     /// 内联执行一轮并返回结果。适合测试与同步调用方。
     pub async fn run_turn_blocking(
         &self,

@@ -10,7 +10,7 @@ use crate::planner::{Plan, StepStatus};
 use crate::resource::ResourceContext;
 use crate::runtime::active_turn::ActiveTurn;
 use crate::runtime::event::{RuntimeEvent, RuntimeEventSender};
-use crate::runtime::input_queue::{InputQueue, TurnInput};
+use crate::runtime::input_queue::{InputQueue, TurnInput, UserInput};
 use crate::runtime::session_state::SessionState;
 use crate::skill::SkillContext;
 use crate::tools::{ToolAction, ToolCall, ToolObservation};
@@ -291,6 +291,23 @@ impl Session {
             .record_user(text);
     }
 
+    /// 记录一条运行中到达的插话(steering)并广播 [`RuntimeEvent::UserMessage`]。
+    ///
+    /// 首次输入由 UI 先入历史，runtime 不重发事件避免气泡重复；插话走 runtime
+    /// 记录，事件也由这里发出，让其他订阅方（回放 / IPC）看到同一条用户消息。
+    pub fn record_steering_message(&self, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.record_user_input(text.clone());
+        self.emit(RuntimeEvent::UserMessage {
+            session_id: self.id.clone(),
+            turn_id: self.current_turn_id().unwrap_or_else(TurnId::new),
+            text,
+        });
+    }
+
     /// 记录一条带图片的用户输入(多模态)。
     pub fn record_user_input_with_images(
         &self,
@@ -494,6 +511,16 @@ impl Session {
 
     pub fn queue_input(&self, input: TurnInput) {
         self.input_queue.lock().expect("session 锁中毒").push(input);
+    }
+
+    /// 运行中插话：仅当本会话正有轮次在执行时入队，由当前轮在下一轮采样前消费。
+    /// 挂起等审批 / 空闲时返回 `false`（调用方自行决定排队或开新轮）。
+    pub fn steer(&self, input: UserInput) -> bool {
+        if self.active_turn_id().is_none() {
+            return false;
+        }
+        self.queue_input(TurnInput::User(input));
+        true
     }
 
     pub fn take_pending_inputs(&self) -> Vec<TurnInput> {

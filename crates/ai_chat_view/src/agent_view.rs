@@ -3097,9 +3097,9 @@ impl AgentChatView {
             mentions,
             images,
         };
-        // steer：ACP 会话正在跑一轮、队列为空时，新提交**并发发出去**而不是排队。
-        // 轮次能跑几十分钟（实测 182 分钟），排队等不起；ACP 允许同会话并发
-        // prompt（插话），agent 不支持时会以该轮 TurnFailed 浮出，旧轮不受影响。
+        // steer：会话正在跑一轮、队列为空时，新提交**并发注入**而不是排队。
+        // ACP：并发 prompt 直接发；本地：入 runtime 队列，由当前轮在下一轮采样前
+        // 注入历史（见 `run_agent_loop` 开头的 take_pending_inputs）。
         // 有排队时仍走 FIFO——插队会破坏已排消息的顺序。
         let steer_in_flight_turn = self.backend == Backend::Acp
             && self.running_sessions.contains(&session_uid)
@@ -3108,7 +3108,11 @@ impl AgentChatView {
             && !self.acp_connecting
             && self.acp_pending.is_none()
             && self.acp_session_transition_phase(&session_uid).is_none();
-        if self.running_sessions.contains(&session_uid) && !steer_in_flight_turn {
+        let steer_local_turn = self.backend == Backend::Local
+            && self.running_sessions.contains(&session_uid)
+            && self.pending_submissions.len(&session_uid) == 0;
+        if self.running_sessions.contains(&session_uid) && !steer_in_flight_turn && !steer_local_turn
+        {
             self.enqueue_submission(&session_uid, submission, cx);
             return;
         }
@@ -3125,6 +3129,34 @@ impl AgentChatView {
             if self.start_submission(&session_uid, &submission, cx) == SubmissionStart::RetryLater {
                 self.enqueue_submission(&session_uid, submission, cx);
             }
+            return;
+        }
+        if steer_local_turn {
+            // 本地 steer：入 runtime 输入队列即可，当前轮自己会在下一轮采样前取走。
+            // 含图片时退回排队——同轮多批图片会叠加 token / 请求体，留到轮次结束后重开。
+            let session_id = SessionId::from_string(session_uid.clone());
+            let steered = submission.images.is_empty()
+                && self
+                    .runtime
+                    .session(&session_id)
+                    .is_some_and(|session| session.steer(UserInput::new(submission.text.clone())));
+            if steered {
+                self.push_user_to_session(
+                    &session_uid,
+                    &submission.text,
+                    &submission.images,
+                    &self.resources.clone(),
+                );
+                self.push_system_to_session(
+                    &session_uid,
+                    t!("AgentUi.local_steer_sent").to_string(),
+                );
+                self.request_scroll_to_bottom();
+                cx.notify();
+                return;
+            }
+            // 会话已不在运行中（轮次刚好结束）或带图片：退回排队语义，轮次收尾时自然发走。
+            self.enqueue_submission(&session_uid, submission, cx);
             return;
         }
 
