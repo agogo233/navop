@@ -155,6 +155,7 @@ fn assistant_message_events(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         text,
+        reasoning: None,
     }]
 }
 

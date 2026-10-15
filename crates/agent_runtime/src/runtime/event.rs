@@ -88,10 +88,14 @@ pub enum RuntimeEvent {
         delta: String,
     },
     /// 助手文本消息(完整 / 最终)。
+    ///
+    /// `reasoning` 为本轮思考过程的终值：broadcast 滞后丢了增量时，
+    /// 消费方可用它整体替换累积值自愈；`None` 表示未知/无，维持增量累积。
     AssistantMessage {
         session_id: SessionId,
         turn_id: TurnId,
         text: String,
+        reasoning: Option<String>,
     },
     /// 用户文本消息(用于外部协议恢复/回放用户消息)。
     UserMessage {

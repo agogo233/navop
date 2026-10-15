@@ -459,7 +459,9 @@ impl AgentTranscript {
             }
             RuntimeEvent::AssistantMessageDelta { delta, .. } => self.append_delta(delta),
             RuntimeEvent::ReasoningDelta { delta, .. } => self.append_reasoning_delta(delta),
-            RuntimeEvent::AssistantMessage { text, .. } => self.finalize_assistant(text),
+            RuntimeEvent::AssistantMessage { text, reasoning, .. } => {
+                self.finalize_assistant(text, reasoning.as_deref())
+            }
             RuntimeEvent::UserMessage { text, .. } => self.push_user_from_text(text),
             RuntimeEvent::Status { title, is_done, .. } => self.upsert_status(title, *is_done),
             _ => unreachable!("non-message event routed to apply_message_event"),
@@ -641,11 +643,16 @@ impl AgentTranscript {
         self.push_message(msg);
     }
 
-    fn finalize_assistant(&mut self, text: &str) {
+    /// 落最终文本。`reasoning_final` 为思考终值：
+    /// - `Some`：整体替换累积值（broadcast 滞后丢增量时的自愈路径）；
+    /// - `None`：沿用已累积的增量（旧语义，例如 ACP 回放）。
+    fn finalize_assistant(&mut self, text: &str, reasoning_final: Option<&str>) {
         self.finish_active_status();
         if let Some(id) = self.streaming_id.take() {
             if let Some(index) = self.messages.iter().position(|m| m.id == id) {
-                let reasoning = self.messages[index].reasoning_content.clone();
+                let reasoning = reasoning_final
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.messages[index].reasoning_content.clone());
                 let mut messages = assistant_messages_from_content(text);
                 if let Some(first) = messages.first_mut() {
                     first.reasoning_content = reasoning;
@@ -655,7 +662,13 @@ impl AgentTranscript {
                 return;
             }
         }
-        let messages = self.stamp_turn(assistant_messages_from_content(text));
+        let mut messages = assistant_messages_from_content(text);
+        if let Some(reasoning) = reasoning_final
+            && let Some(first) = messages.first_mut()
+        {
+            first.reasoning_content = reasoning.to_owned();
+        }
+        let messages = self.stamp_turn(messages);
         self.messages.extend(messages);
     }
 
@@ -1798,6 +1811,7 @@ mod tests {
             session_id: sid(),
             turn_id: turn(7),
             text: text.to_string(),
+            reasoning: None,
         });
 
         assert_eq!(3, tr.messages.len(), "chart block should split messages");
@@ -2334,11 +2348,58 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: "你好".into(),
+            reasoning: None,
         });
         // 增量与最终合并为一条消息。
         assert_eq!(tr.messages.len(), 1);
         assert_eq!(tr.messages[0].content, "你好");
         assert!(!tr.messages[0].is_streaming);
+    }
+
+    /// broadcast 滞后丢了增量时，终值必须整体替换累积值（自愈），
+    /// 否则用户看到的是一段中间被剜掉的思考。
+    #[test]
+    fn reasoning_final_value_overwrites_stale_accumulated_deltas() {
+        let mut tr = AgentTranscript::new();
+        // 只有部分增量送达（前面的 ReasoningDelta 被 Lagged 掉了）。
+        tr.apply(&RuntimeEvent::ReasoningDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "…后半段".to_string(),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessage {
+            session_id: sid(),
+            turn_id: tid(),
+            text: "答案".to_string(),
+            reasoning: Some("先分析，再…后半段".to_string()),
+        });
+
+        assert_eq!(1, tr.messages.len());
+        assert_eq!("答案", tr.messages[0].content);
+        assert_eq!(
+            "先分析，再…后半段",
+            tr.messages[0].reasoning_content,
+            "终值应整体替换残缺累积"
+        );
+    }
+
+    /// `None` 维持旧语义：沿用增量累积（ACP 回放等没有终值的路径）。
+    #[test]
+    fn reasoning_none_keeps_accumulated_deltas() {
+        let mut tr = AgentTranscript::new();
+        tr.apply(&RuntimeEvent::ReasoningDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "先分析".to_string(),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessage {
+            session_id: sid(),
+            turn_id: tid(),
+            text: "答案".to_string(),
+            reasoning: None,
+        });
+
+        assert_eq!("先分析", tr.messages[0].reasoning_content);
     }
 
     #[test]
@@ -2382,6 +2443,7 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: "最终答案".to_string(),
+            reasoning: None,
         });
 
         assert_eq!(1, tr.messages.len());
@@ -3237,6 +3299,7 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: text.to_string(),
+            reasoning: None,
         });
 
         assert_eq!(3, tr.messages.len());
@@ -3255,6 +3318,7 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: text.to_string(),
+            reasoning: None,
         });
 
         assert_eq!(1, tr.messages.len());

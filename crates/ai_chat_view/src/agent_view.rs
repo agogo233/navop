@@ -10709,6 +10709,7 @@ mod tests {
                     session_id,
                     turn_id: agent_runtime::TurnId::from_string("turn-card"),
                     text: "改完了".into(),
+                    reasoning: None,
                 },
                 cx,
             );
@@ -12826,6 +12827,7 @@ mod tests {
                     session_id: SessionId::from_string("acp:42"),
                     turn_id: turn_id.clone(),
                     text: "回来之后的输出".into(),
+                    reasoning: None,
                 },
                 cx,
             );
@@ -13313,6 +13315,7 @@ mod tests {
                     session_id: event_session_id,
                     turn_id,
                     text: "历史上答过的话".into(),
+                    reasoning: None,
                 },
                 cx,
             );
@@ -13347,11 +13350,13 @@ mod tests {
             session_id: detail,
             turn_id: detail_turn_id_for("ses_child"),
             text: "子代理的推理".into(),
+            reasoning: None,
         };
         let other_event = RuntimeEvent::AssistantMessage {
             session_id: SessionId::from_string("acp:other"),
             turn_id: TurnId::from_string("t"),
             text: "别的连接".into(),
+            reasoning: None,
         };
 
         assert!(
@@ -13384,6 +13389,7 @@ mod tests {
                     session_id: SessionId::from_string(detail_uid.clone()),
                     turn_id: detail_turn_id_for("ses_child"),
                     text: "子代理查了连接数".into(),
+                    reasoning: None,
                 },
                 cx,
             );

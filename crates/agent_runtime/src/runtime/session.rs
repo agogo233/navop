@@ -333,6 +333,11 @@ impl Session {
     ) {
         let text = text.into();
         let reasoning = reasoning.into();
+        let reasoning_event = if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning.clone())
+        };
         let _ = self.with_writable_turn(turn_id, || {
             self.state
                 .lock()
@@ -343,6 +348,7 @@ impl Session {
                 session_id: self.id.clone(),
                 turn_id: turn_id.clone(),
                 text,
+                reasoning: reasoning_event,
             });
         });
     }
