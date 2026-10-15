@@ -182,6 +182,14 @@ async fn run_agent_loop(ctx: AgentLoopContext, cancellation: CancellationToken) 
 
         let tool_specs =
             specs_for_task(ctx.task_kind, ctx.tool_mode, &ctx.services, &ctx.resources);
+        // 工具声明进 transcript：重放/审计可还原「当时模型看到了哪些工具」。
+        // 相同快照不重复记；模型侧定义仍由 request.tools 携带。
+        ctx.session.record_tools_declared(
+            tool_specs
+                .iter()
+                .map(|spec| spec.name.as_str().to_string())
+                .collect(),
+        );
         let tools = match tool_specs
             .iter()
             .map(|spec| spec.to_llm_tool())

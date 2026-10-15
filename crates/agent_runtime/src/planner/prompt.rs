@@ -79,6 +79,9 @@ pub fn history_to_messages(history: &RuntimeHistory) -> Vec<Message> {
                 flush_pending_assistant(&mut messages, &mut pending_assistant);
                 push_context_message(&mut messages, orphan_observation_text(obs));
             }
+            // 工具声明纯 transcript 记录：模型侧由 request.tools 携带，
+            // 回灌历史时跳过（否则旧轮工具表会干扰当前轮的可用集）。
+            HistoryItem::ToolsDeclared { .. } => {}
         }
         index += 1;
     }

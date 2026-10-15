@@ -291,6 +291,15 @@ impl Session {
             .record_user(text);
     }
 
+    /// 记录本轮工具声明快照（transcript 事实，不回灌模型）。
+    pub fn record_tools_declared(&self, names: Vec<String>) {
+        self.state
+            .lock()
+            .expect("session 锁中毒")
+            .history
+            .record_tools_declared(names);
+    }
+
     /// 记录一条运行中到达的插话(steering)并广播 [`RuntimeEvent::UserMessage`]。
     ///
     /// 首次输入由 UI 先入历史，runtime 不重发事件避免气泡重复；插话走 runtime

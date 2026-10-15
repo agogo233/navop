@@ -32,6 +32,10 @@ pub enum HistoryItem {
     ToolCall(ToolCall),
     /// 工具观测结果。
     Observation(ToolObservation),
+    /// 本轮可用的工具声明（名称快照）。纯 transcript 事实记录：
+    /// 模型侧由每轮请求的 `tools` 字段携带定义，重放/审计时从这里还原
+    /// 「当时模型看到了哪些工具」。内容变化时才记一条，不逐轮重复。
+    ToolsDeclared { names: Vec<String> },
 }
 
 impl HistoryItem {
@@ -42,7 +46,10 @@ impl HistoryItem {
     /// 见 `ai_chat_view::AgentChatView::reusable_blank_session`——那边用它决定
     /// 「新建会话」能不能复用一张旧白纸。
     pub fn is_system_note(&self) -> bool {
-        matches!(self, HistoryItem::System(_))
+        matches!(
+            self,
+            HistoryItem::System(_) | HistoryItem::ToolsDeclared { .. }
+        )
     }
 }
 
@@ -156,6 +163,26 @@ impl RuntimeHistory {
 
     pub fn record_observation(&mut self, observation: ToolObservation) {
         self.record(HistoryItem::Observation(observation));
+    }
+
+    /// 历史里最近一次工具声明（无则空切片）。
+    pub fn last_declared_tools(&self) -> &[String] {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                HistoryItem::ToolsDeclared { names } => Some(names.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+
+    /// 记录工具声明快照。与最近一次声明相同则不记（避免逐轮重复膨胀）。
+    pub fn record_tools_declared(&mut self, names: Vec<String>) {
+        if self.last_declared_tools() == names.as_slice() {
+            return;
+        }
+        self.record(HistoryItem::ToolsDeclared { names });
     }
 
     pub fn items(&self) -> &[HistoryItem] {
@@ -302,6 +329,28 @@ mod tests {
             }
             .is_system_note()
         );
+    }
+
+    /// 工具声明：变化才记，重复去重；且不算「聊过」（is_system_note）。
+    #[test]
+    fn tools_declared_records_only_changes() {
+        let mut history = RuntimeHistory::new();
+        history.record_tools_declared(vec!["echo".into(), "read_file".into()]);
+        history.record_tools_declared(vec!["echo".into(), "read_file".into()]); // 相同 → 不记
+        history.record_tools_declared(vec!["echo".into()]); // 变化 → 记
+
+        let declared: Vec<_> = history
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ToolsDeclared { names } => Some(names.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(2, declared.len(), "相同快照不重复记录");
+        assert_eq!(vec!["echo".to_string()], declared[1]);
+        assert_eq!(history.last_declared_tools(), ["echo".to_string()]);
+        assert!(HistoryItem::ToolsDeclared { names: Vec::new() }.is_system_note());
     }
 
     #[test]

@@ -356,6 +356,8 @@ impl AgentTranscript {
                         self.finish_tool_call(obs.call_id.as_str(), obs.success);
                     }
                 }
+                // 工具声明是 transcript 事实记录，不产生 UI 气泡。
+                HistoryItem::ToolsDeclared { .. } => {}
             }
             // 历史恢复也逐项收敛,避免先完整装载大历史再统一淘汰的峰值。
             self.enforce_budget();
