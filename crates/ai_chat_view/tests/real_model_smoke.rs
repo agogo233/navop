@@ -252,6 +252,10 @@ fn summarize_history(history: &agent_runtime::RuntimeHistory) -> String {
                 observation.success,
                 truncate(&observation.summary)
             ),
+            // 工具声明的名称快照：断言失败时打出来，能看出「当时模型手里有哪些工具」。
+            agent_runtime::HistoryItem::ToolsDeclared { names } => {
+                format!("tools_declared:{}", names.join(","))
+            }
         })
         .collect::<Vec<_>>()
         .join(" | ")

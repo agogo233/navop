@@ -231,11 +231,10 @@ pub(crate) fn build_ai_workbench_shell(
                         };
                         let opened = window.update(cx, |_, window, cx| {
                             explorer.update(cx, |explorer, cx| {
-                                explorer
-                                    .open_turn_review(&session_id, &turn_id, window, cx)
+                                explorer.open_turn_review(&session_id, &turn_id, window, cx)
                             })
                         });
-                        if opened {
+                        if opened.unwrap_or(false) {
                             shell.update(cx, |shell, cx| {
                                 shell.reveal_panel(WorkbenchPanelKind::Review, cx);
                             });
@@ -348,11 +347,10 @@ pub(crate) fn build_ai_workbench_shell(
                         };
                         let opened = window.update(cx, |_, window, cx| {
                             explorer.update(cx, |explorer, cx| {
-                                explorer
-                                    .open_turn_review(&session_id, &turn_id, window, cx)
+                                explorer.open_turn_review(&session_id, &turn_id, window, cx)
                             })
                         });
-                        if opened {
+                        if opened.unwrap_or(false) {
                             shell.update(cx, |shell, cx| {
                                 shell.reveal_panel(WorkbenchPanelKind::Review, cx);
                             });
