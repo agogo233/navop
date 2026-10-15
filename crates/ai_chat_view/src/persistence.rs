@@ -141,12 +141,17 @@ fn agent_usage_repository(cx: &App) -> Option<std::sync::Arc<one_core::llm::Agen
 /// 已有快照会被当作基底：工作区归属继续定格（首存优先）、输入草稿等本地字段保留，
 /// 这里只更新外部地址与标题。标题留空时沿用首条用户消息的推导结果。
 /// 内容没变化时仓储层自会跳过写入，不会因此把会话在侧栏里顶到最上面。
+///
+/// `mark_active` 区分「真有过动静」与「只是点开看一眼」：只有前者才把侧栏时间
+/// 顶到当前（发送消息 / 一轮结束）。打开历史会话、接上 agent 这类**被动**落盘
+/// 传 `false`，否则点一下会话就会把它排到列表最前面。
 pub fn save_acp_session(
     cx: &App,
     uid: &str,
     title: &str,
     workspace_root: Option<&str>,
     acp: AcpSessionRef,
+    mark_active: bool,
 ) -> Option<(String, i64)> {
     let uid = uid.trim();
     if uid.is_empty() || acp.agent_id.trim().is_empty() || acp.session_id.trim().is_empty() {
@@ -168,8 +173,9 @@ pub fn save_acp_session(
     let saved = repo.save_snapshot(uid, &title, &snapshot_json).ok()?;
     // 外部会话的快照内容几乎不变（地址一存就定），仓储层会跳过写入，更新时间就会
     // 永远停在首次落盘那一刻；而列表按时间倒序排，刚聊过的对话反而沉到底部。
-    // 这里显式提一次时间：调这个函数的地方都是「真有过动静」。
-    if let Ok(Some(row)) = repo.get_by_uid(uid) {
+    // 但只有「真有过动静」（发送消息 / 一轮结束）才该提时间：点开一条历史会话
+    // 只是看一眼，不是活跃，不能因此把它顶到列表最前面。
+    if mark_active && let Ok(Some(row)) = repo.get_by_uid(uid) {
         let _ = repo.update(&row);
     }
     Some((saved.title, saved.updated_at))
@@ -681,6 +687,7 @@ mod tests {
                     "查一下连接数",
                     Some("/w/project"),
                     acp_ref("builtin.codex", "acp-1"),
+                    true,
                 )
             })
             .expect("保存外部会话");
@@ -719,6 +726,7 @@ mod tests {
                 "第一句话",
                 Some("/w/first"),
                 acp_ref("builtin.codex", "acp-1"),
+                true,
             )
         })
         .expect("首次保存");
@@ -742,6 +750,7 @@ mod tests {
                 "第一句话",
                 Some("/w/second"),
                 acp_ref("builtin.codex", "acp-2"),
+                true,
             )
         })
         .expect("再次保存");
@@ -766,18 +775,59 @@ mod tests {
         });
         let uid = "sess_acp";
         let first = cx
-            .update(|cx| save_acp_session(cx, uid, "第一句话", None, acp_ref("agent-1", "acp-1")))
+            .update(|cx| {
+                save_acp_session(cx, uid, "第一句话", None, acp_ref("agent-1", "acp-1"), true)
+            })
             .expect("首次保存")
             .1;
 
         std::thread::sleep(std::time::Duration::from_secs(1));
-        cx.update(|cx| save_acp_session(cx, uid, "第一句话", None, acp_ref("agent-1", "acp-1")))
-            .expect("重复保存");
+        cx.update(|cx| {
+            save_acp_session(cx, uid, "第一句话", None, acp_ref("agent-1", "acp-1"), true)
+        })
+        .expect("重复保存");
 
         let summaries = cx.update(|cx| list_summaries(cx));
         assert!(
             summaries[0].updated_at > first,
             "同一轮对话再次活跃时应当提到列表前面"
+        );
+    }
+
+    /// 被动落盘（点开一条历史会话 / 接回 agent）不能把会话顶到列表最前面：
+    /// 点一下只是看一眼，不是活跃。
+    #[gpui::test]
+    fn passively_resaving_an_acp_session_does_not_reorder_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(GlobalStorageState {
+                storage: test_storage(),
+            });
+        });
+        let uid = "sess_acp";
+        let first = cx
+            .update(|cx| {
+                save_acp_session(cx, uid, "第一句话", None, acp_ref("agent-1", "acp-1"), true)
+            })
+            .expect("首次保存")
+            .1;
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        cx.update(|cx| {
+            save_acp_session(
+                cx,
+                uid,
+                "第一句话",
+                None,
+                acp_ref("agent-1", "acp-1"),
+                false,
+            )
+        })
+        .expect("被动重复保存");
+
+        let summaries = cx.update(|cx| list_summaries(cx));
+        assert_eq!(
+            first, summaries[0].updated_at,
+            "点开看一眼不应把会话排到列表最前面"
         );
     }
 
@@ -800,6 +850,7 @@ mod tests {
                 "正常会话",
                 Some("/w/ok"),
                 acp_ref("builtin.codex", "acp-1"),
+                true,
             )
             .expect("保存正常会话");
         });

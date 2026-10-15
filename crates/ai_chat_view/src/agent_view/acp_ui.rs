@@ -458,7 +458,8 @@ impl AgentChatView {
         );
         // 会话列表里得有这一行：ACP 会话的本地历史是空的，不在这里落盘就永远不会出现在侧栏。
         // 它读的是 `self.acp`，所以必须排在下面两个会 `take()` 连接的操作之前。
-        self.persist_acp_session(&origin_session_uid, cx);
+        // 连接本身不是活跃（可能是点开历史会话触发的重连）：不顶时间。
+        self.persist_acp_session(&origin_session_uid, false, cx);
         // 从零重开一条外部会话时，`resume` 只接上下文、不回放历史；agent 支持
         // `session/load` 的话再主动 load 一次，把那段对话摆回屏幕上。
         //

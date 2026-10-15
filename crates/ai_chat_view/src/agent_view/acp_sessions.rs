@@ -88,8 +88,15 @@ impl AgentChatView {
     /// 就跳过」的规则会让这类会话永远进不了侧栏。所以这里单独落一行：地址 + 一个
     /// 可读标题（本地转录里的首条用户消息，没有就用 agent 名）。
     ///
-    /// 调用时机都是「真有过动静」：接上 agent、手动打开一条历史会话、一轮结束。
-    pub(crate) fn persist_acp_session(&mut self, uid: &str, cx: &mut Context<Self>) {
+    /// `mark_active` 只在**真有过动静**（一轮结束）时传 `true`，把侧栏时间顶到
+    /// 当前；打开历史会话 / 接上 agent 这类被动落盘传 `false`，避免点一下就把
+    /// 会话排到列表最前面。
+    pub(crate) fn persist_acp_session(
+        &mut self,
+        uid: &str,
+        mark_active: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(agent_id) = self.current_acp_id.clone() else {
             return;
         };
@@ -136,11 +143,20 @@ impl AgentChatView {
             .get(uid)
             .cloned()
             .unwrap_or_else(|| self.workspace_root.to_string_lossy().into_owned());
-        persistence::save_acp_session(cx, uid, &title, Some(&workspace_root), reference);
-        // live 摘要也要换上新标题：merge 时 live 的名字会覆盖落盘行，不更新它
-        // 的话侧栏要等到重启才能看到 agent 取的新名字。
-        let now = now_secs();
-        self.upsert_live_summary(uid.to_string(), title, now);
+        // 落盘与 live 摘要用同一份时间：被动落盘（点开看一眼）时取回的是库里
+        // 原有的时间，不会因为打开会话就把它顶到列表最前面；只有真有过动静才提。
+        if let Some((saved_title, updated_at)) = persistence::save_acp_session(
+            cx,
+            uid,
+            &title,
+            Some(&workspace_root),
+            reference,
+            mark_active,
+        ) {
+            // live 摘要也要换上新标题：merge 时 live 的名字会覆盖落盘行，不更新它
+            // 的话侧栏要等到重启才能看到 agent 取的新名字。
+            self.upsert_live_summary(uid.to_string(), saved_title, updated_at);
+        }
         self.reload_sessions(cx);
     }
 
@@ -533,7 +549,8 @@ impl AgentChatView {
                     cx,
                 );
                 // 从 agent 自己的列表里挑中的会话，同样要留在侧栏会话列表里。
-                self.persist_acp_session(&session_uid, cx);
+                // 这是「点开看一眼」，不是活跃：不顶时间。
+                self.persist_acp_session(&session_uid, false, cx);
                 // `activate_acp` 里那次列表刷新会被正在进行的 load 挡下（连接被占着），
                 // 这里补一次：历史摆上屏幕之后，会话列表也该跟上。
                 self.reload_acp_sessions(cx);

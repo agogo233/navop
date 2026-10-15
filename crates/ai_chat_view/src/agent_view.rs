@@ -2411,7 +2411,7 @@ impl AgentChatView {
                     self.start_next_pending(&session_uid, cx);
                 }
                 Backend::Acp if acp_terminal_allows_queue_advance(acp_phase.as_ref()) => {
-                    self.persist_acp_session(&session_uid, cx);
+                    self.persist_acp_session(&session_uid, true, cx);
                     self.advance_acp_pending_after_terminal(&session_uid, cx);
                 }
                 Backend::Acp => {}
@@ -4111,7 +4111,7 @@ impl AgentChatView {
         // ACP 会话的历史仍然归外部 agent，但侧栏得留着这一行，而且每轮结束
         // 都算一次「有过动静」，不然这段对话会永远沉在列表底部。
         if backend == Backend::Acp && is_real_terminal {
-            self.persist_acp_session(&session_uid, cx);
+            self.persist_acp_session(&session_uid, true, cx);
         }
         if advances_queue {
             match backend {
