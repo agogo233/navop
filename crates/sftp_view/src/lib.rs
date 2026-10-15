@@ -1614,8 +1614,12 @@ pub struct SftpView {
     local_path_input: Entity<InputState>,
     remote_path_input: Entity<InputState>,
     /// 本地栏磁盘下拉的展开状态。
+    /// WIP：磁盘下拉 UI 未接线（checkpoint 93701c530），接线前无读者。
+    #[allow(dead_code)]
     local_volume_popover_open: bool,
     /// 缓存的可跳转本地卷；打开下拉时刷新，避免每帧读盘。
+    /// WIP：同上，接线前无读者。
+    #[allow(dead_code)]
     local_volumes: Vec<local_volume::LocalVolume>,
     local_favorite_popover_open: bool,
     remote_favorite_popover_open: bool,

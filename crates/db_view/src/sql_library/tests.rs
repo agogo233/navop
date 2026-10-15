@@ -154,7 +154,7 @@ fn database_tab_opens_library_files_in_the_sql_editor() {
 fn database_sidebar_exposes_the_sql_library_panel() {
     let source = include_str!("../sidebar/mod.rs");
     assert!(source.contains("SidebarPanel::SqlLibrary"));
-    assert!(source.contains("IconName::FolderQueries"));
+    assert!(source.contains("IconName::SqlLibrary"));
     assert!(source.contains("SqlLibraryPanel"));
 }
 

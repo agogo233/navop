@@ -4,6 +4,52 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [v0.20.1] - 2026-10-13
+
+#### 更新内容
+
+- Windows 原生 RDP 远程桌面改用合成呈现（issue #310）：GPUI 的浮层（标签菜单、弹窗、下拉）此前会被原生 RDP 画面「挖孔」盖住，落在下面的控件既看不见也点不到。现在浮层正常画在 RDP 画面之上，附加失败会自动退回子窗口方式，不会留下被遮蔽却不可用的窗口。浮动侧边栏与对话框同步适配。
+- 新增 SQL 库（issue #313）：SQL 文件不再依附于连接管理，独立成库可跨连接复用；侧边栏列表采用 dbx 风格的单色书签图标。
+- 主密钥支持修改与重置（issue #371）：修改时校验旧密钥后重新加密本地连接、钥匙串条目与已同步数据，中途断网只记待办、下次同步前自动补做；重置需输入 RESET 二次确认，删除范围逐项可勾选。「个人密钥」入口不再转交给「修改主密钥」弹窗，两个入口各司其职。
+- AI 供应商设置重做：新增 OpenRouter / MiniMax / 硅基流动等 6 家供应商并预填 base_url；内置 Navop AI 供应商移除，AI 能力改由用户自备（OpenAI 兼容接口均可接入）。
+- 新增鼠标中键关闭未固定（unpinned）的标签页。
+- DDL 统一由数据库驱动生成，删除宿主兜底拼装。
+- 终端嵌套 shell 场景新增 `terminal.control` 的 `reintegrate`，恢复丢失的宿主集成；shell 宿主新增 `navop.i18n` / `navop.theme` 两条 host 模块。
+- FTP / Telnet 连接的端口改为普通输入框，移除预设下拉。
+- 语言扩展的 WASM 编译改用专用大栈线程，修复打开高亮文件时崩溃。
+
+##### 修复与优化
+
+- 表格列筛选 / 隐藏列后操作落到错误行列：筛选生效时「删除记录」删的是另一行——界面提示成功、选中的行还在，刷新后像「删不掉」；隐藏 / 移动列后打开大文本编辑器显示的是别的列的内容（issue #387）。视图层「显示坐标」与数据层「数据坐标」的换算统一收口到委托层：删除、批量删除、新增行、复制行、大文本编辑全部修正，新增行在筛选生效时也照常可见，空筛选值集改为取消该列筛选。
+- 复制 SQL 时限定表名逐段加引号，不再把整段语句的表名一次包进引号。
+- Markdown 编辑器 Cmd/Ctrl+A 一次全选整篇，删除两段式选中循环。
+- 修复 gpui-fast 后端暴露的多处保留渲染契约违规；渲染栈整体迁移到 gpui-fast 0.1.8 自包含快照并同步 gpui-kit 上游修复。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.20.1) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- The Windows native RDP session is presented through composition (issue #310): GPUI overlays (tab menus, popovers, dropdowns) used to be swallowed by the airspace hole of the native RDP surface, leaving controls beneath it invisible and unclickable. Overlays now draw above the RDP content, with an automatic fallback to the plain child-window presentation when attaching fails. The floating sidebar and dialogs are adapted accordingly.
+- New SQL Library (issue #313): SQL files no longer live inside individual connections — they form a standalone library reusable across connections, with dbx-style monochrome bookmark icons in the sidebar.
+- Master key can now be changed and reset (issue #371): changing it verifies the old key and re-encrypts local connections, keychain entries and already-synced data, deferring interrupted re-encryption to the next sync; resetting requires typing RESET and lets you tick exactly what gets wiped. The "personal key" entry no longer hands over to the "change master key" dialog — each entry keeps its own form.
+- AI provider settings reworked: 6 providers including OpenRouter / MiniMax / SiliconFlow are added with prefilled base_url; the built-in Navop AI provider is removed — bring your own key with any OpenAI-compatible endpoint.
+- Middle-click closes unpinned tabs.
+- DDL is now generated uniformly by database drivers; the host-side fallback assembly is gone.
+- Nested shells in the terminal gain `terminal.control`'s `reintegrate` to restore lost host integration, and the shell host adds `navop.i18n` / `navop.theme` host modules.
+- FTP / Telnet port fields become plain inputs instead of a preset dropdown.
+- Language-extension WASM compilation moves to a dedicated large-stack thread, fixing a crash when opening highlighted files.
+
+#### Fixes and Improvements
+
+- Table operations no longer land on the wrong row or column while column filters or hidden columns are active: with a filter on, "delete record" deleted a different row — reported success while the selected row survived the refresh; with a column hidden or moved, the large-text editor showed another column's content (issue #387). Display-to-data coordinate translation is now centralized in the delegate layer: delete, batch delete, add row, clone row and large-text editing are all corrected, newly added rows stay visible under active filters, and an empty filter selection now clears that column's filter.
+- Copying SQL quotes each table reference segment individually instead of wrapping the whole statement's identifiers at once.
+- The Markdown editor's Cmd/Ctrl+A selects the whole document in one shot; the two-stage selection loop is gone.
+- Fixed several retained-rendering contract violations surfaced by the gpui-fast backend; the rendering stack moves to the self-contained gpui-fast 0.1.8 snapshot with upstream gpui-kit fixes.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.20.0...v0.20.1
+
 ## [v0.20.0] - 2026-10-10
 
 #### 更新内容

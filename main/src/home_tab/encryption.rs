@@ -60,14 +60,6 @@ impl HomePage {
             return;
         }
 
-        // 已解锁状态下这个入口就是"修改主密钥"。修改需要旧密钥 + 新密钥 +
-        // 确认新密钥三个输入框，与首次设置/解锁的单输入框弹窗是两件事，因此
-        // 在这里就转交出去，避免弹窗叠加。
-        if crypto::has_repo_password_set() && crypto::has_master_key() {
-            self.show_change_master_key_dialog(window, cx);
-            return;
-        }
-
         self.master_key_dialog_open = true;
 
         let view = cx.entity();
@@ -399,7 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_dialog_hands_over_to_the_dedicated_change_dialog() {
+    fn personal_key_entry_keeps_its_own_dialog() {
+        // 「个人密钥」入口只做首次设置/解锁；已解锁时也不能转交给修改弹窗，
+        // 否则它会与独立的「修改主密钥」入口弹出同一个表单。
         let source = include_str!("encryption.rs");
         let dialog = source
             .split("pub(super) fn show_encryption_key_dialog(")
@@ -407,7 +401,7 @@ mod tests {
             .and_then(|source| source.split("pub(super) fn team_management_url").next())
             .expect("show_encryption_key_dialog source");
 
-        assert!(dialog.contains("self.show_change_master_key_dialog(window, cx)"));
+        assert!(!dialog.contains("self.show_change_master_key_dialog(window, cx)"));
         assert!(RESET_CONFIRM_WORD == "RESET");
     }
 }

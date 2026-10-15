@@ -22,6 +22,15 @@ const VOLCENGINE_BASE_URL: &str = "https://ark.cn-beijing.volces.com/api/v3";
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// MiniMax 国内站；国际站为 https://api.minimax.io/v1，可由用户改 api_base 切换。
+const MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/v1";
+/// 硅基流动国内站；国际站为 https://api.siliconflow.com/v1。
+const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
+/// 腾讯混元 OpenAI 兼容端点（单 API Key），非 TC3 签名协议的 hunyuan.tencentcloudapi.com。
+const HUNYUAN_BASE_URL: &str = "https://api.hunyuan.cloud.tencent.com/v1";
+const XIAOMI_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
+const XINFERENCE_BASE_URL: &str = "http://127.0.0.1:9997/v1";
 /// Idle timeout: aborts a request only after this long without any bytes, so
 /// long streaming responses (thinking/CoT, tool loops) are not cut off.
 pub const LLM_CLIENT_TIMEOUT_SECS: u64 = 120;
@@ -152,6 +161,42 @@ fn client_from_config(config: &ProviderConfig, options: ClientOptions<'_>) -> Re
             provider_base_url(config, GOOGLE_BASE_URL),
             options,
         ),
+        // OpenRouter：service_name 复用 llm-connector 已内置的 openrouter 能力位。
+        ProviderType::OpenRouter => openai_compatible_client(
+            required_api_key(config, "OpenRouter")?,
+            provider_base_url(config, OPENROUTER_BASE_URL),
+            "openrouter",
+            options,
+        ),
+        // MiniMax：复用 minimax 能力位（文本块模式，不带多模态）。
+        ProviderType::MiniMax => openai_compatible_client(
+            required_api_key(config, "MiniMax")?,
+            provider_base_url(config, MINIMAX_BASE_URL),
+            "minimax",
+            options,
+        ),
+        ProviderType::SiliconFlow => openai_compatible_client(
+            required_api_key(config, "SiliconFlow")?,
+            provider_base_url(config, SILICONFLOW_BASE_URL),
+            "siliconflow",
+            options,
+        ),
+        ProviderType::TencentHunyuan => openai_compatible_client(
+            required_api_key(config, "Tencent Hunyuan")?,
+            provider_base_url(config, HUNYUAN_BASE_URL),
+            "hunyuan",
+            options,
+        ),
+        ProviderType::Xiaomi => build_client(
+            LlmClient::builder().xiaomi(required_api_key(config, "Xiaomi MiMo")?),
+            provider_base_url(config, XIAOMI_BASE_URL),
+            options,
+        ),
+        ProviderType::Xinference => build_client(
+            LlmClient::builder().xinference(),
+            provider_base_url(config, XINFERENCE_BASE_URL),
+            options,
+        ),
         ProviderType::AzureOpenAI => azure_openai_client(config, options),
         ProviderType::OpenAICompatible => openai_compatible_client(
             required_api_key(config, "OpenAI Compatible")?,
@@ -159,11 +204,6 @@ fn client_from_config(config: &ProviderConfig, options: ClientOptions<'_>) -> Re
             &config.name,
             options,
         ),
-        ProviderType::OnetCli => {
-            anyhow::bail!(
-                "OnetCli provider should be created via ProviderManager, not LlmConnector"
-            )
-        }
     }
 }
 
@@ -257,6 +297,32 @@ fn required_base_url<'a>(config: &'a ProviderConfig, provider_name: &str) -> Res
 
 fn provider_base_url<'a>(config: &'a ProviderConfig, default_base_url: &'static str) -> &'a str {
     config.api_base.as_deref().unwrap_or(default_base_url)
+}
+
+/// 该 provider 类型开箱可用的默认 API Base URL，供设置表单预填。
+///
+/// 返回 `None` 表示没有通用默认值（自建 / 代理类服务、企业专属端点），
+/// 必须由用户显式填写。这里的取值与 [`client_from_config`] 的兜底地址同源，
+/// 由测试 `preset_provider_types_build_client_without_explicit_base_url` 守住一致性。
+pub fn default_api_base(provider_type: ProviderType) -> Option<&'static str> {
+    match provider_type {
+        ProviderType::OpenAI => Some(OPENAI_BASE_URL),
+        ProviderType::Anthropic => Some(ANTHROPIC_BASE_URL),
+        ProviderType::Aliyun => Some(ALIYUN_BASE_URL),
+        ProviderType::Zhipu => Some(ZHIPU_BASE_URL),
+        ProviderType::Ollama => Some(OLLAMA_BASE_URL),
+        ProviderType::Volcengine => Some(VOLCENGINE_BASE_URL),
+        ProviderType::Moonshot => Some(MOONSHOT_BASE_URL),
+        ProviderType::DeepSeek => Some(DEEPSEEK_BASE_URL),
+        ProviderType::Google => Some(GOOGLE_BASE_URL),
+        ProviderType::OpenRouter => Some(OPENROUTER_BASE_URL),
+        ProviderType::MiniMax => Some(MINIMAX_BASE_URL),
+        ProviderType::SiliconFlow => Some(SILICONFLOW_BASE_URL),
+        ProviderType::TencentHunyuan => Some(HUNYUAN_BASE_URL),
+        ProviderType::Xiaomi => Some(XIAOMI_BASE_URL),
+        ProviderType::Xinference => Some(XINFERENCE_BASE_URL),
+        ProviderType::AzureOpenAI | ProviderType::OpenAICompatible => None,
+    }
 }
 
 fn aliyun_base_url(config: &ProviderConfig) -> &str {
@@ -496,5 +562,71 @@ mod tests {
             &config,
             Some("http://"),
         ));
+    }
+
+    /// 新增供应商预置的默认地址。锁定取值，避免以后被无意改掉。
+    #[test]
+    fn added_providers_expose_preset_api_base_urls() {
+        assert_eq!(
+            Some("https://openrouter.ai/api/v1"),
+            default_api_base(ProviderType::OpenRouter)
+        );
+        assert_eq!(
+            Some("https://api.minimaxi.com/v1"),
+            default_api_base(ProviderType::MiniMax)
+        );
+        assert_eq!(
+            Some("https://api.siliconflow.cn/v1"),
+            default_api_base(ProviderType::SiliconFlow)
+        );
+        assert_eq!(
+            Some("https://api.hunyuan.cloud.tencent.com/v1"),
+            default_api_base(ProviderType::TencentHunyuan)
+        );
+        assert_eq!(
+            Some("https://api.xiaomimimo.com/v1"),
+            default_api_base(ProviderType::Xiaomi)
+        );
+        assert_eq!(
+            Some("http://127.0.0.1:9997/v1"),
+            default_api_base(ProviderType::Xinference)
+        );
+    }
+
+    /// 用户必须显式提供端点的类型不得有预置值，否则设置页会预填出一个错误地址。
+    #[test]
+    fn explicit_endpoint_providers_have_no_preset_api_base_url() {
+        assert_eq!(None, default_api_base(ProviderType::OpenAICompatible));
+        assert_eq!(None, default_api_base(ProviderType::AzureOpenAI));
+    }
+
+    /// 契约测试：凡是声明了预置地址的类型，都必须能在用户不填 base_url 的情况下建出 client。
+    /// 这条同时守住「预置地址」与 `client_from_config` 分支的一致性。
+    #[test]
+    fn preset_provider_types_build_client_without_explicit_base_url() {
+        let mut checked = 0;
+
+        for provider_type in ProviderType::all() {
+            if default_api_base(provider_type).is_none() {
+                continue;
+            }
+
+            let config = ProviderConfig {
+                provider_type,
+                api_key: Some("test-key".to_string()),
+                model: "test-model".to_string(),
+                ..Default::default()
+            };
+
+            assert!(
+                LlmConnector::from_config(&config).is_ok(),
+                "{} 声明了预置地址却无法在未填 base_url 时构建 client",
+                provider_type.as_str()
+            );
+            checked += 1;
+        }
+
+        // 防止测试因 all() 被清空而空转通过。
+        assert!(checked >= 13, "只校验到 {checked} 个类型，疑似漏配");
     }
 }

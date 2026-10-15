@@ -18,15 +18,21 @@ pub(crate) struct LocalVolume {
 }
 
 impl LocalVolume {
+    /// WIP：磁盘下拉 UI 未接线，接线前仅测试使用（checkpoint 93701c530）。
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
+    /// WIP：同上，接线前仅测试使用。
+    #[allow(dead_code)]
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
 
     /// 完整路径文本；与 `label` 相同时（例如根目录 `/`）不必重复展示。
+    /// WIP：同上，接线前仅测试使用。
+    #[allow(dead_code)]
     pub(crate) fn location(&self) -> String {
         self.path.to_string_lossy().to_string()
     }
@@ -50,6 +56,8 @@ pub(crate) fn local_volumes() -> Vec<LocalVolume> {
 }
 
 /// 命中路径最长的卷即为「当前卷」，根目录 `/` 不会盖掉具体挂载点。
+/// WIP：磁盘下拉 UI 未接线，接线前仅测试使用（checkpoint 93701c530）。
+#[allow(dead_code)]
 pub(crate) fn current_volume_index(volumes: &[LocalVolume], current: &Path) -> Option<usize> {
     volumes
         .iter()
@@ -164,8 +172,8 @@ fn display_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalVolume, current_volume_index, display_label, local_volumes, normalize_local_path_input,
-        normalize_local_path_input_for,
+        LocalVolume, current_volume_index, display_label, local_volumes,
+        normalize_local_path_input, normalize_local_path_input_for,
     };
     use std::path::{Path, PathBuf};
 
@@ -271,7 +279,10 @@ mod tests {
             Some(1),
             current_volume_index(&volumes, Path::new("/Volumes/USB/docs"))
         );
-        assert_eq!(Some(0), current_volume_index(&volumes, Path::new("/Users/me")));
+        assert_eq!(
+            Some(0),
+            current_volume_index(&volumes, Path::new("/Users/me"))
+        );
         assert_eq!(None, current_volume_index(&[], Path::new("/")));
     }
 }

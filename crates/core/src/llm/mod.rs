@@ -2,16 +2,14 @@ pub mod chat_history;
 pub mod composer_draft;
 pub mod connector;
 pub mod manager;
-pub mod navop_provider;
 pub mod notifier;
 pub mod storage;
 pub mod types;
 pub mod usage_history;
 
 pub use composer_draft::{ComposerDraft, ComposerDraftRepository};
-pub use connector::{ChatStream, LlmConnector, LlmProvider};
+pub use connector::{ChatStream, LlmConnector, LlmProvider, default_api_base};
 pub use manager::{GlobalProviderState, ProviderManager};
-pub use navop_provider::NavopLLMProvider;
 pub use types::{ProviderConfig, ProviderType};
 pub use usage_history::{AgentUsageRepository, AgentUsageSample};
 

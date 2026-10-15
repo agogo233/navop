@@ -35,7 +35,6 @@ use gpui_component::{
 use one_assets::IconName;
 use rust_i18n::t;
 
-
 /// 列头行在布局测试里的 debug selector，非 test 构建为空实现。
 pub(crate) const HEAD_ROW_SELECTOR: &str = "edit-table-head-row";
 /// 数据行 debug selector 前缀，后面接行号，例如 `edit-table-row-0`。
@@ -1831,6 +1830,7 @@ where
     }
 
     pub fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 契约：委托返回的是视图层的显示行号，滚动用的也是显示行号。
         let row_ix = self.delegate.on_row_added(window, cx);
         self.scroll_to_row(row_ix, cx);
         cx.emit(EditTableEvent::RowAdded);
@@ -1842,6 +1842,25 @@ where
         self.delegate.on_row_deleted(row_ix, window, cx);
         cx.emit(EditTableEvent::RowDeleted(row_ix));
         self.clear_deleted_row_selection(row_ix);
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    /// 一次删除多行（`display_row_indices` 是显示层行号）。
+    ///
+    /// 整批交给委托处理：逐行删除时行集与筛选映射会变，后面的显示行号会落到别的行上。
+    pub fn delete_rows(
+        &mut self,
+        display_row_indices: &[usize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delegate
+            .on_rows_deleted(display_row_indices, window, cx);
+        for &row_ix in display_row_indices {
+            cx.emit(EditTableEvent::RowDeleted(row_ix));
+            self.clear_deleted_row_selection(row_ix);
+        }
         self.refresh(cx);
         cx.notify();
     }

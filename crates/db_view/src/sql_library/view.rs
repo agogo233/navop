@@ -43,7 +43,7 @@ pub(super) fn render_header(
                 .items_center()
                 .gap_1()
                 .child(
-                    Icon::new(IconName::FolderQueries)
+                    Icon::new(IconName::SqlLibrary)
                         .with_size(px(14.))
                         .text_color(cx.theme().muted_foreground),
                 )
@@ -259,7 +259,7 @@ pub(super) fn render_placeholder(message: String, cx: &mut Context<SqlLibraryPan
         .gap_1()
         .p_4()
         .child(
-            Icon::new(IconName::FolderQueries)
+            Icon::new(IconName::SqlLibrary)
                 .with_size(px(24.))
                 .text_color(cx.theme().muted_foreground),
         )

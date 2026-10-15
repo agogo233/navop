@@ -262,7 +262,7 @@ impl DatabaseSidebar {
                 t!("DatabaseSidebar.execution_history").to_string(),
             ),
             SidebarPanel::SqlLibrary => {
-                (IconName::FolderQueries, t!("SqlLibrary.title").to_string())
+                (IconName::SqlLibrary, t!("SqlLibrary.title").to_string())
             }
         };
 

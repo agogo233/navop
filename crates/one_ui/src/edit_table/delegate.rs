@@ -414,6 +414,7 @@ pub trait EditTableDelegate: Sized + 'static {
         false
     }
 
+    /// 新增一行。返回新行在**视图层**的显示行号（列筛选生效时不等于数据行下标）。
     fn on_row_added(
         &mut self,
         window: &mut Window,
@@ -422,12 +423,29 @@ pub trait EditTableDelegate: Sized + 'static {
         0
     }
 
+    /// 删除一行。`row_ix` 是视图层的显示行号。
     fn on_row_deleted(
         &mut self,
         row_ix: usize,
         window: &mut Window,
         cx: &mut Context<EditTableState<Self>>,
     ) {
+    }
+
+    /// 一次删除多行。`display_row_indices` 是视图层的显示行号。
+    ///
+    /// 默认逐行转交 [`Self::on_row_deleted`]；行集会在删除过程中变化的委托（删掉未保存的
+    /// 新行会真的移除数据行，显示行号与数据行下标的映射随之改变）必须覆盖它，否则整批里
+    /// 后面的显示行号会落到别的行上。
+    fn on_rows_deleted(
+        &mut self,
+        display_row_indices: &[usize],
+        window: &mut Window,
+        cx: &mut Context<EditTableState<Self>>,
+    ) {
+        for &row_ix in display_row_indices {
+            self.on_row_deleted(row_ix, window, cx);
+        }
     }
 
     fn column_filter_enabled(&self, cx: &App) -> bool {

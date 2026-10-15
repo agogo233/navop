@@ -645,7 +645,7 @@ impl SettingsPanel {
                             ),
                         ),
                     close_behavior_setting_group(default_settings.close_button_behavior),
-                    notes_setting_group(),
+                    notes_setting_group(font_options.clone()),
                     SettingGroup::new()
                         .title(t!("Settings.General.Appearance.group_title"))
                         .item(SettingItem::render(render_appearance_settings)),
@@ -2905,7 +2905,6 @@ fn apply_global_http_client(
     auth_service.replace_http_client(http_for_auth);
 
     if let Some(provider_state) = cx.try_global::<GlobalProviderState>() {
-        provider_state.set_cloud_client(auth_service.cloud_client());
         if let Err(err) = provider_state.set_proxy_settings(proxy_settings) {
             tracing::error!(error = %err, "LLM 代理设置同步失败");
         }

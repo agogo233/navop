@@ -11,9 +11,20 @@ pub enum ProviderType {
     Moonshot,
     DeepSeek,
     Google,
+    /// 聚合网关：一个 key 覆盖多家模型（含 OpenAI / Anthropic / Google 系）。
+    OpenRouter,
+    /// MiniMax（稀宇科技）OpenAI 兼容端点。
+    MiniMax,
+    /// 硅基流动 OpenAI 兼容端点（国内站）。
+    SiliconFlow,
+    /// 腾讯混元 OpenAI 兼容端点（单 API Key，非 TC3 签名协议）。
+    TencentHunyuan,
+    /// 小米 MiMo。
+    Xiaomi,
+    /// 本地 / 自托管 Xinference（OpenAI 兼容，默认无需 API Key）。
+    Xinference,
     AzureOpenAI,
     OpenAICompatible,
-    OnetCli,
 }
 
 impl ProviderType {
@@ -28,9 +39,14 @@ impl ProviderType {
             ProviderType::Moonshot => "moonshot",
             ProviderType::DeepSeek => "deepseek",
             ProviderType::Google => "google",
+            ProviderType::OpenRouter => "openrouter",
+            ProviderType::MiniMax => "minimax",
+            ProviderType::SiliconFlow => "siliconflow",
+            ProviderType::TencentHunyuan => "tencent_hunyuan",
+            ProviderType::Xiaomi => "xiaomi",
+            ProviderType::Xinference => "xinference",
             ProviderType::AzureOpenAI => "azure_openai",
             ProviderType::OpenAICompatible => "openai_compatible",
-            ProviderType::OnetCli => "onet_cli",
         }
     }
 
@@ -45,9 +61,14 @@ impl ProviderType {
             "moonshot" => Some(ProviderType::Moonshot),
             "deepseek" => Some(ProviderType::DeepSeek),
             "google" => Some(ProviderType::Google),
+            "openrouter" => Some(ProviderType::OpenRouter),
+            "minimax" => Some(ProviderType::MiniMax),
+            "siliconflow" => Some(ProviderType::SiliconFlow),
+            "tencent_hunyuan" => Some(ProviderType::TencentHunyuan),
+            "xiaomi" => Some(ProviderType::Xiaomi),
+            "xinference" => Some(ProviderType::Xinference),
             "azure_openai" => Some(ProviderType::AzureOpenAI),
             "openai_compatible" => Some(ProviderType::OpenAICompatible),
-            "onet_cli" => Some(ProviderType::OnetCli),
             _ => None,
         }
     }
@@ -63,9 +84,14 @@ impl ProviderType {
             ProviderType::Moonshot => "Moonshot",
             ProviderType::DeepSeek => "DeepSeek",
             ProviderType::Google => "Google (Gemini)",
+            ProviderType::OpenRouter => "OpenRouter",
+            ProviderType::MiniMax => "MiniMax",
+            ProviderType::SiliconFlow => "SiliconFlow",
+            ProviderType::TencentHunyuan => "Tencent Hunyuan",
+            ProviderType::Xiaomi => "Xiaomi (MiMo)",
+            ProviderType::Xinference => "Xinference",
             ProviderType::AzureOpenAI => "Azure OpenAI",
             ProviderType::OpenAICompatible => "OpenAI Compatible",
-            ProviderType::OnetCli => "Navop",
         }
     }
 
@@ -80,27 +106,20 @@ impl ProviderType {
             ProviderType::Moonshot,
             ProviderType::DeepSeek,
             ProviderType::Google,
+            ProviderType::OpenRouter,
+            ProviderType::MiniMax,
+            ProviderType::SiliconFlow,
+            ProviderType::TencentHunyuan,
+            ProviderType::Xiaomi,
+            ProviderType::Xinference,
             ProviderType::AzureOpenAI,
             ProviderType::OpenAICompatible,
-            ProviderType::OnetCli,
         ]
     }
 
+    /// 是否需要用户提供 API Key。只有本地部署的 Ollama / Xinference 可以不填。
     pub fn requires_api_key(&self) -> bool {
-        !matches!(self, ProviderType::Ollama | ProviderType::OnetCli)
-    }
-
-    /// 是否为内置 provider（不需要用户配置）
-    pub fn is_builtin(&self) -> bool {
-        matches!(self, ProviderType::OnetCli)
-    }
-
-    /// 返回用户可配置的 provider 类型列表（不包含内置类型）
-    pub fn user_configurable() -> Vec<Self> {
-        Self::all()
-            .into_iter()
-            .filter(|p| !p.is_builtin())
-            .collect()
+        !matches!(self, ProviderType::Ollama | ProviderType::Xinference)
     }
 }
 
@@ -143,24 +162,90 @@ impl Default for ProviderConfig {
     }
 }
 
-impl ProviderConfig {
-    /// 是否为内置 provider
-    pub fn is_builtin(&self) -> bool {
-        self.provider_type.is_builtin()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::ProviderType;
 
+    /// 内置 Navop AI（`onet_cli`）已下线：历史配置值不再被识别，也不再出现在候选列表里。
     #[test]
-    fn onetcli_provider_uses_navop_display_name_and_legacy_id() {
-        assert_eq!("Navop", ProviderType::OnetCli.display_name());
-        assert_eq!("onet_cli", ProviderType::OnetCli.as_str());
-        assert_eq!(
-            Some(ProviderType::OnetCli),
-            ProviderType::from_str("onet_cli")
+    fn builtin_navop_ai_provider_is_no_longer_recognised() {
+        assert_eq!(None, ProviderType::from_str("onet_cli"));
+        assert!(
+            !ProviderType::all()
+                .iter()
+                .any(|provider_type| provider_type.as_str() == "onet_cli"),
+            "内置 Navop AI 不应再出现在 ProviderType::all() 中"
         );
+    }
+
+    /// 内置 provider 下线后，只剩本地部署的两家可以不填 API Key。
+    #[test]
+    fn only_local_providers_skip_api_key() {
+        let without_api_key: Vec<ProviderType> = ProviderType::all()
+            .into_iter()
+            .filter(|provider_type| !provider_type.requires_api_key())
+            .collect();
+
+        assert_eq!(
+            vec![ProviderType::Ollama, ProviderType::Xinference],
+            without_api_key
+        );
+    }
+
+    /// 新增供应商的存储 id 必须能原样往返：旧配置读回不丢、新配置写入可读。
+    #[test]
+    fn added_provider_types_round_trip_through_storage_ids() {
+        let cases = [
+            (ProviderType::OpenRouter, "openrouter"),
+            (ProviderType::MiniMax, "minimax"),
+            (ProviderType::SiliconFlow, "siliconflow"),
+            (ProviderType::TencentHunyuan, "tencent_hunyuan"),
+            (ProviderType::Xiaomi, "xiaomi"),
+            (ProviderType::Xinference, "xinference"),
+        ];
+
+        for (provider_type, storage_id) in cases {
+            assert_eq!(storage_id, provider_type.as_str());
+            assert_eq!(Some(provider_type), ProviderType::from_str(storage_id));
+            assert!(
+                !provider_type.display_name().is_empty(),
+                "{storage_id} 缺少展示名"
+            );
+            assert!(
+                ProviderType::all().contains(&provider_type),
+                "{storage_id} 未加入 all()"
+            );
+        }
+    }
+
+    /// 新增供应商必须出现在设置页的候选列表里，否则用户选不到（issue #379 的成因）。
+    #[test]
+    fn added_provider_types_are_offered_to_users() {
+        let all = ProviderType::all();
+
+        for provider_type in [
+            ProviderType::OpenRouter,
+            ProviderType::MiniMax,
+            ProviderType::SiliconFlow,
+            ProviderType::TencentHunyuan,
+            ProviderType::Xiaomi,
+            ProviderType::Xinference,
+        ] {
+            assert!(
+                all.contains(&provider_type),
+                "{} 未出现在候选列表中",
+                provider_type.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn xinference_is_the_only_added_provider_without_api_key() {
+        assert!(!ProviderType::Xinference.requires_api_key());
+        assert!(ProviderType::OpenRouter.requires_api_key());
+        assert!(ProviderType::SiliconFlow.requires_api_key());
+        assert!(ProviderType::TencentHunyuan.requires_api_key());
+        assert!(ProviderType::Xiaomi.requires_api_key());
+        assert!(ProviderType::MiniMax.requires_api_key());
     }
 }
