@@ -2588,19 +2588,40 @@ impl SelectItem for BranchChoice {
 
     fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let mut row = v_flex()
-            .gap(px(1.0))
-            .debug_selector(|| "agent-branch-option".to_string())
-            .child(div().text_sm().truncate().child(self.option.name.clone()));
-        if self.option.remote {
-            row = row.child(
+        // 行高由列表按**第一行**量一次、全体共用（`List::prepare_items_if_needed`），
+        // 所以这里必须是死的一行：名字下面再压一行（远端标记）会撑破后面的行 ——
+        // 屏幕上就是一行叠在一行上。远端标记因此并到同一行的右侧。
+        h_flex()
+            .debug_selector(|| {
+                if self.option.remote {
+                    "agent-branch-option-remote".to_string()
+                } else {
+                    "agent-branch-option-local".to_string()
+                }
+            })
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .items_center()
+            .child(
                 div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(t!("AgentUi.composer_branch_remote").to_string()),
-            );
-        }
-        row
+                    // 共享选择器：点开/点选那类用例不需要区分本地与远端。
+                    .debug_selector(|| "agent-branch-option".to_string())
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .child(self.option.name.clone()),
+            )
+            .when(self.option.remote, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(t!("AgentUi.composer_branch_remote").to_string()),
+                )
+            })
     }
 }
 

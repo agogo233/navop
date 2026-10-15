@@ -11326,6 +11326,69 @@ mod tests {
         );
     }
 
+    /// 分支下拉的行必须一样高。
+    ///
+    /// 列表是按**第一行**量一次高度、全体共用的（`List::prepare_items_if_needed`），
+    /// 谁比这个高度多出一行，就会压到下一行上 —— 远端分支原先就是这么叠起来的。
+    /// 所以断言的不是「长得好看」，而是两种行的高度必须一致。
+    #[gpui::test]
+    fn acp_branch_dropdown_rows_share_one_height(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        // 第一条是本地分支（列表就量它）：它后面的远端行才看得出撑没撑破。
+        let source = ComposerContextSource {
+            snapshot: Arc::new(|_: &mut gpui::App| ComposerContextSnapshot {
+                branches: vec![
+                    ComposerBranchOption::new("main", true, false),
+                    ComposerBranchOption::new("origin/feature/x", false, true),
+                ],
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+
+        let branch = cx
+            .debug_bounds("agent-input-branch")
+            .expect("分支选择应当渲染");
+        cx.simulate_click(branch.center(), Modifiers::default());
+        refresh_frame(cx);
+
+        let local = cx
+            .debug_bounds("agent-branch-option-local")
+            .expect("本地分支应当有一行");
+        let remote = cx
+            .debug_bounds("agent-branch-option-remote")
+            .expect("远端分支应当有一行");
+        assert!(
+            (local.size.height - remote.size.height).abs() <= px(1.0),
+            "本地与远端的分支行必须一样高（多的那一行会压到下一行上）：local={local:?}, remote={remote:?}"
+        );
+        assert!(
+            remote.origin.y >= local.origin.y,
+            "远端行排在本地行之后：local={local:?}, remote={remote:?}"
+        );
+    }
+
     #[gpui::test]
     fn switching_backend_carries_the_draft_between_composers(cx: &mut TestAppContext) {
         init_test_ui(cx);
