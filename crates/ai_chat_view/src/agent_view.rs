@@ -3111,7 +3111,9 @@ impl AgentChatView {
         let steer_local_turn = self.backend == Backend::Local
             && self.running_sessions.contains(&session_uid)
             && self.pending_submissions.len(&session_uid) == 0;
-        if self.running_sessions.contains(&session_uid) && !steer_in_flight_turn && !steer_local_turn
+        if self.running_sessions.contains(&session_uid)
+            && !steer_in_flight_turn
+            && !steer_local_turn
         {
             self.enqueue_submission(&session_uid, submission, cx);
             return;

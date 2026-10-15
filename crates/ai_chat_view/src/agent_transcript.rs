@@ -461,9 +461,9 @@ impl AgentTranscript {
             }
             RuntimeEvent::AssistantMessageDelta { delta, .. } => self.append_delta(delta),
             RuntimeEvent::ReasoningDelta { delta, .. } => self.append_reasoning_delta(delta),
-            RuntimeEvent::AssistantMessage { text, reasoning, .. } => {
-                self.finalize_assistant(text, reasoning.as_deref())
-            }
+            RuntimeEvent::AssistantMessage {
+                text, reasoning, ..
+            } => self.finalize_assistant(text, reasoning.as_deref()),
             RuntimeEvent::UserMessage { text, .. } => self.push_user_from_text(text),
             RuntimeEvent::Status { title, is_done, .. } => self.upsert_status(title, *is_done),
             _ => unreachable!("non-message event routed to apply_message_event"),
@@ -2379,8 +2379,7 @@ mod tests {
         assert_eq!(1, tr.messages.len());
         assert_eq!("答案", tr.messages[0].content);
         assert_eq!(
-            "先分析，再…后半段",
-            tr.messages[0].reasoning_content,
+            "先分析，再…后半段", tr.messages[0].reasoning_content,
             "终值应整体替换残缺累积"
         );
     }
