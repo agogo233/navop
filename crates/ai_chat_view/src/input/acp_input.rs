@@ -58,7 +58,7 @@ use crate::input::slash::{SlashCommandItem, SlashCompletionProvider};
 use crate::theme::{AgentChatTheme, active_agent_chat_theme, sp};
 use crate::usage::{ContextUsage, UsagePressure, format_token_count};
 
-const COMPOSER_EDITOR_MIN_ROWS: usize = 3;
+const COMPOSER_EDITOR_MIN_ROWS: usize = 1;
 const COMPOSER_EDITOR_MAX_ROWS: usize = 10;
 const COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT: f32 = 20.0;
 const COMPOSER_EDITOR_VERTICAL_PADDING: f32 = 12.0;
@@ -77,14 +77,8 @@ const USAGE_GAUGE_DIAMETER: f32 = 16.0;
 const COMPOSER_CHIP_MIN_WIDTH: f32 = 44.0;
 /// 上下文档位 chip 的自然宽度上限。
 const COMPOSER_CHIP_MAX_WIDTH: f32 = 220.0;
-/// chip 里除文字外的固定占位：左右内边距 + 图标 + 间距。
-///
-/// 原来是 48（含 `⌄`）；这次减线去掉了箭头，占位跟着降到 34。
-const TRIGGER_CHROME_WIDTH: f32 = 34.0;
 /// 模型 chip 的宽度上限：模型名长起来没边，超了就省略（全名进 tooltip）。
 const MODEL_TRIGGER_MAX_WIDTH: f32 = 200.0;
-/// 参数行里模型选择器能被压到的最小宽度。
-const MODEL_TRIGGER_MIN_WIDTH: f32 = 140.0;
 /// 卡片上下内边距。
 const COMPOSER_CARD_PADDING_VERTICAL: f32 = 10.0;
 /// 参数行与上下文行的水平内边距。
@@ -138,21 +132,6 @@ fn composer_chip_label(icon: IconName, label: SharedString) -> impl IntoElement 
         .gap_1()
         .child(Icon::new(icon).xsmall().flex_shrink_0())
         .child(div().flex_1().min_w_0().truncate().text_xs().child(label))
-}
-
-/// chip 的自然宽度：按标签估算后夹在区间内。
-fn composer_chip_width(label: &str) -> gpui::Rems {
-    sp((estimated_label_width(label) + TRIGGER_CHROME_WIDTH)
-        .clamp(COMPOSER_CHIP_MIN_WIDTH, COMPOSER_CHIP_MAX_WIDTH))
-}
-
-/// 模型 chip 的宽度：按标签估，夹在模型自己的区间里。
-///
-/// 模型名（`9router / deepseek-v3.1`）比分支名更长更杂，所以单独给它一个上限：
-/// 宁可省略，也不要它把整行拆没。
-fn model_trigger_width(label: &str) -> gpui::Rems {
-    sp((estimated_label_width(label) + TRIGGER_CHROME_WIDTH)
-        .clamp(MODEL_TRIGGER_MIN_WIDTH, MODEL_TRIGGER_MAX_WIDTH))
 }
 
 /// 参数行 / 上下文行统一的 ghost chip：无描边、无底色，hover 才浮一层 `overlay`。
@@ -1330,7 +1309,12 @@ impl AcpAgentInput {
                     });
                 }
             })
-            .trigger(self.render_capability_trigger("acp-plan-trigger", label, IconName::Check, cx))
+            .trigger(self.render_capability_trigger(
+                "acp-plan-trigger",
+                label,
+                IconName::ListChecks,
+                cx,
+            ))
             .content(move |_state, _window, cx| render_acp_plan_content(items.clone(), cx))
     }
 
@@ -1419,14 +1403,14 @@ impl AcpAgentInput {
                 .justify_between()
                 .disabled(self.is_running)
                 .tooltip(label.to_string())
-                .child(composer_chip_label(IconName::Key, label.clone())),
+                .child(composer_chip_label(IconName::Settings, label.clone())),
             &theme,
             cx,
         );
 
         div()
-            .w(composer_chip_width(&label))
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
             .flex_shrink_0()
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .overflow_hidden()
@@ -1478,8 +1462,6 @@ impl AcpAgentInput {
             .id("acp-model-control")
             .debug_selector(|| "agent-input-acp-model-control".to_string())
             .flex_shrink(1.0)
-            .w(model_trigger_width(&model_label))
-            .min_w(sp(MODEL_TRIGGER_MIN_WIDTH))
             .max_w(sp(MODEL_TRIGGER_MAX_WIDTH))
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .rounded(px(COMPOSER_CHIP_RADIUS))
@@ -1496,7 +1478,7 @@ impl AcpAgentInput {
                     .w_full()
                     .h(sp(COMPOSER_CHIP_HEIGHT))
                     .small()
-                    .icon(IconName::AI)
+                    .icon(IconName::AILine)
                     .appearance(false)
                     .placeholder(model_label)
                     .search_placeholder(t!("AgentUi.search_model").to_string())
@@ -1540,8 +1522,8 @@ impl AcpAgentInput {
         );
 
         div()
-            .w(composer_chip_width(&label))
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
             .flex_shrink(1.0)
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .overflow_hidden()
@@ -1602,8 +1584,8 @@ impl AcpAgentInput {
         div()
             .id("acp-branch-control")
             .debug_selector(|| "agent-input-branch".to_string())
-            .w(composer_chip_width(&current))
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
             .flex_shrink(1.0)
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .rounded(px(COMPOSER_CHIP_RADIUS))
