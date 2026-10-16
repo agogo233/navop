@@ -11399,6 +11399,78 @@ mod tests {
         }
     }
 
+    /// Worktree 从组件库 `Checkbox` 换成 chip 之后，点一下仍然要把**翻转后**的值
+    /// 交给宿主：开关的语义搬到了 `☑/☐` 图标上，回路不变。
+    #[gpui::test]
+    fn acp_worktree_chip_reports_the_flipped_state(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let enabled = Arc::new(Mutex::new(true));
+        let enabled_for_snapshot = enabled.clone();
+        let toggled = Arc::new(Mutex::new(Vec::new()));
+        let toggled_for_source = toggled.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let source = ComposerContextSource {
+            snapshot: Arc::new(move |_: &mut gpui::App| ComposerContextSnapshot {
+                branches: vec![ComposerBranchOption::new("main", true, false)],
+                worktree: ComposerWorktreeState {
+                    enabled: *enabled_for_snapshot.lock().unwrap(),
+                    label: Some(SharedString::from("navop-wt-chip")),
+                    pending: false,
+                },
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(move |next: bool, _: &mut gpui::App| {
+                *enabled.lock().unwrap() = next;
+                toggled_for_source.lock().unwrap().push(next);
+            }),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+
+        let chip = cx
+            .debug_bounds("agent-input-worktree")
+            .expect("Worktree chip 应当渲染");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert_eq!(
+            toggled.lock().unwrap().as_slice(),
+            [false],
+            "勾选态为开时点一下，应当报「关」"
+        );
+
+        // 宿主把新状态灌回快照后再点一次：这一回报的应当是「开」。
+        view.update(cx, |view, cx| view.sync_composer(cx));
+        refresh_frame(cx);
+        let chip = cx
+            .debug_bounds("agent-input-worktree")
+            .expect("Worktree chip 应当仍在");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert_eq!(
+            toggled.lock().unwrap().as_slice(),
+            [false, true],
+            "关着的时候点一下，应当报「开」"
+        );
+    }
+
     /// ACP 的能力栏：计划与子代理是参数行左端的两颗 chip，折叠开关收在身份行右端。
     ///
     /// 与早前不同：这两栏不再是“撑满一行、外面还套个框”的能力栏，而是参数行里两颗

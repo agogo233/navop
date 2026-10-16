@@ -29,7 +29,6 @@ use gpui::{
     Subscription, Window, div, img, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::progress::ProgressCircle;
@@ -80,7 +79,7 @@ const COMPOSER_CHIP_MAX_WIDTH: f32 = 220.0;
 /// 模型 chip 的宽度上限：模型名长起来没边，超了就省略（全名进 tooltip）。
 const MODEL_TRIGGER_MAX_WIDTH: f32 = 200.0;
 /// 卡片上下内边距。
-const COMPOSER_CARD_PADDING_VERTICAL: f32 = 10.0;
+const COMPOSER_CARD_PADDING_VERTICAL: f32 = 8.0;
 /// 参数行与上下文行的水平内边距。
 const COMPOSER_ROW_PADDING_X: f32 = 10.0;
 /// 上下文行的高度：`[工作区][分支][Worktree] … [用量]`。
@@ -124,27 +123,51 @@ fn composer_editor_height(state: &EditorState) -> Pixels {
 ///
 /// 不带 `⌄`：整块卡片原来有六条小箭头，一起消失是这次减线里最见效的一步。
 /// “可点”改由 hover 底色与 tooltip 表达。
-fn composer_chip_label(icon: IconName, label: SharedString) -> impl IntoElement {
+fn composer_chip_label(
+    icon: IconName,
+    icon_color: gpui::Hsla,
+    label: SharedString,
+) -> impl IntoElement {
     h_flex()
         .w_full()
         .min_w_0()
         .items_center()
         .gap_1()
-        .child(Icon::new(icon).xsmall().flex_shrink_0())
+        .child(
+            Icon::new(icon)
+                .xsmall()
+                .flex_shrink_0()
+                .text_color(icon_color),
+        )
         .child(div().flex_1().min_w_0().truncate().text_xs().child(label))
 }
 
-/// 参数行 / 上下文行统一的 ghost chip：无描边、无底色，hover 才浮一层 `overlay`。
+/// 参数行统一的 ghost chip：无描边、无底色，hover 才浮一层 `overlay`。
 ///
 /// 组件库的 `Button::ghost()` 拿 accent 当 hover，铺在整行里太抢眼；这里用 `custom`
 /// 把底色钉成中性 overlay，与其余自绘 chip 同一种反馈（去掉的是线，不是反馈）。
 fn ghost_chip(button: Button, theme: &AgentChatTheme, cx: &App) -> Button {
+    ghost_chip_with(button, theme.foreground, theme, cx)
+}
+
+/// 上下文行的 ghost chip：整行是元数据，文字压到次要色——它不该跟参数行的
+/// 控件（模型 / 模式 / 发送）抢语气。
+fn ghost_chip_muted(button: Button, theme: &AgentChatTheme, cx: &App) -> Button {
+    ghost_chip_with(button, theme.muted_foreground, theme, cx)
+}
+
+fn ghost_chip_with(
+    button: Button,
+    foreground: gpui::Hsla,
+    theme: &AgentChatTheme,
+    cx: &App,
+) -> Button {
     button
         .h(sp(COMPOSER_CHIP_HEIGHT))
         .rounded(px(COMPOSER_CHIP_RADIUS))
         .custom(
             ButtonCustomVariant::new(cx)
-                .foreground(theme.foreground)
+                .foreground(foreground)
                 .hover(theme.overlay)
                 .active(theme.overlay),
         )
@@ -1183,9 +1206,7 @@ impl AcpAgentInput {
             .as_ref()
             .map(|target| target.label.clone())
             .unwrap_or_else(|| SharedString::from(t!("AgentUi.acp_session").to_string()));
-        let summary = self.capabilities_summary();
-
-        let mut row = h_flex()
+        let row = h_flex()
             .debug_selector(|| "agent-input-acp-header".to_string())
             .w_full()
             .min_w_0()
@@ -1221,14 +1242,13 @@ impl AcpAgentInput {
                     .child(session_title),
             );
 
-        if !summary.is_empty() {
-            row = row.child(self.render_capabilities_info(summary, cx));
-        }
-
         row.child(self.render_header_toggle(cx))
     }
 
     /// agent 声明的协议能力清单，拼成一行（没声明过就是空串）。
+    ///
+    /// 原先由身份行的 ⓘ 常驻承载；那个按钮去掉后，清单改挂在折叠键的 tooltip 上：
+    /// 背景信息留个入口就够，不值得再占一颗常驻按钮。
     fn capabilities_summary(&self) -> SharedString {
         SharedString::from(
             self.context
@@ -1240,31 +1260,16 @@ impl AcpAgentInput {
         )
     }
 
-    /// ⓘ：把原先单占一行的协议能力清单收进 tooltip。
-    ///
-    /// 清单是"这家 agent 支持哪些协议特性"的背景信息：值得留个入口，但不值得常驻
-    /// 一行——常驻的那行每次都在跟身份行抢注意力。
-    fn render_capabilities_info(
-        &self,
-        summary: SharedString,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let theme = self.local_theme(cx);
-        ghost_chip(
-            Button::new("acp-capabilities-info")
-                .debug_selector(|| "agent-input-acp-capabilities-info".to_string())
-                .icon(IconName::Info)
-                .xsmall()
-                .flex_shrink_0()
-                .tooltip(summary),
-            &theme,
-            cx,
-        )
-    }
-
     /// 能力栏右侧的折叠开关：折起来之后参数行里的计划 / 子代理两栏收起。
     fn render_header_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
+        let summary = self.capabilities_summary();
+        let collapse_hint = t!("AgentUi.collapse_capabilities").to_string();
+        let tooltip = if summary.is_empty() {
+            collapse_hint
+        } else {
+            format!("{collapse_hint} · {summary}")
+        };
         ghost_chip(
             Button::new("acp-header-toggle")
                 .debug_selector(|| "agent-input-acp-header-toggle".to_string())
@@ -1276,7 +1281,7 @@ impl AcpAgentInput {
                 .xsmall()
                 .size(sp(COMPOSER_CHIP_HEIGHT))
                 .flex_shrink_0()
-                .tooltip(t!("AgentUi.collapse_capabilities").to_string())
+                .tooltip(tooltip)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.header_collapsed = !this.header_collapsed;
                     if this.header_collapsed {
@@ -1403,7 +1408,11 @@ impl AcpAgentInput {
                 .justify_between()
                 .disabled(self.is_running)
                 .tooltip(label.to_string())
-                .child(composer_chip_label(IconName::Settings, label.clone())),
+                .child(composer_chip_label(
+                    IconName::Settings,
+                    theme.foreground,
+                    label.clone(),
+                )),
             &theme,
             cx,
         );
@@ -1503,7 +1512,7 @@ impl AcpAgentInput {
         let current_path = self.context.workspace.path.clone();
         let theme = self.local_theme(cx);
 
-        let trigger = ghost_chip(
+        let trigger = ghost_chip_muted(
             Button::new("acp-workspace")
                 .debug_selector(|| "agent-input-workspace".to_string())
                 .small()
@@ -1516,7 +1525,11 @@ impl AcpAgentInput {
                         .map(|path| path.to_string())
                         .unwrap_or_else(|| t!("AgentUi.composer_pick_workspace").to_string()),
                 )
-                .child(composer_chip_label(IconName::Workspace, label.clone())),
+                .child(composer_chip_label(
+                    IconName::Workspace,
+                    theme.muted_foreground,
+                    label.clone(),
+                )),
             &theme,
             cx,
         );
@@ -1591,7 +1604,7 @@ impl AcpAgentInput {
             .rounded(px(COMPOSER_CHIP_RADIUS))
             .overflow_hidden()
             .hover(|this| this.bg(theme.overlay))
-            .text_color(theme.foreground)
+            .text_color(theme.muted_foreground)
             .tooltip({
                 let full = current.clone();
                 move |window, cx| Tooltip::new(full.clone()).build(window, cx)
@@ -1612,13 +1625,15 @@ impl AcpAgentInput {
             )
     }
 
-    /// 上下文行里的「Worktree」勾选。
+    /// 上下文行里的「Worktree」开关。
     ///
     /// 标签固定用短词 `Worktree`：早前直接拿 `worktree.label` 当标签，底栏上就会
     /// 出现两个一模一样的 `navop-wt-ai-workbench`（工作区 chip 一个、这里一个）。
     /// 完整名字进 tooltip，不跟工作区 chip 在字面上打架。
+    ///
+    /// 开关态画在 `☑/☐` 图标上（开 = accent），不再用组件库 `Checkbox` 的实心
+    /// 主色方块 —— 那颗方块是这一行最亮的元素，而这一行只是元数据。
     fn render_worktree_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let view = cx.entity();
         let theme = self.local_theme(cx);
         let label = SharedString::from(t!("AgentUi.composer_worktree").to_string());
         let checked = self.context.worktree.enabled;
@@ -1632,32 +1647,39 @@ impl AcpAgentInput {
             None => hint,
         };
 
+        // `☑/☐` 一对字形 + 开启时走 accent：开关语义留在图标上，
+        // 不再借组件库 `Checkbox` 那颗实心主色方块——它是这一行最亮的元素，
+        // 而这一行只是元数据。
         div()
             .debug_selector(|| "agent-input-worktree".to_string())
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
             .flex_shrink(1.0)
-            .h(sp(COMPOSER_CHIP_HEIGHT))
-            .px(sp(6.0))
-            .rounded(px(COMPOSER_CHIP_RADIUS))
             .overflow_hidden()
-            .flex()
-            .items_center()
-            .hover(|this| this.bg(theme.overlay))
-            .child(
-                Checkbox::new("acp-worktree-toggle")
-                    .checked(checked)
+            .child(ghost_chip_muted(
+                Button::new("acp-worktree-toggle")
                     .disabled(self.is_running)
                     .tooltip(tooltip)
-                    .label(label)
-                    .on_click(move |checked, _window, cx| {
-                        let enabled = *checked;
-                        view.update(cx, |this, cx| {
-                            this.open_menu = None;
-                            cx.emit(AgentInputEvent::ToggleWorktree { enabled });
-                            cx.notify();
-                        });
-                    }),
-            )
+                    .child(composer_chip_label(
+                        if checked {
+                            IconName::SquareCheck
+                        } else {
+                            IconName::Square
+                        },
+                        if checked {
+                            theme.accent
+                        } else {
+                            theme.muted_foreground
+                        },
+                        label,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_menu = None;
+                        cx.emit(AgentInputEvent::ToggleWorktree { enabled: !checked });
+                        cx.notify();
+                    })),
+                &theme,
+                cx,
+            ))
     }
 }
 
@@ -2022,7 +2044,7 @@ impl AcpAgentInput {
             .overflow_hidden()
             .flex_shrink_0()
             .text_size(sp(12.5))
-            .text_color(theme.foreground)
+            .text_color(theme.muted_foreground)
             .child(group)
             .child(div().flex_1().min_w_0())
             .children(self.render_usage_gauge(cx))
