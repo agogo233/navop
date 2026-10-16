@@ -160,6 +160,15 @@ jobs:
             throw "Release binary was not created: '$binary'"
           }
 
+      - name: Validate Windows executable manifest
+        shell: pwsh
+        run: |
+          # 产物缺 Common-Controls v6 清单时，exe 会因静态导入 comctl32!TaskDialogIndirect
+          # 在进 main 前就以 STATUS_ENTRYPOINT_NOT_FOUND / 0xC0000139 退出（弹「无法定位
+          # 程序输入点」），编译期没有任何信号，所以必须在打包前对真实产物校验一次。
+          node script/validate-windows-exe.mjs `
+            "target\x86_64-pc-windows-msvc\release\navop.exe"
+
       - name: Assemble portable package
         shell: pwsh
         run: |
