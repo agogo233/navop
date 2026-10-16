@@ -11399,7 +11399,11 @@ mod tests {
         }
     }
 
-    /// ACP 的能力栏：计划与子代理两栏 + 同一行尾端的折叠开关；折起来只剩开关。
+    /// ACP 的能力栏：计划与子代理是参数行左端的两颗 chip，折叠开关收在身份行右端。
+    ///
+    /// 与早前不同：这两栏不再是“撑满一行、外面还套个框”的能力栏，而是参数行里两颗
+    /// 普通 chip；折叠开关也搬到了身份行——它折的就是参数行左端那两颗 chip，因此
+    /// 必须在参数行之上一行，且始终可见。
     #[gpui::test]
     fn acp_composer_keeps_plan_and_subagent_tabs(cx: &mut TestAppContext) {
         init_test_ui(cx);
@@ -11416,37 +11420,58 @@ mod tests {
 
         let header = cx
             .debug_bounds("agent-input-acp-header")
-            .expect("ACP 抬头应当渲染");
-        let plan = cx.debug_bounds("acp-plan-trigger").expect("计划栏应当渲染");
+            .expect("ACP 身份行应当渲染");
+        let plan = cx
+            .debug_bounds("acp-plan-trigger")
+            .expect("计划 chip 应当渲染");
         let subagents = cx
             .debug_bounds("acp-subagents-trigger")
-            .expect("子代理栏应当渲染");
+            .expect("子代理 chip 应当渲染");
+        let mode = cx
+            .debug_bounds("agent-input-acp-mode")
+            .expect("模式 chip 应当渲染");
         let toggle = cx
             .debug_bounds("agent-input-acp-header-toggle")
             .expect("折叠开关应当渲染");
 
+        // 参数行左端：计划 → 子代理 → … → 模式（右侧还有模型 / 附件 / 发送）。
         assert!(
-            plan.origin.x < subagents.origin.x && subagents.origin.x < toggle.origin.x,
-            "顺序应为 计划 → 子代理 → 折叠开关：plan={plan:?}, subagents={subagents:?}, \
-             toggle={toggle:?}"
+            plan.origin.x < subagents.origin.x && subagents.origin.x < mode.origin.x,
+            "顺序应为 计划 → 子代理 → … → 模式：plan={plan:?}, subagents={subagents:?}, \
+             mode={mode:?}"
         );
-        // 三样高度不同（两栏是整行高的按钮，折叠开关矮一号），所以比的是中线：
-        // 中线对上了就是同一行。
+        // 三颗都是 26 高的 chip，真的同高，所以比中线就够。
         let row_center = plan.origin.y + plan.size.height / 2.0;
         let header_bottom = header.origin.y + header.size.height;
-        for bounds in [plan, subagents, toggle] {
+        for bounds in [plan, subagents, mode] {
             let center = bounds.origin.y + bounds.size.height / 2.0;
             assert!(
                 (center - row_center).abs() <= px(2.0),
-                "计划栏、子代理栏与折叠开关必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
+                "计划、子代理与模式必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
             );
             assert!(
                 bounds.origin.y >= header_bottom,
-                "能力栏在抬头之下：{bounds:?}, header={header:?}"
+                "参数行在身份行之下：{bounds:?}, header={header:?}"
             );
         }
 
-        // 折起来：两栏收起，开关留着——否则展开不回去。
+        // 折叠开关在身份行里：同一根中线，且贴在该行右端。
+        let toggle_center = toggle.origin.y + toggle.size.height / 2.0;
+        let header_center = header.origin.y + header.size.height / 2.0;
+        assert!(
+            (toggle_center - header_center).abs() <= px(2.0),
+            "折叠开关必须与身份行同一中线：toggle={toggle:?}, header={header:?}"
+        );
+        assert!(
+            toggle.origin.x + toggle.size.width >= header.origin.x + header.size.width - px(20.0),
+            "折叠开关收在身份行右端：toggle={toggle:?}, header={header:?}"
+        );
+        assert!(
+            toggle.origin.y < plan.origin.y,
+            "折叠开关在参数行之上的身份行里：toggle={toggle:?}, plan={plan:?}"
+        );
+
+        // 折起来：两栏收起，开关与身份行留着——否则展开不回去。
         cx.simulate_click(toggle.center(), Modifiers::default());
         refresh_frame(cx);
         assert!(
