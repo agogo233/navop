@@ -16,6 +16,7 @@ fn summary() -> CredentialSummary {
         has_passphrase: true,
         has_ssh_expect: false,
         sync_enabled: false,
+        forward_to_agent: false,
         cloud_id: None,
         last_synced_at: None,
         team_id: None,
@@ -92,6 +93,55 @@ fn password_and_private_key_are_mutually_exclusive() {
     assert!(reference.password);
     assert!(!reference.private_key);
     assert!(!reference.passphrase);
+}
+
+#[test]
+fn combined_capability_references_password_and_private_key_together() {
+    let reference = build_reference(
+        CredentialSelectValue::Credential(42),
+        CredentialCapabilities::ssh_password_and_private_key(),
+        &[summary()],
+    )
+    .expect("credential should be selectable");
+
+    assert!(reference.username);
+    assert!(reference.password);
+    assert!(reference.private_key);
+    assert!(reference.passphrase);
+}
+
+#[test]
+fn combined_capability_keeps_both_factors_when_normalizing() {
+    let combined = CredentialReference {
+        credential_id: 42,
+        credential_cloud_id: None,
+        username: true,
+        password: true,
+        private_key: true,
+        passphrase: true,
+    };
+
+    assert_eq!(
+        combined,
+        normalize_reference(
+            combined.clone(),
+            CredentialCapabilities::ssh_password_and_private_key(),
+            None,
+        )
+    );
+
+    // 单一认证方式仍保持互斥：密码优先，私钥与口令被清空。
+    assert_eq!(
+        CredentialReference {
+            credential_id: 42,
+            credential_cloud_id: None,
+            username: true,
+            password: true,
+            private_key: false,
+            passphrase: false,
+        },
+        normalize_reference(combined, CredentialCapabilities::login(), None)
+    );
 }
 
 #[test]

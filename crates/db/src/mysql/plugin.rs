@@ -244,6 +244,7 @@ fn build_mysql_ui_manifest() -> DatabaseUiManifest {
             supports_schema: false,
             uses_schema_as_database: false,
             supports_views: true,
+            supports_materialized_views: false,
             supports_indexes: true,
             supports_users: true,
             supports_user_create: true,
@@ -1590,7 +1591,7 @@ impl DatabasePlugin for MySqlPlugin {
     ) -> Result<Vec<ColumnInfo>> {
         let sql = format!(
             "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, COLUMN_COMMENT, \
-             CHARACTER_SET_NAME, COLLATION_NAME \
+             CHARACTER_SET_NAME, COLLATION_NAME, EXTRA \
              FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
              ORDER BY ORDINAL_POSITION",
@@ -1624,6 +1625,9 @@ impl DatabasePlugin for MySqlPlugin {
                     comment: cell(5)?,
                     charset: cell(6)?,
                     collation: cell(7)?,
+                    // AUTO_INCREMENT 只出现在 EXTRA 里，COLUMN_TYPE 看不到。
+                    is_auto_increment: cell(8)?
+                        .is_some_and(|extra| extra.to_lowercase().contains("auto_increment")),
                 });
             }
 
@@ -3604,6 +3608,7 @@ mod tests {
             comment: None,
             charset: None,
             collation: None,
+            is_auto_increment: false,
         }
     }
 
@@ -4337,6 +4342,7 @@ mod tests {
             comment: None,
             charset: Some("utf8mb4".to_string()),
             collation: Some("utf8mb4_bin".to_string()),
+            is_auto_increment: false,
         };
 
         let def = plugin.build_column_definition(&column, true);

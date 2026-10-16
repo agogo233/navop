@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, anyhow};
 use ftp::FtpConnectConfig;
-use one_core::storage::models::{SshAuthMethod, StoredConnection};
+use one_core::storage::models::StoredConnection;
 use ssh::{HostKeyVerifier, SshAuth, SshConnectConfig};
 
 /// SSH 目标解析复用 `sftp_transfer`：终端侧边栏的远端文件面板需要在会话中途
@@ -39,8 +39,7 @@ pub(crate) fn resolve_ssh_connection(
         .context("connection does not contain valid SSH parameters")?;
     let credential_prompt_policy = SshCredentialPromptPolicy {
         username: params.prompts_for_username(),
-        password: params.prompts_for_password()
-            && matches!(&params.auth_method, SshAuthMethod::Password { .. }),
+        password: params.prompts_for_password() && params.auth_method.contains_password(),
     };
     let target = sftp_transfer::resolve_ssh_target(connection)?;
     Ok(ResolvedSftpConnection {
@@ -97,6 +96,8 @@ pub(crate) fn unused_ssh_config_placeholder() -> SshConnectConfig {
         host_key_verifier: HostKeyVerifier::default(),
         x11_forwarding: false,
         allow_legacy_algorithms: false,
+        forward_agent: false,
+        agent_identities: Vec::new(),
     }
 }
 
@@ -197,6 +198,8 @@ mod tests {
                 disable_shell_integration: None,
                 x11_forwarding: None,
                 allow_legacy_algorithms: Some(true),
+                forward_agent: None,
+                agent_forward_key: None,
                 jump_server: None,
                 proxy: None,
                 os_id: None,

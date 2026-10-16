@@ -15,7 +15,7 @@ use gpui::{
     WeakEntity, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IndexPath, Sizable,
+    ActiveTheme, Disableable, Sizable,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -33,6 +33,8 @@ use one_core::storage::{
 };
 use rust_i18n::t;
 
+/// Telnet 表单窗口配置。`Clone` 见 `one_core::popup_window::open_reusable_popup_window`。
+#[derive(Clone)]
 pub struct TelnetFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub workspaces: Vec<Workspace>,
@@ -73,24 +75,6 @@ impl SelectItem for WorkspaceSelectItem {
     }
 }
 
-/// Telnet 默认端口列表，供下拉选择。
-#[derive(Clone, PartialEq)]
-struct TelnetPortItem {
-    port: u16,
-}
-
-impl SelectItem for TelnetPortItem {
-    type Value = u16;
-
-    fn title(&self) -> SharedString {
-        self.port.to_string().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.port
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TelnetBackspaceSelectItem {
     code: TelnetBackspaceCode,
@@ -126,7 +110,6 @@ pub struct TelnetFormWindow {
     name_input: Entity<InputState>,
     host_input: Entity<InputState>,
     port_input: Entity<InputState>,
-    port_select: Entity<SelectState<Vec<TelnetPortItem>>>,
     backspace_code_select: Entity<SelectState<Vec<TelnetBackspaceSelectItem>>>,
     workspace_select: Entity<SelectState<Vec<WorkspaceSelectItem>>>,
     team_select: Entity<SelectState<Vec<TeamSelectItem>>>,
@@ -139,7 +122,7 @@ pub struct TelnetFormWindow {
     test_result: Option<Result<(), String>>,
 }
 
-const TELNET_DEFAULT_PORTS: &[u16] = &[23, 2323, 8000, 8023];
+/// 端口留空或非法时回退的默认值，与 SSH 表单的 22 同义。
 const TELNET_DEFAULT_PORT: u16 = 23;
 
 fn collect_login_script_steps(
@@ -189,21 +172,19 @@ impl TelnetFormWindow {
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("Telnet.name_placeholder")));
         let host_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("Telnet.host_placeholder")));
-        let port_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(t!("Telnet.port_placeholder")));
+        // 端口统一为普通输入框（与 SSH 表单一致）：新建时预填默认端口。
+        let port_input = cx.new(|cx| {
+            let default_port = TELNET_DEFAULT_PORT.to_string();
+            let mut state = InputState::new(window, cx).placeholder(default_port.clone());
+            state.set_value(&default_port, window, cx);
+            state
+        });
         let remark_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(t!("Telnet.remark_placeholder"))
                 .auto_grow(3, 10)
         });
 
-        // 端口选择，默认 23（索引 0）
-        let port_items: Vec<TelnetPortItem> = TELNET_DEFAULT_PORTS
-            .iter()
-            .map(|&port| TelnetPortItem { port })
-            .collect();
-        let port_select = cx
-            .new(|cx| SelectState::new(port_items, Some(IndexPath::default().row(0)), window, cx));
         let backspace_code_items = TelnetBackspaceCode::all()
             .iter()
             .copied()
@@ -243,9 +224,6 @@ impl TelnetFormWindow {
                 host_input.update(cx, |s, cx| s.set_value(&params.host, window, cx));
                 let port = params.port.to_string();
                 port_input.update(cx, |s, cx| s.set_value(&port, window, cx));
-                port_select.update(cx, |s, cx| {
-                    s.set_selected_value(&params.port, window, cx);
-                });
                 backspace_code_select.update(cx, |select, cx| {
                     select.set_selected_value(&params.backspace_code, window, cx);
                 });
@@ -305,7 +283,6 @@ impl TelnetFormWindow {
             name_input,
             host_input,
             port_input,
-            port_select,
             backspace_code_select,
             workspace_select,
             team_select,
@@ -378,15 +355,14 @@ impl TelnetFormWindow {
     }
 
     fn get_port(&self, cx: &App) -> Option<u16> {
-        let manual = self.port_input.read(cx).text().to_string();
-        let manual = manual.trim();
-        if !manual.is_empty() {
-            return manual.parse::<u16>().ok();
-        }
-        self.port_select
+        // 与 SSH 表单一致：端口只由输入框决定，留空或非法时回退默认端口。
+        self.port_input
             .read(cx)
-            .selected_value()
-            .copied()
+            .text()
+            .to_string()
+            .trim()
+            .parse::<u16>()
+            .ok()
             .or(Some(TELNET_DEFAULT_PORT))
     }
 
@@ -541,6 +517,10 @@ impl TelnetFormWindow {
 
         match result {
             Ok(saved_conn) => {
+                // 保存已经落地：先把表单切到「已保存」（编辑）状态，再关窗。
+                // 关窗返回 `Retained` 时窗口会留在屏幕上（隐藏失败），没有这一步用户再点
+                // 一次「保存」就会按「新建」再插一条连接。
+                self.mark_saved(&saved_conn, cx);
                 if let Some(notifier) = get_notifier(cx) {
                     let event = if is_editing {
                         ConnectionDataEvent::ConnectionUpdated {
@@ -555,7 +535,7 @@ impl TelnetFormWindow {
                         cx.emit(event);
                     });
                 }
-                window.remove_window();
+                let _ = one_core::window_close::close_window_after_save(window, cx);
             }
             Err(error) => {
                 let message = t!("Telnet.save_failed", error = error).to_string();
@@ -566,8 +546,21 @@ impl TelnetFormWindow {
         }
     }
 
-    fn on_cancel(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        window.remove_window();
+    /// 保存已经落地：把表单切到「已保存」（编辑）状态。
+    ///
+    /// 不能依赖「窗口反正会消失」来结束这轮操作：关闭漏斗返回 `Retained` 时窗口会留在
+    /// 屏幕上（隐藏失败），没有这一步用户再点一次「保存」会按「新建」再插一条。
+    fn mark_saved(&mut self, saved: &StoredConnection, cx: &mut Context<Self>) {
+        self.is_editing = true;
+        self.editing_id = saved.id;
+        self.editing_cloud_id = saved.cloud_id.clone();
+        self.editing_last_synced_at = saved.last_synced_at;
+        self.editing_owner_id = saved.owner_id.clone();
+        cx.notify();
+    }
+
+    fn on_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = one_core::window_close::close_window_for_reuse(window, cx);
     }
 
     fn render_form_row(&self, label: &str, child: impl IntoElement) -> impl IntoElement {
@@ -727,21 +720,10 @@ impl Render for TelnetFormWindow {
                                     Input::new(&self.host_input),
                                 ),
                             )
-                            .child(
-                                self.render_form_row(
-                                    &t!("Telnet.port"),
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .child(Select::new(&self.port_select).w_full()),
-                                        )
-                                        .child(
-                                            div().w(px(120.0)).child(Input::new(&self.port_input)),
-                                        ),
-                                ),
-                            )
+                            .child(self.render_form_row(
+                                &t!("Telnet.port"),
+                                Input::new(&self.port_input),
+                            ))
                             .child(self.render_form_row(
                                 &t!("Telnet.backspace_code"),
                                 Select::new(&self.backspace_code_select).w_full(),

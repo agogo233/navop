@@ -3,7 +3,7 @@ use gpui_component::{
     WindowExt, button::ButtonVariant, dialog::DialogButtonProps, notification::Notification,
 };
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event_from_app};
-use one_core::popup_window::{PopupWindowOptions, open_popup_window};
+use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
 use one_core::storage::{
     CredentialEntry, CredentialReferenceHit, CredentialRepository, DeleteCredentialOutcome,
     StorageManager,
@@ -44,7 +44,13 @@ impl CredentialVaultView {
         let editing = existing.is_some();
         let storage_manager = self.storage_manager.clone();
         let view = cx.entity();
-        open_popup_window(
+        // 复用键按「新建 / 哪一个条目」区分：反复编辑同一个凭据复用同一个原生窗口。
+        // 还没落库的条目（id 为空）只能落在「新建」键上：它本来就是同一个草稿窗口。
+        let reuse_key = match existing.as_ref().and_then(|entry| entry.id) {
+            Some(id) => format!("credential-form:{id}"),
+            None => "credential-form:new".to_string(),
+        };
+        open_reusable_popup_window(
             PopupWindowOptions::new(if editing {
                 t!("CredentialForm.edit_title").to_string()
             } else {
@@ -53,8 +59,17 @@ impl CredentialVaultView {
             .size(700.0, 650.0)
             .min_width(560.0)
             .min_height(480.0),
+            reuse_key,
             move |window, cx| {
-                cx.new(|cx| CredentialFormWindow::new(existing, storage_manager, view, window, cx))
+                cx.new(|cx| {
+                    CredentialFormWindow::new(
+                        existing.clone(),
+                        storage_manager.clone(),
+                        view.clone(),
+                        window,
+                        cx,
+                    )
+                })
             },
             Some(_window),
             cx,
@@ -102,19 +117,32 @@ fn delete_credential(
         .get::<CredentialRepository>()
         .ok_or_else(|| t!("CredentialVault.repository_unavailable").to_string())
         .and_then(|repo| {
-            let cloud_id = repo
-                .get_summary(id)
-                .map_err(|error| error.to_string())?
-                .and_then(|summary| summary.cloud_id);
+            // 删之前把摘要读出来：`cloud_id` 用于删除云端数据，`last_synced_at`
+            // 是个人同步判断「远端是否在本地删除之后又被别的设备改过」的基线
+            // （详见 `ConnectionDataEvent::ConnectionDeleted`），行删掉就取不到了。
+            let summary = repo.get_summary(id).map_err(|error| error.to_string())?;
+            let cloud_id = summary
+                .as_ref()
+                .and_then(|summary| summary.cloud_id.clone());
+            let last_synced_at = summary.and_then(|summary| summary.last_synced_at);
             let outcome = repo.delete_checked(id).map_err(|error| error.to_string())?;
-            Ok((outcome, cloud_id))
+            Ok((outcome, cloud_id, last_synced_at))
         });
     match result {
-        Ok((DeleteCredentialOutcome::Deleted, cloud_id)) => {
+        Ok((DeleteCredentialOutcome::Deleted, cloud_id, last_synced_at)) => {
+            if let Some(cloud_id) = &cloud_id {
+                // 本地凭据没了，遗留的冲突也就解不开了，删除时一并丢掉。
+                crate::personal_sync_runtime::forget_personal_conflict(
+                    storage,
+                    one_core::cloud_sync::data_type::CREDENTIAL,
+                    cloud_id,
+                );
+            }
             emit_connection_event_from_app(
                 ConnectionDataEvent::CredentialDeleted {
                     credential_id: id,
                     cloud_id,
+                    last_synced_at,
                 },
                 cx,
             );
@@ -125,7 +153,7 @@ fn delete_credential(
             );
             true
         }
-        Ok((DeleteCredentialOutcome::NotFound, _)) => {
+        Ok((DeleteCredentialOutcome::NotFound, _, _)) => {
             _ = view.update(cx, |view, cx| view.reload(cx));
             window.push_notification(
                 Notification::warning(t!("CredentialVault.already_deleted").to_string())
@@ -134,7 +162,7 @@ fn delete_credential(
             );
             true
         }
-        Ok((DeleteCredentialOutcome::Referenced(hits), _)) => {
+        Ok((DeleteCredentialOutcome::Referenced(hits), _, _)) => {
             window.push_notification(
                 Notification::error(format_reference_hits(&hits)).autohide(false),
                 cx,

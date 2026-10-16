@@ -122,6 +122,11 @@ impl Editor {
             insert_target: None,
             table_target: Some(target),
         };
+        // The clicked cell focuses itself synchronously on right-click; the
+        // RequestFocus it emitted left a stale pending_focus that the next
+        // render would redeem and steal keyboard focus back from the deferred
+        // popup menu (which focuses itself after this update, before draw).
+        self.pending_focus = None;
     }
 
     pub(super) fn clear_context_menu_target(&mut self) {

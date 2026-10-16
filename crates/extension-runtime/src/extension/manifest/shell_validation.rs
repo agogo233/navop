@@ -8,7 +8,7 @@ use super::{Manifest, ShellHostModule, ShellViewContrib};
 
 const SHELL_EXEC_PERMISSION: &str = "shell:exec";
 const RESERVED_BACKEND_ALIASES: &[&str] = &["host", "navop", "default"];
-const GPUI_SHELL_VERSION: &str = "0.2.0";
+const GPUI_SHELL_VERSION: &str = "0.6.4";
 
 pub(crate) fn validate_shell_views(manifest: &Manifest) -> Result<(), ShellViewValidationError> {
     if manifest.contributes.shell_views.is_empty() {
@@ -154,6 +154,8 @@ fn validate_backends(
 fn validate_modules(view: &ShellViewContrib) -> Result<(), ShellViewValidationError> {
     let mut modules = HashSet::new();
     for module in &view.modules {
+        // 这张表是**宿主支持面**的清单：新增一个 host 模块必须在这里显式登记，
+        // 否则声明了它的扩展在**安装期**就被拒（而不是装上了、用到才发现）。
         if !matches!(
             module,
             ShellHostModule::Context
@@ -165,6 +167,8 @@ fn validate_modules(view: &ShellViewContrib) -> Result<(), ShellViewValidationEr
                 | ShellHostModule::Runtime
                 | ShellHostModule::Dev
                 | ShellHostModule::Workbench
+                | ShellHostModule::I18n
+                | ShellHostModule::Theme
         ) {
             return Err(error(
                 shell_field(view, "modules"),

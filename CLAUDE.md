@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Navop** is a cross-platform desktop application built on [GPUI](https://gpui.rs) that provides a unified interface for database management, SSH/SFTP, terminal, and AI tools. The project was migrated from OnetCli, so some compatibility-sensitive protocols, persisted identifiers (such as `ProviderType::OnetCli` and its `onet_cli` value), upgrade entries, and public environment variables still use the historical `onetcli` / `OnetCli` spelling.
+**Navop** is a cross-platform desktop application built on [GPUI](https://gpui.rs) that provides a unified interface for database management, SSH/SFTP, terminal, and AI tools. The project was migrated from OnetCli, so some compatibility-sensitive protocols, internal identifiers (such as `OnetCliApp` and `onetcli_app.rs`), upgrade entries, and public environment variables still use the historical `onetcli` / `OnetCli` spelling.
 
 Key capabilities:
 
@@ -95,7 +95,7 @@ The `navop` executable is GUI/update-only and does not embed database, SSH, SFTP
 - **`reqwest_client`** — HTTP client wrapper around Zed's custom reqwest fork. Comes from the
   `gpui-pre` fork as the package `gpui-pre-reqwest-client` (lib name `reqwest_client`), patched in
   the root `Cargo.toml`; there is no longer a local `crates/reqwest_client` copy.
-- **`crates/webview` (gpui-wry)** — WebView integration via Wry.
+- **`crates/webview` (gpui-webview, upstream's former gpui-wry)** — WebView integration via Wry.
 - **`crates/license_tool`** — License key generation and management.
 - **`crates/story`** — Component gallery/showcase app (runs with `cargo run` from default members).
 - **`examples/`** — Standalone examples (`hello_world`, `input`, `dialog_overlay`, `webview`, `system_monitor`, `focus_trap`, etc.).
@@ -114,7 +114,7 @@ The startup sequence in `main/src/main.rs` and `main/src/navop_app.rs` is order-
   - Auth init → license init → AI provider state setup
   - `db::init_cache(cx)` + disk cache cleanup task
   - `terminal_view::init(cx)`, `redis_view::init(cx)`, `mongodb_view::init(cx)`
-  - Key bindings (`shift-escape` → ToggleZoom, `cmd-w`/`ctrl-d` → ClosePanel)
+  - Key bindings (`shift-escape` → ToggleZoom, `cmd-w` → CloseActiveWindow for auxiliary windows only, `cmd-shift-w` → CloseActiveTab; all configurable via Settings → Shortcuts)
   - `TabContentRegistry` global setup
 5. `setting_tab::init_settings(cx)` — settings system
 6. `GlobalDbState::new()` + cleanup task → `cx.set_global()`

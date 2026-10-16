@@ -2,12 +2,15 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod common;
 pub mod compare;
+mod auto_session;
 pub mod connection_form_window;
 pub mod database_objects_tab;
 #[cfg(test)]
 mod database_objects_tab_tests;
 pub mod database_tab;
 mod database_table_columns;
+#[cfg(test)]
+mod database_table_columns_tests;
 mod database_toolbar;
 mod database_users_list;
 mod database_users_tab;
@@ -15,6 +18,7 @@ mod database_users_toolbar;
 pub mod database_view_plugin;
 pub mod db_object_selector;
 mod db_tree_event;
+mod db_tree_search;
 pub mod db_tree_view;
 mod driver_i18n;
 pub mod er_diagram;
@@ -22,22 +26,27 @@ pub mod extension_menu;
 #[cfg(test)]
 mod extension_menu_contract_tests;
 mod import_export;
+mod object_list_selection;
 pub mod search_shortcut;
 pub mod settings;
 mod sidebar;
 pub mod sql_editor;
 #[cfg(test)]
 mod sql_editor_completion_tests;
+mod sql_editor_definition;
 mod sql_editor_hover;
 mod sql_editor_signature;
 pub mod sql_editor_view;
 pub(crate) mod sql_inline_completion;
+pub mod sql_library;
+mod sql_object_details_tab;
 pub mod sql_result_tab;
 #[cfg(test)]
 mod sql_result_tab_tests;
 mod table_copy_menu;
 mod table_data;
 pub mod table_data_tab;
+mod table_ddl;
 pub mod table_designer_tab;
 
 pub use ai_chat_view::{AskAiButton, emit_ask_ai_event, init_ask_ai_notifier};

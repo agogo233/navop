@@ -1,4 +1,7 @@
 use crate::server_copy::CopyFileRequest;
+use crate::upload_batch::{
+    MAX_CONCURRENT_SMALL_FILE_UPLOADS, ProgressHighWater, job_weight, run_bounded,
+};
 use crate::{
     DirectoryConflictPolicy, FileEntry, PathMetadata, ProgressCallback, RemoteFileClient,
     SftpClient, TransferCancelled, TransferProgress, validate_read_size,
@@ -26,7 +29,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -953,6 +956,61 @@ fn validate_chunk_len(offset: u64, total_size: u64, actual_len: usize) -> Result
     Ok(())
 }
 
+/// 把流水线分片读满。
+///
+/// SFTP 只要求服务端「最多」返回请求长度，**不保证一次读满**：短读是合法应答。
+/// 隧道/堡垒机/中继在压力下会真的只回一部分（issue #363：请求 61440 字节，
+/// 经 JumpServer 拿到 32768），此时整条下载不能就此失败——剩下的字节要在
+/// 同一个分片内、按已读到的偏移继续读，直到凑满 `expected_len`。
+/// 这样下游拿到的仍然是与 `validate_chunk_len` 约定一致的「长度恰好」分片，
+/// 流水线的连续写与进度累计都不用改。
+async fn read_chunk_fully<F, Fut>(offset: u64, expected_len: usize, mut read: F) -> Result<Vec<u8>>
+where
+    F: FnMut(u64, u32) -> Fut,
+    Fut: Future<Output = std::result::Result<Vec<u8>, SftpError>>,
+{
+    let mut buffer: Vec<u8> = Vec::with_capacity(expected_len);
+    while buffer.len() < expected_len {
+        let chunk_offset = offset + buffer.len() as u64;
+        let missing = expected_len - buffer.len();
+        let chunk = match read(chunk_offset, missing as u32).await {
+            Ok(chunk) => chunk,
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                return Err(unexpected_eof_error(chunk_offset, missing));
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "SFTP read failed at offset {} ({} bytes): {}",
+                    chunk_offset,
+                    missing,
+                    error
+                ));
+            }
+        };
+        if chunk.len() > missing {
+            return Err(anyhow!(
+                "SFTP read at offset {} returned {} bytes for a {} byte request",
+                chunk_offset,
+                chunk.len(),
+                missing
+            ));
+        }
+        if chunk.is_empty() {
+            return Err(unexpected_eof_error(chunk_offset, missing));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
+fn unexpected_eof_error(offset: u64, missing: usize) -> anyhow::Error {
+    anyhow!(
+        "Unexpected EOF while reading remote file at offset {}: expected {} more bytes",
+        offset,
+        missing
+    )
+}
+
 async fn abort_pipeline_reads<T: 'static>(reads: &mut JoinSet<T>) {
     reads.abort_all();
     while reads.join_next().await.is_some() {}
@@ -1070,6 +1128,9 @@ fn sftp_auth_failure_messages() -> AuthFailureMessages {
         keyboard_interactive_required: t!("Sftp.auth_keyboard_interactive_required").to_string(),
         keyboard_interactive_failed: t!("Sftp.auth_keyboard_interactive_failed").to_string(),
         keyboard_interactive_cancelled: t!("Sftp.auth_keyboard_interactive_cancelled").to_string(),
+        chain_failed: t!("Sftp.auth_chain_failed").to_string(),
+        chain_incomplete: t!("Sftp.auth_chain_incomplete").to_string(),
+        chain_unsupported_factor: t!("Sftp.auth_chain_unsupported_factor").to_string(),
     }
 }
 
@@ -1534,30 +1595,22 @@ impl RusshSftpClient {
                 let raw = Arc::clone(&raw_session);
                 let handle = file_handle.clone();
                 reads.spawn(async move {
-                    match raw
-                        .read(handle, offset, expected_len as u32)
+                    // 短读（服务端只回一部分）在这里被续读补齐，而不是让整个
+                    // 下载失败；补齐后的分片长度必然等于 `expected_len`。
+                    let session = Arc::clone(&raw);
+                    let fetch = move |chunk_offset: u64, len: u32| {
+                        let session = Arc::clone(&session);
+                        let handle = handle.clone();
+                        async move {
+                            session
+                                .read(handle, chunk_offset, len)
+                                .await
+                                .map(|data| data.data)
+                        }
+                    };
+                    read_chunk_fully(offset, expected_len, fetch)
                         .await
-                    {
-                        Ok(data) => {
-                            validate_chunk_len(offset, total_size, data.data.len())?;
-                            Ok::<_, anyhow::Error>((offset, data.data))
-                        }
-                        Err(SftpError::Status(status))
-                            if status.status_code == StatusCode::Eof =>
-                        {
-                            Err(anyhow!(
-                                "Unexpected EOF while reading remote file at offset {}: expected {} bytes",
-                                offset,
-                                expected_len
-                            ))
-                        }
-                        Err(error) => Err(anyhow!(
-                            "SFTP read failed at offset {} ({} bytes): {}",
-                            offset,
-                            expected_len,
-                            error
-                        )),
-                    }
+                        .map(|data| (offset, data))
                 });
                 next_request += 1;
             }
@@ -2878,88 +2931,119 @@ impl RemoteFileClient for RusshSftpClient {
                 self.ensure_copy_directory(&remote_dir).await?;
             }
 
-            let files: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !*is_dir).collect();
+            let files: Vec<_> = entries
+                .iter()
+                .filter(|(_, is_dir, _)| !*is_dir)
+                .cloned()
+                .collect();
             let start_time = Instant::now();
-            let mut transferred: u64 = 0;
+            // 每个文件都要付固定的控制往返（stat/open/fsync/fstat/close/rename），
+            // 串行执行时小文件吞吐由 RTT 而不是带宽决定，所以让小文件互相重叠；
+            // 大文件仍然独占预算，保持原有的串行与内存语义。
+            //
+            // 共享状态一律先取成 Copy 引用：run_bounded 接受 `Fn` 闭包（会被多次调用），
+            // 非 Copy 值（例如 `progress: Box<dyn Fn>`）不能被每个文件的 future 各自拿走。
+            let sftp = &self.sftp;
+            let cancelled = &cancelled;
+            let progress = &progress;
+            let upload_root = upload_root.as_str();
+            let written = AtomicU64::new(0);
+            let written = &written;
+            let published = ProgressHighWater::new();
+            let published = &published;
 
-            for (file_path, _, file_size) in files {
-                ensure_not_cancelled(&cancelled)?;
-                let relative = file_path
-                    .strip_prefix(local_base)
-                    .map_err(|e| anyhow!("Failed to strip prefix: {}", e))?;
-                let relative_str = relative.to_string_lossy().replace('\\', "/");
-                let remote_file_path =
-                    format!("{}/{}", upload_root.trim_end_matches('/'), relative_str);
+            let job_result: Result<(), anyhow::Error> = run_bounded(
+                files,
+                MAX_CONCURRENT_SMALL_FILE_UPLOADS,
+                |entry: &(PathBuf, bool, u64)| {
+                    job_weight(entry.2, MAX_CONCURRENT_SMALL_FILE_UPLOADS)
+                },
+                |(file_path, _, file_size)| async move {
+                    ensure_not_cancelled(cancelled)?;
 
-                let current_file_name = relative_str.clone();
+                    let relative = file_path
+                        .strip_prefix(local_base)
+                        .map_err(|e| anyhow!("Failed to strip prefix: {}", e))?;
+                    let relative_str = relative.to_string_lossy().replace('\\', "/");
+                    let remote_file_path =
+                        format!("{}/{}", upload_root.trim_end_matches('/'), relative_str);
 
-                let local_file = File::open(file_path)
-                    .await
-                    .map_err(|e| anyhow!("Failed to open local file {:?}: {}", file_path, e))?;
-                let mut local_file = BufReader::with_capacity(BUFFER_SIZE, local_file);
-                let committed_before = transferred;
-                let expected_size = *file_size;
-                let current_file_transferred = with_remote_replace(
-                    &self.sftp,
-                    &remote_file_path,
-                    expected_size,
-                    |mut remote_file| async {
-                        let mut buffer = vec![0u8; BUFFER_SIZE];
-                        let mut current_file_transferred: u64 = 0;
+                    let local_file = File::open(&file_path)
+                        .await
+                        .map_err(|e| anyhow!("Failed to open local file {:?}: {}", file_path, e))?;
+                    let mut local_file = BufReader::with_capacity(BUFFER_SIZE, local_file);
+                    let expected_size = file_size;
+                    let current_file_name = relative_str;
 
-                        loop {
-                            ensure_not_cancelled(&cancelled)?;
-                            let bytes_read = local_file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|e| anyhow!("Failed to read from local file: {}", e))?;
+                    with_remote_replace(
+                        sftp,
+                        &remote_file_path,
+                        expected_size,
+                        |mut remote_file| async {
+                            let mut buffer = vec![0u8; BUFFER_SIZE];
+                            let mut current_file_transferred: u64 = 0;
 
-                            if bytes_read == 0 {
-                                break;
+                            loop {
+                                ensure_not_cancelled(cancelled)?;
+                                let bytes_read =
+                                    local_file.read(&mut buffer).await.map_err(|e| {
+                                        anyhow!("Failed to read from local file: {}", e)
+                                    })?;
+
+                                if bytes_read == 0 {
+                                    break;
+                                }
+
+                                remote_file.write_all(&buffer[..bytes_read]).await.map_err(
+                                    |e| anyhow!("Failed to write to remote file: {}", e),
+                                )?;
+
+                                current_file_transferred += bytes_read as u64;
+
+                                // 多个文件交错上报，先汇总成全局进度再走高水位，
+                                // 否则后到的回调会带着更小的值把进度条拽回去。
+                                let written_so_far = written
+                                    .fetch_add(bytes_read as u64, Ordering::Relaxed)
+                                    + bytes_read as u64;
+                                let displayed_transferred = published.publish(written_so_far);
+                                let elapsed = start_time.elapsed().as_secs_f64();
+                                let speed = if elapsed > 0.0 {
+                                    displayed_transferred as f64 / elapsed
+                                } else {
+                                    0.0
+                                };
+
+                                progress(TransferProgress {
+                                    transferred: displayed_transferred,
+                                    total: total_size,
+                                    speed,
+                                    current_file: Some(current_file_name.clone()),
+                                    current_file_transferred,
+                                    current_file_total: expected_size,
+                                });
                             }
 
-                            remote_file
-                                .write_all(&buffer[..bytes_read])
-                                .await
-                                .map_err(|e| anyhow!("Failed to write to remote file: {}", e))?;
-
-                            current_file_transferred += bytes_read as u64;
-
-                            let elapsed = start_time.elapsed().as_secs_f64();
-                            let displayed_transferred = committed_before + current_file_transferred;
-                            let speed = if elapsed > 0.0 {
-                                displayed_transferred as f64 / elapsed
-                            } else {
-                                0.0
-                            };
-
-                            progress(TransferProgress {
-                                transferred: displayed_transferred,
-                                total: total_size,
-                                speed,
-                                current_file: Some(current_file_name.clone()),
-                                current_file_transferred,
-                                current_file_total: expected_size,
-                            });
-                        }
-
-                        ensure_not_cancelled(&cancelled)?;
-                        Ok((remote_file, current_file_transferred))
-                    },
-                )
-                .await
-                .map_err(|error| {
-                    anyhow!(
-                        "Failed to upload {} without replacing the original: {}",
-                        remote_file_path,
-                        error
+                            ensure_not_cancelled(cancelled)?;
+                            Ok((remote_file, current_file_transferred))
+                        },
                     )
-                })?;
-                transferred = committed_before + current_file_transferred;
-            }
+                    .await
+                    .map_err(|error| {
+                        anyhow!(
+                            "Failed to upload {} without replacing the original: {}",
+                            remote_file_path,
+                            error
+                        )
+                    })?;
 
-            ensure_not_cancelled(&cancelled)?;
-            Ok(transferred)
+                    Ok(())
+                },
+            )
+            .await;
+            job_result?;
+
+            ensure_not_cancelled(cancelled)?;
+            Ok(written.load(Ordering::Relaxed))
         }
         .await;
 
@@ -3211,6 +3295,8 @@ mod tests {
             host_key_verifier,
             x11_forwarding: false,
             allow_legacy_algorithms: false,
+            forward_agent: false,
+            agent_identities: Vec::new(),
         };
 
         let config =
@@ -3243,6 +3329,8 @@ mod tests {
             host_key_verifier: HostKeyVerifier::default(),
             x11_forwarding: false,
             allow_legacy_algorithms: false,
+            forward_agent: false,
+            agent_identities: Vec::new(),
         };
 
         let default_config =
@@ -3289,6 +3377,8 @@ mod tests {
             host_key_verifier: HostKeyVerifier::default(),
             x11_forwarding: false,
             allow_legacy_algorithms: false,
+            forward_agent: false,
+            agent_identities: Vec::new(),
         };
 
         let modern =
@@ -3369,6 +3459,8 @@ mod tests {
             host_key_verifier: HostKeyVerifier::default(),
             x11_forwarding: false,
             allow_legacy_algorithms: false,
+            forward_agent: false,
+            agent_identities: Vec::new(),
         };
 
         let transport =
@@ -3402,6 +3494,109 @@ mod tests {
         let out_of_range =
             expected_chunk_len(10, 10).expect_err("offset at EOF must not be scheduled");
         assert!(out_of_range.to_string().contains("out-of-range chunk"));
+    }
+
+    #[tokio::test]
+    async fn a_short_read_is_read_again_until_the_chunk_is_complete() {
+        let payload: Vec<u8> = (0..100u8).collect();
+        let requests = StdMutex::new(Vec::new());
+
+        let chunk = read_chunk_fully(0, payload.len(), |offset: u64, len: u32| {
+            requests.lock().expect("requests mutex").push((offset, len));
+            // 模拟中继：一次最多只回 32 字节 —— 这正是 issue #363 里
+            // 「请求 61440 字节、只拿到 32768」的形态。
+            let start = offset as usize;
+            let end = start + (len as usize).min(32);
+            let slice = payload[start..end].to_vec();
+            async move { Ok::<_, SftpError>(slice) }
+        })
+        .await
+        .expect("短读必须续读补齐，不能让整条下载失败");
+
+        assert_eq!(payload, chunk);
+        // 每个后续请求都从上一次拿到的位置接着要，缺口一路收窄。
+        assert_eq!(
+            vec![(0, 100), (32, 68), (64, 36), (96, 4)],
+            *requests.lock().expect("requests mutex")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_size_read_is_not_split_into_extra_requests() {
+        let payload: Vec<u8> = (0..100u8).collect();
+        let requests = StdMutex::new(Vec::new());
+
+        let chunk = read_chunk_fully(0, payload.len(), |offset: u64, len: u32| {
+            requests.lock().expect("requests mutex").push((offset, len));
+            let start = offset as usize;
+            let slice = payload[start..start + len as usize].to_vec();
+            async move { Ok::<_, SftpError>(slice) }
+        })
+        .await
+        .expect("读满的分片必须一次结束");
+
+        assert_eq!(payload, chunk);
+        assert_eq!(vec![(0, 100)], *requests.lock().expect("requests mutex"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_read_is_reported_as_eof_instead_of_looping() {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_chunk_fully(
+                4096,
+                PIPELINE_CHUNK_SIZE as usize,
+                |_offset: u64, _len: u32| async { Ok::<_, SftpError>(Vec::new()) },
+            ),
+        )
+        .await;
+
+        let error = outcome
+            .expect("空读必须立刻失败，不能一直续读下去")
+            .expect_err("空读代表远端提前结束");
+        assert!(
+            error
+                .to_string()
+                .contains("Unexpected EOF while reading remote file at offset 4096"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eof_status_is_reported_as_eof() {
+        let error = read_chunk_fully(1024, 8, |_offset: u64, _len: u32| async {
+            Err::<Vec<u8>, _>(SftpError::Status(russh_sftp::protocol::Status {
+                id: 0,
+                status_code: StatusCode::Eof,
+                error_message: "eof".to_string(),
+                language_tag: "en".to_string(),
+            }))
+        })
+        .await
+        .expect_err("EOF 状态码要翻译成可读的 EOF 报错");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unexpected EOF while reading remote file at offset 1024"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_longer_than_requested_is_rejected() {
+        let error = read_chunk_fully(0, 8, |_offset: u64, _len: u32| async {
+            Ok::<_, SftpError>(vec![0u8; 9])
+        })
+        .await
+        .expect_err("返回超过请求长度的数据时必须报错，否则分片会错位");
+
+        assert!(
+            error
+                .to_string()
+                .contains("SFTP read at offset 0 returned 9 bytes for a 8 byte request"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -4045,3 +4240,7 @@ mod tests {
         assert_eq!(preserved.mtime, None);
     }
 }
+
+#[cfg(test)]
+#[path = "russh_impl_short_read_tests.rs"]
+mod short_read_tests;

@@ -1,13 +1,14 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use gpui::http_client::HttpClient;
 use gpui::{App, AsyncApp, Global, Subscription};
 use one_core::cloud_sync::personal::{
     ConfiguredPersonalSyncStore, PersonalSyncConflict, PersonalSyncConflictRepository,
     PersonalSyncConflictResolver, PersonalSyncEvent, PersonalSyncLocalRepositorySource,
     PersonalSyncRuntimeConfig, PersonalSyncRuntimeError, PersonalSyncStore, PersonalSyncWatcher,
     PersonalSyncWorker, SqlitePersonalSyncConflictSink, SyncDeviceId, SyncStoreError,
-    SyncStoreHealth, WorkerConfig, build_personal_sync_runtime_config,
+    SyncStoreHealth, WorkerConfig, build_personal_sync_runtime_config, open_webdav_password,
 };
 use one_core::cloud_sync::{CloudSyncData, CloudSyncService, ConflictResolution, data_type};
 use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
@@ -17,8 +18,9 @@ use one_core::settings::{AppSettings, GlobalCurrentUser, PersonalSyncSettings, S
 use one_core::storage::traits::Repository;
 use one_core::storage::{
     ConnectionRepository, ConnectionType, CredentialRepository, CredentialSummary, DatabaseType,
-    GlobalStorageState, StoredConnection, Workspace, WorkspaceRepository,
+    GlobalStorageState, StorageManager, StoredConnection, Workspace, WorkspaceRepository,
 };
+use rust_i18n::t;
 
 use crate::personal_sync_status::PersonalSyncRuntimeStatus;
 
@@ -74,8 +76,19 @@ pub fn runtime_status(cx: &App) -> PersonalSyncRuntimeStatus {
 
 pub fn actions_enabled(cx: &App) -> bool {
     let settings = AppSettings::global(cx);
-    active_personal_sync_settings(settings)
-        .is_some_and(|settings| build_personal_sync_runtime_config(&settings).is_ok())
+    active_personal_sync_settings(settings).is_some_and(|settings| {
+        let password = webdav_password_for(&settings);
+        build_personal_sync_runtime_config(&settings, password.as_deref()).is_ok()
+    })
+}
+
+/// 取出 WebDAV 后端的明文密码。
+///
+/// 只在真正要建连时才解密，且结果不会离开调用栈：runtime config 虽然会带上它，
+/// 但那个结构体手写了 `Debug`，日志里只会看到 `<redacted>`。
+fn webdav_password_for(settings: &PersonalSyncSettings) -> Option<String> {
+    let password = open_webdav_password(&settings.webdav.password);
+    (!password.is_empty()).then_some(password)
 }
 
 pub fn test_connection(cx: &mut App) {
@@ -84,8 +97,9 @@ pub fn test_connection(cx: &mut App) {
         return;
     };
     let generation = begin_operation(cx, PersonalSyncRuntimeStatus::Syncing);
+    let http = cx.http_client();
     let task = Tokio::spawn(cx, async move {
-        let store = ConfiguredPersonalSyncStore::from_runtime_config(&config);
+        let store = ConfiguredPersonalSyncStore::from_runtime_config(&config, http)?;
         store.probe().await
     });
     cx.spawn(async move |cx: &mut AsyncApp| {
@@ -212,6 +226,7 @@ pub fn resolve_personal_conflict(
     };
 
     let generation = begin_operation(cx, PersonalSyncRuntimeStatus::Syncing);
+    let http = cx.http_client();
     let task = Tokio::spawn(cx, async move {
         resolve_personal_conflict_once(
             config,
@@ -219,6 +234,7 @@ pub fn resolve_personal_conflict(
             (*conflicts).clone(),
             selection_key,
             strategy,
+            http,
         )
         .await
     });
@@ -259,6 +275,7 @@ pub fn resolve_personal_conflicts(strategies: Vec<(String, ConflictResolution)>,
     };
 
     let generation = begin_operation(cx, PersonalSyncRuntimeStatus::Syncing);
+    let http = cx.http_client();
     let task = Tokio::spawn(cx, async move {
         for (selection_key, strategy) in strategies {
             resolve_personal_conflict_once(
@@ -267,6 +284,7 @@ pub fn resolve_personal_conflicts(strategies: Vec<(String, ConflictResolution)>,
                 (*conflicts).clone(),
                 selection_key,
                 strategy,
+                http.clone(),
             )
             .await?;
         }
@@ -538,7 +556,8 @@ fn run_temporary_full_scan(
     conflict_sink: SqlitePersonalSyncConflictSink,
 ) {
     let generation = begin_operation(cx, PersonalSyncRuntimeStatus::Syncing);
-    let task = Tokio::spawn(cx, run_sync(config, source, conflict_sink));
+    let http = cx.http_client();
+    let task = Tokio::spawn(cx, run_sync(config, source, conflict_sink, http));
     cx.spawn(async move |cx: &mut AsyncApp| {
         let status = personal_sync_status_from_task(task.await);
         let _ = cx.update(move |cx| finish_operation(cx, generation, status));
@@ -551,7 +570,10 @@ fn reconcile_runtime(cx: &mut App) {
     let settings = AppSettings::global(cx);
     let config = active_personal_sync_settings(settings)
         .ok_or(PersonalSyncRuntimeError::Disabled)
-        .and_then(|settings| build_personal_sync_runtime_config(&settings));
+        .and_then(|settings| {
+            let password = webdav_password_for(&settings);
+            build_personal_sync_runtime_config(&settings, password.as_deref())
+        });
     match config {
         Ok(config) => {
             if runtime_config_unchanged(cx, &config) {
@@ -600,7 +622,7 @@ fn start_running_runtime(
 ) -> Result<RunningPersonalSyncRuntime, SyncStoreError> {
     let source = build_local_source(cx).ok_or(SyncStoreError::NotConfigured)?;
     let conflict_sink = build_conflict_sink(cx).ok_or(SyncStoreError::NotConfigured)?;
-    let store = ConfiguredPersonalSyncStore::from_runtime_config(config);
+    let store = ConfiguredPersonalSyncStore::from_runtime_config(config, cx.http_client())?;
     let worker = PersonalSyncWorker::with_conflict_sink(
         store.clone(),
         source,
@@ -610,7 +632,8 @@ fn start_running_runtime(
             device_id: SyncDeviceId("local-device".to_string()),
         },
     );
-    let watcher = if config.auto_sync {
+    // WebDAV 后端没有本地目录，文件监听无从谈起：交由 60 秒一次的周期全量扫描驱动。
+    let watcher = if config.auto_sync && !config.root.as_os_str().is_empty() {
         Some(start_watcher(
             cx,
             config.root.clone(),
@@ -659,24 +682,30 @@ pub(crate) fn personal_sync_event_from_connection_event(
         }
         ConnectionDataEvent::ConnectionDeleted {
             cloud_id: Some(cloud_id),
+            last_synced_at,
             ..
         } => Some(PersonalSyncEvent::LocalDeleted {
             data_type: data_type::CONNECTION.to_string(),
             cloud_id: cloud_id.clone(),
+            last_synced_at: *last_synced_at,
         }),
         ConnectionDataEvent::WorkspaceDeleted {
             cloud_id: Some(cloud_id),
+            last_synced_at,
             ..
         } => Some(PersonalSyncEvent::LocalDeleted {
             data_type: data_type::WORKSPACE.to_string(),
             cloud_id: cloud_id.clone(),
+            last_synced_at: *last_synced_at,
         }),
         ConnectionDataEvent::CredentialDeleted {
             cloud_id: Some(cloud_id),
+            last_synced_at,
             ..
         } => Some(PersonalSyncEvent::LocalDeleted {
             data_type: data_type::CREDENTIAL.to_string(),
             cloud_id: cloud_id.clone(),
+            last_synced_at: *last_synced_at,
         }),
         ConnectionDataEvent::ConnectionDeleted { cloud_id: None, .. }
         | ConnectionDataEvent::WorkspaceCreated { .. }
@@ -802,8 +831,9 @@ async fn run_sync(
     config: PersonalSyncRuntimeConfig,
     source: PersonalSyncLocalRepositorySource,
     conflict_sink: SqlitePersonalSyncConflictSink,
+    http: Arc<dyn HttpClient>,
 ) -> Result<(), SyncStoreError> {
-    let store = ConfiguredPersonalSyncStore::from_runtime_config(&config);
+    let store = ConfiguredPersonalSyncStore::from_runtime_config(&config, http)?;
     let worker = PersonalSyncWorker::with_conflict_sink(
         store.clone(),
         source,
@@ -831,12 +861,33 @@ fn build_conflict_repository(cx: &App) -> Option<Arc<PersonalSyncConflictReposit
     storage.get::<PersonalSyncConflictRepository>()
 }
 
+/// 本地条目被删除后，把它遗留的同步冲突一并清掉。
+///
+/// 冲突表的主键是 `(profile, data_type, 云端 record_id)`，但解析冲突要按云端 id
+/// 反查本地条目（`local.list_items()`）。本地条目消失后冲突就永远解不开 ——
+/// 两个按钮分别报 `connection not found` / `Connection N not found`；更糟的是点
+/// 「使用远程版本」还会把刚删掉的条目重新拉回本地。所以删除实体时必须一起清掉。
+pub(crate) fn forget_personal_conflict(storage: &StorageManager, data_type: &str, cloud_id: &str) {
+    let Some(conflicts) = storage.get::<PersonalSyncConflictRepository>() else {
+        return;
+    };
+    if let Err(error) = conflicts.delete("personal", data_type, cloud_id) {
+        tracing::warn!(
+            error = %error,
+            data_type,
+            cloud_id,
+            "Failed to forget personal sync conflict after local delete"
+        );
+    }
+}
+
 async fn resolve_personal_conflict_once(
     config: PersonalSyncRuntimeConfig,
     source: PersonalSyncLocalRepositorySource,
     conflicts: PersonalSyncConflictRepository,
     selection_key: String,
     strategy: ConflictResolution,
+    http: Arc<dyn HttpClient>,
 ) -> Result<(), SyncStoreError> {
     let (data_type, record_id) = parse_personal_conflict_selection_key(&selection_key)?;
     let conflict = conflicts
@@ -849,7 +900,7 @@ async fn resolve_personal_conflict_once(
                 "personal sync conflict not found: {data_type}/{record_id}"
             ))
         })?;
-    let store = ConfiguredPersonalSyncStore::from_runtime_config(&config);
+    let store = ConfiguredPersonalSyncStore::from_runtime_config(&config, http)?;
     let resolver = PersonalSyncConflictResolver::new(store.clone(), source, conflicts);
     resolver.resolve(&conflict, strategy).await?;
     store.flush().await
@@ -887,8 +938,10 @@ fn sync_master_key_and_user(cx: &mut App) {
 }
 
 fn active_or_current_config(cx: &App) -> Option<PersonalSyncRuntimeConfig> {
-    active_personal_sync_settings(AppSettings::global(cx))
-        .and_then(|settings| build_personal_sync_runtime_config(&settings).ok())
+    active_personal_sync_settings(AppSettings::global(cx)).and_then(|settings| {
+        let password = webdav_password_for(&settings);
+        build_personal_sync_runtime_config(&settings, password.as_deref()).ok()
+    })
 }
 
 fn active_personal_sync_settings(settings: &AppSettings) -> Option<PersonalSyncSettings> {
@@ -949,4 +1002,123 @@ fn personal_sync_status_from_task(
 
 fn set_status(cx: &mut App, status: PersonalSyncRuntimeStatus) {
     cx.global_mut::<GlobalPersonalSyncRuntime>().status = status;
+}
+
+/// 主密钥变更后，把个人同步远端记录从旧密钥重加密为新密钥。
+///
+/// 业务时间戳没变，个人同步 planner 会判定「已同步」而不重传，所以云端存量
+/// 密文必须主动遍历重写（方案甲）。未完成的部分记 pending 标记，下次同步前补做。
+pub fn reencrypt_cloud_data(
+    old_key: &str,
+    new_key: &str,
+    key_version: u32,
+    notifier: Option<crate::master_key_flow::CloudReencryptNotifier>,
+    cx: &mut App,
+) -> bool {
+    let Some(config) = configured_sync_config(cx) else {
+        tracing::info!("个人同步未配置，跳过云端重加密");
+        return false;
+    };
+    let http = cx.http_client();
+    let old_key = old_key.to_string();
+    let new_key = new_key.to_string();
+
+    let task = Tokio::spawn(cx, async move {
+        let store = ConfiguredPersonalSyncStore::from_runtime_config(&config, http)?;
+        // 重加密只用 re_encrypt_sync_data（显式传旧/新密钥），不依赖服务内的当前密钥
+        let service = CloudSyncService::new();
+        let stats =
+            one_core::cloud_sync::reencrypt_personal(&store, &service, &old_key, &new_key, key_version)
+                .await?;
+        store.flush().await?;
+        Ok::<_, SyncStoreError>(stats)
+    });
+
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let message = match task.await {
+            Ok(Ok(stats)) => {
+                one_core::master_key_meta::set_pending_cloud_reencrypt(stats.incomplete());
+                tracing::info!(
+                    "个人同步云端重加密完成：共 {} 条，重加密 {} 条，失败 {} 条",
+                    stats.total,
+                    stats.re_encrypted,
+                    stats.failed
+                );
+                if stats.incomplete() {
+                    t!("Encryption.cloud_reencrypt_failed").to_string()
+                } else {
+                    t!("Encryption.cloud_reencrypt_done").to_string()
+                }
+            }
+            Ok(Err(error)) => {
+                one_core::master_key_meta::set_pending_cloud_reencrypt(true);
+                tracing::error!("个人同步云端重加密失败: {error}");
+                t!("Encryption.cloud_reencrypt_failed").to_string()
+            }
+            Err(error) => {
+                one_core::master_key_meta::set_pending_cloud_reencrypt(true);
+                tracing::error!("个人同步云端重加密任务失败: {error}");
+                t!("Encryption.cloud_reencrypt_failed").to_string()
+            }
+        };
+        let _ = cx.update(move |cx: &mut App| {
+            if let Some(notify) = notifier.as_ref() {
+                notify(cx, message.clone());
+            }
+        });
+        Ok::<(), anyhow::Error>(())
+    })
+    .detach();
+    true
+}
+
+/// 重置主密钥时清空个人同步远端数据（记录软删除并提交后端）。
+pub fn wipe_cloud_data(cx: &mut App) {
+    let Some(config) = configured_sync_config(cx) else {
+        return;
+    };
+    let http = cx.http_client();
+
+    let task = Tokio::spawn(cx, async move {
+        let store = ConfiguredPersonalSyncStore::from_runtime_config(&config, http)?;
+        let records = store.list_records(None, None).await?;
+        let total = records.len();
+        for record in records {
+            store
+                .tombstone_record(&record.data_type, &record.id, Some(record.version))
+                .await?;
+        }
+        store.flush().await?;
+        Ok::<_, SyncStoreError>(total)
+    });
+
+    cx.spawn(async move |_cx: &mut AsyncApp| {
+        match task.await {
+            Ok(Ok(total)) => {
+                one_core::master_key_meta::set_pending_cloud_wipe(false);
+                tracing::info!("个人同步云端数据已清空：{total} 条");
+            }
+            Ok(Err(error)) => {
+                one_core::master_key_meta::set_pending_cloud_wipe(true);
+                tracing::error!("个人同步云端数据清空失败: {error}");
+            }
+            Err(error) => {
+                one_core::master_key_meta::set_pending_cloud_wipe(true);
+                tracing::error!("个人同步云端数据清空任务失败: {error}");
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .detach();
+}
+
+/// 取当前个人同步后端配置。
+///
+/// 与 [`active_or_current_config`] 的区别是不要求「同步总开关已打开且当前
+/// provider 正是个人同步」：重置主密钥时无论当前走哪条同步链路，都要清掉
+/// 已经落在个人同步后端里的数据。
+fn configured_sync_config(cx: &App) -> Option<PersonalSyncRuntimeConfig> {
+    let settings = AppSettings::global(cx);
+    let password = webdav_password_for(&settings.personal_sync);
+    build_personal_sync_runtime_config(&settings.personal_sync, password.as_deref()).ok()
 }

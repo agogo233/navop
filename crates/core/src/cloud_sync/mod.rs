@@ -22,6 +22,7 @@ pub mod conflict;
 mod connection_sync;
 pub mod engine;
 mod generic_sync;
+pub mod master_key_reencrypt;
 mod models;
 pub mod personal;
 pub mod queue;
@@ -40,6 +41,12 @@ mod team_key_envelope_tests;
 #[cfg(test)]
 #[path = "team_key_manager_status_tests.rs"]
 mod team_key_manager_status_tests;
+
+#[cfg(test)]
+#[path = "workspace_hierarchy_engine_tests.rs"]
+mod workspace_hierarchy_engine_tests;
+
+mod workspace_hierarchy;
 mod workspace_sync;
 
 use std::collections::HashMap;
@@ -50,6 +57,7 @@ use gpui::{App, Global};
 pub use client::*;
 pub use conflict::*;
 pub use engine::*;
+pub use master_key_reencrypt::*;
 pub use models::*;
 pub use queue::*;
 pub use service::*;

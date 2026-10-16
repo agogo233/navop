@@ -31,8 +31,20 @@ The normal release sequence is:
 6. The workflow checks the application version and tagged changelog entry before starting expensive builds.
 7. macOS ARM64, macOS x86_64, Linux x86_64, Linux ARM64, and Windows x86_64 build in parallel in one matrix.
 8. After all requested platforms finish, the workflow extracts the tagged entry, uses it as the GitHub Release body, and writes the same Markdown to the R2 `latest.json` `release_notes` field.
+9. Once every uploaded object has been verified, R2 keeps only the tag that was just uploaded: the other `releases/<tag>/` prefixes are pruned, so the bucket carries one version's installers instead of the whole history. Nothing becomes unreachable — `updates/latest.json` only ever points at the tag being uploaded, and older installers stay on their GitHub Release and on the CNB mirror.
 
 The build workflow checks out the requested tag, while the workflow itself runs from `main`. This keeps Cargo input caches and sccache data reusable across tags and repair runs.
+
+## Release-only pull requests
+
+A pull request that only carries the `CHANGELOG.md` entry and the version bump does not need the platform matrix. `.github/workflows/ci.yml` classifies every pull request in the `classify` job through `script/release_pr.py check`:
+
+- The pull request qualifies only when every changed file is `CHANGELOG.md`, `main/Cargo.toml`, or `Cargo.lock`, and the `Cargo.toml` / `Cargo.lock` diff contains nothing but `version = "..."` lines. Any other file, or a dependency change in `main/Cargo.toml`, keeps the full matrix.
+- When it qualifies, the `test` and `windows-rdp-probe` jobs are skipped and the release metadata is validated instead: `main/Cargo.toml` and the `main` package in `Cargo.lock` must agree, and the bilingual entry for that version must exist, be complete (`更新内容` / `修复与优化` plus `What's New` / `Fixes and Improvements`) and carry the CNB mirror line.
+- `CI gate` stays the only required status check, and it still fails the pull request when the classification itself fails, so an invalid release entry cannot reach `main`.
+- If the diff cannot be computed (for example a fork pull request whose head commit was not fetched), the classifier falls back to the full matrix.
+
+A release pull request keeps the fast path after `main` is merged back into `dev`, because the classifier only looks at the diff against the base branch.
 
 ## Branch model
 
@@ -106,5 +118,6 @@ For a failed matrix job in the same workflow run, prefer **Re-run failed jobs**.
 - A new release tag must contain a valid bilingual `CHANGELOG.md` entry before builds begin.
 - GitHub Release notes and R2 updater `release_notes` are extracted from the same tagged changelog entry.
 - Publishing uses `--clobber` only for newly built platform files and `sha256sums.txt`.
+- R2 keeps only the newest release. The prune step runs after the upload has been verified object by object and never carries `always()`, so a failed upload leaves the existing objects alone; it refuses to delete anything when its own tag is missing from R2, and a non-stable tag (for example `v0.20.0-rc.1`) skips pruning so it cannot take the last stable installers with it.
 - Legacy pre-changelog repairs preserve their existing GitHub Release body.
 - All five primary platform builds belong to one matrix, so they start in parallel and a failed job can be rerun without rebuilding successful matrix jobs.

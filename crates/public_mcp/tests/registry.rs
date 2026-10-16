@@ -85,7 +85,7 @@ impl TerminalControlSessionHandle for FakeTerminal {
                 target: request.target,
                 action: request.action,
                 sent: true,
-                readiness_before: TerminalControlReadiness::CommandRunning,
+                readiness_before: Some(TerminalControlReadiness::CommandRunning),
             })
         })
     }
@@ -420,7 +420,7 @@ async fn visible_terminal_control_accepts_connected_local_session() {
 
     assert!(result.sent);
     assert_eq!(
-        TerminalControlReadiness::CommandRunning,
+        Some(TerminalControlReadiness::CommandRunning),
         result.readiness_before
     );
 }

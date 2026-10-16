@@ -26,7 +26,7 @@ Display density never changes stored field values. Use the appropriate editor fo
 
 ## Configure terminal and remote editors
 
-Choose a local Terminal profile or trusted custom program. Configure completion, selection copy, right/middle paste, multiline confirmation, dangerous-command warnings, and terminal fonts. Understand bracketed paste and clipboard risk before reducing safeguards.
+Choose a local Terminal profile or trusted custom program. Terminal-scoped options (fonts, completion, selection copy, right/middle paste, multiline paste confirmation, dangerous-command warnings) live in the terminal tool sidebar's Settings panel rather than the app Settings page; paste confirmations sit in its Safety section, and the paste dialog also offers Open Settings and Don't Ask Again. Understand bracketed paste and clipboard risk before reducing safeguards.
 
 Select a built-in or extension-provided remote editor, its executable, and automatic upload behavior. Keep remote-conflict checks enabled.
 
@@ -38,7 +38,7 @@ MCP settings control Temporary/Persistent mode, permission profile, and Tool Exp
 
 ## Customize shortcuts
 
-Shortcuts are grouped for global actions, terminal, database, table, remote editing, Redis, and Notes. Bindings can be cleared, and system-wide hotkeys can be disabled entirely (disabling the global hotkey releases the registered system-level combinations). Search existing bindings before changing them, and account for operating-system and input-method interception. Avoid easy single-key bindings for destructive actions.
+Shortcuts are grouped for global actions, terminal, database, table, remote editing, Redis, and Notes. Bindings can be cleared, and system-wide hotkeys can be disabled entirely (disabling the global hotkey releases the registered system-level combinations). The default shortcut for closing the active tab is Cmd/Ctrl+Shift+W, rebindable in settings. Search existing bindings before changing them, and account for operating-system and input-method interception. Avoid easy single-key bindings for destructive actions.
 
 If a shortcut fails, check focus, platform, input method, and conflicts before resetting or choosing another combination.
 

@@ -2,13 +2,13 @@ use crate::search_shortcut::{DB_SEARCH_CONTEXT, FocusSearchInput, focus_search_i
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, ParentElement,
-    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, App, AsyncApp, Context, Div, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton,
+    ParentElement, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Subscription, Task, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IndexPath, Sizable, Size, WindowExt,
+    ActiveTheme, Icon, IndexPath, Sizable, Size, Theme, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     clipboard::Clipboard,
@@ -48,7 +48,10 @@ use one_core::storage::DatabaseType;
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent};
 use rust_i18n::t;
 
-const COLUMN_EDITOR_RESIZE_HANDLE_WIDTH: Pixels = px(6.0);
+/// 列宽抓取区在列边界两侧各自的宽度。
+const COLUMN_EDITOR_RESIZE_GRAB_PADDING: Pixels = px(4.0);
+/// 分隔线本身的宽度。
+const COLUMN_EDITOR_RESIZE_LINE_WIDTH: Pixels = px(1.0);
 const COLUMN_EDITOR_COLUMN_COUNT: usize = 7;
 const COLUMN_NAME_COL: usize = 0;
 const COLUMN_TYPE_COL: usize = 1;
@@ -85,6 +88,20 @@ const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(120.0),
     px(140.0),
 ];
+
+/// 列/索引行的选中底色透明度。
+const SELECTED_ROW_BACKGROUND_OPACITY: f32 = 0.1;
+/// 列/索引行的悬停底色透明度。
+const HOVERED_ROW_BACKGROUND_OPACITY: f32 = 0.3;
+
+/// 行悬停时叠加的底色。
+///
+/// 选中的行返回 `None`：悬停样式是在基础样式之后 refine 的，一旦叠加就会把选中
+/// 底色整个盖掉，看起来就像「鼠标移到这一行，高亮没了」。树视图同样只在未选中
+/// 的行上叠加悬停底色。
+fn row_hover_background(is_selected: bool, theme: &Theme) -> Option<Hsla> {
+    (!is_selected).then(|| theme.muted.opacity(HOVERED_ROW_BACKGROUND_OPACITY))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DesignerTab {
@@ -158,13 +175,34 @@ pub(crate) fn build_table_design_from_metadata(
     table_info: Option<&TableInfo>,
     plugin: Option<&dyn DatabasePlugin>,
 ) -> TableDesign {
+    // IPC 驱动的 schema/columns 不一定回列级主键（共享 handleSchemaColumns
+    // 不查约束），但 schema/indexes 会标记 PK 索引——从它的成员反推列主键。
+    // 原生插件两条路都有，先到先得，不覆盖已有 true。
+    // Oracle 家族的字典列名全大写，列名可能小写——不区分大小写匹配。
+    let pk_members: std::collections::HashSet<String> = indexes
+        .iter()
+        .filter(|idx| idx.is_primary || idx.name.eq_ignore_ascii_case("PRIMARY"))
+        .flat_map(|idx| idx.columns.iter())
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let columns: Vec<ColumnInfo> = columns
+        .iter()
+        .map(|col| {
+            let mut col = col.clone();
+            if !col.is_primary_key && pk_members.contains(&col.name.to_ascii_uppercase()) {
+                col.is_primary_key = true;
+            }
+            col
+        })
+        .collect();
+    let primary_key_count = columns.iter().filter(|col| col.is_primary_key).count();
     let column_defs: Vec<ColumnDefinition> = columns
         .iter()
         .map(|col| {
             let parsed = plugin
                 .map(|plugin| plugin.parse_column_type(&col.data_type))
                 .unwrap_or_else(|| fallback_parse_column_type(&col.data_type));
-            column_info_to_definition(database_type.clone(), col, parsed)
+            column_info_to_definition(database_type.clone(), col, parsed, primary_key_count)
         })
         .collect();
 
@@ -200,17 +238,15 @@ fn column_info_to_definition(
     database_type: DatabaseType,
     col: &ColumnInfo,
     parsed: ParsedColumnType,
+    primary_key_count: usize,
 ) -> ColumnDefinition {
+    let is_auto_increment =
+        column_is_auto_increment(&database_type, col, &parsed, primary_key_count);
     let base_type = parsed.base_type;
     let data_type = if let Some(enum_values) = parsed.enum_values {
         format!("{}({})", base_type, enum_values)
     } else {
         base_type.clone()
-    };
-    let is_auto_increment = if matches!(database_type, DatabaseType::SQLite) {
-        col.is_primary_key && base_type.eq_ignore_ascii_case("INTEGER")
-    } else {
-        parsed.is_auto_increment
     };
 
     ColumnDefinition {
@@ -228,6 +264,28 @@ fn column_info_to_definition(
         charset: col.charset.clone(),
         collation: col.collation.clone(),
     }
+}
+
+/// 某列在设计器里是否算自增列。
+///
+/// 优先信元数据：各插件已按引擎语义填好 `is_auto_increment`（MSSQL IDENTITY、MySQL EXTRA、
+/// PG serial/identity）；元数据没给时，SQLite 按「单列 INTEGER 主键 = rowid 别名」兜底
+/// （联合主键、WITHOUT ROWID 表都不算），其它引擎退回类型字符串解析。
+fn column_is_auto_increment(
+    database_type: &DatabaseType,
+    col: &ColumnInfo,
+    parsed: &ParsedColumnType,
+    primary_key_count: usize,
+) -> bool {
+    if col.is_auto_increment {
+        return true;
+    }
+    if matches!(database_type, DatabaseType::SQLite) {
+        return col.is_primary_key
+            && parsed.base_type.eq_ignore_ascii_case("INTEGER")
+            && primary_key_count == 1;
+    }
+    parsed.is_auto_increment
 }
 
 fn fallback_parse_column_type(data_type: &str) -> ParsedColumnType {
@@ -270,7 +328,7 @@ fn extract_scale_from_type_str(data_type: &str) -> Option<u32> {
     None
 }
 
-fn find_loaded_table_info(
+pub(crate) fn find_loaded_table_info(
     tables: Vec<TableInfo>,
     table_name: &str,
     schema_name: Option<&str>,
@@ -312,6 +370,7 @@ pub struct TableDesigner {
     ddl_preview_input: Entity<EditorState>,
     preview_refresh_state: PreviewRefreshScheduleState,
     metadata_load_seq: usize,
+    structure_load: StructureLoadState,
     preview_generation: usize,
     sql_preview_loading: bool,
     executing: bool,
@@ -358,6 +417,52 @@ impl PreviewRefreshScheduleState {
 
     fn finish_refresh(&mut self) {
         self.refresh_pending = false;
+    }
+}
+
+/// 表结构加载的触发来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureLoadReason {
+    /// 打开既有表设计器时的首次加载。
+    InitialOpen,
+    /// 保存成功后按最新结构重载。
+    AfterSave,
+    /// 用户在列/索引工具栏主动刷新结构。
+    ManualRefresh,
+}
+
+/// 表结构加载态。
+///
+/// 首次打开和手动刷新都会把整块面板换成加载中：前者还没有结构可显示，
+/// 后者需要明确表达正在从数据库重建当前表单。保存后的自动重载留在原地，
+/// 避免表单闪烁。
+#[derive(Default)]
+struct StructureLoadState {
+    loading: bool,
+    refreshing: bool,
+}
+
+impl StructureLoadState {
+    fn begin(&mut self, reason: StructureLoadReason) {
+        self.loading = matches!(
+            reason,
+            StructureLoadReason::InitialOpen | StructureLoadReason::ManualRefresh
+        );
+        self.refreshing = true;
+    }
+
+    /// 加载结束（成功或失败都要调，否则面板会一直停在加载中）。
+    fn finish(&mut self) {
+        self.loading = false;
+        self.refreshing = false;
+    }
+
+    fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    fn is_refreshing(&self) -> bool {
+        self.refreshing
     }
 }
 
@@ -440,16 +545,18 @@ impl TableDesigner {
             )
         });
 
+        let can_refresh_structure = config.table_name.is_some();
         let columns_editor = cx.new(|cx| {
             ColumnsEditor::new(
                 config.database_type.clone(),
                 charsets.clone(),
                 column_editor_capabilities,
+                can_refresh_structure,
                 window,
                 cx,
             )
         });
-        let indexes_editor = cx.new(|cx| IndexesEditor::new(window, cx));
+        let indexes_editor = cx.new(|cx| IndexesEditor::new(can_refresh_structure, window, cx));
 
         let sql_preview_input = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -509,16 +616,18 @@ impl TableDesigner {
         let cols_sub = cx.subscribe_in(
             &columns_editor,
             window,
-            |this, _, _: &ColumnsEditorEvent, window, cx| {
-                this.schedule_preview_refresh(window, cx);
+            |this, _, event: &ColumnsEditorEvent, window, cx| match event {
+                ColumnsEditorEvent::Changed => this.schedule_preview_refresh(window, cx),
+                ColumnsEditorEvent::RefreshRequested => this.refresh_structure(window, cx),
             },
         );
 
         let idx_sub = cx.subscribe_in(
             &indexes_editor,
             window,
-            |this, _, _: &IndexesEditorEvent, window, cx| {
-                this.schedule_preview_refresh(window, cx);
+            |this, _, event: &IndexesEditorEvent, window, cx| match event {
+                IndexesEditorEvent::Changed => this.schedule_preview_refresh(window, cx),
+                IndexesEditorEvent::RefreshRequested => this.refresh_structure(window, cx),
             },
         );
 
@@ -540,6 +649,7 @@ impl TableDesigner {
             ddl_preview_input,
             preview_refresh_state: PreviewRefreshScheduleState::default(),
             metadata_load_seq: 0,
+            structure_load: StructureLoadState::default(),
             preview_generation: 0,
             sql_preview_loading: false,
             executing: false,
@@ -559,7 +669,7 @@ impl TableDesigner {
         designer.update_previews(window, cx);
 
         if designer.config.table_name.is_some() {
-            designer.load_table_structure("initial_open", cx);
+            designer.load_table_structure(StructureLoadReason::InitialOpen, cx);
         }
 
         designer
@@ -901,7 +1011,10 @@ impl TableDesigner {
                                             designer.config.table_name =
                                                 Some(request.table_name.clone());
                                         }
-                                        designer.load_table_structure("after_save", cx);
+                                        designer.load_table_structure(
+                                            StructureLoadReason::AfterSave,
+                                            cx,
+                                        );
                                     }
                                     ExecuteSuccessBehavior::CloseTab {
                                         tab_container,
@@ -1113,17 +1226,71 @@ impl TableDesigner {
         self.build_and_maybe_execute(design, column_renames, success_behavior, window, cx);
     }
 
-    pub fn load_table_structure(&mut self, reason: &'static str, cx: &mut Context<Self>) {
+    /// 从数据库重新读取当前表结构。
+    ///
+    /// 工具栏在列/索引子编辑器里，但元数据请求和加载状态归表设计器所有，
+    /// 这样两个 tab 共享同一个 loading 生命周期和查询路径。
+    fn refresh_structure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.table_name.is_none() || self.executing || self.structure_load.is_refreshing()
+        {
+            return;
+        }
+
+        if self.has_unsaved_changes(cx) {
+            self.confirm_refresh_structure(window, cx);
+            return;
+        }
+
+        self.load_table_structure(StructureLoadReason::ManualRefresh, cx);
+    }
+
+    fn confirm_refresh_structure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let designer_entity = cx.entity().clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let refresh_entity = designer_entity.clone();
+            let footer = DialogFooter::new().children(vec![
+                Button::new("cancel")
+                    .label(t!("Common.cancel").to_string())
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                    })
+                    .into_any_element(),
+                Button::new("discard-and-refresh")
+                    .label(t!("Table.discard_and_refresh").to_string())
+                    .danger()
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        refresh_entity.update(cx, |designer, cx| {
+                            designer.load_table_structure(StructureLoadReason::ManualRefresh, cx);
+                        });
+                    })
+                    .into_any_element(),
+            ]);
+
+            dialog
+                .title(t!("Table.refresh_structure").to_string())
+                .overlay_closable(false)
+                .close_button(false)
+                .footer(footer)
+                .child(t!("Table.refresh_discard_changes_prompt").to_string())
+        });
+    }
+
+    fn load_table_structure(&mut self, reason: StructureLoadReason, cx: &mut Context<Self>) {
         let Some(table_name) = self.config.table_name.clone() else {
             return;
         };
 
         self.metadata_load_seq += 1;
         let load_seq = self.metadata_load_seq;
+        self.structure_load.begin(reason);
+        self.set_editors_can_refresh(true, cx);
+        cx.notify();
         tracing::warn!(
             target: "table_designer_diag",
             seq = load_seq,
-            reason,
+            reason = ?reason,
             connection_id = %self.config.connection_id,
             database = %self.config.database_name,
             schema = ?self.config.schema_name,
@@ -1183,6 +1350,19 @@ impl TableDesigner {
                             error = %error,
                             "[table_designer_diag] load_table_structure Tokio task failed"
                         );
+                        let message = t!("Table.load_structure_failed", error = error.to_string())
+                            .to_string();
+                        let _ = cx.update(|cx| {
+                            if let Some(window_id) = cx.active_window() {
+                                cx.update_window(window_id, |_entity, window, cx| {
+                                    window.push_notification(message.clone(), cx);
+                                })
+                                .ok();
+                            }
+                        });
+                        let _ = this.update(cx, |designer, cx| {
+                            designer.finish_structure_load(cx);
+                        });
                         return;
                     }
                 };
@@ -1202,8 +1382,30 @@ impl TableDesigner {
             let _ = cx.update(|cx| {
                 if let Some(window_id) = cx.active_window() {
                     cx.update_window(window_id, |_entity, window, cx| {
-                        let columns = columns_result.ok();
-                        let indexes = indexes_result.ok();
+                        // 元数据读取失败时必须可见：否则设计器只剩表头，
+                        // 用户看到空网格却不知道发生了错误。
+                        let mut failures: Vec<String> = Vec::new();
+                        let columns = match columns_result {
+                            Ok(columns) => Some(columns),
+                            Err(error) => {
+                                failures.push(error.to_string());
+                                None
+                            }
+                        };
+                        let indexes = match indexes_result {
+                            Ok(indexes) => Some(indexes),
+                            Err(error) => {
+                                failures.push(error.to_string());
+                                None
+                            }
+                        };
+                        if !failures.is_empty() {
+                            window.push_notification(
+                                t!("Table.load_structure_failed", error = failures.join("; "))
+                                    .to_string(),
+                                cx,
+                            );
+                        }
                         let table_info = tables_result.ok().and_then(|tables| {
                             find_loaded_table_info(tables, &table_name, schema_name.as_deref())
                         });
@@ -1237,14 +1439,33 @@ impl TableDesigner {
                             );
                             designer.original_design = Some(original_design);
                             designer.update_previews(window, cx);
+                            designer.finish_structure_load(cx);
                         });
                     })
                 } else {
+                    let _ = this.update(cx, |designer, cx| {
+                        designer.finish_structure_load(cx);
+                    });
                     Err(anyhow::anyhow!("No active window"))
                 }
             });
         })
         .detach();
+    }
+
+    /// 收掉表结构加载态并刷新面板。
+    fn finish_structure_load(&mut self, cx: &mut Context<Self>) {
+        self.structure_load.finish();
+        cx.notify();
+    }
+
+    fn set_editors_can_refresh(&self, can_refresh: bool, cx: &mut Context<Self>) {
+        self.columns_editor.update(cx, |editor, cx| {
+            editor.set_can_refresh(can_refresh, cx);
+        });
+        self.indexes_editor.update(cx, |editor, cx| {
+            editor.set_can_refresh(can_refresh, cx);
+        });
     }
 
     fn build_original_design(
@@ -1518,14 +1739,36 @@ impl Render for TableDesigner {
             .size_full()
             .child(self.render_toolbar(cx))
             .child(self.render_tabs(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(self.render_active_tab(window, cx)),
-            )
+            .child(div().flex_1().w_full().overflow_hidden().child(
+                if self.structure_load.is_loading() {
+                    render_structure_loading(cx)
+                } else {
+                    self.render_active_tab(window, cx)
+                },
+            ))
     }
+}
+
+/// 表结构加载面板的调试选择器（供回归测试定位该面板）。
+const STRUCTURE_LOADING_SELECTOR: &str = "table-designer-structure-loading";
+
+/// 首次打开既有表时，列/索引/表信息还在路上：先给一个明确的等待反馈，
+/// 而不是先渲染一个空白表单再被数据填上。
+fn render_structure_loading(cx: &App) -> AnyElement {
+    v_flex()
+        .debug_selector(|| STRUCTURE_LOADING_SELECTOR.to_owned())
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(Spinner::new().with_size(Size::Large))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("Table.loading_structure").to_string()),
+        )
+        .into_any_element()
 }
 
 impl EventEmitter<TableDesignerEvent> for TableDesigner {}
@@ -1620,6 +1863,7 @@ impl TabContent for TableDesigner {
 
 pub enum ColumnsEditorEvent {
     Changed,
+    RefreshRequested,
 }
 
 /// 拖拽列时的视觉反馈
@@ -1668,6 +1912,7 @@ impl Render for ResizeColumnEditorColumn {
 
 pub struct ColumnsEditor {
     focus_handle: FocusHandle,
+    can_refresh: bool,
     columns: Vec<ColumnEditorRow>,
     selected_index: Option<usize>,
     column_widths: [Pixels; COLUMN_EDITOR_COLUMN_COUNT],
@@ -1714,6 +1959,7 @@ impl ColumnsEditor {
         database_type: DatabaseType,
         charsets: Vec<CharsetInfo>,
         column_editor_capabilities: ColumnEditorCapabilities,
+        can_refresh: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1735,6 +1981,7 @@ impl ColumnsEditor {
 
         Self {
             focus_handle,
+            can_refresh,
             columns: vec![],
             selected_index: None,
             column_widths: COLUMN_EDITOR_DEFAULT_WIDTHS,
@@ -1840,6 +2087,14 @@ impl ColumnsEditor {
             }
         }
 
+        cx.notify();
+    }
+
+    fn set_can_refresh(&mut self, can_refresh: bool, cx: &mut Context<Self>) {
+        if self.can_refresh == can_refresh {
+            return;
+        }
+        self.can_refresh = can_refresh;
         cx.notify();
     }
 
@@ -2251,6 +2506,7 @@ impl ColumnsEditor {
 
         let global_state = cx.global::<GlobalDbState>();
         let plugin = global_state.db_manager.get_plugin(&self.database_type).ok();
+        let primary_key_count = columns.iter().filter(|col| col.is_primary_key).count();
 
         for col in columns {
             let name_input = cx.new(|cx| {
@@ -2471,11 +2727,12 @@ impl ColumnsEditor {
                 scale_input,
                 nullable: col.is_nullable,
                 is_pk: col.is_primary_key,
-                auto_increment: if matches!(self.database_type, DatabaseType::SQLite) {
-                    col.is_primary_key && parsed_type.base_type.eq_ignore_ascii_case("INTEGER")
-                } else {
-                    parsed_type.is_auto_increment
-                },
+                auto_increment: column_is_auto_increment(
+                    &self.database_type,
+                    &col,
+                    &parsed_type,
+                    primary_key_count,
+                ),
                 is_unsigned: parsed_type.is_unsigned,
                 default_input,
                 comment_input,
@@ -2577,6 +2834,18 @@ impl ColumnsEditor {
                     .tooltip(t!("Table.delete_column").to_string())
                     .on_click(cx.listener(|this, _, _window, cx| this.remove_column(cx))),
             )
+            .when(self.can_refresh, |this| {
+                this.child(
+                    IconButton::new("refresh-columns", IconName::Refresh)
+                        .hit_size(Size::Small)
+                        .glyph_size(OneIconSize::Default)
+                        .tooltip(t!("Table.refresh_structure").to_string())
+                        .accessible_label(t!("Table.refresh_structure").to_string())
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(ColumnsEditorEvent::RefreshRequested);
+                        })),
+                )
+            })
             .child(div().flex_1())
             .child(
                 Input::new(&self.search_input)
@@ -2670,51 +2939,77 @@ impl ColumnsEditor {
             .into_any_element()
     }
 
+    /// 第 `col_ix` 列右缘的列宽抓取区：以列边界（本单元格右缘）为中心、两侧各
+    /// [`COLUMN_EDITOR_RESIZE_GRAB_PADDING`]。
+    ///
+    /// 表头单元格之间隔着 `gap_3`，所以这里不能像相邻列紧贴的表格那样左右各挂一半，
+    /// 而是让抓取区自己骑到边界上：往右多铺半格，落在那段空隙里，不会压到右侧单元格。
     fn render_column_resize_handle(&self, col_ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let group_id = SharedString::from(format!("column-editor-resize:{col_ix}"));
-        div()
-            .id(("column-editor-resize", col_ix))
-            .group(group_id.clone())
-            .absolute()
+        self.column_resize_band(format!("column-editor-resize:{col_ix}"), col_ix, cx)
+            .debug_selector(move || format!("column-editor-resize-{col_ix}"))
             .right_0()
-            .top_0()
-            .bottom_0()
-            .w(COLUMN_EDITOR_RESIZE_HANDLE_WIDTH)
-            .cursor_col_resize()
-            .occlude()
-            .flex()
-            .justify_end()
+            .mr(-COLUMN_EDITOR_RESIZE_GRAB_PADDING)
+            .w(COLUMN_EDITOR_RESIZE_GRAB_PADDING * 2.)
+            .group(group_id.clone())
+            .justify_center()
             .child(
                 div()
                     .h_full()
-                    .w(px(1.0))
+                    .w(COLUMN_EDITOR_RESIZE_LINE_WIDTH)
                     .bg(cx.theme().border.opacity(0.4))
                     .group_hover(&group_id, |el| el.bg(cx.theme().primary)),
             )
+            .into_any_element()
+    }
+
+    /// 一侧抓取区的交互核心（命中、光标、拖动）：位置与外观由调用方决定。
+    ///
+    /// 抓取区以列边界为中心、两侧各 [`COLUMN_EDITOR_RESIZE_GRAB_PADDING`]。以前是一条
+    /// 6px、整条缩在左列右缘里的抓取区：从边界右侧靠过来完全没有反馈，鼠标得精确停在
+    /// 那几个像素上才拉得动。
+    fn column_resize_band(
+        &self,
+        id: String,
+        boundary_col_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(COLUMN_EDITOR_RESIZE_GRAB_PADDING)
+            .flex()
+            .cursor_col_resize()
+            .occlude()
             .on_drag_move(cx.listener(
                 move |this, e: &DragMoveEvent<ResizeColumnEditorColumn>, _window, cx| {
                     let drag = e.drag(cx);
-                    if drag.entity_id != cx.entity_id() || drag.col_ix != col_ix {
+                    if drag.entity_id != cx.entity_id() || drag.col_ix != boundary_col_ix {
                         return;
                     }
 
-                    let width = this.column_width(col_ix);
+                    let width = this.column_width(boundary_col_ix);
                     let delta = e.event.position.x - e.bounds.center().x;
-                    Self::resize_column_width(&mut this.column_widths, col_ix, width + delta);
+                    Self::resize_column_width(
+                        &mut this.column_widths,
+                        boundary_col_ix,
+                        width + delta,
+                    );
                     cx.notify();
                 },
             ))
             .on_drag(
                 ResizeColumnEditorColumn {
                     entity_id: cx.entity_id(),
-                    col_ix,
+                    col_ix: boundary_col_ix,
                 },
                 |drag, _, _, cx| {
                     cx.stop_propagation();
                     cx.new(|_| drag.clone())
                 },
             )
-            .into_any_element()
     }
 
     fn render_row(&self, idx: usize, row: &ColumnEditorRow, cx: &Context<Self>) -> AnyElement {
@@ -2728,8 +3023,13 @@ impl ColumnsEditor {
             .gap_3()
             .px_3()
             .py_1p5()
-            .when(is_selected, |this| this.bg(cx.theme().primary.opacity(0.1)))
-            .hover(|this| this.bg(cx.theme().muted.opacity(0.3)))
+            .when(is_selected, |this| {
+                this.bg(cx.theme().primary.opacity(SELECTED_ROW_BACKGROUND_OPACITY))
+            })
+            .when_some(
+                row_hover_background(is_selected, cx.theme()),
+                |this, background| this.hover(move |style| style.bg(background)),
+            )
             .border_b_1()
             .border_color(cx.theme().border.opacity(0.5))
             .on_mouse_down(
@@ -2787,26 +3087,18 @@ impl ColumnsEditor {
                     .w(self.column_width(COLUMN_NULLABLE_COL))
                     .flex()
                     .justify_center()
-                    .child(
-                        Checkbox::new(("null", idx))
-                            .checked(row.nullable)
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.toggle_nullable(idx, cx)
-                            })),
-                    ),
+                    .child(Checkbox::new(("null", idx)).checked(row.nullable).on_click(
+                        cx.listener(move |this, _, _window, cx| this.toggle_nullable(idx, cx)),
+                    )),
             )
             .child(
                 div()
                     .w(self.column_width(COLUMN_PRIMARY_KEY_COL))
                     .flex()
                     .justify_center()
-                    .child(
-                        Checkbox::new(("pk", idx))
-                            .checked(row.is_pk)
-                            .on_click(
-                                cx.listener(move |this, _, _window, cx| this.toggle_pk(idx, cx)),
-                            ),
-                    ),
+                    .child(Checkbox::new(("pk", idx)).checked(row.is_pk).on_click(
+                        cx.listener(move |this, _, _window, cx| this.toggle_pk(idx, cx)),
+                    )),
             )
             .child(
                 div()
@@ -2991,10 +3283,12 @@ impl Render for ColumnsEditor {
 
 pub enum IndexesEditorEvent {
     Changed,
+    RefreshRequested,
 }
 
 pub struct IndexesEditor {
     focus_handle: FocusHandle,
+    can_refresh: bool,
     indexes: Vec<IndexEditorRow>,
     selected_index: Option<usize>,
     _subscriptions: Vec<Subscription>,
@@ -3007,14 +3301,23 @@ struct IndexEditorRow {
 }
 
 impl IndexesEditor {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(can_refresh: bool, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         Self {
             focus_handle,
+            can_refresh,
             indexes: vec![],
             selected_index: None,
             _subscriptions: vec![],
         }
+    }
+
+    fn set_can_refresh(&mut self, can_refresh: bool, cx: &mut Context<Self>) {
+        if self.can_refresh == can_refresh {
+            return;
+        }
+        self.can_refresh = can_refresh;
+        cx.notify();
     }
 
     fn add_index(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3201,7 +3504,19 @@ impl Render for IndexesEditor {
                             .glyph_size(OneIconSize::Default)
                             .tooltip(t!("Table.delete_index").to_string())
                             .on_click(cx.listener(|this, _, _window, cx| this.remove_index(cx))),
-                    ),
+                    )
+                    .when(self.can_refresh, |this| {
+                        this.child(
+                            IconButton::new("refresh-indexes", IconName::Refresh)
+                                .hit_size(Size::Small)
+                                .glyph_size(OneIconSize::Default)
+                                .tooltip(t!("Table.refresh_structure").to_string())
+                                .accessible_label(t!("Table.refresh_structure").to_string())
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(IndexesEditorEvent::RefreshRequested);
+                                })),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -3246,8 +3561,13 @@ impl Render for IndexesEditor {
                             .gap_3()
                             .px_3()
                             .py_1p5()
-                            .when(is_selected, |this| this.bg(cx.theme().primary.opacity(0.1)))
-                            .hover(|this| this.bg(cx.theme().muted.opacity(0.3)))
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().primary.opacity(SELECTED_ROW_BACKGROUND_OPACITY))
+                            })
+                            .when_some(
+                                row_hover_background(is_selected, cx.theme()),
+                                |this, background| this.hover(move |style| style.bg(background)),
+                            )
                             .border_b_1()
                             .border_color(cx.theme().border.opacity(0.5))
                             .on_mouse_down(
@@ -3564,6 +3884,8 @@ mod tests {
         clickhouse::ClickHousePlugin, mssql::MsSqlPlugin, mysql::MySqlPlugin, oracle::OraclePlugin,
         plugin::DatabasePlugin, postgresql::PostgresPlugin, sqlite::SqlitePlugin,
     };
+    use gpui_component::{Theme, ThemeColor};
+    use std::{cell::Cell, rc::Rc};
 
     /// 表设计器 DDL 断言仅覆盖仍带原生插件的数据库类型。
     ///
@@ -3604,6 +3926,23 @@ mod tests {
         ColumnsEditor::resize_column_width(&mut widths, COLUMN_EDITOR_COLUMN_COUNT, px(260.0));
 
         assert_eq!(COLUMN_EDITOR_DEFAULT_WIDTHS, widths);
+    }
+
+    #[test]
+    fn hovering_a_selected_row_keeps_the_selection_highlight() {
+        let theme = Theme::from(ThemeColor::dark().as_ref());
+
+        // 选中行不叠加悬停底色：悬停样式在基础样式之后 refine，一旦叠加就会
+        // 把选中底色盖掉，看起来像「鼠标移到这一行，高亮没了」。
+        assert_eq!(None, row_hover_background(true, &theme));
+        assert_eq!(
+            Some(theme.muted.opacity(HOVERED_ROW_BACKGROUND_OPACITY)),
+            row_hover_background(false, &theme)
+        );
+        assert_ne!(
+            row_hover_background(true, &theme),
+            row_hover_background(false, &theme)
+        );
     }
 
     fn build_col(name: &str) -> ColumnDefinition {
@@ -3847,6 +4186,60 @@ mod tests {
 
         assert_eq!(idx, 2);
         assert_eq!(data_types, vec!["INT", "VARCHAR", "jsonb"]);
+    }
+
+    #[test]
+    fn test_build_table_design_derives_primary_key_from_pk_index() {
+        // IPC 驱动的 schema/columns 不回列级主键（is_primary 恒 false），
+        // 设计器必须从 PK 索引成员反推，否则 PRIMARY KEY 整条丢失。
+        let columns = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "NUMBER(10)".to_string(),
+                is_nullable: false,
+                is_primary_key: false,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+            ColumnInfo {
+                name: "amount".to_string(),
+                data_type: "DECIMAL(10,4)".to_string(),
+                is_nullable: true,
+                is_primary_key: false,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+        ];
+        let indexes = vec![IndexInfo {
+            name: "PK_ORDERS".to_string(),
+            columns: vec!["ID".to_string()],
+            is_unique: true,
+            is_primary: true,
+            index_type: Some("NORMAL".to_string()),
+        }];
+
+        let design = build_table_design_from_metadata(
+            DatabaseType::Oracle,
+            "app".to_string(),
+            "orders".to_string(),
+            &columns,
+            &indexes,
+            None,
+            None,
+        );
+
+        assert!(design.columns[0].is_primary_key, "id must be primary");
+        assert!(!design.columns[1].is_primary_key, "amount must not be primary");
+        // 精度随 raw_type 走解析链，不能丢。
+        assert_eq!(design.columns[0].length, Some(10));
+        assert_eq!(design.columns[1].length, Some(10));
+        assert_eq!(design.columns[1].scale, Some(4));
     }
 
     #[test]
@@ -4809,10 +5202,11 @@ mod tests {
             comment: Some("会话ID".to_string()),
             charset: Some("utf8mb4".to_string()),
             collation: Some("utf8mb4_general_ci".to_string()),
+            is_auto_increment: false,
         };
         let parsed = MySqlPlugin::new().parse_column_type(&column.data_type);
 
-        let definition = column_info_to_definition(DatabaseType::MySQL, &column, parsed);
+        let definition = column_info_to_definition(DatabaseType::MySQL, &column, parsed, 0);
 
         assert_eq!(definition.data_type, "varchar");
         assert_eq!(definition.length, Some(255));
@@ -4832,6 +5226,7 @@ mod tests {
             comment: None,
             charset: None,
             collation: None,
+            is_auto_increment: false,
         };
         let enum_col = ColumnInfo {
             name: "status".to_string(),
@@ -4842,23 +5237,81 @@ mod tests {
             comment: None,
             charset: Some("utf8mb4".to_string()),
             collation: Some("utf8mb4_bin".to_string()),
+            is_auto_increment: false,
         };
 
         let numeric_definition = column_info_to_definition(
             DatabaseType::MySQL,
             &numeric,
             MySqlPlugin::new().parse_column_type(&numeric.data_type),
+            0,
         );
         let enum_definition = column_info_to_definition(
             DatabaseType::MySQL,
             &enum_col,
             MySqlPlugin::new().parse_column_type(&enum_col.data_type),
+            0,
         );
 
         assert!(numeric_definition.is_unsigned);
         assert_eq!(numeric_definition.length, Some(11));
         assert_eq!(enum_definition.data_type, "enum('todo','done')");
         assert_eq!(enum_definition.collation.as_deref(), Some("utf8mb4_bin"));
+    }
+
+    #[test]
+    fn test_column_info_to_definition_prefers_metadata_auto_increment() {
+        // MSSQL 的 IDENTITY 在类型字符串里没有任何痕迹，只能来自元数据；
+        // 以前这里只认类型字符串解析，设计器就会丢掉 IDENTITY。
+        let identity = ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            is_nullable: false,
+            is_primary_key: true,
+            default_value: None,
+            comment: None,
+            charset: None,
+            collation: None,
+            is_auto_increment: true,
+        };
+        let parsed = MsSqlPlugin::new().parse_column_type(&identity.data_type);
+        assert!(
+            !parsed.is_auto_increment,
+            "类型字符串解析不出 IDENTITY，这正是必须读元数据的原因"
+        );
+
+        let definition = column_info_to_definition(DatabaseType::MSSQL, &identity, parsed, 1);
+
+        assert!(
+            definition.is_auto_increment,
+            "元数据的自增标记必须传导到设计"
+        );
+    }
+
+    #[test]
+    fn test_column_info_to_definition_sqlite_rowid_alias_fallback() {
+        // 旧来源没填元数据时，SQLite 仍按「单列 INTEGER 主键 = rowid 别名」兜底。
+        let column = ColumnInfo {
+            name: "id".to_string(),
+            data_type: "INTEGER".to_string(),
+            is_nullable: false,
+            is_primary_key: true,
+            default_value: None,
+            comment: None,
+            charset: None,
+            collation: None,
+            is_auto_increment: false,
+        };
+        let parsed = SqlitePlugin::new().parse_column_type(&column.data_type);
+
+        let single_pk = column_info_to_definition(DatabaseType::SQLite, &column, parsed.clone(), 1);
+        let composite_pk = column_info_to_definition(DatabaseType::SQLite, &column, parsed, 2);
+
+        assert!(
+            single_pk.is_auto_increment,
+            "单列 INTEGER 主键是 rowid 别名"
+        );
+        assert!(!composite_pk.is_auto_increment, "联合主键不构成 rowid 别名");
     }
 
     #[test]
@@ -4907,6 +5360,126 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_composite_pk_first_column_is_not_auto_increment() {
+        // 复现 issue #301：WITHOUT ROWID 联合主键表的元数据。
+        let columns = vec![
+            ColumnInfo {
+                name: "device_id".to_string(),
+                data_type: "INTEGER".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+            ColumnInfo {
+                name: "tag_id".to_string(),
+                data_type: "INTEGER".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+            ColumnInfo {
+                name: "ts".to_string(),
+                data_type: "INTEGER".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+            ColumnInfo {
+                name: "value".to_string(),
+                data_type: "REAL".to_string(),
+                is_nullable: true,
+                is_primary_key: false,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+        ];
+
+        let design = build_table_design_from_metadata(
+            DatabaseType::SQLite,
+            "main".to_string(),
+            "datapoints".to_string(),
+            &columns,
+            &[],
+            None,
+            Some(&SqlitePlugin::new()),
+        );
+
+        let device_id = design
+            .columns
+            .iter()
+            .find(|col| col.name == "device_id")
+            .expect("device_id column should exist");
+        assert!(
+            !device_id.is_auto_increment,
+            "联合主键首列不应被当作自增，否则 DDL 渲染成 INTEGER PRIMARY KEY AUTOINCREMENT"
+        );
+        assert!(device_id.is_primary_key);
+    }
+
+    #[test]
+    fn sqlite_single_integer_pk_still_auto_increment() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "INTEGER".to_string(),
+                is_nullable: true,
+                is_primary_key: true,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                data_type: "TEXT".to_string(),
+                is_nullable: true,
+                is_primary_key: false,
+                default_value: None,
+                comment: None,
+                charset: None,
+                collation: None,
+                is_auto_increment: false,
+            },
+        ];
+
+        let design = build_table_design_from_metadata(
+            DatabaseType::SQLite,
+            "main".to_string(),
+            "users".to_string(),
+            &columns,
+            &[],
+            None,
+            Some(&SqlitePlugin::new()),
+        );
+
+        let id = design
+            .columns
+            .iter()
+            .find(|col| col.name == "id")
+            .expect("id column should exist");
+        assert!(
+            id.is_auto_increment,
+            "单列 INTEGER 主键仍是 rowid 别名，应保留自增语义"
+        );
+    }
+
+    #[test]
     fn find_loaded_table_info_matches_schema_when_available() {
         let found = find_loaded_table_info(
             vec![
@@ -4952,5 +5525,346 @@ mod tests {
             None,
         );
         assert_eq!(found.and_then(|t| t.comment).as_deref(), Some("demo表"));
+    }
+
+    #[test]
+    fn initial_open_arms_the_structure_loading_panel() {
+        let mut state = StructureLoadState::default();
+
+        state.begin(StructureLoadReason::InitialOpen);
+
+        assert!(state.is_loading());
+    }
+
+    #[test]
+    fn after_save_reload_keeps_the_panel_in_place() {
+        let mut state = StructureLoadState::default();
+
+        state.begin(StructureLoadReason::AfterSave);
+
+        assert!(!state.is_loading());
+        assert!(state.is_refreshing());
+    }
+
+    #[test]
+    fn a_new_designer_starts_without_the_loading_panel() {
+        let state = StructureLoadState::default();
+
+        assert!(!state.is_loading());
+    }
+
+    #[test]
+    fn finishing_a_load_always_clears_the_loading_panel() {
+        let mut state = StructureLoadState::default();
+        state.begin(StructureLoadReason::InitialOpen);
+
+        state.finish();
+
+        assert!(!state.is_loading());
+    }
+
+    #[test]
+    fn manual_refresh_uses_the_full_structure_loading_panel() {
+        let mut state = StructureLoadState::default();
+
+        state.begin(StructureLoadReason::ManualRefresh);
+
+        assert!(state.is_loading());
+        assert!(state.is_refreshing());
+
+        state.finish();
+
+        assert!(!state.is_loading());
+        assert!(!state.is_refreshing());
+    }
+
+    #[test]
+    fn columns_and_indexes_toolbar_refresh_buttons_reach_the_parent_loader() {
+        let source = include_str!("table_designer_tab.rs");
+        let columns_header = source
+            .split("fn render_header(")
+            .nth(1)
+            .unwrap()
+            .split("fn render_table_header(")
+            .next()
+            .unwrap();
+        let indexes_header = source
+            .split("impl Render for IndexesEditor")
+            .nth(1)
+            .unwrap()
+            .split("impl EventEmitter<IndexesEditorEvent>")
+            .next()
+            .unwrap();
+
+        assert!(columns_header.contains("IconButton::new(\"refresh-columns\", IconName::Refresh)"));
+        assert!(columns_header.contains("cx.emit(ColumnsEditorEvent::RefreshRequested)"));
+        assert!(indexes_header.contains("IconButton::new(\"refresh-indexes\", IconName::Refresh)"));
+        assert!(indexes_header.contains("cx.emit(IndexesEditorEvent::RefreshRequested)"));
+
+        let subscriptions = source
+            .split("let cols_sub = cx.subscribe_in(")
+            .nth(1)
+            .unwrap()
+            .split("let mut designer = Self {")
+            .next()
+            .unwrap();
+        assert!(subscriptions.contains("ColumnsEditorEvent::RefreshRequested"));
+        assert!(subscriptions.contains("this.refresh_structure(window, cx)"));
+        assert!(subscriptions.contains("IndexesEditorEvent::RefreshRequested"));
+
+        let loader = source
+            .split("fn refresh_structure(")
+            .nth(1)
+            .unwrap()
+            .split("fn load_table_structure(")
+            .next()
+            .unwrap();
+        assert!(loader.contains("StructureLoadReason::ManualRefresh"));
+    }
+
+    #[test]
+    fn refresh_structure_messages_are_translated() {
+        let title = t!("Table.refresh_structure").to_string();
+        let prompt = t!("Table.refresh_discard_changes_prompt").to_string();
+
+        assert!(!title.contains("Table.refresh_structure"), "{title}");
+        assert!(
+            !prompt.contains("Table.refresh_discard_changes_prompt"),
+            "{prompt}"
+        );
+    }
+
+    /// 打开既有表时真实面板会先停在加载态（列/索引/表信息回来前不渲染空表单）。
+    #[gpui::test]
+    fn opening_an_existing_table_arms_the_loading_panel(cx: &mut gpui::TestAppContext) {
+        let (_designer, armed_at_open, _visual) = designer_window(cx, Some("users"));
+
+        assert!(armed_at_open);
+    }
+
+    /// 新建表没有可拉取的结构，不应该出现加载态。
+    #[gpui::test]
+    fn opening_a_new_table_keeps_the_form_visible(cx: &mut gpui::TestAppContext) {
+        let (_designer, armed_at_open, _visual) = designer_window(cx, None);
+
+        assert!(!armed_at_open);
+    }
+
+    /// 加载期间面板是加载中占位，而不是一片空白表单；加载结束后回到表单。
+    ///
+    /// 直接驱动加载态（不触发真实查询）：这里要验证的是渲染门控，
+    /// 触发时机由 `opening_an_existing_table_arms_the_loading_panel` 负责。
+    #[gpui::test]
+    fn structure_loading_replaces_the_panel_for_initial_open_and_manual_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (designer, _armed_at_open, visual) = designer_window(cx, None);
+
+        visual.update(|_window, cx| {
+            designer.update(cx, |designer, cx| {
+                designer
+                    .structure_load
+                    .begin(StructureLoadReason::InitialOpen);
+                cx.notify();
+            });
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_some());
+
+        visual.update(|_window, cx| {
+            designer.update(cx, |designer, cx| designer.finish_structure_load(cx));
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_none());
+
+        visual.update(|_window, cx| {
+            designer.update(cx, |designer, cx| {
+                designer
+                    .structure_load
+                    .begin(StructureLoadReason::ManualRefresh);
+                cx.notify();
+            });
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_some());
+
+        visual.update(|_window, cx| {
+            designer.update(cx, |designer, cx| designer.finish_structure_load(cx));
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_none());
+    }
+
+    /// 结构加载失败的提示必须能在当前 locale 解析出内容。
+    ///
+    /// 这条文案是加载失败时唯一的用户可见反馈（空白网格、没有提示正是本次
+    /// 问题的现场），key 打错会让用户直接看到原始 key。
+    #[test]
+    fn load_structure_failed_message_is_translated() {
+        let message = t!("Table.load_structure_failed", error = "boom").to_string();
+
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            !message.contains("Table.load_structure_failed"),
+            "{message}"
+        );
+    }
+
+    /// 表设计器第 0/1 列之间那条列边界上的抓取区。
+    const DESIGNER_HANDLE: &str = "column-editor-resize-0";
+    /// 拖动距离。留够余量，别和 2px 的拖动起步阈值贴太近。
+    const DESIGNER_DRAG_DISTANCE: f32 = 60.;
+    /// 拖动后列宽至少该增加这么多（指针相对边界有偏移，所以不写等号）。
+    const DESIGNER_WIDENED_AT_LEAST: f32 = 40.;
+
+    /// 第 `col_ix` 列的当前宽度。
+    fn designer_column_width(
+        designer: &Entity<TableDesigner>,
+        visual: &mut gpui::VisualTestContext,
+        col_ix: usize,
+    ) -> Pixels {
+        visual.read(|cx| {
+            designer
+                .read(cx)
+                .columns_editor
+                .read(cx)
+                .column_width(col_ix)
+        })
+    }
+
+    /// issue #333：表设计器的列宽抓取区必须骑在列边界上，而不是整条缩在左列右缘里。
+    ///
+    /// 表头单元格之间隔着 `gap_3`，抓取区是往右多铺半格、落进那段空隙里的，所以宽度
+    /// 是边界两侧各半格合起来的一整条。
+    #[gpui::test]
+    fn the_column_editor_grab_straddles_the_boundary(cx: &mut gpui::TestAppContext) {
+        let (_designer, _armed, visual) = designer_window(cx, None);
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let grab = visual
+            .debug_bounds(DESIGNER_HANDLE)
+            .expect("第 0 列右缘的抓取区应当被渲染出来");
+
+        assert_eq!(
+            COLUMN_EDITOR_RESIZE_GRAB_PADDING * 2.,
+            grab.size.width,
+            "抓取区应当以列边界为中心、两侧各铺半格插进空隙里"
+        );
+    }
+
+    /// 从 `start` 按下、向右拖 [`DESIGNER_DRAG_DISTANCE`]，返回属性列拖后的宽度。
+    fn drag_column_editor(
+        designer: &Entity<TableDesigner>,
+        visual: &mut gpui::VisualTestContext,
+        start: gpui::Point<Pixels>,
+    ) -> Pixels {
+        let end = gpui::point(start.x + px(DESIGNER_DRAG_DISTANCE), start.y);
+        visual.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        visual.simulate_mouse_move(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        // 多走一格再松手，确保拖动本身真正起步（起步阈值 2px）。
+        visual.simulate_mouse_move(
+            gpui::point(end.x + px(1.), end.y),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        visual.run_until_parked();
+
+        designer_column_width(designer, visual, COLUMN_NAME_COL)
+    }
+
+    /// issue #333：在列边界**右侧**（空隙那一侧）按下也要能拖动列宽。
+    ///
+    /// 分隔线画在抓取区正中，往右 3px 正是旧实现完全没有反馈的位置，按下去只会落到
+    /// 第 1 列的表头上。
+    #[gpui::test]
+    fn dragging_column_editor_from_the_right_of_the_line_widens_the_column(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (designer, _armed, visual) = designer_window(cx, None);
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let width_before = designer_column_width(&designer, visual, COLUMN_NAME_COL);
+        let grab = visual
+            .debug_bounds(DESIGNER_HANDLE)
+            .expect("第 0 列右缘的抓取区");
+        let width_after = drag_column_editor(
+            &designer,
+            visual,
+            gpui::point(grab.center().x + px(3.), grab.center().y),
+        );
+
+        assert!(
+            width_after > width_before + px(DESIGNER_WIDENED_AT_LEAST),
+            "从分隔线右侧拖动的也应是第 0 列被拖宽约 {DESIGNER_DRAG_DISTANCE}px：{width_before:?} → {width_after:?}"
+        );
+    }
+
+    /// issue #333：在列边界**左侧**按下要能拖动列宽（旧实现这条路径是好的，别改坏）。
+    #[gpui::test]
+    fn dragging_column_editor_from_the_left_of_the_line_widens_the_column(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (designer, _armed, visual) = designer_window(cx, None);
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let width_before = designer_column_width(&designer, visual, COLUMN_NAME_COL);
+        let grab = visual
+            .debug_bounds(DESIGNER_HANDLE)
+            .expect("第 0 列右缘的抓取区");
+        let width_after = drag_column_editor(
+            &designer,
+            visual,
+            gpui::point(grab.center().x - px(3.), grab.center().y),
+        );
+
+        assert!(
+            width_after > width_before + px(DESIGNER_WIDENED_AT_LEAST),
+            "从分隔线左侧拖动也应把第 0 列拖宽约 {DESIGNER_DRAG_DISTANCE}px：{width_before:?} → {width_after:?}"
+        );
+    }
+
+    /// 构造表设计器窗口，返回 (designer, 打开瞬间是否在加载态, visual)。
+    ///
+    /// 加载态在构造处当场采样：结构查询是异步的，回过头再读字段就会和「查询已经
+    /// 失败并收掉加载态」赛跑，采样点必须在同一个不中断的闭包内。
+    fn designer_window<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        table_name: Option<&str>,
+    ) -> (Entity<TableDesigner>, bool, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            one_core::gpui_tokio::init(cx);
+            cx.set_global(GlobalDbState::default());
+        });
+
+        let mut config = TableDesignerConfig::new("conn-1", "app", DatabaseType::MySQL);
+        if let Some(table_name) = table_name {
+            config = config.with_table_name(table_name);
+        }
+
+        let armed_at_open = Rc::new(Cell::new(false));
+        let probe = armed_at_open.clone();
+        let (designer, visual) = cx.add_window_view(move |window, cx| {
+            let designer = TableDesigner::new("表设计器", config, window, cx);
+            probe.set(designer.structure_load.is_loading());
+            designer
+        });
+
+        (designer, armed_at_open.get(), visual)
     }
 }

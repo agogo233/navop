@@ -85,9 +85,26 @@ impl ExecSupervisor {
         }
     }
 
+    /// Reintegrate 门控：只在无 exec 在途且未断连时放行。
+    /// 不改 readiness——注入生效后的 OSC `InputStart` 才是唯一翻转来源。
+    /// 嵌套 shell 卡在 `SubmissionPending`/`CommandRunning` 时也放行，
+    /// 那正是该动作的靶场景。
+    pub(crate) fn reintegrate_shell(&self) -> Result<(), TerminalControlError> {
+        if self.active.is_some() {
+            return Err(TerminalControlError::Busy);
+        }
+        match self.readiness {
+            ShellCommandReadiness::Disconnected => Err(TerminalControlError::Disconnected),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn start(&mut self, id: u64, request: TerminalExecRequest) -> Vec<ExecEffect> {
         if self.active.is_some() {
-            return fail(id, TerminalExecError::Busy);
+            // 另一个 exec 在途，readiness 上下文意义不大，但保持同一富化出口。
+            return fail(id, TerminalExecError::BusyContext {
+                readiness: format!("exec_in_flight {:?}", self.readiness),
+            });
         }
         if matches!(self.readiness, ShellCommandReadiness::Ready { .. }) {
             return if self.input_dirty {
@@ -105,7 +122,9 @@ impl ExecSupervisor {
         if !request.ready_timeout.is_zero() {
             return self.start_ready_wait(id, request);
         }
-        fail(id, TerminalExecError::Busy)
+        fail(id, TerminalExecError::BusyContext {
+            readiness: format!("{:?}", self.readiness),
+        })
     }
 
     pub(crate) fn on_input(&mut self, source: TerminalInputSource, data: &[u8]) -> Vec<ExecEffect> {
@@ -272,5 +291,7 @@ fn publish_progress(
 
 #[cfg(test)]
 mod capture_buffer_tests;
+#[cfg(test)]
+mod reintegrate_tests;
 #[cfg(test)]
 mod tests;

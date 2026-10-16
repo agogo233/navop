@@ -18,7 +18,12 @@ const CLIPBOARD_UNAVAILABLE_BACKOFF: Duration = Duration::from_secs(2);
 const REMOTE_CLIPBOARD_TRANSFER_BIT: u64 = 1 << 63;
 pub(super) const FIRST_LOCAL_CLIPBOARD_TRANSFER_ID: u64 = 1;
 const REMOTE_CLIPBOARD_STAGING_ROOT: &str = "navop-rdp-clipboard";
-
+/// Window during which a remote text announcement right after installing
+/// remote files is ignored: rdpclip re-announces a copied .txt file's text
+/// format after the file stream transfer, and honouring it would overwrite
+/// the just-installed file clipboard with plain text (making Finder paste a
+/// "已粘贴 <date>" file instead of the actual file).
+const REMOTE_TEXT_AFTER_FILES_SUPPRESS: Duration = Duration::from_secs(3);
 fn clipboard_sync_is_due(
     last_clipboard_unavailable_at: Option<Instant>,
     last_clipboard_sync_at: Option<Instant>,
@@ -55,6 +60,23 @@ pub(super) fn allocate_local_clipboard_transfer_id(next_id: &mut u64) -> u64 {
 
 fn is_remote_clipboard_transfer_id(transfer_id: u64) -> bool {
     transfer_id & REMOTE_CLIPBOARD_TRANSFER_BIT != 0
+}
+
+/// True while a just-installed file clipboard should be protected from remote
+/// text announcements (rdpclip re-announces a copied file's text format after
+/// the file stream transfer; honouring it would overwrite the file clipboard).
+fn remote_text_suppressed_after_files(installed_at: Option<Instant>, now: Instant) -> bool {
+    installed_at
+        .is_some_and(|at| now.saturating_duration_since(at) < REMOTE_TEXT_AFTER_FILES_SUPPRESS)
+}
+
+/// True while the clipboard still holds files installed from the remote and
+/// no local copy has superseded them. rdpclip re-announces a copied file's
+/// text format long after the stream transfer (observed ~15s later), so the
+/// fixed 3s window alone is not enough: as long as the installed files remain
+/// authoritative for this side, remote text must not clobber them.
+fn remote_text_suppressed_while_files_installed(files: Option<&Vec<String>>) -> bool {
+    files.is_some()
 }
 
 fn remote_clipboard_staging_root() -> PathBuf {
@@ -151,6 +173,21 @@ impl RemoteDesktopView {
         if self.last_clipboard_text.as_deref() == Some(text.as_str()) {
             return;
         }
+        // rdpclip re-announces a just-copied file's text format after the file
+        // stream transfer completes; installing that text would clobber the
+        // file clipboard. Ignore text while the installed files remain
+        // authoritative, plus a short window right after the install.
+        if remote_text_suppressed_while_files_installed(self.last_clipboard_files.as_ref())
+            || remote_text_suppressed_after_files(
+                self.last_clipboard_files_installed_at,
+                Instant::now(),
+            )
+        {
+            tracing::debug!(
+                "ignoring remote clipboard text while installed files hold the clipboard"
+            );
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         self.clear_clipboard_read_backoff();
         self.last_clipboard_text = Some(text);
@@ -210,7 +247,12 @@ impl RemoteDesktopView {
         self.clear_clipboard_read_backoff();
         self.last_clipboard_files = Some(path_strings);
         self.last_clipboard_text = None;
+        self.last_clipboard_files_installed_at = Some(Instant::now());
         self.last_clipboard_sync_at = Some(Instant::now());
+        tracing::info!(
+            files = count,
+            "installed remote clipboard files on the system clipboard"
+        );
         self.notify_clipboard_files_received(count, window, cx);
     }
 

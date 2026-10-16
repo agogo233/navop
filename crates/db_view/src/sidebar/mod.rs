@@ -30,11 +30,13 @@ use self::ai_context::{
     SelectedDatabaseScope, TableMentionLoad, TableMentionLoadParts, apply_database_scope,
 };
 use self::execution_history_panel::ExecutionHistoryPanel;
+use crate::sql_library::SqlLibraryPanel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPanel {
     AiChat,
     ExecutionHistory,
+    SqlLibrary,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,7 @@ pub struct DatabaseSidebar {
     active_panel: Option<SidebarPanel>,
     chat_panel: Entity<DefaultAgentChatPanel>,
     execution_history: Entity<ExecutionHistoryPanel>,
+    sql_library: Entity<SqlLibraryPanel>,
     connections: Vec<StoredConnection>,
     active_conn_id: Option<i64>,
     table_context_seq: usize,
@@ -60,6 +63,7 @@ impl DatabaseSidebar {
         connections: Vec<StoredConnection>,
         active_conn_id: Option<i64>,
         execution_history: Entity<ExecutionHistoryPanel>,
+        sql_library: Entity<SqlLibraryPanel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -106,6 +110,7 @@ impl DatabaseSidebar {
             active_panel: None,
             chat_panel,
             execution_history,
+            sql_library,
             connections,
             active_conn_id,
             table_context_seq: 0,
@@ -139,6 +144,11 @@ impl DatabaseSidebar {
                     history.reload(cx);
                 });
             }
+            if panel == Some(SidebarPanel::SqlLibrary) {
+                self.sql_library.update(cx, |library, cx| {
+                    library.reload(cx);
+                });
+            }
             cx.emit(DatabaseSidebarEvent::PanelChanged);
             cx.notify();
         }
@@ -154,6 +164,11 @@ impl DatabaseSidebar {
 
     pub fn is_panel_visible(&self) -> bool {
         self.active_panel.is_some()
+    }
+
+    /// 执行历史面板句柄：SQL 编辑器页签需要它来记录执行历史。
+    pub fn execution_history(&self) -> Entity<ExecutionHistoryPanel> {
+        self.execution_history.clone()
     }
 
     pub fn ask_ai(&mut self, message: String, cx: &mut Context<Self>) {
@@ -246,6 +261,9 @@ impl DatabaseSidebar {
                 IconName::BookOpen,
                 t!("DatabaseSidebar.execution_history").to_string(),
             ),
+            SidebarPanel::SqlLibrary => {
+                (IconName::SqlLibrary, t!("SqlLibrary.title").to_string())
+            }
         };
 
         IconButton::new(format!("database-sidebar-btn-{panel:?}"), Icon::new(icon))
@@ -274,6 +292,7 @@ impl DatabaseSidebar {
             .gap_1()
             .child(self.render_toolbar_button(SidebarPanel::AiChat, window, cx))
             .child(self.render_toolbar_button(SidebarPanel::ExecutionHistory, window, cx))
+            .child(self.render_toolbar_button(SidebarPanel::SqlLibrary, window, cx))
             .into_any_element()
     }
 
@@ -286,6 +305,7 @@ impl DatabaseSidebar {
         match panel {
             SidebarPanel::AiChat => self.chat_panel.clone().into_any_element(),
             SidebarPanel::ExecutionHistory => self.execution_history.clone().into_any_element(),
+            SidebarPanel::SqlLibrary => self.sql_library.clone().into_any_element(),
         }
     }
 }

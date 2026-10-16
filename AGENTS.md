@@ -176,8 +176,14 @@
 - 若无明确要求，则按当前任务所需执行最小准备，不做额外环境工程。
 - macOS 上 `reqwest` 默认系统代理探测可能在测试进程里触发
   `system-configuration` 的 NULL object panic；应用内需要“无应用代理”的
-  HTTP client 时，优先使用 `ReqwestClient::user_agent("onetcli")` 这类显式
+  HTTP client 时，使用 `ReqwestClient::user_agent_direct("onetcli")` 这类显式
   direct client 构造路径，并用相关 `setting_tab`/CLI 测试验证。
+- **默认客户端跟随系统/环境变量代理（2026-09-22 起）**：`ReqwestClient::user_agent` 不再强制
+  `.no_proxy()`，它跟随操作系统的系统代理与 `ALL_PROXY`/`HTTP_PROXY`/`HTTPS_PROXY`
+  （gpui-pre `fork-0.3.111` 起；此前该路径被改成 direct，导致「浏览器能上网、navop 登录报
+  `error sending request`」——用户把代理开在系统代理里，navop 却直连）。`proxy.enabled = false`
+  的语义因此是「交给系统/环境变量代理」而不是「直连」。需要强制直连时用 `user_agent_direct`。
+  排查该类问题的顺序见 skill `navop-cloud-login-network-diagnose`。
 
 ### Command Verification Rules
 
@@ -315,7 +321,21 @@
   - **验证方式**：如何确认这次处理是对的
   - **适用范围**：影响哪些模块、页面、链路或命令
 
+- **标题**：GPUI 事件订阅回调要求 `'static`，外层闭包里的局部变量必须 `move` 捕获
+- **触发信号**：编译报 `error[E0373]: closure may outlive the current function, but it borrows 'x', which is owned by the current function`，且报错点在 `cx.subscribe(...)` / `cx.observe(...)` 的回调上。
+- **根因 / 约束**：gpui 的 `App::subscribe` / `observe` 回调要求 `F: 'static`。当回调定义在一个 `move` 初始化闭包内部（典型场景：`window.use_keyed_state(key, cx, move |window, cx| { ... })` 里创建 Entity 并订阅自己的事件）时，若回调体只**读取**外层的局部变量，编译器会按引用捕获；这个引用指向初始化闭包的栈帧，不满足 `'static`。注意 `input` 这类由回调签名传入的参数（`&mut Entity<T>`）不算捕获，因此仓库里不涉及外层局部变量的既有写法不会暴露这个问题。
+- **正确做法**：给订阅回调加 `move`，让需要的外层变量按值捕获。若该变量是 `&'static str`、`String`、`Entity<T>` 这类本身可直接放进 `'static` 环境的值，`move` 即可；随后在回调体内再开的内层闭包（如 `update_and_save(cx, |settings| ...)`）会按引用借用这个已被按值捕获的变量，因外层已 `'static` 而不再是问题。反之，若变量是 `&mut Window` 之类借用型且生命周期短于回调，就不能靠 `move` 解决，要改为把所需数据先 `clone` 成拥有型再捕获。
+- **验证方式**：`cargo check -p main` 足以暴露（borrowck 在 type check 之后运行，type check 全绿不代表 borrowck 全绿）；若只想快速验证某个 view，可在 `use_keyed_state` 内故意引用一个外层局部变量看是否复现 E0373。
+- **适用范围**：所有在 `use_keyed_state` / `cx.new` 初始化闭包里订阅自身事件并引用外层局部变量的 GPUI 设置项与自定义组件。
+
 #### 已沉淀经验
+
+- **标题**：发布构建会被 Rust 工具链漂移打断，`setup-rust-toolchain` 默认带 `-D warnings`
+- **触发信号**：CI 发布构建报 `-D deprecated` / `-D warnings` 相关失败，且失败点在自己这次改动之外的既有代码里；典型如 `use of deprecated method ... fetch_update: renamed to try_update`。
+- **根因 / 约束**：`.github/workflows/release.yml` 调 `actions-rust-lang/setup-rust-toolchain@v1` 时没有覆盖 `rustflags`，而该 action 的**默认值就是 `-D warnings`**；工具链又未固定版本（跟随最新 stable）。因此 Rust 一次常规弃用就会让发布构建整体变红。仓库自身 `[workspace.lints.rust]` 只设了 `unexpected_cfgs`，`-D warnings` 不来自仓库配置。
+- **正确做法**：按编译器给出的建议改掉弃用点（保持签名与语义不变），不要为了绕过而给 workflow 加 `rustflags: ""` —— 那会永久关闭整个发布链路的告警。修完顺手 `grep -rn "<弃用 API>" --include=*.rs` 全仓扫一遍同类用法。
+- **验证方式**：`script/build-windows-rdp-probe.ps1` 是很好的快速反馈点——它在正式构建前就会 `cargo build/test` 编译 `one-core`、`windows-rdp-probe`、`windows_rdp_host`、`remote_desktop_view`；它通过后再看第 17 步 `Build release binary (Windows)`。
+- **适用范围**：所有走 release.yml 的发布构建（6 个平台都受影响）；新增平台或新 Rust stable 升级后优先怀疑这一类。
 
 - **标题**：扩展机制收敛时先做全仓 + 外部仓库死代码审计，`extension-api` 不是孤儿而是 WIT 契约宿主
 - **触发信号**：试图删除某个 extension-* crate 或“统一扩展机制”时，凭 `rg` 在 workspace 内没找到 `use extension_api` 就判定它是死 crate；或看到 `extension-host/src/runtime.rs` 的 `IpcExtensionRuntime`/`ComponentExtensionRuntime`/`ExtensionRuntimeFactory` 而以为它是统一运行时核心。
@@ -437,6 +457,13 @@
 - **验证方式**：覆盖 running/submission-pending 允许、ready/awaiting-prompt not-running、busy/unknown/disconnected 零写入、预取消零入队、control 后 observer 仍由真实终态完成；验证 Agent prompt 区分 `terminal_exec`、`terminal_control` 与取消按钮。
 - **适用范围**：`crates/terminal/src/exec_supervisor/*`、`crates/terminal/src/ssh_backend.rs`、`crates/terminal_view/src/public_mcp.rs`、Public MCP terminal control 工具与 Agent prompt。
 
+- **标题**：嵌套 shell 卡死 terminal_busy 用 reintegrate 注入恢复，不要尝试 Ctrl+C
+- **触发信号**：用户在可见 SSH 终端里进入 `sudo -i`、`su` 等嵌套 shell 后，`terminal.exec` 持续报 busy，且 `terminal.control action=interrupt` 发过 ETX 仍不恢复；滚屏看是空闲 root 提示符，session state 正常 connected。
+- **根因 / 约束**：shell integration 是登录时一次 eval 注入，不写 rc 文件，嵌套 shell 不继承；root shell 的提示符不再发 OSC 133/OSC 7，supervisor readiness 卡死在 `SubmissionPending`/`CommandRunning` 瞬态（cwd 也停在上报值）。ETX 对无集成 shell 无意义——空提示符上只回显 `^C` 重画提示符，不产生 OSC 事件，readiness 不会翻转；`on_input` 只在 `Ready` 态处理用户回车，手动按回车也救不回来。
+- **正确做法**：`terminal.control action=reintegrate`（High 风险显式动作）：actor 校验无 exec 在途且未断连（`ExecSupervisor::reintegrate_shell`，卡在瞬态 readiness 时放行），向 PTY 写 `runtime_shell_integration_command()`（幂等守卫已剥，root login shell 重置了环境变量，eval 必然生效）。注入后新提示符的 OSC `InputStart` 无条件把 readiness 翻回 Ready，状态机零改动自愈；Agent 等 1-2 秒后重试 exec。Busy 错误必须带 `BusyContext{readiness}` 富化文案引导 Agent 走 read→reintegrate→retry 链路，不要裸字符串。本地终端 reintegrate 返回 `terminal_control_unsupported`（本地集成形态不同，POSIX eval 注入体不适用），未来支持时在 local actor 接对应注入体。
+- **验证方式**：`cargo test -p terminal --lib reintegrate`（门控 fail-closed、瞬态放行、端到端自愈、SSH actor 注入 contract、local Unsupported contract）+ `cargo test -p public_mcp --test terminal_control`（schema enum、parse、reintegrate 结果 readiness_before=null、未知 action 拒绝）+ 三 crate 全量回归与 clippy。
+- **适用范围**：`crates/terminal/src/exec_supervisor/*`、`crates/terminal/src/ssh_backend.rs`、`crates/terminal/src/pty_backend.rs`、`crates/public_mcp/src/tools/terminal_control.rs`、Agent terminal 工具 prompt 与错误文案。
+
 - **标题**：Agent Auto 模式不进行工具审批，High/Critical 也直接执行
 - **触发信号**：Auto 模式下出现 `NeedUserInput` 工具确认卡，或 Agent→tool_runtime 映射仍把 high-risk policy 设为 `Ask`。
 - **根因 / 约束**：`ToolExecutionMode::Auto` 表达用户已授权 Agent 自主执行当前暴露工具；风险等级仍用于展示、审计和 Manual 模式审批，但不能在 Auto 模式再次暂停。`ReadOnly` 仍通过工具暴露过滤保证只读，不能用 Auto 的放行规则扩大其工具集合。
@@ -450,6 +477,13 @@
 - **正确做法**：在“手动确认/安全确认”模式的 ACP 权限卡中明确说明：允许 ACP 后，实际工具执行还会弹出一次安全确认窗口；如不需要二次审批，可将 MCP 权限模式切换为“自动执行”。Public MCP Ask 统一进入全局 Dialog，不再通过 ACP 一次性路由替换成第二张可操作消息卡。自动执行模式不显示上述提示，且 High/Critical 一并直接执行。
 - **验证方式**：覆盖手动确认卡片包含“安全确认、二次审批、自动执行”说明，自动执行卡片不含误导提示，ACP 后续 Public MCP 请求进入 Dialog 队列并展示完整脱敏参数，以及 Auto High/Critical 直接执行。
 - **适用范围**：`crates/ai_chat_view/src/acp/*`、`agent_transcript.rs`、`agent_view.rs`、`crates/public_mcp/src/permissions.rs`、`main/src/public_mcp_approval*`。
+
+- **标题**：Public MCP 的线上工具名必须净化，内部工具 id 保持带点分层
+- **触发信号**：Grok 这类 OpenAI 兼容客户端已经连上 Public MCP，却一个工具都列不出来（工具数为 0）；或新增带点工具 id 后，同一个工具在 ACP 与 MCP 两个入口显示成不同的名字。
+- **根因 / 约束**：Grok 注册函数时只接受 `[A-Za-z0-9_-]`，而 Navop 内部工具 id 用 `.` 分层（`ssh.command.poll`），带点的名字会在客户端注册阶段被整批丢弃；同时 Claude 等客户端接受 `.`，线上名字不能只按一种客户端的偏好来定。ACP 侧早已由 `ToolName` / `ToolNameAllocator` 完成净化，两条路各写一套会让同一工具在两个入口名字不一致。
+- **正确做法**：内部 id 一律不改（避免污染审批、审计与大量引用）；把 `PublicMcpToolRegistry::client_tools()` / `client_tool()` / `resolve_client_tool_name()` 作为唯一对外汇合点，复用 `agent_runtime::tools::{ToolName, ToolNameAllocator}`，并保持「先按内部 id 排序」的分配顺序，冲突（`sample.echo` 与 `sample_echo`）才会可复现且与 ACP 同名；`tools/call` 同时接受净化名与内部 id。对外暴露工具时不要直接读 `tools()`。
+- **验证方式**：协议层用例断言 `tools/list` 返回的每个名字都落在 `[A-Za-z0-9_-]` 内、且用净化名能成功执行 `tools/call`；单元用例覆盖 `sample.echo` / `sample_echo` 的冲突消解、对照表排序与双向解析；带点的内部 id 调用保持可用。
+- **适用范围**：`crates/public_mcp/src/tools/registry.rs`、`crates/public_mcp/src/protocol.rs`、`crates/agent_runtime/src/tools/spec.rs`、`crates/public_mcp/src/tools/agent_runtime_adapter.rs`。
 
 - **标题**：macOS 自定义标题栏中的可拖元素必须由应用显式接管标题栏拖动
 - **触发信号**：透明标题栏或 tab 栏中，按钮、输入框或 tab 的拖动被解释为窗口移动；为了规避问题出现 `allow_tab_drag = !is_macos` 一类平台禁用逻辑。
@@ -560,7 +594,7 @@
 - **触发信号**：想把 `main/src/shell_plugin_host` + `shell_plugin_tab` 之类“插件机制”抽出到新 crate，却发现 host 依赖 `UniversalPluginService`、`GlobalTabContainer`、headless `ExtensionConnectionTab` 等仍在 main 里的符号，而 Rust 库 crate 无法 `use main`（bin）。
 - **根因 / 约束**：迁移对象只要引用了任何仍留在 main 的类型，就必须把它们一起搬出或先下沉到 crate，否则必然双向依赖。`shell_plugc`…具体到 Navop：`shell_plugin_host/shell_plugin_tab/universal_plugins/extension_connection_tab/extension_connection_form` 是一整簇互相 `crate::` 引用的单元，`cx.global::<GlobalTabContainer>()` 这类 app 级 tab 打开入口是所有 UI 共同的硬依赖，只能把 `GlobalTabContainer`（仅 `Entity<TabContainer>` 包装）下沉到 `one_core::tab_container`，不能反向注入。
 - **正确做法**：整簇 5 个模块一次搬入新 crate（`crates/universal-plugins`），功能开关用 crate 自带 `shell-plugins` optional dep feature 表达（main 的 `shell-plugins` 改为 `["universal-plugins/shell-plugins"]`）。该 feature 自 2026-09-15 起列入 `main` 的 `default`，所以默认构建就带 Shell 页；`crates/universal-plugins` 自身仍保持 `default = []`（给它也设 default 反而会让 `main --no-default-features` 漏进 Shell 页，因为该开关只能关掉当前被选中包的 default）。feature off 时 crate 内这簇为空。搬移时把 `pub(crate)`→`pub` 只改 main 真实消费的边界（global 类型、load/service/open_connection/resource_connection/register_headless_tab 与 `ConnectionShellOpen` 字段），簇内引用 `crate::` 路径在新 crate 里解析位置不变，多数文件零改动。main 侧只改 import 路径。
-- **验证方式**：双态验证默认构建 `cargo check -p main`（含 shell-plugins）与关闭态 `cargo check -p main --no-default-features --features wasm-components,embedded-webview,windows-native-rdp`，各带 `--tests`；`cargo clippy -p universal-plugins --features shell-plugins --all-targets`；`cargo test -p universal-plugins --features shell-plugins`。改共享契约（如 `BindingContext` 加字段）后两态都要跑：漏编发生在关闭态一侧（feature 未开时整个 `shell_plugin_host` 不参与编译），只跑默认构建会漏掉它。
+- **验证方式**：双态验证默认构建 `cargo check -p main`（含 shell-plugins）与关闭态 `cargo check -p main --no-default-features --features wasm-components,windows-native-rdp`，各带 `--tests`；`cargo clippy -p universal-plugins --features shell-plugins --all-targets`；`cargo test -p universal-plugins --features shell-plugins`。改共享契约（如 `BindingContext` 加字段）后两态都要跑：漏编发生在关闭态一侧（feature 未开时整个 `shell_plugin_host` 不参与编译），只跑默认构建会漏掉它。（注意 `main` 的默认集自 2026-09-22 起不含 `embedded-webview`，它已改为全平台 opt-in，原因见 `main/Cargo.toml`。）
 - **适用范围**：`crates/universal-plugins`、`main/src/{home_strategy,home_tab/connection_forms,new_connection/form_page,navop_app,file_open,extension_update,home/home_tabs}`、`crates/core/src/tab_container.rs`，以及任何计划从 main 抽 UI 逻辑到新 crate 的后续重构。
 
 - **标题**：View 内联渲染自己的引用方会造成 GPUI 实体租约重入 panic
@@ -666,6 +700,35 @@
 - **正确做法**：统一用 `crates/process-util`：`process_util::configure_background_child(&mut std_command)`（std）或 `configure_tokio_background_child(&mut tokio_command)`（tokio）。写法必须是「先 `let mut command = Command::new(..)`、配好 args/env/stdio，再 configure，最后 `spawn()` / `output()`」，不能保留链式 `.spawn()`，否则没有可变绑定可配。仅当纯逻辑小 crate 不想为 `process-util`（它硬依赖 `tokio/process`）拉进 tokio 时，按 `main/src/file_association.rs` 先例内联 `#[cfg(windows)]` 的 `creation_flags(CREATE_NO_WINDOW)` helper，并配 `#[cfg(not(windows))]` 空实现避免 unused 告警。
 - **验证方式**：四条结构 contract（`include_str!` 断言源码里存在对应的 `configure_background_child` / `creation_flags`，沿用 `workspace_explorer/src/git/tests.rs` 风格）——`cargo test -p terminal --lib wsl_distributions`、`cargo test -p html-preview`、`cargo test -p workspace_explorer --lib backend`、`cargo test -p main --bin navop mcp_skill`；再跑受影响 crate 的 `cargo check --tests` 与 `cargo clippy --all-targets`（只比对改动文件是否有新增告警）。**macOS 上 `cfg(windows)` 分支根本不参与编译，本机无法验证「不闪窗」**，最终必须 Windows 实机启动一次确认。
 - **适用范围**：`crates/terminal/src/wsl_distributions.rs`（启动期 WSL 识别，commit 57e31731b 引入的遗漏）、`crates/html-preview/src/browser.rs`（Windows 走 `cmd /C start`）、`crates/workspace_explorer/src/backend.rs`（容器后端 `docker exec`）、`main/src/settings/mcp_skill_install.rs`（`npx`/`node` 启动器），以及所有新增后台外部命令调用点；`workspace_explorer/src/git.rs`、`core/cloud_sync/personal/git_store.rs`、`extension-host/src/process.rs`、`remote_desktop/src/backends/rdp/transport.rs`、`remote_file_editor/src/external_launcher.rs`、`main/src/file_association.rs` 是已按此约定收口的正确样例。
+
+- **标题**：macOS 弹窗「关闭即复用」必须同时结束业务会话，并用计数把受控保留和泄漏分开
+- **触发信号**：把弹窗关闭从 `remove_window()` 改成隐藏复用（`orderOut`）后，内存采样里 `GPUIView`/`CAMetalLayer` 只增不减；或反过来为了「彻底释放」把复用窗口改回销毁，于是 Touch Bar 机型又出现关闭闪退（issue #262）。
+- **根因 / 约束**：隐藏的窗口仍然活在 GPUI 内容树里，而内容树**强引用** `PopupWindowContent.view`；复用注册表只存 `WeakEntity`，管不到这份强引用。所以「只隐藏不卸载」＝上一次的业务 view（含数据、任务句柄）被一直扣着，用户不再打开那类窗口时就是纯泄漏；而销毁原生窗口又会触发 AppKit Touch Bar 观察者向已 dealloc 的对象注销并抛 ObjC 异常。两件事必须拆开：**原生窗口**隐藏复用（受控保留，上限＝复用键数量 + 一次性弹窗的停放次数），**业务会话**关闭即结束。
+- **正确做法**：`PopupWindowContent.view: Option<AnyView>`；`close_window_for_reuse(window, cx)` 在 `hide_for_reuse` 成功后**同步**调 `end_popup_session`（`window.blur` + `clear_notifications` + `end_session` 置 `None`），并靠 `Drop` 归还计数（没开保护的构建仍会销毁窗口，此时靠 `Drop` 归还）。清理不能交给 `defer`：延后清理存在「上一轮清理删掉刚打开的新会话」的窗口期，同步卸载没有这个窗口。只有**不是弹窗**的窗口（主窗口、远程编辑器窗口等不经过弹窗登记表的窗口）才 `remove_window()`。计数看 `popup_lifecycle`（`live_windows`/`live_sessions` 存量，`opened_*` 累计），日志 target `one_core::popup_lifecycle`；**不要**给注册表加 LRU 淘汰（淘汰即销毁，把崩溃挪到淘汰路径上）。
+- **关闭路线**：红点（原生 `windowShouldClose:`）和 Cmd-W 也必须接进同一漏斗，而且**弹窗一律只隐藏、不销毁**。`install_popup_close_routes` 要在 `reuse_key` 分支**之外**调用（一次性弹窗也要装）：原生红点默认会让 AppKit 在**它自己的关闭流程里**销毁窗口，那条路上窗口的响应者可能已经被 AppKit 释放，而 Touch Bar 查找器的观察要等下一个显示周期才注销，异常没人接住 ⇒ `-[NSApplication _crashOnException:]` abort（#308 / #314）。0.3.118 的真机结论是「确定」不崩、**红点仍崩** ⇒ 只要还剩一条会销毁的路线就还会崩，所以 `close_window_for_reuse` 对弹窗只 `orderOut` + 结束会话；没有复用键的一次性弹窗登记进 `PARKED_POPUPS` **停放**（代价：停放窗口数随打开次数增长，收敛方向是把热点弹窗改成 `open_reusable_popup_window`，而不是加回销毁）。销毁只允许出现在两处：「不是弹窗」的窗口，以及**没开保护**的构建（`hide_for_reuse` 返回 `Ok(false)`）。**隐藏失败（`Err`）不是销毁路径**：受保护模式下保留窗口与它的业务会话、记 error 日志、返回 `WindowCloseOutcome::Retained` —— 那条销毁同样会经过 AppKit 的关闭流程，把「关不掉」降级成「偷偷销毁」等于把崩溃挪回原位。`close_window_for_reuse` 的返回类型就是 `WindowCloseOutcome`（`Hidden` / `Destroyed` / `Retained`）、带 `#[must_use]`（要忽略就显式写 `let _ =`），语义不再是一个 `bool`；决策本身在纯函数 `close_plan(is_popup, &hide)` 里，四种输入组合由单测钉住（含注入的 `Err`）。**保存类流程还必须多做两件事，缺一不可**：（1）保存成功时**就地**把表单切到「已保存」（写回 id / 标记编辑态）——窗口留在屏幕上时再点一次「保存」会再插一条连接，旧代码是靠「窗口反正会消失」结束这一轮的；（2）关窗改用 `close_window_after_save(window, cx)`，它只在 `Retained` 时提示「已保存，但窗口没能关闭，可以重试关闭」。顺序不能倒：先把窗口藏起来再保存，保存失败时用户正在编辑的界面已经没了（`spawn` 之后立刻关窗的异步保存表单除外，它们用 `cx.update_window` 在保存落地后再补一次「切状态 + 关窗」）。
+- **验证方式**：`cargo test -p one-core --lib`（`popup_window::reuse_contract_tests`（`every_popup_intercepts_the_native_close_route`：两类弹窗都要装关闭路线、且这条路线在 `reuse_key` 分支之外；`popup_windows_are_hidden_and_never_destroyed`：`close_window_for_reuse` 里只允许剩一处 `window.remove_window();`（`ClosePlan::Destroy`，即「不是弹窗」与没开保护的 `Ok(false)`）；`close_plan` 的 `Err(_)` 必须是 `ClosePlan::Retain`、`close_window_after_save` 必须在 `Retained` 时 `push_notification`；`a_failed_hide_keeps_the_window_instead_of_destroying_it`（注入隐藏失败）、`save_flows_close_through_the_save_aware_funnel`、`save_flows_flip_the_form_into_its_saved_state`、`one_shot_popups_are_registered_as_parked`）、`popup_lifecycle::tests`）、`cargo check -p main -p db_view -p extension_view --all-targets`、`cargo test -p main --bin navop setting_tab`。计数判据：复用键弹窗首次打开 `live_windows` +1 后不再增长、关闭后 `live_sessions` 回落；`opened_windows` 随开关次数上涨说明复用没命中；**一次性弹窗的 `live_windows` 随打开次数上涨是预期行为**（停放，见 `docs/macos-memory-investigation.md` §10.7），但它的**绝对量**由 `docs/macos-window-reuse-acceptance.md` §5.1 的资源预算卡住（超预算就暂停往新窗口类型接复用，而不是把结论按「能解释」放过去）。**本机无 Touch Bar，崩溃无法本地复现**，行为层面必须真机验证，自动化只能靠 `include_str!` 源码契约守住「关闭路径必须走会话卸载」。注意这类契约对格式敏感：`popup_window_tests.rs` 用 `find("struct PopupWindowContent")` 切片，改结构体可见性或字段会让它的 `expect` 直接 panic，锚点要跟着改。
+- **适用范围**：`crates/core/src/{window_close,popup_window,popup_lifecycle}.rs`、`crates/core/src/popup_window_tests.rs`，以及所有 `open_reusable_popup_window` 调用点（更新对话框、代理设置、表导入/导出、SQL 运行/转储、比较窗口、离线扩展包对话框）。
+
+- **标题**：剪贴板 TSV 必须成对转义，否则「复制整行后粘贴丢字段」（issue #355）
+- **触发信号**：复制一行/一块表格数据，粘贴后列错位或少了若干字段，而剪贴板里看着数据是全的；典型诱因是某个字段里含 `\t`、`\n`、`\r` 或 `"`（多行文本、JSON、带引号的备注）。
+- **根因 / 约束**：可编辑表格（`one_ui::edit_table`）与结果集（`db_view::table_data`）共用同一套剪贴板格式「`\t` 分列、`\n` 分行」，但两侧各自手写：复制侧 `join("\t")` 原样写值，粘贴侧 `text.lines()` + `split('\t')` 裸切。值本身含分隔符时，复制那一刻就已经在剪贴板上被切成多个字段，粘贴侧无从还原——字段被挤到旁边的列或下一行，观感就是「丢了字段」。CSV 导出那条路早有 RFC 4180 引号转义，说明剪贴板链路只是没跟上。
+- **正确做法**：编解码收敛到 `one_ui::edit_table::tsv`（`escape_tsv_field` / `encode_tsv_row(s)` / `parse_tsv_rows`），四个读写点全走它：`EditTableState::action_copy` / `action_paste`（Ctrl+C/V）与 `CopyFormatter::format_tsv` / `results_delegate` 右键粘贴。规则：字段含 `\t`/`\n`/`\r`/`"` 才加引号并双写内部 `"`（普通值保持原样，粘到 Excel 也是标准格式）；**只有整段文本含 `\t`、换行或 `""` 时才按引号规则解转义**，这样从别处复制单值（JSON 片段、`C:\new\test` 这类路径）仍是原样写入，不会被误当引号字段抹掉引号。`\r\n` 算一个换行、末尾换行不补空行，与旧的 `str::lines()` 行为对齐（否则「复制一行」粘回来会多一行）。已知遗留：值恰为字面量 `\N` 与 SQL NULL 的标记仍无法区分，粘贴侧没有 NULL 语义，这次**没有**动它。
+- **验证方式**：`cargo test -p one-ui --lib tsv`（编解码单测：往返、引号/换行/制表符/回车/空值，加 `clipboard_sites_use_the_shared_codec` 契约测）、`cargo test -p db_view --lib copy_format`（`clipboard_tsv_round_trip_is_lossless` 走真实 `CopyFormatter::format(Tsv, ..)` → `parse_tsv_rows`：按旧规则先跑会精确复现「字段含制表符 → 4 列」「字段含换行 → 多一行且值错位」，改完转绿；`table_data_clipboard_sites_use_the_shared_codec` 用 `include_str!` 钉住两个右侧读写点不许退回 `split('\t')`）。回归面：`cargo test -p db_view --lib`（884）、`cargo test -p one-ui --lib`（114）、`cargo clippy -p one-ui -p db_view --all-targets`、`cargo check -p main`。
+- **适用范围**：`crates/one_ui/src/edit_table/{tsv.rs,tsv_tests.rs,state.rs,mod.rs}`、`crates/db_view/src/table_data/{copy_format.rs,results_delegate.rs}`；任何新增「写/读表格剪贴板」的调用点都必须走这套编解码，不要各自 `join("\t")` / `split('\t')`（`results_delegate` 的「复制列名」是给 SQL 用的，故意不转义）。
+
+- **标题**：拖拽分隔条的抓取区必须骑在边界两侧，细线别被 block 布局丢到盒子起点（issue #333）
+- **触发信号**：某条拖拽分隔条「很难拉」——光标要像素级对准某几个像素才变形，稍微偏一点就退回默认状态；或者给分隔条容器写了 `justify_center` / `items_center`，细线却跑到盒子起点／顶端。
+- **根因 / 约束**：这类站点把热区整条缩在边界一侧。`one_ui::resize_handle` 的 `HandlePlacement::Left`/`Right` 形态是 `w(1px)` + 单侧 `padding`（taffy 是 border-box，实测热区只有 4px），且 `left(px(1.))` / `right(px(1.))` 让细线不在边界上；`redis_view` 值表表头是 6px 整条缩在左列右缘里。从另一侧靠近时完全没有反馈。另一个更隐蔽的坑：gpui 的容器默认是 `display: block`（`Style::default().display = Block`，`div()` 不自动 flex），此时 `justify_content` / `align_items` **静默失效**，子元素被 block 布局丢到内容起点——`justify_center` 看着写了、实际没生效，必须显式 `.flex()`。
+- **正确做法**：热区宽度取「分隔线 + 两侧各 `edge_padding`」（`geometry::Resize::hit_area()`），用负边距跨到边界另一侧（`right_0() + mr(-pad)` / `left_0() + ml(-pad)` / `top_0() + mt(-pad)`），细线再用 `justify_center` / `items_center` 留在原位（实测 `right_0().mr(-4).w(9)` ⇒ 盒子 `[边界-5, 边界+4]`、线仍在 `[边界-1, 边界]`，视觉零变化）。相邻单元格紧贴的表头不能靠单个元素跨列：右侧单元格可能带 `overflow_hidden`，跨列的绝对定位会被裁掉，而且后画的兄弟节点先拿到鼠标 ⇒ 由左右两个单元格各渲染一半（各 4px、都留在自己单元格内），合计 8px 跨边界。`render_*_resize_handles` 要返回 `Vec<AnyElement>` 给调用方 `.children(...)`，不能套一层尺寸为零的 wrapper（`top_0`/`bottom_0` 按直接父节点解析，套一层热区高度会变 0）。
+- **验证方式**：`cargo test -p one-ui --lib resize_handle_tests`、`cargo test -p redis_view --lib value_table_columns_resize_tests`（在 `#[gpui::test]` 里用 `debug_bounds` 量热区和细线的真实 bounds：边界两侧各铺够、细线停在边界、从边界左右按下都能拖动同一列；含变异验证：负边距改成 0、抓取区退回单边 6px、去掉右列那一半，对应用例都转红）。回归面：`cargo test -p one-ui --lib`（117）、`cargo test -p redis_view --lib`（77）、`cargo clippy -p one-ui -p redis_view --all-targets`、`cargo check -p main --all-targets`。
+- **适用范围**：`crates/one_ui/src/resize_handle.rs`（面板分隔条：SQL 结果面板、数据库／Mongo／Redis 侧边栏、终端工具坞共用）、`crates/redis_view/src/value_table_columns.rs`、`crates/db_view/src/{database_table_columns,table_designer_tab}.rs`、`crates/db_view/src/table_data/cell_preview_host.rs`。**故意没改的两处**（不是漏改）：`crates/core/src/tab_container.rs` 的侧边栏手柄已经是 9px（`theme_geometry().resize.hit_area()`），它挂在带 `overflow_hidden` 的面板上，跨出去的那半会被裁掉，面板内侧 9px 已经够宽；`crates/terminal_view/src/view/command_bar/render.rs` 的命令栏手柄是 6px 通栏、不锚定某条边界、两侧对称，加高会吃掉终端内容和输入框的点击。要动这两处得先把手柄搬到不裁剪的父层，属于结构改动。
+
+- **标题**：标签页鼠标动作要复用 `close_tab` 入口；gpui-component 的 `TabBar` 无法在仓内加挂鼠标钩子
+- **触发信号**：给标签栏加中键关闭（或任何新的鼠标按键动作）时，考虑在渲染层再判一次 `closeable && !is_locked`；或想把同样的手势接到工作区文件编辑器、远程文件编辑器的二级页签上。
+- **根因 / 约束**：`TabContainer::close_tab` 已经负责 `closeable` 拒绝、`is_locked` 通知、`closing_tabs` 去重和 `try_close`（未保存确认），渲染层重复判断只会产生两套守卫漂移。实测中键 down+up 不会触发该标签自己的 `on_click`（判别场景：活动标签在前、中键点最后一个背景标签，活动标签仍是它），所以既不需要在 `on_click` 里排除中键，也不能顺手加一个「中键也切激活」的分支——那是不会执行的代码。二级页签侧：`gpui_component::tab::TabBar::child(impl Into<Tab>)` 只接受 `Tab`，不能塞进带 `on_mouse_down` 的 `div` 包装层，`Tab` 自身也没有中键/关闭回调，所以 `workspace_explorer/src/editor/render.rs` 与 `remote_file_editor/src/editor_window.rs` 的页签无法在本仓加中键，只能改 gpui-kit fork。
+- **正确做法**：手势直接调 `close_tab(idx)`；固定（pinned）标签没有 × 且 `remove_pinned_tab_by_id` 会绕过 `try_close`，不要把它当中键目标。测试锚点用 `.id(...)` 后接 `.debug_selector(move || format!("tab-container.tab-{idx}"))`（`debug_bounds` 收 `&'static str`，测试里写 `"tab-container.tab-1"` 字面量）。判别「不抢激活」的场景必须是**活动标签在前、中键点最后一个背景标签**——点中间标签时 `active_index` 钳位会恰好落回原活动标签，断言空跑。
+- **验证方式**：`cargo test -p one-core --lib middle_click`（`middle_click_closes_a_tab_without_hitting_the_close_button` 覆盖只关光标下的标签且不抢激活；`middle_click_respects_uncloseable_tabs_and_leaves_left_click_alone` 覆盖不可关闭标签、固定标签与左键仍只切换）；变异验证：把 `close_tab(idx)` 改成 `close_tab(idx + 99)` 后第一条用例必须转红。回归面：`cargo test -p one-core --lib`、`cargo clippy -p one-core --all-targets`、`cargo check -p main --all-targets`。
+- **适用范围**：`crates/core/src/tab_container.rs` 的标签栏手势，以及任何想给 gpui-component `TabBar` 页签加鼠标动作的站点。
 
 ### 执行原则
 

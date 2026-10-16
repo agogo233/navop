@@ -414,6 +414,7 @@ pub trait EditTableDelegate: Sized + 'static {
         false
     }
 
+    /// 新增一行。返回新行在**视图层**的显示行号（列筛选生效时不等于数据行下标）。
     fn on_row_added(
         &mut self,
         window: &mut Window,
@@ -422,12 +423,29 @@ pub trait EditTableDelegate: Sized + 'static {
         0
     }
 
+    /// 删除一行。`row_ix` 是视图层的显示行号。
     fn on_row_deleted(
         &mut self,
         row_ix: usize,
         window: &mut Window,
         cx: &mut Context<EditTableState<Self>>,
     ) {
+    }
+
+    /// 一次删除多行。`display_row_indices` 是视图层的显示行号。
+    ///
+    /// 默认逐行转交 [`Self::on_row_deleted`]；行集会在删除过程中变化的委托（删掉未保存的
+    /// 新行会真的移除数据行，显示行号与数据行下标的映射随之改变）必须覆盖它，否则整批里
+    /// 后面的显示行号会落到别的行上。
+    fn on_rows_deleted(
+        &mut self,
+        display_row_indices: &[usize],
+        window: &mut Window,
+        cx: &mut Context<EditTableState<Self>>,
+    ) {
+        for &row_ix in display_row_indices {
+            self.on_row_deleted(row_ix, window, cx);
+        }
     }
 
     fn column_filter_enabled(&self, cx: &App) -> bool {
@@ -462,6 +480,22 @@ pub trait EditTableDelegate: Sized + 'static {
     /// 是否支持多选
     fn multi_select_enabled(&self, _cx: &App) -> bool {
         true
+    }
+
+    /// 是否支持表格内查找（Cmd/Ctrl+F）。
+    ///
+    /// 只有知道「显示行」顺序和单元格文本的 delegate 才能正确实现
+    /// 查找，所以默认关闭，由数据表格自行开启。
+    fn find_in_table_enabled(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// 返回该单元格参与查找的文本（`None` 表示按 SQL NULL 处理）。
+    ///
+    /// 默认取 `get_optional_cell_value`；二进制列等需要显示描述文本的
+    /// delegate 应重写此方法，让查找口径与用户看到的文本一致。
+    fn find_cell_text(&self, row_ix: usize, col_ix: usize, cx: &App) -> Option<String> {
+        self.get_optional_cell_value(row_ix, col_ix, cx)
     }
 
     /// 获取单元格的原始字符串值（用于复制）

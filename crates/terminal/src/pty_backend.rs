@@ -619,30 +619,37 @@ fn run_local_exec_supervisor(
                     let _ = result.send(Err(TerminalControlError::Cancelled));
                     true
                 } else {
-                    let readiness = match request.action {
+                    match request.action {
                         crate::TerminalControlAction::Interrupt => {
-                            supervisor.interrupt_foreground()
-                        }
-                    };
-                    match readiness {
-                        Ok(readiness_before) => {
-                            if event_loop_sender
-                                .send(Msg::Input(Cow::Owned(vec![0x03])))
-                                .is_ok()
-                            {
-                                let _ = result.send(Ok(TerminalControlOutput {
-                                    action: request.action,
-                                    sent: true,
-                                    readiness_before,
-                                }));
-                                true
-                            } else {
-                                let _ = result.send(Err(TerminalControlError::Disconnected));
-                                false
+                            let readiness = supervisor.interrupt_foreground();
+                            match readiness {
+                                Ok(readiness_before) => {
+                                    if event_loop_sender
+                                        .send(Msg::Input(Cow::Owned(vec![0x03])))
+                                        .is_ok()
+                                    {
+                                        let _ = result.send(Ok(TerminalControlOutput {
+                                            action: request.action,
+                                            sent: true,
+                                            readiness_before: Some(readiness_before),
+                                        }));
+                                        true
+                                    } else {
+                                        let _ = result
+                                            .send(Err(TerminalControlError::Disconnected));
+                                        false
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = result.send(Err(error));
+                                    true
+                                }
                             }
                         }
-                        Err(error) => {
-                            let _ = result.send(Err(error));
+                        // 本地终端集成形态不同（Windows profile 文件 / 未来 Unix
+                        // local 注入），POSIX eval 注入体不适用；fail closed 拒绝。
+                        crate::TerminalControlAction::Reintegrate => {
+                            let _ = result.send(Err(TerminalControlError::Unsupported));
                             true
                         }
                     }
@@ -1429,7 +1436,7 @@ mod tests {
                     .send(Ok(crate::TerminalControlOutput {
                         action: request.action,
                         sent: true,
-                        readiness_before: crate::TerminalControlReadiness::CommandRunning,
+                        readiness_before: Some(crate::TerminalControlReadiness::CommandRunning),
                     }))
                     .unwrap();
             }

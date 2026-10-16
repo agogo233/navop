@@ -286,6 +286,8 @@ async fn resolve_ssh_target(
         host_key_verifier: HostKeyVerifier::default(),
         x11_forwarding: false,
         allow_legacy_algorithms: false,
+        forward_agent: false,
+        agent_identities: Vec::new(),
     };
 
     let tunnel_result = timeout(
@@ -344,6 +346,28 @@ fn build_auth(config: &SshTunnelConfig) -> Result<SshAuth, TunnelError> {
             passphrase: optional_value(&config.private_key_passphrase),
             certificate_path: None,
         }),
+        // 组合认证：一个隧道配置里同时带密码与私钥两个因素。
+        "password_and_private_key" => {
+            let password = required_value("password", config.password.as_deref().unwrap_or(""))?;
+            let passphrase = optional_value(&config.private_key_passphrase);
+            let key = match (
+                optional_value(&config.private_key_content),
+                optional_value(&config.private_key_path),
+            ) {
+                (Some(private_key), _) => SshAuth::PrivateKeyContent {
+                    private_key,
+                    passphrase,
+                    certificate_path: None,
+                },
+                (None, Some(key_path)) => SshAuth::PrivateKey {
+                    key_path,
+                    passphrase,
+                    certificate_path: None,
+                },
+                (None, None) => return Err(TunnelError::MissingField("private_key_path")),
+            };
+            Ok(SshAuth::Chain(vec![SshAuth::Password(password), key]))
+        }
         _ => Ok(SshAuth::Password(required_value(
             "password",
             config.password.as_deref().unwrap_or(""),

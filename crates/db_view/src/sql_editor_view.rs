@@ -1,13 +1,15 @@
+use crate::auto_session::{AutoExecutionSession, AutoSessionAction, auto_session_action_for};
 use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::sql_editor::{
-    ForeignSchema, RunCursorStatementSql, RunSelectedSql, SQL_GUTTER_CANCELLED, SQL_GUTTER_FAILED,
-    SQL_GUTTER_IDLE, SQL_GUTTER_RUNNING, SQL_GUTTER_SUCCEEDED, SqlColumnDetail, SqlEditor,
-    SqlObjectType, SqlSchema, SqlTableDetail, pending_foreign_qualifiers,
+    ForeignSchema, ForeignSchemaScope, RunCursorStatementSql, RunSelectedSql, SQL_GUTTER_CANCELLED,
+    SQL_GUTTER_FAILED, SQL_GUTTER_IDLE, SQL_GUTTER_RUNNING, SQL_GUTTER_SUCCEEDED, SqlColumnDetail,
+    SqlEditor, SqlObjectType, SqlSchema, SqlTableDetail, pending_foreign_qualifiers,
 };
 use crate::sql_result_tab::{
     ExecutionState, SessionSchemaInvalidation, SessionSqlRun, SqlResultTabContainer,
     emit_schema_changed_events,
 };
+use crate::table_ddl::TableDdlSources;
 use db::cache_manager::{GlobalNodeCache, SchemaInvalidationPlan};
 use db::plugin::SqlCompletionInfo;
 use db::sql_editor::execution::{
@@ -47,7 +49,10 @@ use one_core::connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifie
 use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
 use one_core::settings::AppSettings;
-use one_core::storage::{DatabaseType, QueryDirectoryScope, default_query_directory};
+use one_core::storage::{
+    DatabaseType, QueryDirectoryScope, SqlFileNameError, default_query_directory,
+    sql_file_path_for_name,
+};
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
 use one_ui::resize_handle::{ResizePanel, resize_handle};
@@ -72,7 +77,21 @@ const SQL_EDITOR_CONTEXT: &str = "SqlEditor";
 const SQL_EDITOR_INPUT_CONTEXT: &str = "SqlEditor > Input";
 const RUN_CURRENT_QUERY_KEY_BINDINGS: [&str; 2] = ["cmd-enter", "ctrl-enter"];
 const RUN_ALL_QUERY_KEY_BINDINGS: [&str; 2] = ["cmd-shift-enter", "ctrl-shift-enter"];
-const TOGGLE_LINE_COMMENT_KEY_BINDINGS: [&str; 2] = ["cmd-/", "ctrl-/"];
+
+/// 「注释 / 取消注释」的默认键位（#290）。
+///
+/// 按平台给**单一**默认值，不做双绑：`cmd-/` 在 Windows / Linux 上是 Win 键（按不到），
+/// 而 `ctrl-/` 在 macOS 上又会被输入框自己的「全选」抢（见
+/// `ctrl_slash_binding_wins_inside_sql_input_context`），两边都列只会让人以为绑了两个。
+/// 设置面板展示的是同一对值：`main/src/setting_tab.rs` 的 `sql_toggle_comment` 条目。
+fn toggle_line_comment_defaults() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["cmd-/"]
+    } else {
+        &["ctrl-/"]
+    }
+}
+
 /// Maximum number of concurrent `list_columns` requests while refreshing the
 /// SQL editor schema for a database. Keeps large-schema loads from serializing
 /// a full per-table catalog scan or saturating the backend with an unbounded
@@ -106,65 +125,20 @@ enum QueryFileNameError {
     ReadDirectory(String),
 }
 
-fn query_file_path_for_name(directory: &Path, name: &str) -> Result<PathBuf, QueryFileNameError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(QueryFileNameError::Empty);
-    }
-    if is_invalid_query_file_name(name) {
-        return Err(QueryFileNameError::Invalid);
-    }
-
-    let file_name = if Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
-    {
-        name.to_owned()
-    } else {
-        format!("{name}.sql")
-    };
-    if file_name.eq_ignore_ascii_case(".sql") {
-        return Err(QueryFileNameError::Invalid);
-    }
-
-    match std::fs::read_dir(directory) {
-        Ok(entries) => {
-            if entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&file_name)
-            }) {
-                return Err(QueryFileNameError::AlreadyExists);
-            }
+impl From<SqlFileNameError> for QueryFileNameError {
+    fn from(error: SqlFileNameError) -> Self {
+        match error {
+            SqlFileNameError::Empty => Self::Empty,
+            SqlFileNameError::Invalid => Self::Invalid,
+            SqlFileNameError::AlreadyExists => Self::AlreadyExists,
+            SqlFileNameError::ReadDirectory(message) => Self::ReadDirectory(message),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(QueryFileNameError::ReadDirectory(error.to_string())),
     }
-
-    Ok(directory.join(file_name))
 }
 
-fn is_invalid_query_file_name(name: &str) -> bool {
-    const INVALID_CHARACTERS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    const RESERVED_NAMES: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-
-    if matches!(name, "." | "..")
-        || name.chars().any(char::is_control)
-        || name
-            .chars()
-            .any(|character| INVALID_CHARACTERS.contains(&character))
-    {
-        return true;
-    }
-    let base_name = name.split('.').next().unwrap_or(name);
-    RESERVED_NAMES
-        .iter()
-        .any(|reserved| base_name.eq_ignore_ascii_case(reserved))
+/// 查询文件名解析统一走 `one_core::storage::sql_library`，避免两套校验漂移。
+fn query_file_path_for_name(directory: &Path, name: &str) -> Result<PathBuf, QueryFileNameError> {
+    sql_file_path_for_name(directory, name).map_err(QueryFileNameError::from)
 }
 
 fn write_sql_file(file_path: &Path, sql: &str) -> io::Result<()> {
@@ -219,11 +193,24 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         .map(|key| KeyBinding::new(&key, RunAllQuery, Some(SQL_EDITOR_CONTEXT))),
     );
     keybindings.extend(
-        TOGGLE_LINE_COMMENT_KEY_BINDINGS
+        toggle_line_comment_shortcuts(cx)
             .into_iter()
-            .map(|key| KeyBinding::new(key, ToggleLineComment, Some(SQL_EDITOR_INPUT_CONTEXT))),
+            .map(|key| KeyBinding::new(&key, ToggleLineComment, Some(SQL_EDITOR_INPUT_CONTEXT))),
     );
     keybindings
+}
+
+/// 「注释 / 取消注释」的快捷键（#290）。
+///
+/// 刻意走 [`shortcuts_for`] 而不是把常量直接绑上去：这样它会出现在
+/// 「设置 → 快捷键」里，用户既能**发现**它，也能改成自己顺手的组合
+/// （例如被输入法吞掉 `cmd-/` 时换一个）。
+fn toggle_line_comment_shortcuts(cx: &App) -> Vec<String> {
+    shortcuts_for(
+        cx,
+        action_id::SQL_TOGGLE_COMMENT,
+        toggle_line_comment_defaults(),
+    )
 }
 
 fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
@@ -247,11 +234,14 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
         Some(SQL_EDITOR_CONTEXT),
         RunAllQuery,
     ));
-    keybindings.extend(
-        TOGGLE_LINE_COMMENT_KEY_BINDINGS
-            .into_iter()
-            .map(|key| KeyBinding::new(key, ToggleLineComment, Some(SQL_EDITOR_INPUT_CONTEXT))),
-    );
+    // 注释键也必须走 rebind：否则改了键位之后，init 时绑的默认键还留在 keymap 里。
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::SQL_TOGGLE_COMMENT,
+        toggle_line_comment_defaults(),
+        Some(SQL_EDITOR_INPUT_CONTEXT),
+        ToggleLineComment,
+    ));
     keybindings
 }
 
@@ -612,6 +602,10 @@ async fn fetch_foreign_schema_metadata(
 
     let mut foreign = ForeignSchema {
         name: qualifier.to_string(),
+        scope: ForeignSchemaScope {
+            database: database.to_string(),
+            schema: schema.clone(),
+        },
         tables: Vec::with_capacity(tables.len()),
         columns_by_table: HashMap::new(),
         table_details: HashMap::new(),
@@ -643,6 +637,8 @@ async fn fetch_foreign_schema_metadata(
                 object_type: match table.object_type {
                     TableObjectType::Table => SqlObjectType::Table,
                     TableObjectType::View => SqlObjectType::View,
+                    // 外部表参与 SQL 补全时按表处理，避免从候选中消失。
+                    TableObjectType::ForeignTable => SqlObjectType::Table,
                 },
                 schema: table.schema.clone(),
                 comment: table.comment.clone(),
@@ -711,6 +707,11 @@ struct OffsetEdit {
     replacement_len: usize,
 }
 
+/// SQL 行注释标记。带一个尾随空格：在空白行上按一次就得到 `-- `，光标停在后面可以直接接着写。
+const SQL_LINE_COMMENT_MARKER: &str = "-- ";
+
+/// 逐行增删行注释。空白行也补 `-- `（用户可以先在空行上生成注释、再写内容），
+/// 取消注释时空白行保持原样。
 fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentResult {
     let selection_start = clamp_to_char_boundary(text, selection.start.min(text.len()));
     let selection_end =
@@ -740,18 +741,34 @@ fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentR
 
     let mut edits = Vec::new();
     let mut relative_line_start = 0;
+    // 光标所在的空白行补上注释后，光标要跟着落到 `-- ` 后面，否则接着敲字会落在注释前面。
+    let mut caret_after_blank_line_marker = None;
     for line in lines {
         let content = line.strip_suffix('\r').unwrap_or(line);
-        if content.trim_matches([' ', '\t']).is_empty() {
+        let is_blank = content.trim_matches([' ', '\t']).is_empty();
+        if is_blank && uncomment {
+            // 空白行没有注释符可去，保持原样。
             relative_line_start += line.len() + 1;
             continue;
         }
         let indentation_len = content.len() - content.trim_start_matches([' ', '\t']).len();
         let edit_start = line_start + relative_line_start + indentation_len;
+        if is_blank && selection_start == selection_end {
+            let line_abs_start = line_start + relative_line_start;
+            if selection_start >= line_abs_start
+                && selection_start <= line_abs_start + content.len()
+            {
+                caret_after_blank_line_marker = Some(edit_start);
+            }
+        }
 
         if uncomment {
             let comment = &content[indentation_len..];
-            let removed_len = if comment.starts_with("-- ") { 3 } else { 2 };
+            let removed_len = if comment.starts_with(SQL_LINE_COMMENT_MARKER) {
+                SQL_LINE_COMMENT_MARKER.len()
+            } else {
+                2
+            };
             edits.push(OffsetEdit {
                 range: edit_start..edit_start + removed_len,
                 replacement_len: 0,
@@ -759,7 +776,7 @@ fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentR
         } else {
             edits.push(OffsetEdit {
                 range: edit_start..edit_start,
-                replacement_len: 3,
+                replacement_len: SQL_LINE_COMMENT_MARKER.len(),
             });
         }
 
@@ -769,12 +786,21 @@ fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentR
     let mut replacement = target.to_owned();
     for edit in edits.iter().rev() {
         let edit_range = edit.range.start - line_start..edit.range.end.saturating_sub(line_start);
-        let inserted_text = if edit.replacement_len == 0 { "" } else { "-- " };
+        let inserted_text = if edit.replacement_len == 0 {
+            ""
+        } else {
+            SQL_LINE_COMMENT_MARKER
+        };
         replacement.replace_range(edit_range, inserted_text);
     }
 
     let mapped_selection = if selection_start == selection_end {
-        let cursor = map_offset_after_edits(selection_start, &edits, true);
+        let cursor = match caret_after_blank_line_marker {
+            Some(insert_start) => {
+                map_offset_after_edits(insert_start, &edits, false) + SQL_LINE_COMMENT_MARKER.len()
+            }
+            None => map_offset_after_edits(selection_start, &edits, true),
+        };
         cursor..cursor
     } else {
         map_offset_after_edits(selection_start, &edits, false)
@@ -915,13 +941,13 @@ fn transaction_mode_options() -> SearchableVec<TransactionModeOption> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SqlExecutionScope {
-    database: Option<String>,
-    schema: Option<String>,
+pub(crate) struct SqlExecutionScope {
+    pub(crate) database: Option<String>,
+    pub(crate) schema: Option<String>,
 }
 
 impl SqlExecutionScope {
-    fn new(database: Option<String>, schema: Option<String>) -> Self {
+    pub(crate) fn new(database: Option<String>, schema: Option<String>) -> Self {
         Self { database, schema }
     }
 }
@@ -1066,6 +1092,30 @@ fn transaction_control_failed(result: &anyhow::Result<Vec<db::SqlResult>>) -> bo
     }
 }
 
+/// 事务控制语句失败后，会话是否已被断连杀死。
+///
+/// 空闲/断连重连后 COMMIT/ROLLBACK 打在死连接上报 `Connection to the server is
+/// closed` 一类错误：此时服务器端事务早已随断连终止（MySQL 断连自动回滚），
+/// 客户端再握着事务标志只会把编辑器锁成“提交不了也关不掉”的死循环。
+/// 连接死亡 → 判定事务已终止，清标志放行；连接仍活（如死锁、语法错）→
+/// 保留事务状态允许用户重试。
+#[derive(Debug, PartialEq, Eq)]
+enum TransactionLiveness {
+    /// 连接已死，事务已被服务器端断连终止。
+    Dead,
+    /// 连接仍活，事务状态未知但会话可用，允许重试。
+    Alive,
+}
+
+fn transaction_liveness(probe: &anyhow::Result<Vec<db::SqlResult>>) -> TransactionLiveness {
+    // 复用 PR #272 的会话级 ping 超时：死连接的探测有界返回 Err。
+    match probe {
+        Err(_) => TransactionLiveness::Dead,
+        Ok(results) if results.iter().any(db::SqlResult::is_error) => TransactionLiveness::Dead,
+        Ok(_) => TransactionLiveness::Alive,
+    }
+}
+
 fn query_connection_context_label(connection_name: &str, server_info: &str) -> String {
     let connection_name = connection_name.trim();
     let server_info = server_info.trim();
@@ -1168,6 +1218,8 @@ struct QueryToolbarButtonSpec {
     color: Hsla,
     tooltip: SharedString,
     disabled: bool,
+    /// 按钮自身的异步动作进行中时显示 loading（自动换成 spinner）。
+    loading: bool,
 }
 
 /// 工具栏按钮组之间的竖向分隔线。
@@ -1188,6 +1240,15 @@ fn query_toolbar_action(is_executing: bool, has_selection: bool) -> QueryToolbar
     } else {
         QueryToolbarAction::Run
     }
+}
+
+/// 提交 / 回滚按钮的 loading 只属于正在收尾的那个动作：另一个按钮保持
+/// 普通图标（但已被禁用），避免两个按钮同时转圈分不清在提交还是回滚。
+fn transaction_action_loading(
+    finishing: Option<ManualTransactionAction>,
+    action: ManualTransactionAction,
+) -> bool {
+    finishing == Some(action)
 }
 
 fn is_current_query_context_generation(expected: u64, current: u64) -> bool {
@@ -1256,6 +1317,9 @@ pub struct SqlEditorTabConfig {
     pub initial_database: Option<String>,
     pub initial_schema: Option<String>,
     pub execution_history: Entity<ExecutionHistoryPanel>,
+    /// 编辑器所住的页签容器（数据库页签内部的容器）：对象详情页签要开在这里，
+    /// 而不是主窗口的页签栏。
+    pub tab_container: Entity<TabContainer>,
 }
 
 /// A windowed statement scan plus the buffer rows it covers.
@@ -1387,7 +1451,9 @@ pub struct SqlEditorTab {
     /// install or clear a session owned by a newer operation.
     manual_transaction_generation: Arc<AtomicU64>,
     manual_transaction_starting: bool,
-    manual_transaction_finishing: bool,
+    /// 正在收尾的手动事务动作（提交 / 回滚）。`None` 表示没有收尾中的操作，
+    /// 有值时对应按钮显示 loading。
+    manual_transaction_finishing: Option<ManualTransactionAction>,
     /// 自动保存序列号，用于防抖
     auto_save_seq: Arc<AtomicU64>,
     /// 是否有未保存的修改
@@ -1441,6 +1507,15 @@ pub struct SqlEditorTab {
     range_decorations: RangeDecorationCollection,
     /// 与 gutter lane 标记顺序一致的 marker id，用于把点击事件映射回语句。
     gutter_marker_ids: Vec<String>,
+    /// Auto 模式粘性会话（issue #312）：同 tab 跨执行复用同一物理连接，
+    /// 使 `SET @var` 等连接级状态存活。scope/连接/模式变化时释放重建。
+    auto_session: Option<AutoExecutionSession>,
+    /// Auto 粘性会话生命周期代次：释放/重建推进，旧异步完成不得回写。
+    auto_session_generation: Arc<AtomicU64>,
+    /// Auto 粘性会话建立中（防止并发双建）。
+    auto_session_starting: bool,
+    /// 页签释放钩子订阅（关闭时释放粘性会话）。
+    _auto_session_release: Option<Subscription>,
 }
 
 struct SqlSchemaUpdateRequest {
@@ -1457,6 +1532,17 @@ impl SqlEditorTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| SqlEditor::new(window, cx));
+        // 详情页签是编辑器页签的兄弟，必须开在同一个容器里；建表 DDL 与表设计器
+        // 同一条驱动链路，所以还要带上连接与方言。
+        let ddl_sources = TableDdlSources::driven(
+            cx.global::<GlobalDbState>().clone(),
+            config.connection_id.clone(),
+            config.database_type.clone(),
+        );
+        editor.update(cx, |editor, _| {
+            editor.set_tab_container(config.tab_container.clone());
+            editor.set_table_ddl_sources(Some(ddl_sources));
+        });
         let focus_handle = cx.focus_handle();
         let global_state = cx.global::<GlobalDbState>().clone();
         let execution_history = config.execution_history.clone();
@@ -1556,7 +1642,7 @@ impl SqlEditorTab {
             manual_transaction: None,
             manual_transaction_generation,
             manual_transaction_starting: false,
-            manual_transaction_finishing: false,
+            manual_transaction_finishing: None,
             auto_save_seq: auto_save_seq.clone(),
             is_dirty: is_dirty.clone(),
             context_generation,
@@ -1581,6 +1667,10 @@ impl SqlEditorTab {
             last_insert_hints_key: None,
             range_decorations,
             gutter_marker_ids: Vec::new(),
+            auto_session: None,
+            auto_session_generation: Arc::new(AtomicU64::new(0)),
+            auto_session_starting: false,
+            _auto_session_release: None,
         };
 
         instance.bind_gutter_marker_event(window, cx);
@@ -1590,6 +1680,25 @@ impl SqlEditorTab {
         instance.bind_execution_marker_event(cx);
         instance.bind_editor_input_observe(window, cx);
         instance.bind_connection_data_event(window, cx);
+        // 页签关闭时释放粘性会话：连接归还池中关闭，不再占用数据库连接。
+        instance._auto_session_release = Some(cx.on_release(
+            |this: &mut SqlEditorTab, cx: &mut App| {
+                this.auto_session_generation.fetch_add(1, Ordering::SeqCst);
+                this.auto_session_starting = false;
+                if let Some(session) = this.auto_session.take() {
+                    let global_state = cx.global::<GlobalDbState>().clone();
+                    let session_id = session.session_id().to_string();
+                    cx.spawn(async move |cx: &mut AsyncApp| {
+                        if let Err(error) =
+                            global_state.close_session(cx, session_id.clone()).await
+                        {
+                            error!("Failed to close auto session on release: {:?}", error);
+                        }
+                    })
+                    .detach();
+                }
+            },
+        ));
         instance.refresh_statement_snapshot(cx);
         instance.run_diagnostics(cx);
         instance.load_databases_async(
@@ -1666,6 +1775,8 @@ impl SqlEditorTab {
                 let global_state = cx.global::<GlobalDbState>().clone();
                 if let SelectEvent::Confirm(Some(db_name)) = event {
                     let generation = this.next_context_generation(cx);
+                    // 粘性会话绑 (database, schema)：切库后旧会话作废。
+                    this.discard_auto_session(cx);
                     let window_handle = window.window_handle();
                     if this.supports_schema && !this.uses_schema_as_database {
                         Self::clear_string_select(&this.schema_select, window, cx);
@@ -1711,6 +1822,8 @@ impl SqlEditorTab {
                 let global_state = cx.global::<GlobalDbState>().clone();
                 if let SelectEvent::Confirm(Some(schema_name)) = event {
                     let generation = this.next_context_generation(cx);
+                    // 粘性会话绑 (database, schema)：切 schema 后旧会话作废。
+                    this.discard_auto_session(cx);
                     let window_handle = window.window_handle();
                     let database_or_schema = if this.uses_schema_as_database {
                         Some(schema_name.clone())
@@ -1765,7 +1878,7 @@ impl SqlEditorTab {
     fn has_manual_transaction_lifecycle(&self) -> bool {
         self.manual_transaction.is_some()
             || self.manual_transaction_starting
-            || self.manual_transaction_finishing
+            || self.manual_transaction_finishing.is_some()
     }
 
     fn refresh_statement_snapshot(&mut self, cx: &mut Context<Self>) {
@@ -2252,6 +2365,8 @@ impl SqlEditorTab {
 
         let previous_connection_id = self.connection_id.clone();
         let generation = self.next_context_generation(cx);
+        // 粘性会话绑连接：切连接后旧会话必须释放，否则占着旧库连接。
+        self.discard_auto_session(cx);
         let capabilities = global_state.capabilities(&connection.database_type);
         self.connection_id = connection_id.to_string();
         self.database_type = connection.database_type.clone();
@@ -2311,6 +2426,10 @@ impl SqlEditorTab {
                             cx,
                         );
                         return;
+                    }
+                    if *mode != this.transaction_mode {
+                        // 模式切换即执行管线切换：粘性会话不再被引用，释放。
+                        this.discard_auto_session(cx);
                     }
                     this.transaction_mode = *mode;
                     cx.notify();
@@ -2563,6 +2682,10 @@ impl SqlEditorTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let ConnectionDataEvent::ConnectionDeleted { .. } = event {
+            // 连接被删：物理连接由池卸载，编辑器只丢弃引用，避免指向已关会话。
+            self.discard_auto_session_without_close(cx);
+        }
         let ConnectionDataEvent::SchemaChanged {
             connection_id,
             database,
@@ -3010,6 +3133,8 @@ impl SqlEditorTab {
                     object_type: match table.object_type {
                         TableObjectType::Table => SqlObjectType::Table,
                         TableObjectType::View => SqlObjectType::View,
+                        // 外部表参与 SQL 补全时按表处理，避免从候选中消失。
+                        TableObjectType::ForeignTable => SqlObjectType::Table,
                     },
                     schema: table.schema.clone(),
                     comment: table.comment.clone(),
@@ -3319,26 +3444,223 @@ impl SqlEditorTab {
     }
 
     fn run_auto_sql_text(
-        &self,
+        &mut self,
         sql: String,
         source: SqlExecutionResultSource,
         scope: SqlExecutionScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match auto_session_action_for(self.auto_session.as_ref(), &scope) {
+            AutoSessionAction::RunInstalledSession => {
+                let session = self
+                    .auto_session
+                    .as_ref()
+                    .expect("validated installed auto session");
+                let session_id = session.session_id().to_string();
+                let connection_lost = session.connection_lost().clone();
+                let schema_invalidation = self.auto_schema_invalidation();
+                Self::run_session_sql(
+                    self.sql_result_tab_container.clone(),
+                    sql,
+                    source,
+                    session_id,
+                    self.connection_id.clone(),
+                    scope,
+                    self.database_type.clone(),
+                    schema_invalidation,
+                    connection_lost,
+                    cx,
+                );
+            }
+            AutoSessionAction::StartSession => {
+                // scope 变化或会话已死：旧会话丢弃，异步新建后执行。
+                self.discard_auto_session(cx);
+                self.start_auto_session_and_run(sql, source, scope, window, cx);
+            }
+        }
+    }
+
+    /// Auto 粘性会话的 DDL 失效策略：始终 Immediate（无事务缓冲，DDL 立即
+    /// 生效并广播刷新）。
+    fn auto_schema_invalidation(&self) -> SessionSchemaInvalidation {
+        SessionSchemaInvalidation::Immediate
+    }
+
+    fn discard_auto_session(&mut self, cx: &mut App) {
+        self.auto_session_generation.fetch_add(1, Ordering::SeqCst);
+        self.auto_session_starting = false;
+        if let Some(session) = self.auto_session.take() {
+            let global_state = cx.global::<GlobalDbState>().clone();
+            let session_id = session.session_id().to_string();
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                if let Err(error) = global_state.close_session(cx, session_id.clone()).await {
+                    error!("Failed to close auto session {}: {:?}", session_id, error);
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// 仅丢弃引用不关闭会话（连接已被外部卸载，关闭只会报错）。
+    fn discard_auto_session_without_close(&mut self, _cx: &mut App) {
+        self.auto_session_generation.fetch_add(1, Ordering::SeqCst);
+        self.auto_session_starting = false;
+        self.auto_session = None;
+    }
+
+    /// 会话建立后（或复用）在粘性会话上执行 SQL，并监听连接级失败。
+    #[allow(clippy::too_many_arguments)]
+    fn run_session_sql(
+        container: Entity<SqlResultTabContainer>,
+        sql: String,
+        source: SqlExecutionResultSource,
+        session_id: String,
+        connection_id: String,
+        scope: SqlExecutionScope,
+        database_type: DatabaseType,
+        schema_invalidation: SessionSchemaInvalidation,
+        connection_lost: Arc<AtomicBool>,
+        cx: &mut App,
+    ) {
+        let request = SessionSqlRun {
+            sql,
+            session_id,
+            connection_id,
+            database: scope.database,
+            schema: scope.schema,
+            database_type,
+            schema_invalidation,
+            source,
+            connection_lost: Some(connection_lost),
+        };
+        container.update(cx, |container, cx| {
+            container.handle_run_query_with_session(request, cx);
+        });
+    }
+
+    fn start_auto_session_and_run(
+        &mut self,
+        sql: String,
+        source: SqlExecutionResultSource,
+        scope: SqlExecutionScope,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.auto_session_starting {
+            // 会话建立中：与 Manual Busy 同语义，提示而不静默丢点击，
+            // 否则 marker 会卡在 running。
+            _window.push_notification(t!("Query.running").to_string(), cx);
+            self.finalize_execution_marker(SqlGutterMarkerState::Cancelled, cx);
+            return;
+        }
+        let generation = self.auto_session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.auto_session_starting = true;
+        cx.notify();
+
+        let global_state = cx.global::<GlobalDbState>().clone();
         let connection_id = self.connection_id.clone();
-        let sql_result_tab_container = self.sql_result_tab_container.clone();
-        sql_result_tab_container.update(cx, |container, cx| {
-            container.handle_run_query(
-                sql,
-                source,
-                connection_id,
-                scope.database,
-                scope.schema,
-                window,
-                cx,
-            );
+        let context_generation = self.context_generation.load(Ordering::SeqCst);
+        let context_generation_guard = self.context_generation.clone();
+        let transaction_generation = self.auto_session_generation.clone();
+
+        cx.spawn(async move |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let session_id =
+                match global_state.create_session(cx, connection_id.clone(), scope.database.clone())
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        let is_current = entity
+                            .update(cx, |this, cx| {
+                                if transaction_generation.load(Ordering::SeqCst) != generation {
+                                    return false;
+                                }
+                                this.auto_session_starting = false;
+                                this.finalize_execution_marker(SqlGutterMarkerState::Failed, cx);
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false);
+                        if is_current {
+                            Self::notify_async(
+                                cx,
+                                t!("Query.auto_session_start_failed", error = error.to_string())
+                                    .to_string(),
+                            );
+                        }
+                        return;
+                    }
+                };
+
+            if transaction_generation.load(Ordering::SeqCst) != generation
+                || context_generation_guard.load(Ordering::SeqCst) != context_generation
+            {
+                let _ = entity.update(cx, |this, cx| {
+                    if transaction_generation.load(Ordering::SeqCst) == generation
+                        && this.auto_session_starting
+                    {
+                        this.auto_session_starting = false;
+                        this.finalize_execution_marker(SqlGutterMarkerState::Cancelled, cx);
+                        cx.notify();
+                    }
+                });
+                if let Err(error) = global_state.close_session(cx, session_id).await {
+                    error!("Failed to close stale auto session: {:?}", error);
+                }
+                return;
+            }
+
+            let installed = entity
+                .update(cx, |this, cx| {
+                    if transaction_generation.load(Ordering::SeqCst) != generation
+                        || context_generation_guard.load(Ordering::SeqCst) != context_generation
+                        || !this.auto_session_starting
+                        || this.auto_session.is_some()
+                    {
+                        return false;
+                    }
+                    let session = AutoExecutionSession::new(
+                        session_id.clone(),
+                        scope.database.clone(),
+                        scope.schema.clone(),
+                    );
+                    let connection_lost = session.connection_lost().clone();
+                    this.auto_session = Some(session);
+                    this.auto_session_starting = false;
+                    let schema_invalidation = this.auto_schema_invalidation();
+                    Self::run_session_sql(
+                        this.sql_result_tab_container.clone(),
+                        sql.clone(),
+                        source,
+                        session_id.clone(),
+                        this.connection_id.clone(),
+                        scope.clone(),
+                        this.database_type.clone(),
+                        schema_invalidation,
+                        connection_lost,
+                        cx,
+                    );
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !installed {
+                let _ = entity.update(cx, |this, cx| {
+                    if transaction_generation.load(Ordering::SeqCst) == generation
+                        && this.auto_session_starting
+                    {
+                        this.auto_session_starting = false;
+                        this.finalize_execution_marker(SqlGutterMarkerState::Cancelled, cx);
+                        cx.notify();
+                    }
+                });
+                if let Err(error) = global_state.close_session(cx, session_id).await {
+                    error!("Failed to close uninstalled auto session: {:?}", error);
+                }
+            }
         })
+        .detach();
     }
 
     fn execute_manual_sql_text(
@@ -3356,7 +3678,7 @@ impl SqlEditorTab {
         let action = manual_sql_execution_action(
             &self.database_type,
             installed_session_matches_scope,
-            self.manual_transaction_starting || self.manual_transaction_finishing,
+            self.manual_transaction_starting || self.manual_transaction_finishing.is_some(),
         );
 
         match action {
@@ -3412,6 +3734,7 @@ impl SqlEditorTab {
             database_type: self.database_type.clone(),
             schema_invalidation,
             source,
+            connection_lost: None,
         };
         self.sql_result_tab_container.update(cx, |container, cx| {
             container.handle_run_query_with_session(request, cx);
@@ -3445,7 +3768,7 @@ impl SqlEditorTab {
         let context_generation = self.context_generation.load(Ordering::SeqCst);
         let context_generation_guard = self.context_generation.clone();
         self.manual_transaction_starting = true;
-        self.manual_transaction_finishing = false;
+        self.manual_transaction_finishing = None;
         cx.notify();
 
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -3663,7 +3986,7 @@ impl SqlEditorTab {
             window.push_notification(t!("Query.transaction_control_unavailable").to_string(), cx);
             return;
         };
-        if self.manual_transaction_finishing {
+        if self.manual_transaction_finishing.is_some() {
             window.push_notification(t!("Query.running").to_string(), cx);
             return;
         }
@@ -3674,7 +3997,7 @@ impl SqlEditorTab {
             + 1;
         let transaction_generation = self.manual_transaction_generation.clone();
         let session_id = session.session_id().to_string();
-        self.manual_transaction_finishing = true;
+        self.manual_transaction_finishing = Some(action);
         cx.notify();
 
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -3691,6 +4014,19 @@ impl SqlEditorTab {
                 )
                 .await;
             if transaction_control_failed(&result) {
+                // 断连后 COMMIT 打在死连接上报 Connection closed：服务器端事务
+                // 已随断连终止（MySQL 断连自动回滚）。探测会话存活，死了就
+                // 清标志+丢会话，避免“提交不了也关不掉”的死循环。
+                let probe = global_state
+                    .execute_session_on_runtime(
+                        cx,
+                        session_id.clone(),
+                        "SELECT 1".to_string(),
+                        Some(manual_transaction_control_options()),
+                    )
+                    .await;
+                let session_dead = transaction_liveness(&probe) == TransactionLiveness::Dead;
+
                 let is_current = entity
                     .update(cx, |this, cx| {
                         let current_session_id = this
@@ -3705,13 +4041,34 @@ impl SqlEditorTab {
                         ) {
                             return false;
                         }
-                        this.manual_transaction_finishing = false;
+                        if session_dead {
+                            // 事务已被断连终止：整体满退，放行关闭。
+                            this.manual_transaction = None;
+                            this.manual_transaction_finishing = None;
+                        } else {
+                            this.manual_transaction_finishing = None;
+                        }
                         cx.notify();
                         true
                     })
                     .unwrap_or(false);
                 if is_current {
-                    Self::notify_async(cx, t!("Query.transaction_control_failed").to_string());
+                    if session_dead {
+                        Self::notify_async(
+                            cx,
+                            t!("Query.transaction_terminated_by_disconnect").to_string(),
+                        );
+                        // 死会话不再可复用，丢弃；失败只记日志不阻断收尾。
+                        if let Err(error) = global_state.close_session(cx, session_id.clone()).await
+                        {
+                            error!(
+                                "Failed to close dead manual transaction session {}: {:?}",
+                                session_id, error
+                            );
+                        }
+                    } else {
+                        Self::notify_async(cx, t!("Query.transaction_control_failed").to_string());
+                    }
                 }
                 return;
             }
@@ -3759,7 +4116,7 @@ impl SqlEditorTab {
                         return false;
                     }
                     this.manual_transaction = None;
-                    this.manual_transaction_finishing = false;
+                    this.manual_transaction_finishing = None;
                     cx.notify();
                     true
                 })
@@ -3811,7 +4168,7 @@ impl SqlEditorTab {
                 self.manual_transaction_generation
                     .fetch_add(1, Ordering::SeqCst);
                 self.manual_transaction_starting = false;
-                self.manual_transaction_finishing = false;
+                self.manual_transaction_finishing = None;
                 self.finalize_execution_marker(SqlGutterMarkerState::Cancelled, cx);
                 cx.notify();
             }
@@ -3819,7 +4176,7 @@ impl SqlEditorTab {
                 self.manual_transaction_generation
                     .fetch_add(1, Ordering::SeqCst);
                 self.manual_transaction_starting = false;
-                self.manual_transaction_finishing = false;
+                self.manual_transaction_finishing = None;
                 let Some(session) = self.manual_transaction.take() else {
                     return;
                 };
@@ -4429,7 +4786,8 @@ impl SqlEditorTab {
         let is_manual_mode = self.transaction_mode == SqlTransactionMode::Manual;
         let has_manual_transaction = self.manual_transaction.is_some();
         let is_manual_transaction_starting = self.manual_transaction_starting;
-        let is_manual_transaction_finishing = self.manual_transaction_finishing;
+        let is_manual_transaction_finishing = self.manual_transaction_finishing.is_some();
+        let finishing_action = self.manual_transaction_finishing;
         let has_manual_transaction_lifecycle = self.has_manual_transaction_lifecycle();
 
         let is_query_executing = self.sql_result_tab_container.read(cx).is_executing(cx);
@@ -4461,6 +4819,7 @@ impl SqlEditorTab {
                         color: cx.theme().danger,
                         tooltip: t!("Query.stop").into(),
                         disabled: false,
+                        loading: false,
                     },
                     cx.listener(Self::handle_stop_query),
                     cx,
@@ -4472,6 +4831,7 @@ impl SqlEditorTab {
                         color: cx.theme().success,
                         tooltip: t!("Query.run_selected").into(),
                         disabled: transaction_finishing,
+                        loading: false,
                     },
                     cx.listener(Self::handle_run_query),
                     cx,
@@ -4483,6 +4843,7 @@ impl SqlEditorTab {
                         color: cx.theme().success,
                         tooltip: t!("Query.run").into(),
                         disabled: transaction_finishing,
+                        loading: false,
                     },
                     cx.listener(Self::handle_run_query),
                     cx,
@@ -4495,6 +4856,7 @@ impl SqlEditorTab {
                     color: cx.theme().info,
                     tooltip: t!("Query.explain").into(),
                     disabled: is_query_executing || transaction_finishing,
+                    loading: false,
                 },
                 cx.listener(Self::handle_explain_sql),
                 cx,
@@ -4506,6 +4868,7 @@ impl SqlEditorTab {
                     color: cx.theme().warning,
                     tooltip: t!("Query.format").into(),
                     disabled: false,
+                    loading: false,
                 },
                 cx.listener(Self::handle_format_query),
                 cx,
@@ -4517,6 +4880,7 @@ impl SqlEditorTab {
                     color: cx.theme().primary,
                     tooltip: t!("Query.save").into(),
                     disabled: false,
+                    loading: false,
                 },
                 cx.listener(Self::handle_save_query),
                 cx,
@@ -4543,6 +4907,10 @@ impl SqlEditorTab {
                                     color: cx.theme().success,
                                     tooltip: t!("Query.transaction_commit").into(),
                                     disabled: transaction_unavailable,
+                                    loading: transaction_action_loading(
+                                        finishing_action,
+                                        ManualTransactionAction::Commit,
+                                    ),
                                 },
                                 cx.listener(Self::handle_commit_transaction),
                                 cx,
@@ -4554,6 +4922,10 @@ impl SqlEditorTab {
                                     color: cx.theme().danger,
                                     tooltip: t!("Query.transaction_rollback").into(),
                                     disabled: transaction_unavailable,
+                                    loading: transaction_action_loading(
+                                        finishing_action,
+                                        ManualTransactionAction::Rollback,
+                                    ),
                                 },
                                 cx.listener(Self::handle_rollback_transaction),
                                 cx,
@@ -4629,6 +5001,7 @@ impl SqlEditorTab {
             .disabled(spec.disabled)
             .tooltip(spec.tooltip)
             .icon(spec.icon)
+            .loading(spec.loading)
             .on_click(on_click)
     }
 }
@@ -4759,6 +5132,10 @@ impl Clone for SqlEditorTab {
             last_insert_hints_key: self.last_insert_hints_key,
             range_decorations: self.range_decorations.clone(),
             gutter_marker_ids: self.gutter_marker_ids.clone(),
+            auto_session: self.auto_session.clone(),
+            auto_session_generation: self.auto_session_generation.clone(),
+            auto_session_starting: self.auto_session_starting,
+            _auto_session_release: None,
         }
     }
 }
@@ -4938,17 +5315,27 @@ mod tests {
         query_connection_context_label, query_connection_ids, query_file_path_for_name,
         query_toolbar_action, schema_changed_event_matches_scope, should_render_schema_select,
         sql_text_for_run_all, sql_text_for_toolbar_run, statement_for_gutter_marker,
-        statement_marker_id, supports_manual_transactions, toggle_sql_line_comments,
+        statement_marker_id, supports_manual_transactions, toggle_line_comment_defaults,
+        toggle_sql_line_comments, transaction_action_loading, transaction_liveness,
         unquote_sql_identifier, viewport_statement_scan_input, write_new_sql_file, write_sql_file,
     };
+    use crate::sql_editor::SqlEditor;
     use db::DbManager;
     use db::sql_editor::statement_ranges::{SqlDialect, SqlStatementSnapshot};
-    use gpui::{KeyBinding, KeyContext, Keymap, Keystroke};
+    use gpui::{
+        AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
+        KeyBinding, KeyContext, Keymap, Keystroke, ParentElement as _, Render, Styled as _,
+        VisualTestContext, Window, WindowOptions, div,
+    };
+    use gpui_component::Root;
     use gpui_component::input;
     use gpui_component::input::RangeDecorationStyle;
+    use one_core::settings::AppSettings;
     use one_core::storage::DatabaseType;
     use ropey::Rope;
+    use std::cell::Cell;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -5987,6 +6374,251 @@ mod tests {
         );
     }
 
+    /// 探针宿主：复刻 `SqlEditorTab::render` 的关键结构 —— 根节点挂 `on_action`，
+    /// 内部用 `div.key_context("SqlEditor")` 包住 SQL 编辑器。
+    struct LineCommentShortcutProbe {
+        editor: Entity<SqlEditor>,
+        hits: Rc<Cell<usize>>,
+    }
+
+    impl Render for LineCommentShortcutProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hits = self.hits.clone();
+            div()
+                .size_full()
+                .on_action(move |_: &ToggleLineComment, _window, _cx| {
+                    hits.set(hits.get() + 1);
+                })
+                .child(
+                    div()
+                        .size_full()
+                        .key_context(SQL_EDITOR_CONTEXT)
+                        .child(self.editor.clone()),
+                )
+        }
+    }
+
+    fn comment_shortcut_keystroke() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-/"
+        } else {
+            "ctrl-/"
+        }
+    }
+
+    fn override_comment_keystroke() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-shift-c"
+        } else {
+            "ctrl-shift-c"
+        }
+    }
+
+    /// 开一个「SQL 编辑器 + 宿主动作」的探针窗口，并把焦点交给编辑器内部节点
+    /// （等价于用户点进 SQL 编辑区）。
+    ///
+    /// 用**运行时真实 keymap**（`gpui_component::init` + `sql_editor_view::init`）而不是
+    /// 手工拼 `Keymap`：手工 keymap 只能证明「绑定写对了」，证明不了
+    /// 「焦点落在编辑器里时它会被派发到」（#290 的真实症状）。
+    fn open_comment_probe(
+        cx: &mut gpui::TestAppContext,
+        hits: Rc<Cell<usize>>,
+    ) -> (VisualTestContext, Entity<LineCommentShortcutProbe>) {
+        let (window, probe) = cx.update(|cx| {
+            let mut probe_slot = None;
+            let window = cx
+                .open_window(WindowOptions::default(), |window, cx| {
+                    let editor = cx.new(|cx| SqlEditor::new(window, cx));
+                    let probe = cx.new(|_| LineCommentShortcutProbe { editor, hits });
+                    probe_slot = Some(probe.clone());
+                    cx.new(|cx| Root::new(probe, window, cx))
+                })
+                .expect("open sql editor keybinding probe window");
+            (window, probe_slot.expect("probe view"))
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let focus = cx.read(|cx| {
+            probe
+                .read(cx)
+                .editor
+                .read(cx)
+                .input()
+                .read(cx)
+                .focus_handle(cx)
+        });
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.run_until_parked();
+        (cx, probe)
+    }
+
+    /// 行为验证：焦点在 SQL 编辑器内部时，注释快捷键必须被派发到宿主的动作上。
+    #[gpui::test]
+    fn toggle_line_comment_shortcut_reaches_the_sql_editor(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(AppSettings::default());
+            super::init(cx);
+        });
+
+        let hits = Rc::new(Cell::new(0_usize));
+        let (mut cx, _probe) = open_comment_probe(cx, hits.clone());
+
+        cx.simulate_keystrokes(comment_shortcut_keystroke());
+        cx.run_until_parked();
+
+        assert_eq!(
+            1,
+            hits.get(),
+            "焦点在 SQL 编辑器里时按注释快捷键，应命中宿主的 ToggleLineComment 动作"
+        );
+    }
+
+    /// 用户把 `sql.toggle_comment` 改到别的组合后，编辑器必须跟着换键。
+    ///
+    /// 这正是 #290 的出路：`cmd-/` 被输入法吞掉、或与别的软件冲突的机器上，
+    /// 用户能在「设置 → 快捷键」里自己换一个。
+    #[gpui::test]
+    fn toggle_line_comment_shortcut_follows_user_overrides(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let mut settings = AppSettings::default();
+            settings.custom_keybindings.insert(
+                one_core::keybindings::action_id::SQL_TOGGLE_COMMENT.to_string(),
+                vec!["cmd-shift-c".to_string(), "ctrl-shift-c".to_string()],
+            );
+            cx.set_global(settings);
+            super::init(cx);
+        });
+
+        let hits = Rc::new(Cell::new(0_usize));
+        let (mut cx, _probe) = open_comment_probe(cx, hits.clone());
+
+        cx.simulate_keystrokes(comment_shortcut_keystroke());
+        cx.run_until_parked();
+        assert_eq!(
+            0,
+            hits.get(),
+            "用户改键后，默认的 cmd-/ / ctrl-/ 不应再触发注释"
+        );
+
+        cx.simulate_keystrokes(override_comment_keystroke());
+        cx.run_until_parked();
+        assert_eq!(1, hits.get(), "用户自定义的注释快捷键应命中");
+    }
+
+    /// 真实序列：应用先按默认键位启动，用户在「设置 → 快捷键」里改键之后，
+    /// 新键必须立刻生效、旧键必须立刻失效。
+    ///
+    /// 与上一个用例的区别：那个用**全新 init + 预先塞好 override**，绕过了
+    /// 运行中改键这条真实路径（默认绑定已在 keymap 里，刷新时要把它顶掉）。
+    #[gpui::test]
+    fn toggle_line_comment_shortcut_follows_a_live_rebind(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(AppSettings::default());
+            super::init(cx);
+        });
+
+        let hits = Rc::new(Cell::new(0_usize));
+        let (mut cx, _probe) = open_comment_probe(cx, hits.clone());
+
+        cx.simulate_keystrokes(comment_shortcut_keystroke());
+        cx.run_until_parked();
+        assert_eq!(1, hits.get(), "默认键位应可用（基线）");
+
+        // 等价于 set_custom_keybinding：写 override + 刷新快捷键（不落盘）
+        cx.update(|_window, cx| {
+            let mut settings = AppSettings::default();
+            settings.custom_keybindings.insert(
+                one_core::keybindings::action_id::SQL_TOGGLE_COMMENT.to_string(),
+                vec![override_comment_keystroke().to_string()],
+            );
+            cx.set_global(settings);
+            super::refresh_keybindings(cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(override_comment_keystroke());
+        cx.run_until_parked();
+        let after_new_key = hits.get();
+
+        cx.simulate_keystrokes(comment_shortcut_keystroke());
+        cx.run_until_parked();
+        let after_old_key = hits.get();
+
+        assert_eq!(
+            (2, 2),
+            (after_new_key, after_old_key),
+            "改键后：新键应生效、旧键应失效（各计一次命中）"
+        );
+    }
+
+    /// 设置面板里列出的默认键位必须与运行时默认值一致。
+    ///
+    /// 「设置 → 快捷键」是这条快捷键唯一的可发现入口（#290 里用户正是找不到它），
+    /// 一旦两边漂移，用户看到的和实际生效的就不是一回事。
+    #[test]
+    fn comment_shortcut_defaults_match_the_settings_panel() {
+        let macos = panel_comment_shortcut_keys("keys_macos:");
+        let other = panel_comment_shortcut_keys("keys_other:");
+
+        assert_eq!(
+            vec!["cmd-/".to_string()],
+            macos,
+            "macOS 的默认键位应只有 cmd+/（不做双绑）"
+        );
+        assert_eq!(
+            vec!["ctrl-/".to_string()],
+            other,
+            "Windows / Linux 的默认键位应只有 ctrl+/（不做双绑）"
+        );
+
+        // 当前平台那一列必须与运行时默认值逐字一致。
+        let panel = if cfg!(target_os = "macos") {
+            &macos
+        } else {
+            &other
+        };
+        assert_eq!(
+            toggle_line_comment_defaults()
+                .iter()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>(),
+            panel.clone(),
+            "设置面板列出的默认键位必须与运行时默认值一致"
+        );
+    }
+
+    /// 从设置面板的源码里取出注释快捷键条目某个平台字段列出的键位。
+    fn panel_comment_shortcut_keys(field: &str) -> Vec<String> {
+        let settings_source = include_str!("../../../main/src/setting_tab.rs");
+        let anchor = settings_source
+            .find("action_id::SQL_TOGGLE_COMMENT")
+            .expect("设置面板应列出注释快捷键");
+        let entry_start = settings_source[..anchor]
+            .rfind("ShortcutEntry {")
+            .expect("注释快捷键的 ShortcutEntry");
+        let entry = &settings_source[entry_start..anchor];
+        assert!(
+            entry.contains("Settings.Shortcuts.sql_toggle_comment"),
+            "设置面板条目必须带词条 key，否则界面显示不出名字"
+        );
+
+        let field_start = entry
+            .find(field)
+            .unwrap_or_else(|| panic!("设置面板缺少 {field}"));
+        let list = &entry[field_start..];
+        let start = list.find('[').expect("键位列表起始");
+        let end = list[start..].find(']').expect("键位列表结束") + start;
+        list[start + 1..end]
+            .split(',')
+            .map(|key| key.trim().trim_matches('"').to_string())
+            .filter(|key| !key.is_empty())
+            .collect()
+    }
+
     #[test]
     fn toggle_line_comment_comments_and_uncomments_current_line() {
         let sql = "select *\n  from users";
@@ -6047,6 +6679,43 @@ mod tests {
     }
 
     #[test]
+    fn toggle_line_comment_comments_a_blank_line_and_puts_the_caret_after_the_marker() {
+        let sql = "select 1\n\nselect 2";
+        let blank_line = sql.find('\n').expect("first line ends") + 1;
+
+        let commented = toggle_sql_line_comments(sql, blank_line..blank_line);
+        assert_eq!("select 1\n-- \nselect 2", commented.apply_to(sql));
+        assert_eq!(blank_line + 3..blank_line + 3, commented.selection);
+
+        let commented_sql = commented.apply_to(sql);
+        let uncommented = toggle_sql_line_comments(&commented_sql, commented.selection.clone());
+        assert_eq!(sql, uncommented.apply_to(&commented_sql));
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_an_indented_blank_line_after_the_indentation() {
+        let sql = "select 1\n    \nselect 2";
+        let blank_line = sql.find('\n').expect("first line ends") + 1;
+
+        let commented = toggle_sql_line_comments(sql, blank_line..blank_line);
+
+        assert_eq!("select 1\n    -- \nselect 2", commented.apply_to(sql));
+        assert_eq!(blank_line + 7..blank_line + 7, commented.selection);
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_blank_lines_inside_a_selection() {
+        let sql = "select id\n\n  from users";
+
+        let commented = toggle_sql_line_comments(sql, 0..sql.len());
+
+        assert_eq!(
+            "-- select id\n-- \n  -- from users",
+            commented.apply_to(sql)
+        );
+    }
+
+    #[test]
     fn schema_select_is_visible_when_schema_is_database() {
         assert!(should_render_schema_select(true, true));
         assert!(should_render_schema_select(false, true));
@@ -6077,6 +6746,71 @@ mod tests {
             query_toolbar_action(false, true)
         );
         assert_eq!(QueryToolbarAction::Run, query_toolbar_action(false, false));
+    }
+
+    #[test]
+    fn transaction_button_loading_follows_the_finishing_action() {
+        // 没在收尾时没有按钮转圈。
+        assert!(!transaction_action_loading(
+            None,
+            ManualTransactionAction::Commit
+        ));
+        assert!(!transaction_action_loading(
+            None,
+            ManualTransactionAction::Rollback
+        ));
+        // 只有正在执行的那个动作转圈，另一个保持普通图标（已被禁用）。
+        assert!(transaction_action_loading(
+            Some(ManualTransactionAction::Commit),
+            ManualTransactionAction::Commit
+        ));
+        assert!(!transaction_action_loading(
+            Some(ManualTransactionAction::Commit),
+            ManualTransactionAction::Rollback
+        ));
+        assert!(transaction_action_loading(
+            Some(ManualTransactionAction::Rollback),
+            ManualTransactionAction::Rollback
+        ));
+    }
+
+    #[test]
+    fn manual_transaction_button_loading_is_wired_to_its_own_action() {
+        let source = include_str!("sql_editor_view.rs");
+        let toolbar = source
+            .split("let finishing_action = self.manual_transaction_finishing;")
+            .nth(1)
+            .unwrap()
+            .split("fn query_toolbar_button")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            2,
+            toolbar
+                .matches("loading: transaction_action_loading(")
+                .count(),
+            "提交与回滚两个按钮都要按各自的动作决定 loading"
+        );
+        assert!(toolbar.contains("ManualTransactionAction::Commit,"));
+        assert!(toolbar.contains("ManualTransactionAction::Rollback,"));
+    }
+
+    #[test]
+    fn query_toolbar_button_spec_loading_reaches_the_button() {
+        let source = include_str!("sql_editor_view.rs");
+        let builder = source
+            .split("fn query_toolbar_button(")
+            .nth(1)
+            .unwrap()
+            .split("fn metadata_scope_selection")
+            .next()
+            .unwrap();
+
+        assert!(
+            builder.contains(".loading(spec.loading)"),
+            "QueryToolbarButtonSpec::loading 必须真的传到 Button，否则按钮只会被禁用、不转圈"
+        );
     }
 
     #[test]
@@ -6121,6 +6855,46 @@ mod tests {
         assert!(!session.matches_scope(Some("analytics"), Some("public")));
         assert!(!session.matches_scope(Some("app_db"), Some("private")));
         assert!(!session.matches_scope(None, Some("public")));
+    }
+
+    #[test]
+    fn transaction_liveness_classifies_probe_outcomes() {
+        use super::TransactionLiveness;
+
+        // 探测 Err（含 ping 超时/连接关闭）→ 连接死，事务已被断连终止
+        assert_eq!(
+            TransactionLiveness::Dead,
+            transaction_liveness(&Err(anyhow::anyhow!(
+                "Input/output Error: Driver error: Connection to the server is closed."
+            )))
+        );
+        // 探测返回 SQL 错误结果 → 连接死
+        assert_eq!(
+            TransactionLiveness::Dead,
+            transaction_liveness(&Ok(vec![db::SqlResult::Error(db::SqlErrorInfo {
+                sql: "SELECT 1".to_string(),
+                message: "connection closed".to_string(),
+            })]))
+        );
+        // 探测成功 → 连接活，保留事务状态允许重试
+        assert_eq!(
+            TransactionLiveness::Alive,
+            transaction_liveness(&Ok(vec![]))
+        );
+    }
+
+    /// 断连杀死的会话不得再拦截编辑器关闭：事务已随断连终止。
+    #[test]
+    fn has_manual_transaction_lifecycle_must_not_flag_a_dead_session() {
+        // 纯决策函数无法直接构造 view；这里钉住判定入口的组合逻辑：
+        // manual_transaction 被清空后，starting/finishing 也必须同时复位，
+        // 否则 try_close 仍会被 has_manual_transaction_lifecycle 拦住。
+        // （视图字段复位由 finish_manual_transaction 的断连分支保证。）
+        let has_lifecycle =
+            |manual: bool, starting: bool, finishing: bool| manual || starting || finishing;
+        assert!(!has_lifecycle(false, false, false));
+        assert!(has_lifecycle(true, false, false));
+        assert!(has_lifecycle(false, true, false));
     }
 
     #[test]

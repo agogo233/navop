@@ -34,6 +34,23 @@ pub const SQLITE_DATA_TYPES: &[(&str, &str)] = &[
     ("DATETIME", "Date and time (stored as TEXT)"),
 ];
 
+/// SQLite 没有独立的自增列元数据：单列 INTEGER 主键是 rowid 别名，插入时自动取值。
+/// 联合主键（包括 WITHOUT ROWID 表）不成立；声明成 `INT` 也不是别名，所以只认 `INTEGER`。
+fn mark_rowid_alias_column(columns: &mut [ColumnInfo]) {
+    let primary_keys: Vec<&ColumnInfo> = columns
+        .iter()
+        .filter(|column| column.is_primary_key)
+        .collect();
+    let is_rowid_alias =
+        primary_keys.len() == 1 && primary_keys[0].data_type.eq_ignore_ascii_case("INTEGER");
+    if !is_rowid_alias {
+        return;
+    }
+    for column in columns.iter_mut().filter(|column| column.is_primary_key) {
+        column.is_auto_increment = true;
+    }
+}
+
 /// SQLite database plugin implementation
 pub struct SqlitePlugin;
 
@@ -752,6 +769,29 @@ impl DatabasePlugin for SqlitePlugin {
         "rowid"
     }
 
+    async fn table_supports_rowid_projection(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<bool> {
+        // WITHOUT ROWID 表、视图与部分虚拟表没有 rowid 伪列，
+        // 直接投影会让整条预览 SQL 报 no such column 而整页空白。
+        // 探测一次，不可用则回退到普通 SELECT *。
+        let table_ref = self.format_table_reference(database, schema, table);
+        let probe = format!(
+            "SELECT {} FROM {} LIMIT 0",
+            self.rowid_column_name(),
+            table_ref
+        );
+        // SQLite 连接在 SQL 错误时返回 Ok(SqlResult::Error)，只有 Query 才代表 rowid 可用
+        Ok(matches!(
+            connection.query(&probe).await,
+            Ok(SqlResult::Query(_))
+        ))
+    }
+
     fn sql_dialect(&self) -> Box<dyn sqlparser::dialect::Dialect> {
         Box::new(sqlparser::dialect::SQLiteDialect {})
     }
@@ -864,19 +904,25 @@ impl DatabasePlugin for SqlitePlugin {
                     )?
                     .map(|value| value == 0)
                     .unwrap_or(true),
+                    // PRAGMA table_info 的 pk 列是联合主键内的 1-based 序号（0 = 非主键），
+                    // 不能按布尔处理：`== 1` 会漏掉联合主键的第 2、3 列。
                     is_primary_key: crate::metadata_read::metadata_integer(
                         &query_result,
                         row_index,
                         5,
                     )?
-                    .map(|value| value == 1)
+                    .map(|value| value > 0)
                     .unwrap_or(false),
                     default_value: cell(4)?,
                     comment: None,
                     charset: None,
                     collation: None,
+                    is_auto_increment: false,
                 });
             }
+            // SQLite 没有独立的列自增元数据：单列 INTEGER 主键就是 rowid 别名，
+            // 插入时自动取值（声明成 INT 就不是别名，所以只认 INTEGER）。
+            mark_rowid_alias_column(&mut columns);
             Ok(columns)
         } else {
             Err(anyhow::anyhow!("Unexpected result type"))
@@ -957,7 +1003,7 @@ impl DatabasePlugin for SqlitePlugin {
                 let index_name = cell(1)?.unwrap_or_default();
                 let is_unique =
                     crate::metadata_read::metadata_integer(&query_result, row_index, 2)?
-                        .map(|value| value == 1)
+                        .map(|value| value > 0)
                         .unwrap_or(false);
 
                 let info_sql = format!("PRAGMA index_info(\"{}\")", index_name);
@@ -1446,7 +1492,13 @@ impl DatabasePlugin for SqlitePlugin {
             .filter(|c| c.is_primary_key)
             .map(|c| c.name.as_str())
             .collect();
-        if !pk_columns.is_empty() {
+        // 单列自增主键已由 build_column_def 内联为 "PRIMARY KEY AUTOINCREMENT"，
+        // 不能再追加表级 PRIMARY KEY，否则主键声明两次（SQLite 会报 more than one primary key）。
+        let pk_inlined_in_column = design
+            .columns
+            .iter()
+            .any(|c| c.is_primary_key && c.is_auto_increment);
+        if !pk_columns.is_empty() && !pk_inlined_in_column {
             let pk_cols: Vec<String> = pk_columns
                 .iter()
                 .map(|c| self.quote_identifier(c))
@@ -1592,6 +1644,167 @@ mod tests {
             SqliteDbConnection::new(build_config(db_path.to_string_lossy().to_string()));
         connection.connect().await.expect("sqlite should connect");
         (temp_dir, connection)
+    }
+
+    // ==================== 表展开懒加载 ====================
+
+    fn table_node(table: &str) -> DbNode {
+        let mut metadata = HashMap::new();
+        metadata.insert("database".to_string(), "main".to_string());
+        DbNode::new(
+            format!("main:{table}"),
+            table,
+            DbNodeType::Table,
+            "sqlite-plugin-test".to_string(),
+            DatabaseType::SQLite,
+        )
+        .with_metadata(metadata)
+    }
+
+    fn folder_of<'a>(children: &'a [DbNode], ty: &DbNodeType) -> &'a DbNode {
+        children
+            .iter()
+            .find(|child| &child.node_type == ty)
+            .unwrap_or_else(|| panic!("folder {ty:?} should exist"))
+    }
+
+    /// 表展开只应查「字段」：索引 / 外键 / 触发器 / 检查约束必须留成空文件夹，
+    /// 等用户点开才查。
+    ///
+    /// 这里刻意给表建了**非空**的索引与触发器、另建一张带 REFERENCES 的表，
+    /// 否则「没查」与「查了但结果为空」无法区分 —— 实现被改回一次性全查时，
+    /// 用例仍会通过，等于没测住。
+    #[tokio::test]
+    async fn load_table_children_defers_secondary_metadata_to_lazy_folders() {
+        let (_temp_dir, connection) = create_connection().await;
+        connection
+            .query("CREATE TABLE lazy_parent (id INTEGER PRIMARY KEY, label TEXT NOT NULL);")
+            .await
+            .expect("table creation should succeed");
+        connection
+            .query("CREATE INDEX idx_lazy_label ON lazy_parent(label);")
+            .await
+            .expect("index creation should succeed");
+        connection
+            .query("CREATE TRIGGER trg_lazy_parent AFTER INSERT ON lazy_parent BEGIN UPDATE lazy_parent SET label = label WHERE id = NEW.id; END;")
+            .await
+            .expect("trigger creation should succeed");
+        connection
+            .query("CREATE TABLE lazy_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES lazy_parent(id));")
+            .await
+            .expect("child table creation should succeed");
+
+        let plugin = create_plugin();
+        let children = plugin
+            .load_table_children(&connection, &table_node("lazy_parent"), "main:lazy_parent")
+            .await
+            .expect("table children should load");
+
+        let types: Vec<DbNodeType> = children
+            .iter()
+            .map(|child| child.node_type.clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                DbNodeType::ColumnsFolder,
+                DbNodeType::IndexesFolder,
+                DbNodeType::ForeignKeysFolder,
+                DbNodeType::TriggersFolder,
+                DbNodeType::ChecksFolder,
+            ],
+            "表展开必须固定给出这 5 个文件夹，顺序稳定"
+        );
+
+        // 列是立即加载的：既有子项，也标记为已加载。
+        let columns = folder_of(&children, &DbNodeType::ColumnsFolder);
+        assert!(columns.children_loaded, "列应随表展开一起加载");
+        assert_eq!(columns.children.len(), 2, "lazy_parent 有 id / label 两列");
+
+        // 其余四类：未加载、无子项，且 metadata 足以支撑点开时的按需查询。
+        for deferred in [
+            DbNodeType::IndexesFolder,
+            DbNodeType::ForeignKeysFolder,
+            DbNodeType::TriggersFolder,
+            DbNodeType::ChecksFolder,
+        ] {
+            let folder = folder_of(&children, &deferred);
+            assert!(
+                !folder.children_loaded,
+                "{deferred:?} 应留待懒加载，不能被表展开顺带查掉"
+            );
+            assert!(
+                folder.children.is_empty(),
+                "{deferred:?} 在展开前不应预置子项"
+            );
+            assert_eq!(
+                folder.get_table_name().as_deref(),
+                Some("lazy_parent"),
+                "{deferred:?} 必须带着表名，否则点开时查不到"
+            );
+            assert_eq!(
+                folder.get_database_name().as_deref(),
+                Some("main"),
+                "{deferred:?} 必须带着库名，否则点开时查不到"
+            );
+        }
+
+        // 有外键的表：外键同样不随表展开加载。
+        let child_children = plugin
+            .load_table_children(&connection, &table_node("lazy_child"), "main:lazy_child")
+            .await
+            .expect("child table children should load");
+        let foreign_keys = folder_of(&child_children, &DbNodeType::ForeignKeysFolder);
+        assert!(
+            !foreign_keys.children_loaded && foreign_keys.children.is_empty(),
+            "有外键的表展开时同样不应查外键"
+        );
+    }
+
+    /// 懒加载路径必须真的取得到数据：点开索引文件夹应查到刚才建的索引。
+    ///
+    /// 只断言「展开表时索引为空」，一个永远返回空的实现也会通过；
+    /// 这条把「延后查询」和「查询丢失」区分开。
+    #[tokio::test]
+    async fn expanding_indexes_folder_queries_indexes_on_demand() {
+        let (_temp_dir, connection) = create_connection().await;
+        connection
+            .query("CREATE TABLE lazy_indexed (id INTEGER PRIMARY KEY, label TEXT NOT NULL);")
+            .await
+            .expect("table creation should succeed");
+        connection
+            .query("CREATE INDEX idx_lazy_indexed_label ON lazy_indexed(label);")
+            .await
+            .expect("index creation should succeed");
+
+        let plugin = create_plugin();
+        let children = plugin
+            .load_table_children(
+                &connection,
+                &table_node("lazy_indexed"),
+                "main:lazy_indexed",
+            )
+            .await
+            .expect("table children should load");
+        let indexes_folder = folder_of(&children, &DbNodeType::IndexesFolder);
+        assert!(
+            indexes_folder.children.is_empty(),
+            "展开表阶段不应已经带上索引"
+        );
+
+        let indexes = plugin
+            .load_table_folder_children(&connection, indexes_folder, &indexes_folder.id)
+            .await
+            .expect("indexes should load on demand");
+
+        assert_eq!(
+            indexes
+                .iter()
+                .map(|index| index.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["idx_lazy_indexed_label"],
+            "点开索引文件夹应查到真实索引"
+        );
     }
 
     // ==================== Basic Plugin Info Tests ====================
@@ -1754,6 +1967,159 @@ mod tests {
             .disconnect()
             .await
             .expect("sqlite should disconnect");
+    }
+
+    #[tokio::test]
+    async fn list_columns_marks_all_composite_primary_key_columns() {
+        let (_temp_dir, connection) = create_connection().await;
+        connection
+            .query(
+                "CREATE TABLE datapoints (
+                    device_id INTEGER NOT NULL,
+                    tag_id INTEGER NOT NULL,
+                    ts INTEGER NOT NULL,
+                    value REAL,
+                    PRIMARY KEY (device_id, tag_id, ts)
+                ) WITHOUT ROWID;",
+            )
+            .await
+            .expect("WITHOUT ROWID composite-key table creation should succeed");
+
+        let columns = create_plugin()
+            .list_columns(&connection, "main", None, "datapoints")
+            .await
+            .expect("column listing should succeed");
+
+        let pk_flags: Vec<(&str, bool)> = columns
+            .iter()
+            .map(|col| (col.name.as_str(), col.is_primary_key))
+            .collect();
+        assert_eq!(
+            pk_flags,
+            vec![
+                ("device_id", true),
+                ("tag_id", true),
+                ("ts", true),
+                ("value", false),
+            ],
+            "PRAGMA table_info 的 pk 是联合主键 1-based 序号，全部主键列都应被标记"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_columns_marks_rowid_alias_only_for_single_integer_pk() {
+        let (_temp_dir, connection) = create_connection().await;
+        connection
+            .query(
+                "CREATE TABLE rowid_alias (\n\
+                    id INTEGER PRIMARY KEY,\n\
+                    label TEXT NOT NULL\n\
+                );",
+            )
+            .await
+            .expect("rowid 别名表创建应成功");
+        // `INT` 不是 `INTEGER`，构不成 rowid 别名；联合主键同理。
+        connection
+            .query(
+                "CREATE TABLE declared_int (\n\
+                    id INT PRIMARY KEY,\n\
+                    label TEXT NOT NULL\n\
+                );",
+            )
+            .await
+            .expect("INT 声明表创建应成功");
+
+        let plugin = create_plugin();
+        let alias_columns = plugin
+            .list_columns(&connection, "main", None, "rowid_alias")
+            .await
+            .expect("column listing should succeed");
+        assert_eq!(
+            alias_columns
+                .iter()
+                .map(|col| (col.name.as_str(), col.is_auto_increment))
+                .collect::<Vec<_>>(),
+            vec![("id", true), ("label", false)],
+            "单列 INTEGER 主键是 rowid 别名，插入时自动取值"
+        );
+
+        let int_columns = plugin
+            .list_columns(&connection, "main", None, "declared_int")
+            .await
+            .expect("column listing should succeed");
+        assert!(
+            int_columns.iter().all(|col| !col.is_auto_increment),
+            "声明成 INT 的主键不是 rowid 别名"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_composite_pk_not_autoincrement() {
+        let plugin = create_plugin();
+        // 表设计器从元数据重建 design：联合主键三列，无自增。
+        let design = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "datapoints".to_string(),
+            columns: vec![
+                ColumnDefinition::new("device_id")
+                    .data_type("INTEGER")
+                    .nullable(false)
+                    .primary_key(true),
+                ColumnDefinition::new("tag_id")
+                    .data_type("INTEGER")
+                    .nullable(false)
+                    .primary_key(true),
+                ColumnDefinition::new("ts")
+                    .data_type("INTEGER")
+                    .nullable(false)
+                    .primary_key(true),
+                ColumnDefinition::new("value").data_type("REAL"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(
+            !sql.contains("AUTOINCREMENT"),
+            "联合主键不应渲染 AUTOINCREMENT: {sql}"
+        );
+        assert!(
+            sql.contains("PRIMARY KEY (\"device_id\", \"tag_id\", \"ts\")"),
+            "联合主键应完整出现在表级约束: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_single_autoincrement_pk_no_duplicate_pk() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "main".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id")
+                    .data_type("INTEGER")
+                    .primary_key(true)
+                    .auto_increment(true),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(
+            sql.contains("PRIMARY KEY AUTOINCREMENT"),
+            "单列自增主键应内联在列定义中: {sql}"
+        );
+        assert_eq!(
+            sql.matches("PRIMARY KEY").count(),
+            1,
+            "主键只应声明一次，否则 SQLite 报 more than one primary key: {sql}"
+        );
     }
 
     #[test]

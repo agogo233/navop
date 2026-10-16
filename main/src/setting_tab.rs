@@ -26,7 +26,7 @@ use gpui::http_client::{AsyncBody, Method, Request};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, AsyncApp, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
+    FontWeight, Global, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
     PathPromptOptions, Render, SharedString, Styled, WeakEntity, Window, div,
 };
 use gpui_component::{
@@ -49,7 +49,8 @@ use gpui_component::{
 use one_assets::IconName;
 use one_core::cloud_sync::{
     CloudSyncService, GlobalCloudUser, SyncEngine, TeamKeyCacheStatus, TeamOption,
-    get_cached_team_options, personal::SyncStoreHealth,
+    get_cached_team_options,
+    personal::{SyncStoreHealth, open_webdav_password, seal_webdav_password},
 };
 use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
 use one_core::crypto;
@@ -57,7 +58,7 @@ use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::action_id;
 use one_core::license::Feature;
 use one_core::llm::manager::GlobalProviderState;
-use one_core::popup_window::{PopupWindowOptions, open_popup_window};
+use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
 use one_core::storage::GlobalStorageState;
 pub const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
 pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
@@ -73,6 +74,7 @@ pub use one_core::settings::{
 };
 use one_core::tab_container::{TabContent, TabContentEvent};
 use one_core::utils::auto_save_config::AutoSaveConfig;
+use one_core::window_close::close_window_for_reuse;
 use reqwest_client::ReqwestClient;
 use rust_i18n::t;
 use terminal_view::{MAX_FONT_SIZE, MIN_FONT_SIZE, available_monospace_fonts};
@@ -449,6 +451,8 @@ fn update_master_key_setting(is_portable: bool, enabled: bool, cx: &mut App) {
 pub struct SettingsPanel {
     focus_handle: FocusHandle,
     llm_providers_view: Entity<LlmProvidersView>,
+    update_check_state: Entity<update::UpdateCheckState>,
+    _update_check_subscription: gpui::Subscription,
     size: Size,
     group_variant: GroupBoxVariant,
     initial_page_index: usize,
@@ -483,9 +487,15 @@ impl SettingsPanel {
 
     fn new_with_initial_page(initial_page_index: usize, cx: &mut Context<Self>) -> Self {
         let llm_providers_view = cx.new(|cx| LlmProvidersView::new(cx));
+        // 检查更新状态由 app 持有（启动时的自动检查可能早于设置页打开），这里只观察它，
+        // 让「检查中」和「上次检查结果」能驱动设置页重绘。
+        let update_check_state = update::update_check_state(cx);
+        let _update_check_subscription = cx.observe(&update_check_state, |_, _, cx| cx.notify());
         Self {
             focus_handle: cx.focus_handle(),
             llm_providers_view,
+            update_check_state,
+            _update_check_subscription,
             size: Size::default(),
             group_variant: GroupBoxVariant::Outline,
             initial_page_index,
@@ -579,6 +589,11 @@ impl SettingsPanel {
                                             effective_locale_for_setting(&locale);
                                         gpui_component::set_locale(effective_locale);
                                         notes::set_markdown_editor_locale(effective_locale, cx);
+                                        // 扩展页自己带词条表，读的是宿主的语言事实
+                                        // (`navop.i18n.locale()`)；而页面描述重建不会
+                                        // 因为 set_locale 自己发生 —— 必须显式叫醒
+                                        // 它们，否则页面停在旧语言上。
+                                        universal_plugins::refresh_shell_views(cx);
                                         AppSettings::update_and_save(cx, |settings| {
                                             settings.locale = locale;
                                         });
@@ -707,6 +722,25 @@ impl SettingsPanel {
                             )
                             .description(
                                 t!("Settings.General.Font.sql_editor_font_size_desc").to_string(),
+                            ),
+                        )
+                        .item(
+                            SettingItem::new(
+                                t!("Settings.General.Font.sql_editor_hover_enabled"),
+                                SettingField::switch(
+                                    |cx: &App| AppSettings::global(cx).sql_editor_hover_enabled,
+                                    |value: bool, cx: &mut App| {
+                                        AppSettings::update_and_save(cx, |settings| {
+                                            settings.sql_editor_hover_enabled = value;
+                                        });
+                                        cx.refresh_windows();
+                                    },
+                                )
+                                .default_value(default_settings.sql_editor_hover_enabled),
+                            )
+                            .description(
+                                t!("Settings.General.Font.sql_editor_hover_enabled_desc")
+                                    .to_string(),
                             ),
                         )
                         .item(
@@ -949,6 +983,7 @@ impl SettingsPanel {
                     default_settings.sync_enabled,
                     default_settings.sync_provider,
                     &default_settings.personal_sync,
+                    AppSettings::global(cx).personal_sync.backend,
                 )),
             SettingPage::new(t!("TeamSync.manage_keys"))
                 .resettable(false)
@@ -970,22 +1005,38 @@ impl SettingsPanel {
                     .keywords([t!("LlmProviders.title").to_string()]),
                 ),
             ),
-            // 账户设置页
-            SettingPage::new(t!("Settings.Account.title")).group(
-                SettingGroup::new().item(
-                    SettingItem::render(move |_options, window, cx| {
-                        render_account_section(window, cx)
-                    })
-                    .keywords([
-                        t!("Settings.Account.title").to_string(),
-                        t!("Settings.Account.username").to_string(),
-                        t!("Settings.Account.email").to_string(),
-                        t!("Settings.Account.not_logged_in").to_string(),
-                        t!("Auth.logout").to_string(),
-                        t!("License.import_offline").to_string(),
-                    ]),
+            // 账户设置页：账户信息与主密钥是两件独立的事——没有账户也可以有主密钥，
+// 所以拆成两个并列分组，关系与「关于 / 更新」一致。
+            SettingPage::new(t!("Settings.Account.title"))
+                .group(
+                    SettingGroup::new().title(t!("Settings.Account.title")).item(
+                        SettingItem::render(move |_options, window, cx| {
+                            render_account_section(window, cx)
+                        })
+                        .keywords([
+                            t!("Settings.Account.title").to_string(),
+                            t!("Settings.Account.username").to_string(),
+                            t!("Settings.Account.email").to_string(),
+                            t!("Settings.Account.not_logged_in").to_string(),
+                            t!("Auth.logout").to_string(),
+                            t!("License.import_offline").to_string(),
+                        ]),
+                    ),
+                )
+                .group(
+                    SettingGroup::new()
+                        .title(t!("Settings.Account.master_key_section"))
+                        .item(
+                            SettingItem::render(move |_options, _window, cx| {
+                                master_key_section(cx)
+                            })
+                            .keywords([
+                                t!("Settings.Account.master_key_section").to_string(),
+                                t!("Encryption.change_repo_password").to_string(),
+                                t!("Encryption.reset_master_key").to_string(),
+                            ]),
+                        ),
                 ),
-            ),
             // 关于页面
             SettingPage::new(t!("Settings.About.title"))
                 .group(
@@ -1000,7 +1051,10 @@ impl SettingsPanel {
                             ]),
                     ),
                 )
-                .group(about_update_setting_group(default_settings.auto_update)),
+                .group(about_update_setting_group(
+                    default_settings.auto_update,
+                    self.update_check_state.clone(),
+                )),
         ];
         if !is_feature_enabled(Feature::TeamManagement, cx) {
             pages.remove(TEAM_KEYS_SETTINGS_PAGE_INDEX);
@@ -1047,29 +1101,75 @@ fn close_behavior_setting_group(default: CloseButtonBehavior) -> SettingGroup {
         )
 }
 
+/// 同步设置分组。
+///
+/// `setting_pages` 每次渲染都会重建这里，所以按**当前**后端（而不是默认值）决定
+/// 显示哪些项：选了 WebDAV 就没必要再让人填本地同步路径；选了文件夹 / Git 时
+/// 隐藏三项 WebDAV 配置。`setting_pages` 在 `cx: &App` 上运行，切换后端会触发
+/// 重新求值，因此下拉一改，条目就跟着增减。
 fn sync_setting_group(
     sync_enabled_default: bool,
     sync_provider_default: SyncProvider,
     defaults: &PersonalSyncSettings,
+    current_backend: PersonalSyncBackendKind,
 ) -> SettingGroup {
-    SettingGroup::new()
-        .title(t!("Settings.Sync.group_title"))
-        .items(vec![
-            sync_enabled_item(sync_enabled_default),
-            sync_provider_item(sync_provider_default),
-            personal_sync_backend_item(defaults.backend),
-            personal_sync_path_item(defaults.path.clone()),
-            personal_sync_auto_sync_item(defaults.auto_sync),
-            personal_sync_git_auto_push_item(defaults.git.auto_push),
-            SettingItem::render(move |_options, window, cx| {
-                render_personal_sync_actions(window, cx)
-            })
+    let webdav_selected = current_backend == PersonalSyncBackendKind::Webdav;
+
+    let mut items = vec![
+        sync_enabled_item(sync_enabled_default),
+        sync_provider_item(sync_provider_default),
+        personal_sync_backend_item(defaults.backend),
+    ];
+
+    if webdav_selected {
+        // 与「同步路径」项同构：SettingItem::new + SettingField::render + .description。
+        // 不把标签只放进 keywords，否则搜索能命中但界面没有标题。
+        items.push(
+            SettingItem::new(
+                t!("Settings.Sync.webdav_url"),
+                SettingField::render(move |options, window, cx| {
+                    render_personal_sync_webdav_url_field(options, window, cx)
+                }),
+            )
+            .description(t!("Settings.Sync.webdav_url_desc").to_string()),
+        );
+        items.push(
+            SettingItem::new(
+                t!("Settings.Sync.webdav_username"),
+                SettingField::render(move |options, window, cx| {
+                    render_personal_sync_webdav_username_field(options, window, cx)
+                }),
+            )
+            .description(t!("Settings.Sync.webdav_username_desc").to_string()),
+        );
+        items.push(
+            SettingItem::new(
+                t!("Settings.Sync.webdav_password"),
+                SettingField::render(move |options, window, cx| {
+                    render_personal_sync_webdav_password_field(options, window, cx)
+                }),
+            )
+            .description(t!("Settings.Sync.webdav_password_desc").to_string()),
+        );
+    } else {
+        // WebDAV 不用本地目录，填了也会被忽略。
+        items.push(personal_sync_path_item(defaults.path.clone()));
+    }
+
+    items.push(personal_sync_auto_sync_item(defaults.auto_sync));
+    items.push(personal_sync_git_auto_push_item(defaults.git.auto_push));
+    items.push(
+        SettingItem::render(move |_options, window, cx| render_personal_sync_actions(window, cx))
             .keywords([
                 t!("Settings.Sync.status").to_string(),
                 t!("Settings.Sync.test_connection").to_string(),
                 t!("Settings.Sync.sync_now").to_string(),
             ]),
-        ])
+    );
+
+    SettingGroup::new()
+        .title(t!("Settings.Sync.group_title"))
+        .items(items)
 }
 
 fn sync_enabled_item(default: bool) -> SettingItem {
@@ -1284,7 +1384,215 @@ pub(crate) fn personal_sync_backend_options() -> Vec<(SharedString, SharedString
             SharedString::from("git"),
             SharedString::from(t!("Settings.Sync.Backend.git")),
         ),
+        (
+            SharedString::from("webdav"),
+            SharedString::from(t!("Settings.Sync.Backend.webdav")),
+        ),
     ]
+}
+
+// ============================================================================
+// WebDAV 后端：服务器地址 / 用户名 / 密码
+// ============================================================================
+
+fn render_personal_sync_webdav_url_field(
+    options: &gpui_component::setting::RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    render_personal_sync_webdav_text_field(
+        "url",
+        t!("Settings.Sync.webdav_url_placeholder").to_string(),
+        options,
+        window,
+        cx,
+    )
+}
+
+fn render_personal_sync_webdav_username_field(
+    options: &gpui_component::setting::RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    render_personal_sync_webdav_text_field(
+        "username",
+        t!("Settings.Sync.webdav_username_placeholder").to_string(),
+        options,
+        window,
+        cx,
+    )
+}
+
+/// WebDAV 三个输入框统一宽度。
+///
+/// 用户名与密码必须同宽、同一起始位置，否则在设置右侧列里会明显错位；
+/// 同时这个宽度要能容纳较长的 URL，省得用户还要横向滚动。
+const WEBDAV_FIELD_WIDTH: f32 = 420.0;
+
+/// 密码框的明文/掩码状态。
+///
+/// 放在 Global 里而不是组件内部：`use_keyed_state` 的 key 会带上这个标记，
+/// 切换时 key 变化 → 整个输入框连同订阅一起重建。
+/// 这样就不需要 `InputState::set_masked`（gpui-component 并未公开该方法）。
+struct WebDavPasswordVisibility {
+    revealed: bool,
+}
+
+impl Global for WebDavPasswordVisibility {}
+
+fn webdav_password_revealed(cx: &App) -> bool {
+    cx.try_global::<WebDavPasswordVisibility>()
+        .is_some_and(|state| state.revealed)
+}
+
+fn set_webdav_password_revealed(cx: &mut App, revealed: bool) {
+    if cx.try_global::<WebDavPasswordVisibility>().is_some() {
+        cx.global_mut::<WebDavPasswordVisibility>().revealed = revealed;
+    } else {
+        cx.set_global(WebDavPasswordVisibility { revealed });
+    }
+}
+
+struct WebDavInputState {
+    input: Entity<InputState>,
+    _subscription: gpui::Subscription,
+}
+
+/// 把输入框的值写回 `personal_sync.webdav.<field>`。
+fn persist_webdav_field(field: &'static str, value: &str, cx: &mut App) {
+    AppSettings::update_and_save(cx, |settings| match field {
+        "url" => settings.personal_sync.webdav.url = value.trim().to_string(),
+        "username" => settings.personal_sync.webdav.username = value.trim().to_string(),
+        // 密码不在 settings.json 里留明文：落盘前先加密。
+        "password" => settings.personal_sync.webdav.password = seal_webdav_password(value),
+        // 显式兜底而非 `_ =>` 走密码分支：新增字段时不会被静默当成密码加密。
+        _ => {}
+    });
+}
+
+/// 构造（或复用）一个 webdav 输入框，并把值变更绑定回 settings。
+fn bind_webdav_input(
+    field: &'static str,
+    key_suffix: &str,
+    options: &gpui_component::setting::RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut Context<InputState>) -> InputState,
+) -> Entity<InputState> {
+    let state = window.use_keyed_state(
+        SharedString::from(format!(
+            "personal-sync-webdav-{field}-{key_suffix}-{}-{}-{}",
+            options.page_ix(),
+            options.group_ix(),
+            options.item_ix()
+        )),
+        cx,
+        move |window, cx| {
+            let input = cx.new(|cx| build(window, cx));
+            // `subscribe` 的回调要求 `'static`，而 `field` 是外层闭包的局部变量。
+            // 必须 `move` 按值捕获（`&'static str` 本身是 Copy + 'static），
+            // 否则闭包按引用借用它，触发 E0373。
+            let _subscription = cx.subscribe(&input, move |_, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value();
+                    persist_webdav_field(field, &value, cx);
+                }
+            });
+            WebDavInputState {
+                input,
+                _subscription,
+            }
+        },
+    );
+    state.read(cx).input.clone()
+}
+
+/// 服务器地址 / 用户名：纯输入框。
+fn render_personal_sync_webdav_text_field(
+    field: &'static str,
+    default: String,
+    options: &gpui_component::setting::RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let value = match field {
+        "username" => AppSettings::global(cx)
+            .personal_sync
+            .webdav
+            .username
+            .clone(),
+        _ => AppSettings::global(cx).personal_sync.webdav.url.clone(),
+    };
+    let input = bind_webdav_input(field, "", options, window, cx, |window, cx| {
+        InputState::new(window, cx)
+            .default_value(value)
+            .placeholder(default)
+    });
+
+    h_flex()
+        .w_full()
+        .child(
+            Input::new(&input)
+                .with_size(options.size())
+                .w(gpui::px(WEBDAV_FIELD_WIDTH)),
+        )
+        .into_any_element()
+}
+
+/// 密码框：与上面两项同宽同位置，右侧一个小眼睛切换明文 / 掩码。
+fn render_personal_sync_webdav_password_field(
+    options: &gpui_component::setting::RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let revealed = webdav_password_revealed(cx);
+    let plaintext = open_webdav_password(&AppSettings::global(cx).personal_sync.webdav.password);
+    // key 带上 revealed：切换显隐时 key 变化，输入框连同订阅一起重建。
+    let input = bind_webdav_input(
+        "password",
+        if revealed { "shown" } else { "masked" },
+        options,
+        window,
+        cx,
+        |window, cx| {
+            InputState::new(window, cx)
+                .default_value(plaintext)
+                .masked(!revealed)
+                .placeholder(t!("Settings.Sync.webdav_password_placeholder").to_string())
+        },
+    );
+
+    let tooltip = if revealed {
+        t!("Settings.Sync.webdav_hide_password").to_string()
+    } else {
+        t!("Settings.Sync.webdav_show_password").to_string()
+    };
+
+    h_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            Input::new(&input)
+                .with_size(options.size())
+                .w(gpui::px(WEBDAV_FIELD_WIDTH)),
+        )
+        .child(
+            Button::new("personal-sync-webdav-password-toggle")
+                .icon(if revealed {
+                    IconName::EyeOff
+                } else {
+                    IconName::Eye
+                })
+                .ghost()
+                .xsmall()
+                .tooltip(tooltip)
+                .on_click(|_, window, cx| {
+                    let next = !webdav_password_revealed(cx);
+                    set_webdav_password_revealed(cx, next);
+                    window.refresh();
+                }),
+        )
+        .into_any_element()
 }
 
 pub(crate) fn personal_sync_status_label(health: &SyncStoreHealth) -> String {
@@ -1305,6 +1613,12 @@ pub(crate) fn personal_sync_status_label(health: &SyncStoreHealth) -> String {
         }
         SyncStoreHealth::PausedAfterRepeatedFailures => {
             t!("Settings.Sync.Status.paused_after_repeated_failures").to_string()
+        }
+        SyncStoreHealth::WebdavAuthFailed => {
+            t!("Settings.Sync.Status.webdav_auth_failed").to_string()
+        }
+        SyncStoreHealth::WebdavUnreachable => {
+            t!("Settings.Sync.Status.webdav_unreachable").to_string()
         }
     }
 }
@@ -2081,7 +2395,10 @@ impl Render for SettingsPanel {
 }
 
 /// 关于页的“更新”分组：自动检查更新开关与手动检查入口
-fn about_update_setting_group(auto_update_default: bool) -> SettingGroup {
+fn about_update_setting_group(
+    auto_update_default: bool,
+    update_check_state: Entity<update::UpdateCheckState>,
+) -> SettingGroup {
     SettingGroup::new()
         .title(t!("Settings.About.Update.group_title"))
         .items(vec![
@@ -2098,16 +2415,28 @@ fn about_update_setting_group(auto_update_default: bool) -> SettingGroup {
                 .default_value(auto_update_default),
             )
             .description(t!("Settings.About.Update.auto_update_desc").to_string()),
-            SettingItem::render(move |_options, _window, cx| render_manual_update_check_item(cx))
-                .keywords([
-                    t!("Settings.About.Update.group_title").to_string(),
-                    t!("Settings.About.Update.check_now").to_string(),
-                    t!("Settings.About.Update.check_now_desc").to_string(),
-                ]),
+            SettingItem::render(move |_options, _window, cx| {
+                render_manual_update_check_item(&update_check_state, cx)
+            })
+            .keywords([
+                t!("Settings.About.Update.group_title").to_string(),
+                t!("Settings.About.Update.check_now").to_string(),
+                t!("Settings.About.Update.check_now_desc").to_string(),
+            ]),
         ])
 }
 
-fn render_manual_update_check_item(cx: &mut App) -> gpui::AnyElement {
+fn render_manual_update_check_item(
+    update_check_state: &Entity<update::UpdateCheckState>,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let state = update_check_state.read(cx);
+    let checking = state.is_checking();
+    // 检查完成后就地记下结果，避免用户只靠一闪而过的通知判断「到底查过了没有」。
+    let status = state
+        .last_check_label()
+        .unwrap_or_else(|| t!("Settings.About.Update.check_now_desc").to_string());
+
     h_flex()
         .w_full()
         .justify_between()
@@ -2126,15 +2455,17 @@ fn render_manual_update_check_item(cx: &mut App) -> gpui::AnyElement {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(t!("Settings.About.Update.check_now_desc").to_string()),
+                        .child(status),
                 ),
         )
         .child(
             Button::new("settings-check-update")
                 .icon(IconName::Refresh)
                 .label(t!("Settings.About.Update.check_now"))
-                .on_click(|_, window, cx| {
-                    update::check_for_updates_manually(window, cx);
+                // loading 态的按钮不会响应点击，因此检查期间天然防重复触发。
+                .loading(checking)
+                .on_click(|_, _window, cx| {
+                    update::check_for_updates_manually(cx);
                 }),
         )
         .into_any_element()
@@ -2395,14 +2726,17 @@ impl GlobalProxySettingsView {
         apply_global_proxy_settings(proxy_settings, new_client, cx);
 
         window.push_notification(t!("Settings.General.Proxy.save_success").to_string(), cx);
-        window.remove_window();
+        // macOS 上「关」只是隐藏原生窗口，业务会话当场卸载（view 连同表单一起释放），
+        // 下次打开才会用 `GlobalProxySettingsView::new` 重建 —— 表单自然回到生效值，
+        // 不需要在关闭前手工复位。
+        let _ = close_window_for_reuse(window, cx);
     }
 
-    fn on_cancel(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.testing {
             return;
         }
-        window.remove_window();
+        let _ = close_window_for_reuse(window, cx);
     }
 }
 
@@ -2541,10 +2875,19 @@ impl Render for GlobalProxySettingsView {
     }
 }
 
+/// 全局代理设置弹窗的复用键：关闭时隐藏、再次打开时复用同一个窗口。
+///
+/// 不复用（关闭即销毁）会让 macOS 上 AppKit 的 Touch Bar 观察者去注销一个已经释放的
+/// 窗口而抛异常闪退（`EXC_CRASH (SIGABRT)`）。机制说明见
+/// [`one_core::window_close::hide_for_reuse`] 与 skill
+/// `navop-macos-selector-availability-crash` §9.11。
+const GLOBAL_PROXY_SETTINGS_WINDOW_KEY: &str = "settings.global-proxy";
+
 fn show_global_proxy_settings_window(cx: &mut App) {
-    open_popup_window(
+    open_reusable_popup_window(
         PopupWindowOptions::new(t!("Settings.General.Proxy.dialog_title").to_string())
             .size(560.0, 460.0),
+        GLOBAL_PROXY_SETTINGS_WINDOW_KEY,
         move |window, cx| cx.new(|cx| GlobalProxySettingsView::new(window, cx)),
         None,
         cx,
@@ -2572,7 +2915,6 @@ fn apply_global_http_client(
     auth_service.replace_http_client(http_for_auth);
 
     if let Some(provider_state) = cx.try_global::<GlobalProviderState>() {
-        provider_state.set_cloud_client(auth_service.cloud_client());
         if let Err(err) = provider_state.set_proxy_settings(proxy_settings) {
             tracing::error!(error = %err, "LLM 代理设置同步失败");
         }
@@ -2753,6 +3095,53 @@ fn render_account_section(_window: &mut Window, cx: &App) -> gpui::AnyElement {
     }
 }
 
+/// 账户页的「主密钥」区块：只放修改与重置两个入口。
+///
+/// 重置时要删哪些数据是「每一次重置」的决定，不是长期配置，所以勾选项放进重置
+/// 弹窗里当场选（默认全选），设置页不再维护这份开关。
+fn master_key_section(cx: &App) -> gpui::Div {
+    v_flex()
+        .gap_3()
+        .w_full()
+        .child(
+            div()
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(t!("Settings.Account.master_key_section").to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("Settings.Account.master_key_section_desc").to_string()),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("change-master-key-button")
+                        .icon(IconName::Edit)
+                        .label(t!("Encryption.change_repo_password").to_string())
+                        .on_click(|_, window, cx| {
+                            crate::master_key_dialogs::show_change_master_key_dialog(
+                                window, cx, None,
+                            );
+                        }),
+                )
+                .child(
+                    Button::new("reset-master-key-button")
+                        .icon(IconName::Delete)
+                        .label(t!("Encryption.reset_master_key").to_string())
+                        .danger()
+                        .on_click(|_, window, cx| {
+                            crate::master_key_dialogs::show_reset_master_key_dialog(
+                                window, cx, None,
+                            );
+                        }),
+                ),
+        )
+}
+
 // ============================================================================
 // 快捷键设置页
 // ============================================================================
@@ -2861,6 +3250,13 @@ const TAB_SHORTCUTS: &[ShortcutEntry] = &[
         keys_other: &["alt-shift-t"],
         label_key: "Settings.Shortcuts.duplicate_tab",
         action_id: Some(action_id::APP_DUPLICATE_TAB),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["cmd-shift-w"],
+        keys_other: &["alt-shift-w"],
+        label_key: "Settings.Shortcuts.close_active_tab",
+        action_id: Some(action_id::APP_CLOSE_ACTIVE_TAB),
         system_hotkey: false,
     },
     ShortcutEntry {
@@ -3041,6 +3437,13 @@ const DATABASE_SHORTCUTS: &[ShortcutEntry] = &[
         system_hotkey: false,
     },
     ShortcutEntry {
+        keys_macos: &["cmd-a"],
+        keys_other: &["ctrl-a"],
+        label_key: "Settings.Shortcuts.database_select_all_objects",
+        action_id: Some(action_id::DB_SELECT_ALL_OBJECTS),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
         keys_macos: &["cmd-enter", "ctrl-enter"],
         keys_other: &["cmd-enter", "ctrl-enter"],
         label_key: "Settings.Shortcuts.sql_run_query",
@@ -3052,6 +3455,13 @@ const DATABASE_SHORTCUTS: &[ShortcutEntry] = &[
         keys_other: &["cmd-shift-enter", "ctrl-shift-enter"],
         label_key: "Settings.Shortcuts.sql_run_all_query",
         action_id: Some(action_id::SQL_RUN_ALL_QUERY),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["cmd-/"],
+        keys_other: &["ctrl-/"],
+        label_key: "Settings.Shortcuts.sql_toggle_comment",
+        action_id: Some(action_id::SQL_TOGGLE_COMMENT),
         system_hotkey: false,
     },
 ];
@@ -3111,6 +3521,27 @@ const TABLE_SHORTCUTS: &[ShortcutEntry] = &[
         keys_other: &["escape"],
         label_key: "Settings.Shortcuts.table_cancel",
         action_id: Some(action_id::TABLE_CANCEL),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["cmd-f"],
+        keys_other: &["ctrl-f"],
+        label_key: "Settings.Shortcuts.table_find",
+        action_id: Some(action_id::TABLE_FIND),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["cmd-g"],
+        keys_other: &["ctrl-g"],
+        label_key: "Settings.Shortcuts.table_find_next",
+        action_id: Some(action_id::TABLE_FIND_NEXT),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["cmd-shift-g"],
+        keys_other: &["ctrl-shift-g"],
+        label_key: "Settings.Shortcuts.table_find_previous",
+        action_id: Some(action_id::TABLE_FIND_PREVIOUS),
         system_hotkey: false,
     },
 ];
@@ -3622,18 +4053,108 @@ mod tests {
     use rust_i18n::t;
 
     use super::{
-        AppSettings, CustomFont, FontFamilyKind, GlobalProxySettings, ProxyType, WINDOW_SHORTCUTS,
-        app_font_options, build_app_http_client, builtin_monospace_font_options,
-        emit_team_key_change_event, is_supported_font_file, master_key_setting_enabled,
-        merge_font_options_with_custom_fonts, monospace_font_options, parse_font_families,
-        personal_sync_backend_options, personal_sync_status_label, personal_sync_status_view_model,
-        team_key_refresh_success_message, team_key_rotation_inputs_valid,
+        AppSettings, CustomFont, DATABASE_SHORTCUTS, FontFamilyKind, GlobalProxySettings,
+        ProxyType, WINDOW_SHORTCUTS, app_font_options, build_app_http_client,
+        builtin_monospace_font_options, emit_team_key_change_event, is_supported_font_file,
+        master_key_setting_enabled, merge_font_options_with_custom_fonts, monospace_font_options,
+        parse_font_families, personal_sync_backend_options, personal_sync_status_label,
+        personal_sync_status_view_model, team_key_refresh_success_message,
+        team_key_rotation_inputs_valid,
     };
     use crate::local_terminal_profiles::setting_options as local_terminal_profile_options;
     use crate::personal_sync_status::PersonalSyncRuntimeStatus;
     use one_core::settings::LocalTerminalProfileKind;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    /// `include_str!` 的源码契约必须先截掉测试模块本身，否则断言会命中测试自己写的字面量。
+    fn implementation_source() -> &'static str {
+        include_str!("setting_tab.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(implementation, _)| implementation)
+            .expect("setting_tab.rs has a tests module")
+    }
+
+    /// 截出 `signature` 开头、到同一 impl 块里下一个方法（或该 impl 块结尾）为止的源码。
+    fn method_source<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect(signature);
+        let body_start = start + signature.len();
+        let rest = &source[body_start..];
+        let end = rest
+            .find("\n    fn ")
+            .or_else(|| rest.find("\n}\n"))
+            .map(|offset| body_start + offset)
+            .unwrap_or(source.len());
+        &source[start..end]
+    }
+
+    /// 在 macOS 上销毁原生窗口，会让 AppKit 的 Touch Bar 观察者去注销一个已经释放的对象，
+    /// 抛出的 ObjC 异常无人接住 ⇒ 闪退（`EXC_CRASH (SIGABRT)`）。代理设置弹窗因此改成
+    /// 「关闭即隐藏 + 复用」。这个契约必须锁住：打开要走可复用入口，两个关闭入口都不能
+    /// 再销毁窗口。
+    #[test]
+    fn global_proxy_settings_window_is_reused_instead_of_destroyed() {
+        let source = implementation_source();
+
+        let opener = method_source(source, "fn show_global_proxy_settings_window(");
+        assert!(
+            opener.contains("open_reusable_popup_window("),
+            "the proxy window must go through the reusable opener, otherwise closing destroys it"
+        );
+        assert!(
+            opener.contains("GLOBAL_PROXY_SETTINGS_WINDOW_KEY"),
+            "the proxy window must declare a reuse key, otherwise reopening creates a new window"
+        );
+
+        for signature in ["fn on_cancel(", "fn on_save("] {
+            let body = method_source(source, signature);
+            // 必须走带 `cx` 的关闭入口：只有它能在隐藏原生窗口的同时卸载业务会话。
+            assert!(
+                body.contains("close_window_for_reuse(window, cx)"),
+                "{signature} must close through the session-ending reuse route"
+            );
+            assert!(
+                !body.contains("window.remove_window()"),
+                "{signature} must not destroy the native window (Touch Bar KVO crash)"
+            );
+        }
+    }
+
+    /// 复用窗口时会用**本次**的 factory 重建 view，所以「复位」这件事落在
+    /// `GlobalProxySettingsView::new` 上：它必须从当前生效的设置读出全部字段，
+    /// 否则隐藏窗口里的上一次编辑会被重新显示出来。
+    #[test]
+    fn reused_proxy_window_rebuilds_every_field_from_settings() {
+        let source = implementation_source();
+        let impl_start = source
+            .find("impl GlobalProxySettingsView {")
+            .expect("setting_tab.rs defines GlobalProxySettingsView");
+        let new_body = method_source(&source[impl_start..], "fn new(");
+
+        assert!(
+            new_body.contains("AppSettings::global(cx).global_proxy.clone()"),
+            "`new` must read the effective settings: the reused window has no other chance to reset"
+        );
+
+        for field in [
+            "enabled: current.enabled",
+            "proxy_type_select",
+            "host_input",
+            "port_input",
+            "username_input",
+            "password_input",
+        ] {
+            assert!(
+                new_body.contains(field),
+                "`new` must initialize {field} from the effective settings"
+            );
+        }
+
+        assert!(
+            new_body.contains("testing: false") && new_body.contains("status_message: None"),
+            "`new` must start from a clean transient state"
+        );
+    }
 
     #[test]
     fn close_window_shortcut_does_not_reserve_terminal_ctrl_d() {
@@ -3649,6 +4170,38 @@ mod tests {
         assert_eq!(shortcut.keys_other, &["ctrl-shift-w"]);
         assert!(!shortcut.keys_macos.contains(&"ctrl-d"));
         assert!(!shortcut.keys_other.contains(&"ctrl-d"));
+    }
+
+    #[test]
+    fn close_active_tab_shortcut_avoids_single_ctrl_letter_defaults() {
+        let shortcut = super::TAB_SHORTCUTS
+            .iter()
+            .find(|entry| {
+                entry.action_id == Some(one_core::keybindings::action_id::APP_CLOSE_ACTIVE_TAB)
+            })
+            .expect("close active tab shortcut");
+
+        assert_eq!(shortcut.keys_macos, &["cmd-shift-w"]);
+        assert_eq!(shortcut.keys_other, &["alt-shift-w"]);
+        assert_eq!("Settings.Shortcuts.close_active_tab", shortcut.label_key);
+        assert!(!shortcut.keys_macos.contains(&"ctrl-w"));
+        assert!(!shortcut.keys_other.contains(&"ctrl-w"));
+        assert!(!shortcut.keys_macos.contains(&"ctrl-d"));
+        assert!(!shortcut.keys_other.contains(&"ctrl-d"));
+    }
+
+    #[test]
+    fn object_list_select_all_entry_matches_runtime_defaults() {
+        use one_core::keybindings::action_id;
+
+        let entry = DATABASE_SHORTCUTS
+            .iter()
+            .find(|entry| entry.action_id == Some(action_id::DB_SELECT_ALL_OBJECTS))
+            .expect("select all objects shortcut entry");
+
+        assert_eq!(entry.keys_macos, &["cmd-a"]);
+        assert_eq!(entry.keys_other, &["ctrl-a"]);
+        assert!(!entry.system_hotkey);
     }
 
     #[test]
@@ -3704,6 +4257,48 @@ mod tests {
         assert!(locales.contains("Anyone who obtains both the application"));
         assert!(locales.contains("任何同时获得应用程序和完整 data 目录的人"));
         assert!(locales.contains("任何同時取得應用程式和完整 data 目錄的人"));
+    }
+
+    /// 切界面语言必须**叫醒已挂载的扩展页面**。
+    ///
+    /// 扩展页的文案不在宿主的 rust-i18n 目录里：页面自己带词条表，只从宿主读
+    /// 「现在是什么语言」（`navop.i18n.locale()`）。而 `gpui_component::set_locale`
+    /// 只换宿主自己的词条，**不会**让脚本重建页面描述 —— 少了这一行，界面切了、
+    /// 扩展页停在旧语言上，且不报任何错。
+    ///
+    /// 断言两件事：这行在实现里存在，且在语言下拉的 `set_locale` 之后 ——
+    /// 顺序反了会读到上一个语言值。
+    #[test]
+    fn changing_the_ui_language_reruns_mounted_extension_views() {
+        let source = implementation_source();
+        let set_locale = source
+            .find("gpui_component::set_locale(effective_locale);")
+            .expect("语言下拉里应有一处 set_locale");
+        let refresh = source
+            .find("universal_plugins::refresh_shell_views(cx)")
+            .expect("切语言后必须让扩展页重跑脚本");
+        assert!(
+            refresh > set_locale,
+            "刷新扩展页要排在 set_locale 之后，否则扩展读到的是上一个语言值"
+        );
+    }
+
+    #[test]
+    fn manual_update_check_shows_progress_and_last_result() {
+        let source = include_str!("setting_tab.rs");
+        let item = source
+            .split("fn render_manual_update_check_item(")
+            .nth(1)
+            .expect("手动检查更新入口存在")
+            .split("fn render_global_proxy_settings_item")
+            .next()
+            .expect("手动检查更新入口有结尾");
+
+        // loading 态的按钮不响应点击，检查期间天然防重复触发。
+        assert!(item.contains(".loading(checking)"));
+        assert!(item.contains("last_check_label()"));
+        // 状态挂在 app 上并由设置页观察，自动检查也能驱动按钮重绘。
+        assert!(source.contains("cx.observe(&update_check_state"));
     }
 
     #[test]
@@ -4263,8 +4858,12 @@ mod tests {
         assert!(proxy_url.is_none());
     }
 
+    /// 关闭应用内代理时，navop 不传自己的代理，而是把代理决定权交回客户端：
+    /// `ReqwestClient::user_agent` 会跟随系统代理与环境变量代理（与浏览器一致），
+    /// 因此这里断言的是「navop 自己没有指定代理」，不是「不走任何代理」。
+    /// 需要强制直连时应改用 `ReqwestClient::user_agent_direct`。
     #[test]
-    fn build_app_http_client_uses_no_app_proxy_when_proxy_disabled() {
+    fn build_app_http_client_defers_to_system_proxy_when_proxy_disabled() {
         let settings = GlobalProxySettings {
             enabled: false,
             host: "127.0.0.1".to_string(),
@@ -4317,13 +4916,16 @@ mod tests {
     }
 
     #[test]
-    fn personal_sync_backend_options_include_folder_and_git() {
+    fn personal_sync_backend_options_include_all_backends() {
         let options = personal_sync_backend_options();
 
+        // 逐项精确比对（含顺序）：下拉里可选的后端必须与 `PersonalSyncBackendKind`
+        // 一一对应，新增后端时这里要同步补一行，否则 CI 会拦下来。
         assert_eq!(
             vec![
                 ("folder".into(), t!("Settings.Sync.Backend.folder").into()),
                 ("git".into(), t!("Settings.Sync.Backend.git").into()),
+                ("webdav".into(), t!("Settings.Sync.Backend.webdav").into()),
             ],
             options
         );

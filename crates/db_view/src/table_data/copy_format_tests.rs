@@ -1,6 +1,7 @@
 use db::ipc::{ExternalDatabasePlugin, IpcDriverManifest};
 use db::{BinaryCell, ColumnInfo, DatabasePlugin, DbManager, TableCellValue};
 use one_core::storage::DatabaseType;
+use one_ui::edit_table::tsv::parse_tsv_rows;
 use std::path::PathBuf;
 
 use super::*;
@@ -15,6 +16,7 @@ fn column(name: &str, data_type: &str) -> ColumnInfo {
         comment: None,
         charset: None,
         collation: None,
+        is_auto_increment: false,
     }
 }
 
@@ -501,6 +503,189 @@ fn typed_cells_are_authoritative_over_legacy_projection() {
     assert_eq!(
         CopyFormatter::format(CopyFormat::Tsv, context),
         "legacy-text\tbase64:CQk=\t\\N"
+    );
+}
+
+/// issue #355：复制整行 → 粘贴必须是「无损往返」，否则现象就是「剪贴板里字段是全的，
+/// 粘进去少了几个字段」。
+///
+/// 复制端 = [`CopyFormatter::format`] 的 TSV 分支（表数据页签右键「复制」，与
+/// Ctrl/Cmd+C 走的 `one_ui::edit_table::EditTableState::action_copy` 同一套编码）；
+/// 粘贴端 = `EditTableState::action_paste` 与 `EditorTableDelegate` 右键粘贴共用的
+/// [`parse_tsv_rows`]。
+#[test]
+fn clipboard_tsv_round_trip_is_lossless() {
+    let columns: Vec<SharedString> = vec!["id".into(), "note".into(), "tail".into()];
+    let cases: Vec<(&str, Vec<Option<String>>)> = vec![
+        (
+            "普通整行",
+            vec![
+                Some("1".into()),
+                Some("alice".into()),
+                Some("beijing".into()),
+            ],
+        ),
+        (
+            "字段含制表符",
+            vec![Some("1".into()), Some("a\tb".into()), Some("c".into())],
+        ),
+        (
+            "字段含换行",
+            vec![
+                Some("1".into()),
+                Some("line1\nline2".into()),
+                Some("c".into()),
+            ],
+        ),
+        (
+            "字段含回车",
+            vec![
+                Some("1".into()),
+                Some("line1\r\nline2".into()),
+                Some("c".into()),
+            ],
+        ),
+        (
+            "字段含引号",
+            vec![
+                Some("1".into()),
+                Some("\"quoted\"".into()),
+                Some("say \"hi\"".into()),
+            ],
+        ),
+        (
+            "含空值与 SQL NULL",
+            vec![None, Some(String::new()), Some("\\N".into())],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, row) in cases {
+        let data = vec![row.clone()];
+        let metadata = TableMetadata::new("t").with_columns(columns.clone());
+        let clipboard = CopyFormatter::format(
+            CopyFormat::Tsv,
+            CopyFormatContext::new(&data, &columns, &metadata),
+        );
+        let expected: Vec<Vec<String>> = vec![
+            row.iter()
+                .map(|cell| cell.clone().unwrap_or_else(|| "\\N".to_string()))
+                .collect(),
+        ];
+        let pasted = parse_tsv_rows(&clipboard);
+        if pasted != expected {
+            failures.push(format!(
+                "{name}: 剪贴板 {clipboard:?} 粘回来是 {pasted:?}，期望 {expected:?}"
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "往返丢字段：\n{}", failures.join("\n"));
+}
+
+/// #355：表数据页签的右键复制/粘贴也必须走共享编解码，不能单面带一套转义。
+#[test]
+fn table_data_clipboard_sites_use_the_shared_codec() {
+    let delegate = include_str!("results_delegate.rs").replace("\r\n", "\n");
+    assert!(delegate.contains("parse_tsv_rows"), "右键粘贴要解转义");
+    assert!(
+        !delegate.contains(r"split('\t')"),
+        "右键粘贴不能按制表符裸切"
+    );
+
+    let copy_formats = include_str!("copy_format.rs");
+    assert!(copy_formats.contains("encode_tsv_rows"), "右键复制要转义");
+    assert!(
+        !copy_formats.contains(r#"join("\t")"#),
+        "右键复制不能直接拼制表符"
+    );
+}
+
+#[test]
+fn clipboard_tsv_escapes_fields_with_separators() {
+    let data = vec![vec![Some("1".into()), Some("a\tb".into())]];
+    let columns = vec!["id".into(), "note".into()];
+    let metadata = TableMetadata::new("t").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::Tsv, context),
+        "1\t\"a\tb\""
+    );
+}
+
+/// 查询结果里的表名是 `库.表` 的拼接形式，复制出来的 SQL 必须逐段引用，
+/// 否则会得到 `ads.tbl` 这种被粘在一个引号对里的非法名字。
+#[test]
+fn qualified_table_name_is_quoted_per_part() {
+    let plugin = DbManager::default()
+        .get_plugin(&DatabaseType::MySQL)
+        .expect("MySQL plugin should exist");
+    let data = vec![vec![Some("4".into()), Some("值".into())]];
+    let columns = vec!["indicator_key".into(), "indicator_name".into()];
+    let metadata = TableMetadata::new("ads.ads_tb_indicator_target_fill_test")
+        .with_columns(columns.clone())
+        .with_column_meta(vec![
+            column("indicator_key", "VARCHAR(20)"),
+            column("indicator_name", "VARCHAR(50)"),
+        ])
+        .with_primary_keys(vec![0]);
+    let context = sql_context((&data, &columns, &metadata), plugin.as_ref());
+
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        concat!(
+            "INSERT INTO `ads`.`ads_tb_indicator_target_fill_test` ",
+            "(`indicator_key`, `indicator_name`) VALUES\n('4', '值');",
+        )
+    );
+
+    let context = sql_context((&data, &columns, &metadata), plugin.as_ref());
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlUpdate, context),
+        concat!(
+            "UPDATE `ads`.`ads_tb_indicator_target_fill_test` SET `indicator_name` = '值' ",
+            "WHERE `indicator_key` = '4';",
+        )
+    );
+
+    let context = sql_context((&data, &columns, &metadata), plugin.as_ref());
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlDelete, context),
+        "DELETE FROM `ads`.`ads_tb_indicator_target_fill_test` WHERE `indicator_key` = '4';"
+    );
+}
+
+#[test]
+fn qualified_table_name_is_split_for_dialectless_and_multi_part_names() {
+    let data = vec![vec![Some("1".into())]];
+    let columns = vec!["id".into()];
+
+    let metadata = TableMetadata::new("sales.orders").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        "INSERT INTO \"sales\".\"orders\" (\"id\") VALUES\n(1);"
+    );
+
+    let metadata = TableMetadata::new("warehouse.sales.orders").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        "INSERT INTO \"warehouse\".\"sales\".\"orders\" (\"id\") VALUES\n(1);"
+    );
+}
+
+#[test]
+fn unqualified_table_name_stays_a_single_identifier() {
+    let data = vec![vec![Some("1".into())]];
+    let columns = vec!["id".into()];
+    let metadata = TableMetadata::new("users").with_columns(columns.clone());
+    let context = CopyFormatContext::new(&data, &columns, &metadata);
+
+    assert_eq!(
+        CopyFormatter::format(CopyFormat::SqlInsert, context),
+        "INSERT INTO \"users\" (\"id\") VALUES\n(1);"
     );
 }
 

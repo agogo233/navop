@@ -2,7 +2,7 @@
 
 use crate::value_table_columns::{
     ColumnWidths, HASH_COLUMNS, LIST_COLUMNS, SET_COLUMNS, ValueColumn, ZSET_COLUMNS,
-    columns_min_row_width, render_column_resize_handle,
+    columns_min_row_width, render_column_resize_handles,
 };
 use crate::{
     GlobalRedisState, HashField, KeyInfo, KeyValueContent, KeyValueDetail, RedisKeyType, ZSetMember,
@@ -3574,8 +3574,9 @@ impl KeyValueView {
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .when(is_action, |this| this.text_right())
                 .child(label)
-                .child(render_column_resize_handle(
-                    column,
+                .children(render_column_resize_handles(
+                    columns,
+                    index,
                     cx,
                     |view: &Self, column| px(view.column_width(column)),
                     |view: &mut Self, column, width| view.set_column_width(column, width),
@@ -3869,7 +3870,7 @@ mod tests {
         AppContext, Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px,
         size,
     };
-    use gpui_component::Root;
+    use gpui_component::{Root, render_dialog_layer};
 
     #[gpui::test]
     fn delete_key_confirmation_dialog_opens(cx: &mut TestAppContext) {
@@ -3904,7 +3905,7 @@ mod tests {
 
         assert!(view.read_with(&cx, |view, _| view.current_key.is_some()));
         assert!(
-            !cx.update(|window, cx| Root::render_dialog_layer(window, cx).is_some()),
+            !cx.update(|window, cx| render_dialog_layer(window, cx).is_some()),
             "confirmation dialog should initially be closed"
         );
         view.update_in(&mut cx, |view, window, cx| {
@@ -3913,7 +3914,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            cx.update(|window, cx| Root::render_dialog_layer(window, cx).is_some()),
+            cx.update(|window, cx| render_dialog_layer(window, cx).is_some()),
             "delete confirmation dialog should be registered with the window root"
         );
     }

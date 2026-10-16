@@ -49,6 +49,8 @@ fn ssh_params(reference: Option<CredentialReference>) -> SshParams {
         disable_shell_integration: None,
         x11_forwarding: None,
         allow_legacy_algorithms: None,
+        forward_agent: None,
+        agent_forward_key: None,
         jump_server: None,
         proxy: None,
         os_id: None,
@@ -404,6 +406,46 @@ fn resolver_supports_proxy_jump_server_sentinel_and_private_key_content() {
     });
 }
 
+/// 关键场景：keychain 凭据用密码登录跳板机，同时把随身携带的私钥标记为
+/// 「转发到 agent」。连接本身认证方式仍是密码，但 resolver 必须把私钥
+/// 明文回填到 `agent_forward_key`，否则下游没有身份可加入本地 ssh-agent，
+/// ForwardAgent 通道会白白打开却转发一个空 agent。
+#[test]
+fn resolver_forwards_credential_private_key_even_when_password_auth_is_selected() {
+    with_master_key(|| {
+        let (_temp, _connection, repository) = super::test_repository();
+        let mut credential = CredentialEntry::new("Bastion with spare key");
+        credential.username = Some("vault-user".to_string());
+        credential.password = Some("vault-password".to_string());
+        credential.private_key_content = Some("spare-private-key".to_string());
+        credential.passphrase = Some("spare-passphrase".to_string());
+        credential.forward_to_agent = true;
+        let credential_id = repository
+            .insert(&mut credential)
+            .expect("insert credential");
+
+        let reference = Some(password_reference(credential_id));
+        let ssh = repository
+            .resolve_ssh(ssh_params(reference))
+            .expect("resolve ssh");
+
+        assert!(matches!(
+            ssh.auth_method,
+            SshAuthMethod::Password { ref password } if password == "vault-password"
+        ));
+        assert_eq!(Some(true), ssh.forward_agent);
+        let forwarded = ssh
+            .agent_forward_key
+            .as_ref()
+            .expect("agent_forward_key should be filled in for forward_to_agent credentials");
+        assert_eq!(
+            Some("spare-private-key"),
+            forwarded.private_key_content.as_deref()
+        );
+        assert_eq!(Some("spare-passphrase"), forwarded.passphrase.as_deref());
+    });
+}
+
 #[test]
 fn resolver_uses_stable_cloud_id_without_falling_back_to_foreign_local_id() {
     with_master_key(|| {
@@ -459,7 +501,7 @@ fn resolver_uses_stable_cloud_id_without_falling_back_to_foreign_local_id() {
 }
 
 #[test]
-fn resolve_connection_returns_a_temporary_clone_and_rejects_conflicting_ssh_fields() {
+fn resolve_connection_returns_a_temporary_clone_and_supports_password_with_private_key() {
     with_master_key(|| {
         let (_temp, _connection, repository) = super::test_repository();
         let credential_id = insert_password_credential(&repository);
@@ -479,19 +521,41 @@ fn resolve_connection_returns_a_temporary_clone_and_rejects_conflicting_ssh_fiel
         assert_eq!(ConnectionType::SshSftp, resolved.connection_type);
         assert!(resolved.params.contains("vault-password"));
 
-        let mut conflicting = ssh_params(Some(CredentialReference {
-            credential_id,
+        // 同时勾选密码与私钥的钥匙串条目应解析成「密码 + 密钥」认证链。
+        let mut combined_credential = CredentialEntry::new("Combined login");
+        combined_credential.username = Some("combined-user".to_string());
+        combined_credential.password = Some("combined-password".to_string());
+        combined_credential.private_key_path = Some("/local/combined-key".to_string());
+        let combined_id = repository
+            .insert(&mut combined_credential)
+            .expect("insert combined credential");
+
+        let mut combined = ssh_params(Some(CredentialReference {
+            credential_id: combined_id,
             credential_cloud_id: None,
-            username: false,
+            username: true,
             password: true,
             private_key: true,
             passphrase: false,
         }));
-        conflicting.auth_method = SshAuthMethod::Agent;
-        let error = repository
-            .resolve_ssh(conflicting)
-            .expect_err("password and private key cannot both be selected");
-        assert!(error.to_string().contains("password and private key"));
+        combined.auth_method = SshAuthMethod::Agent;
+        let resolved = repository
+            .resolve_ssh(combined)
+            .expect("password and private key references should resolve together");
+        assert_eq!("combined-user", resolved.username);
+        match resolved.auth_method {
+            SshAuthMethod::Chain(steps) => assert!(
+                matches!(
+                    steps.as_slice(),
+                    [
+                        SshAuthMethod::Password { password },
+                        SshAuthMethod::PrivateKey { key_path, .. }
+                    ] if password == "combined-password" && key_path == "/local/combined-key"
+                ),
+                "组合认证应保留密码与私钥两个因素，实际：{steps:?}"
+            ),
+            other => panic!("期望「密码 + 密钥」认证链，实际：{other:?}"),
+        }
     });
 }
 

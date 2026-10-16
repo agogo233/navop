@@ -365,7 +365,9 @@ impl TerminalControlSessionHandle for ThreadSafeTerminalControlHandle {
                 target,
                 action: request.action,
                 sent: output.sent,
-                readiness_before: map_control_readiness(output.readiness_before),
+                readiness_before: output
+                    .readiness_before
+                    .map(map_control_readiness),
             })
         })
     }
@@ -545,6 +547,7 @@ fn map_exec_completion(completion: CoreTerminalExecCompletion) -> TerminalExecCo
 fn map_control_action(action: TerminalControlAction) -> CoreTerminalControlAction {
     match action {
         TerminalControlAction::Interrupt => CoreTerminalControlAction::Interrupt,
+        TerminalControlAction::Reintegrate => CoreTerminalControlAction::Reintegrate,
     }
 }
 
@@ -718,7 +721,7 @@ mod tests {
                 Ok(CoreTerminalControlOutput {
                     action: CoreTerminalControlAction::Interrupt,
                     sent: true,
-                    readiness_before: CoreTerminalControlReadiness::CommandRunning,
+                    readiness_before: Some(CoreTerminalControlReadiness::CommandRunning),
                 })
             })
         })
@@ -748,7 +751,7 @@ mod tests {
         assert_eq!(CoreTerminalControlAction::Interrupt, recorded[0].action);
         assert!(result.sent);
         assert_eq!(
-            TerminalControlReadiness::CommandRunning,
+            Some(TerminalControlReadiness::CommandRunning),
             result.readiness_before
         );
     }

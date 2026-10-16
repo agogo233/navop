@@ -6,8 +6,9 @@ use gpui_shell::{LoadedScriptView, ViewLoadOptions, policy::Policy};
 
 use super::{
     PreparedShellView, ShellPluginHost, blob::blob_module, context::context_module, dev,
-    event::event_module, job::job_module, log::log_module, resource::resource_module,
-    runtime::runtime_module, session::ShellMountSession,
+    event::event_module, i18n::i18n_module, job::job_module, log::log_module,
+    resource::resource_module, runtime::runtime_module, session::ShellMountSession,
+    theme::theme_module,
 };
 
 pub(crate) struct LoadedShellView {
@@ -106,6 +107,12 @@ fn load_with_session_and_connection(
     if modules.contains(&extension_runtime::extension::manifest::ShellHostModule::Dev) {
         policy = policy.with_host_module(dev::dev_module())?;
     }
+    if modules.contains(&extension_runtime::extension::manifest::ShellHostModule::I18n) {
+        policy = policy.with_host_module(i18n_module())?;
+    }
+    if modules.contains(&extension_runtime::extension::manifest::ShellHostModule::Theme) {
+        policy = policy.with_host_module(theme_module())?;
+    }
     if modules.contains(&extension_runtime::extension::manifest::ShellHostModule::Workbench) {
         let (descriptor, handle, page_context) = workbench.ok_or_else(|| {
             anyhow!("navop.workbench requires a borrowed resource-workbench session")
@@ -123,7 +130,11 @@ fn load_with_session_and_connection(
         entry_relative_path(&prepared.contribution)?,
         Rc::new(policy),
     );
-    host.runtime.load_view(options, window, cx)
+    let loaded = host.runtime.load_view(options, window, cx)?;
+    // 登记视图，宿主才知道切语言时要让谁重跑脚本。注销靠弱引用自己失效
+    // （`refresh_views` 顺手清理），所以这里不需要配套的 unregister。
+    host.track_view(loaded.view().downgrade());
+    Ok(loaded)
 }
 
 impl ShellPluginHost {

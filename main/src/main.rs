@@ -24,6 +24,8 @@ mod home;
 mod home_tab;
 mod license;
 mod local_terminal_profiles;
+mod master_key_dialogs;
+mod master_key_flow;
 mod navigation_applications;
 mod navop_app;
 pub mod new_connection;
@@ -36,6 +38,7 @@ mod personal_sync_status;
 mod public_mcp_approval;
 mod public_mcp_runtime;
 mod resource_workbench_terminal;
+mod screenshot_safe;
 mod session_logs;
 mod setting_tab;
 mod settings;
@@ -50,9 +53,8 @@ mod windows_single_instance;
 
 use crate::navop_app::NavopApp;
 use gpui::*;
-use one_core::tab_container::GlobalTabContainer;
 
-use gpui_component::{DialogStateChanged, Root};
+use gpui_component::Root;
 use gpui_component_assets::Assets;
 use one_core::settings::{AppSettings, MainWindowSize, MainWindowState};
 use std::path::PathBuf;
@@ -100,7 +102,7 @@ fn navop_brand_icon(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
 }
 
 const NAVOP_APP_ID: &str = "navop";
-const NAVOP_WINDOW_TITLE: &str = "Navop";
+pub(crate) const NAVOP_WINDOW_TITLE: &str = "Navop";
 const DEFAULT_MAIN_WINDOW_WIDTH: f32 = 1800.0;
 const DEFAULT_MAIN_WINDOW_HEIGHT: f32 = 1260.0;
 const MAIN_WINDOW_DISPLAY_RATIO: f32 = 0.9;
@@ -312,17 +314,64 @@ impl AssetSource for AppAssets {
     }
 }
 
+/// 单实例门禁失败时的用户可见提示。
+///
+/// release 构建是 `windows_subsystem = "windows"`，没有控制台，`eprintln!` 用户
+/// 看不到；这里必须用系统对话框，否则表现为“双击了但没有反应”。
+#[cfg(target_os = "windows")]
+fn report_single_instance_failure(message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
+    use windows::core::HSTRING;
+
+    let text = HSTRING::from(message);
+    let caption = HSTRING::from(NAVOP_WINDOW_TITLE);
+    // SAFETY: 两个字符串在调用期间保持存活；无属主窗口时句柄传 None。
+    unsafe {
+        MessageBoxW(
+            None,
+            &text,
+            &caption,
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
 fn main() {
     env_file::load_env_files();
 
-    // GPUI 的 Windows 平台默认通过 DirectComposition visual 呈现窗口内容，
-    // 该 visual 会盖住传统 child HWND（例如 RDP ActiveX 控件），即使连接
-    // 成功、child 可见，远端桌面区域也表现为白屏。原生 RDP 后端必须在
-    // platform 单例构造之前让 GPUI 走经典 HWND swap-chain 路径，与
-    // `tools/gpui-rdp-smoke` 保持一致；该环境变量只在构造时读取一次。
-    // 使用共享编译期标记（`remote_desktop_view/windows-native-rdp` 也会
-    // 启用它），而不是 main 自身的 feature，保证两种 feature 写法都生效。
-    if remote_desktop::windows_native_rdp_compiled() {
+    // GPUI 的 Windows 平台通过 DirectComposition visual 呈现窗口内容；原生 RDP
+    // 后端可以把 ActiveX 子窗口作为**合成 surface** 挂进同一棵 visual 树
+    // （`remote_desktop_view::windows_native_composition`）：子窗口的栅格化变成一个
+    // 位于 GPUI overlay 层之下的 visual，标签菜单、弹层等 deferred 浮层因此能盖住
+    // 远端桌面（issue #310）。
+    //
+    // 让浮层真正露出来的是 `DWMWA_CLOAK`，而 cloak 会**同时**把窗口踢出系统的命中
+    // 测试。RDP 的按钮输入归 `IHWindowClass`（"Input Capture Window"，靠 RawInput 走
+    // 系统输入路径），窗口一被 cloak 就再也收不到按钮，合成消息也救不回来——实测把
+    // `WM_MOUSEMOVE` / `WM_LBUTTONDOWN` / `WM_RBUTTONDOWN` 分别 PostMessage 与
+    // SendMessage 给 overlay 子树的 6 个窗口（共 12 组），只有 `WM_MOUSEMOVE` 生效
+    // （远端光标会动），按钮消息全部零像素变化；先把真实光标 `SetCursorPos` 到目标点
+    // 再发同样无效。所以 **cloak 不能常驻**。
+    //
+    // 现在的做法是**按需 cloak**：合成照常启用，但窗口默认不 cloak——保持普通子窗口
+    // 的输出与输入；只有 GPUI 真的有浮层内容时（`Window::has_deferred_content`，覆盖
+    // 全部 popup / context / dropdown 菜单以及 prompt）才临时 cloak，浮层一消失立刻
+    // 取消。两个方向都走 `WindowsNativeAdapter::set_overlay_cloak`。
+    //
+    // 硬约束不变：`DWMWA_CLOAK` 必须晚于「窗口第一次拿到真实尺寸并被绘制一次」，
+    // 过早 cloak 会让合成 surface 永久为空、RDP 区域只剩 gpui 背景色 `#171717`。
+    // 见 `docs/windows-native-rdp-cloak-ordering.md`。
+    //
+    // `NAVOP_RDP_DISABLE_COMPOSITION=1` 是逃生门：直接关掉整条合成路径（同时关掉
+    // GPUI 的 DirectComposition），退回经典 HWND 子窗口。该环境变量只在 platform
+    // 单例构造时读取一次，所以必须在这里、在 GPUI 之前决定；使用共享编译期标记
+    // （`remote_desktop_view/windows-native-rdp` 也会启用它）而不是 main 自身的
+    // feature，保证两种 feature 写法都生效。
+    if remote_desktop::windows_native_rdp_compiled()
+        && std::env::var_os("NAVOP_RDP_DISABLE_COMPOSITION").is_some()
+    {
         // SAFETY: 进程尚未创建 GPUI platform，也没有任何线程会读取该
         // 环境变量；与 smoke 工具在进程首部执行相同操作。
         unsafe {
@@ -371,24 +420,32 @@ fn main() {
         use windows_single_instance::{SingleInstanceOutcome, StartupRequest};
 
         let forwarded_request_tx = startup_request_tx.clone();
-        match windows_single_instance::claim_or_forward(
+        let outcome = windows_single_instance::claim_or_forward(
             resolved_paths.config_dir(),
             StartupRequest::new(startup_paths.clone()),
             move |request| {
+                // 返回 false 会让主实例回拒绝 ACK：只有真正进入启动队列的请求才算
+                // 被接管，第二个进程不会因为一次失败入队而静默退出。
                 if let Err(error) = forwarded_request_tx
                     .try_send(AppOpenRequest::ActivateAndOpenPaths(request.into_paths()))
                 {
                     tracing::warn!(%error, "failed to enqueue forwarded startup request");
+                    return false;
                 }
+                true
             },
-        ) {
+        );
+
+        match outcome {
             Ok(SingleInstanceOutcome::Primary) => {}
             Ok(SingleInstanceOutcome::Forwarded) => return,
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "failed to establish Windows single-instance listener; continuing startup"
-                );
+                // 不能把“无法建立通信”解释成“可以另开一个实例”：放行会直接产出
+                // 第二个 GUI，而第二个窗口既没有单实例语义、也分不清谁该处理启动
+                // 文件。这里明确报错并退出。
+                tracing::error!(%error, "failed to establish the Windows single instance");
+                report_single_instance_failure(error.user_message());
+                std::process::exit(1);
             }
         }
     }
@@ -445,6 +502,10 @@ fn main() {
             file_association::schedule_registration(cx);
         }
         notes::init(cx);
+        // notes::init 给 `secondary-/` 绑了一个全局的「切换源码模式」，而 gpui 的
+        // 绑定优先级是「无 context 的绑定等价于最深的 context，同深度后注册者胜」；
+        // SQL 编辑器的注释快捷键必须再登记一次，才能在编辑器里按得动 cmd+/（#290 反馈）。
+        db_view::sql_editor_view::refresh_keybindings(cx);
         extension_runtime::init(cx);
         universal_plugins::init(cx);
         // 资源工作台的 terminal 页面需要宿主提供可嵌入终端;未注册时
@@ -491,18 +552,20 @@ fn main() {
                 // 「隐藏」还是「退出确认」。此处已在主线程且 GPUI 事件
                 // 循环已启动（macOS 的 NSStatusItem 要求如此）。
                 system_tray::init(cx);
-                update::schedule_update_check(window, cx);
+                update::schedule_update_check(cx);
                 extension_update::schedule_plugin_update_check(window, cx);
                 let view = cx.new(|cx| NavopApp::new(window, cx));
                 let root = cx.new(|cx| Root::new(view, window, cx));
-                let tab_container = cx.global::<GlobalTabContainer>().tab_container.clone();
                 system_tray::sync_sessions_from(cx);
-                cx.subscribe(&root, move |_, event: &DialogStateChanged, cx| {
-                    tab_container.update(cx, |tabs, cx| {
-                        tabs.set_active_presentation_obscured_by_dialog(event.active_count > 0, cx);
-                    });
-                })
-                .detach();
+                // 主窗口内的 dialog 与右键菜单一样，都是 GPUI 的 deferred 浮层：
+                // Windows 原生 RDP 那侧的「按需 cloak」会据此把会话窗口让给浮层
+                // （见 `remote_desktop_view::view::render::sync_native_overlay_cloak`），
+                // 所以这里**不再**为 dialog 单独标记 presentation obscured。
+                //
+                // 旧接线（订阅 `DialogStateChanged` → `set_active_presentation_obscured_by_dialog`）
+                // 走的是另一条更重的路：它把会话判为 not active → `native.deactivate()`
+                // 直接撤下 RDP overlay，于是 dialog 背后是一片空白，切回该标签页也是空白。
+                // 浮层该由「让位」解决，不该由「撤下会话」解决。
                 root
             }) {
                 Ok(window) => window,
@@ -521,6 +584,31 @@ fn main() {
             let main_window = main_window.into();
 
             while let Ok(request) = startup_request_rx.recv().await {
+                // 主窗口被「关闭按钮 → 最小化到托盘」隐藏（`ShowWindow(SW_HIDE)`）之后，
+                // 光调 `window.activate_window()` 是叫不回来的：gpui_windows 的
+                // `activate()` 只在 `IsIconic`（系统最小化）时才补一次
+                // `ShowWindowAsync(SW_RESTORE)`，而隐藏窗口不是 iconic，于是一次
+                // ShowWindow 都不会发出。2026-09-20 真机实测：二次启动确实转发成功
+                // （转发方退出码 0、没有开出第二个窗口），但主窗口 `IsWindowVisible`
+                // 仍然是 false —— 用户看到的就是"更新/启动之后应用不再出现"。
+                // 所以这里复用托盘自己的可见性适配器，它对隐藏窗口是恢复、对已可见窗口
+                // 是无操作（`SW_SHOW`，见 `window_visibility::platform::show`）。
+                //
+                // 句柄必须在窗口借用内取、原生调用必须在借用外做：原生激活回调会同步
+                // 重入 GPUI 抢同一个 App 借用，否则现场只剩一行 `RefCell already borrowed`
+                // （`window_visibility` 模块头有实测记录）。
+                let main_window_target = cx.update_window(main_window, |_, window, _| {
+                    window_visibility::main_window_target(window)
+                });
+                if let Ok(Ok(target)) = main_window_target {
+                    if let Err(error) = window_visibility::show_main_window(target) {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to restore the main window for a forwarded startup request"
+                        );
+                    }
+                }
+
                 if cx
                     .update_window(main_window, |_, window, cx| {
                         window.activate_window();
@@ -546,12 +634,33 @@ fn main() {
         })
         .detach();
     });
+
+    // GPUI 的 `run` 循环返回之后，进程才进入 `ExitProcess`，逐个执行已加载
+    // 模块的 `DLL_PROCESS_DETACH`。这台机器上常年驻留着若干第三方注入模块
+    // （输入法 TSF、显卡厂商钩子），其中任何一个在 detach 里阻塞，进程都会停在
+    // 「窗口还在、消息循环已停、连 `TerminateProcess` 都打不进去」的状态，
+    // 从表面看就是「关不掉」。记录这个里程碑，可以把「卡在应用/GPU 资源析构」
+    // 与「卡在进程退出」两类问题区分开。
+    tracing::info!("Navop run loop returned; application resources released");
 }
 
 #[cfg(test)]
 mod embedded_cli_removal_tests {
     use gpui::{px, size};
     use one_core::settings::{MainWindowSize, MainWindowState};
+
+    /// 只取 `main.rs` 的**生产代码**部分（去掉本测试模块）。
+    ///
+    /// 源文本断言必须只看生产代码：否则断言里的字面量本身就在 `include_str!`
+    /// 的范围内，`assert!(source.contains(...))` 会自己满足自己，而
+    /// `assert!(!source.contains(...))` 会永远失败。
+    fn production_source() -> String {
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        let tests = source
+            .find("\n#[cfg(test)]\nmod embedded_cli_removal_tests")
+            .expect("embedded_cli_removal_tests module marker");
+        source[..tests].to_string()
+    }
 
     #[test]
     fn main_does_not_route_business_cli() {
@@ -598,7 +707,7 @@ mod embedded_cli_removal_tests {
 
     #[test]
     fn windows_single_instance_gate_precedes_application_creation() {
-        let source = include_str!("main.rs");
+        let source = production_source();
         let gate = source
             .find("windows_single_instance::claim_or_forward")
             .expect("Windows single-instance gate");
@@ -607,25 +716,64 @@ mod embedded_cli_removal_tests {
             .expect("GPUI application creation");
 
         assert!(gate < application);
-        assert!(source.contains("SingleInstanceOutcome::Forwarded => return"));
+        // 只有确认取得主实例资格（或成功转交）才允许继续；判定失败必须退出，
+        // 否则同一个配置目录会出现第二个 GUI。
+        assert!(source.contains("Ok(SingleInstanceOutcome::Forwarded) => return"));
+        assert!(source.contains("std::process::exit(1)"));
+        assert!(source.contains("report_single_instance_failure(error.user_message())"));
+        assert!(!source.contains("continuing startup"));
     }
 
+    /// 原生 RDP 的合成路径**默认启用**，只有逃生门能关掉它。
+    ///
+    /// 浮层要盖住远端桌面，靠的就是把 ActiveX 子窗口挂进 GPUI 的 visual 树
+    /// （issue #310），所以合成必须开着。让浮层真正露出来的 `DWMWA_CLOAK` 会
+    /// **同时**把窗口踢出系统命中测试：RDP 的按钮输入归 `IHWindowClass`
+    /// （Input Capture Window）走 RawInput，cloak 之后收不到 —— 实测 12 组转发里
+    /// 只有 `WM_MOUSEMOVE` 生效，按钮消息全部零像素变化。所以 cloak 改成**按需**：
+    /// 只有 GPUI 真的画了浮层内容时才 cloaks，见
+    /// `WindowsNativeAdapter::set_overlay_cloak`；窗口默认保持普通子窗口的输入。
+    ///
+    /// 逃生门 `NAVOP_RDP_DISABLE_COMPOSITION=1` 退回经典 HWND 路径，此时必须
+    /// **同时**关掉 GPUI 的 DirectComposition：否则 RDP 只是一个普通子窗口，会被
+    /// GPUI 的合成 visual 盖住。
     #[test]
-    fn windows_native_rdp_disables_direct_composition_before_application_creation() {
-        let source = include_str!("main.rs");
+    fn windows_native_rdp_keeps_direct_composition_unless_the_escape_hatch_is_set() {
+        let source = production_source();
         let marker = source
             .find("remote_desktop::windows_native_rdp_compiled()")
             .expect("windows-native-rdp capability marker");
-        let setter = source
-            .find("GPUI_DISABLE_DIRECT_COMPOSITION")
-            .expect("windows-native-rdp must disable GPUI DirectComposition");
+        // 两个标识符都从 marker 之后开始找：闸门上方的大段注释里也会提到
+        // `GPUI_DISABLE_DIRECT_COMPOSITION`，从文件头找会命中注释。
+        let gate = &source[marker..];
+        let switch = marker
+            + gate
+                .find("NAVOP_RDP_DISABLE_COMPOSITION")
+                .expect("escape hatch for the composition presentation path");
+        let setter = marker
+            + gate
+                .find("GPUI_DISABLE_DIRECT_COMPOSITION")
+                .expect("classic presentation path disables GPUI DirectComposition");
         let application = source
             .find("gpui_platform::application()")
             .expect("GPUI application creation");
 
-        assert!(marker < setter);
+        // 判定必须发生在 GPUI platform 构造之前：该环境变量只被读取一次。
+        assert!(marker < switch);
+        assert!(switch < setter);
         assert!(setter < application);
         assert!(source.contains("std::env::set_var(\"GPUI_DISABLE_DIRECT_COMPOSITION\", \"1\")"));
+        // 关闭动作只能由逃生门把关：默认启用，只有显式关掉合成才跟着关。
+        let guard = &source[marker..setter];
+        assert!(
+            guard.contains("var_os(\"NAVOP_RDP_DISABLE_COMPOSITION\").is_some()"),
+            "DirectComposition must stay on unless the composition path is explicitly disabled"
+        );
+        // 旧的 opt-in 开关已不再承认：留着它会让"默认启用"变成一句空话。
+        assert!(
+            !source.contains("NAVOP_RDP_ENABLE_COMPOSITION"),
+            "the retired opt-in switch must not survive as a no-op"
+        );
     }
 
     #[test]
@@ -644,18 +792,73 @@ mod embedded_cli_removal_tests {
         assert!(activation < open);
     }
 
+    /// 转发的启动请求必须能叫回一个被托盘隐藏的主窗口。
+    ///
+    /// `window.activate_window()` 做不到：gpui_windows 的 `activate()` 只在 `IsIconic`
+    /// （系统最小化）时才补一次 `ShowWindowAsync(SW_RESTORE)`，而托盘隐藏用的是
+    /// `ShowWindow(SW_HIDE)`，隐藏窗口不是 iconic，一次 ShowWindow 都不会发出。
+    /// 2026-09-20 真机实测（安装版 v0.18.4）：二次启动转发成功、窗口数不变，但
+    /// `IsWindowVisible` 仍为 false；此时外部直接 `ShowWindow(SW_SHOW)` 立刻可见。
+    ///
+    /// 这条断言同时钉住「借用外改原生状态」：`show_main_window` 一旦被写进
+    /// `cx.update_window(...)` 的闭包里，原生激活回调会同步重入 GPUI 抢同一个 App
+    /// 借用，现场只剩一行 `RefCell already borrowed`（`window_visibility` 模块头有记录）。
     #[test]
-    fn main_window_dialog_state_obscures_active_native_presentation() {
+    fn forwarded_startup_request_restores_a_tray_hidden_window() {
+        let source = production_source();
+        let receiver = source
+            .find("startup_request_rx.recv().await")
+            .expect("forwarded startup request receiver");
+        let forwarded = &source[receiver..];
+        // 去掉所有空白再断言形态：只关心语句结构，不被缩进与换行绑死。
+        let compact: String = forwarded.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let handle = compact
+            .find(
+                "cx.update_window(main_window,|_,window,_|{window_visibility::main_window_target(window)})",
+            )
+            .expect("转发路径必须在窗口借用内取原生句柄，且闭包内不做原生状态修改");
+        let restore = compact
+            .find("window_visibility::show_main_window(target)")
+            .expect("转发路径必须通过 window_visibility::show_main_window 恢复主窗口");
+        let open = compact
+            .find("file_open::open_input(input,window,cx)")
+            .expect("forwarded file open");
+
+        assert!(handle < restore, "必须先取到句柄、再在借用之外恢复窗口");
+        assert!(restore < open, "恢复主窗口要发生在打开文件之前");
+    }
+
+    /// 主窗口的 dialog **不再**接管 Windows 原生 RDP 的呈现。
+    ///
+    /// 旧接线订阅 `DialogStateChanged`，把活跃 dialog 数喂给
+    /// `TabContainer::set_active_presentation_obscured_by_dialog`，最终落到
+    /// `native.deactivate()` —— 会话窗口被撤下，dialog 背后是空白页，切回该标签页
+    /// 也还是空白。dialog 与右键菜单一样都是 GPUI 的 deferred 浮层，原生 RDP 侧已由
+    /// 「按需 cloak」统一让位，所以这条接线必须保持删除状态：它一旦回来，空白页就跟着
+    /// 回来，而且不会有任何报错。
+    ///
+    /// 被禁的字面量要在测试里拆开写（`concat!`）：断言目标就在同一个文件里，
+    /// 否则 `!source.contains(...)` 会被断言自己的文本满足。所以查的是**代码形状**
+    /// 而不是裸标识符 —— 生产代码的注释里还会提到旧符号名（那是有意留的线索）。
+    #[test]
+    fn dialog_state_does_not_obscure_the_native_presentation() {
         let source = include_str!("main.rs").replace("\r\n", "\n");
 
-        let _ = std::any::TypeId::of::<gpui_component::DialogStateChanged>();
-        assert!(source.contains("use gpui_component::{DialogStateChanged, Root};"));
         assert!(source.contains("let root = cx.new(|cx| Root::new(view, window, cx));"));
-        assert!(source.contains("cx.subscribe(&root,"));
-        assert!(source.contains("event: &DialogStateChanged"));
-        assert!(source.contains("event.active_count > 0"));
-        assert!(source.contains("set_active_presentation_obscured_by_dialog"));
-        assert!(source.contains(".detach();\n                root"));
+
+        let forbidden = [
+            concat!("cx.subscribe(&", "root,"),
+            concat!("event.active", "_count > 0"),
+            concat!("tabs.set_active_presentation_obscured", "_by_dialog("),
+            concat!("use one_core::tab_container::Global", "TabContainer;"),
+        ];
+        for needle in forbidden {
+            assert!(
+                !source.contains(needle),
+                "dialog 不是「遮蔽呈现」的来源：{needle} 一旦回来，RDP 就会在弹窗背后变成空白页"
+            );
+        }
     }
 
     #[test]

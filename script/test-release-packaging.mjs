@@ -15,6 +15,30 @@ const workflowStep = (workflow, name) => {
   return workflow.slice(start, end >= 0 ? end : undefined);
 };
 
+// 合成一个最小 PE（单 `.rsrc` 节），给 `script/validate-windows-exe.mjs` 做正/负样本。
+// 只保证节表能被门禁解析（MZ + PE 签名 + 节表 + 节数据），不追求可执行。
+const peFixtureWithResource = (resourcePayload) => {
+  const peOffset = 0x40;
+  const sectionTable = peOffset + 24; // COFF 头 20 字节 + 可选的 PE32+ 头长度 0
+  const resourceOffset = sectionTable + 40;
+  const payload = Buffer.from(resourcePayload, "utf8");
+  const fixture = Buffer.alloc(resourceOffset + payload.length);
+
+  fixture.write("MZ", 0, "latin1");
+  fixture.writeUInt32LE(peOffset, 0x3c);
+  fixture.write("PE\0\0", peOffset, "latin1");
+  // COFF 头从 PE 签名之后开始（`peOffset + 4`）：Machine / NumberOfSections / …
+  fixture.writeUInt16LE(0x8664, peOffset + 4);
+  fixture.writeUInt16LE(1, peOffset + 6);
+  fixture.writeUInt16LE(0, peOffset + 20);
+  fixture.write(".rsrc\0\0\0", sectionTable, "latin1");
+  fixture.writeUInt32LE(payload.length, sectionTable + 8);
+  fixture.writeUInt32LE(payload.length, sectionTable + 16);
+  fixture.writeUInt32LE(resourceOffset, sectionTable + 20);
+  payload.copy(fixture, resourceOffset);
+  return fixture;
+};
+
 test("release packaging uses the navop executable on every platform", () => {
   const release = read(".github/workflows/release.yml");
   const bundle = read("script/bundle-macos.sh");
@@ -114,64 +138,47 @@ test("renamed Linux packages replace legacy onetcli installations", () => {
   assert.match(release, /Obsoletes: onetcli/);
 });
 
-test("Linux keeps full-feature standard packages and publishes portable variants separately", () => {
+test("Linux publishes one package per architecture plus a separate GPU dependency stack", () => {
   const release = read(".github/workflows/release.yml");
-  const installZig = workflowStep(
-    release,
-    "Install Zig toolchain (portable Linux)",
-  );
-  const installPortable = workflowStep(
-    release,
-    "Install portable packaging dependencies",
-  );
+  const installZig = workflowStep(release, "Install Zig toolchain (Linux)");
   const build = workflowStep(release, "Build release binary");
-  const verifyPortable = workflowStep(
-    release,
-    "Verify portable Linux glibc baseline",
-  );
+  const verifyBaseline = workflowStep(release, "Verify Linux glibc baseline");
   const packageLinux = workflowStep(release, "Package (Linux)");
+  const packageGpuStack = workflowStep(
+    release,
+    "Package Linux GPU dependency stack",
+  );
   const packageInstallers = workflowStep(
     release,
     "Package Linux installers (x86_64)",
   );
 
+  // Linux ships exactly one build per architecture. The portable archive is an
+  // extra artifact produced from that very same binary inside the same job, not
+  // a second matrix entry; the private loader and its launcher are gone, and
+  // the Mesa stack travels as a separate dependency archive instead.
+  assert.doesNotMatch(release, /portable_linux/);
+  assert.doesNotMatch(release, /linux-x64-portable|linux-arm64-portable/);
+  assert.doesNotMatch(release, /package-linux-portable|linux-portable-launcher/);
   assert.match(
     release,
-    /linux_x64='\{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest"[^']*"archive":"navop-x86_64-unknown-linux-gnu\.tar\.gz"[^']*"variant":"standard"[^']*"portable_linux":false\}'/,
+    /linux_x64='\{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest"[^']*"archive":"navop-x86_64-unknown-linux-gnu\.tar\.gz"[^']*"public_label":"linux-x64"[^']*\}'/,
   );
   assert.match(
     release,
-    /linux_x64_portable='\{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22\.04"[^']*"archive":"navop-x86_64-unknown-linux-gnu-portable\.tar\.gz"[^']*"variant":"portable"[^']*"portable_linux":true\}'/,
+    /linux_arm64='\{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-24\.04-arm"[^']*"archive":"navop-aarch64-unknown-linux-gnu\.tar\.gz"[^']*"public_label":"linux-arm64"[^']*\}'/,
   );
   assert.match(
     release,
-    /linux_arm64='\{"target":"aarch64-unknown-linux-gnu"[^']*"archive":"navop-aarch64-unknown-linux-gnu\.tar\.gz"[^']*"variant":"standard"[^']*"portable_linux":false\}'/,
+    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_arm64,\$windows_x64,\$windows_x86\]"/,
   );
-  assert.match(
-    release,
-    /linux_arm64_portable='\{"target":"aarch64-unknown-linux-gnu"[^']*"archive":"navop-aarch64-unknown-linux-gnu-portable\.tar\.gz"[^']*"variant":"portable"[^']*"portable_linux":true\}'/,
-  );
-  assert.match(
-    release,
-    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_x64_portable,\$linux_arm64,\$linux_arm64_portable,\$windows_x64,\$windows_x86\]"/,
-  );
-  assert.match(
-    release,
-    /linux-x64\) matrix="\[\$linux_x64,\$linux_x64_portable\]"/,
-  );
-  assert.match(
-    release,
-    /linux-x64-portable\) matrix="\[\$linux_x64_portable\]"/,
-  );
-  assert.match(
-    release,
-    /linux-arm64\) matrix="\[\$linux_arm64,\$linux_arm64_portable\]"/,
-  );
-  assert.match(
-    release,
-    /linux-arm64-portable\) matrix="\[\$linux_arm64_portable\]"/,
-  );
-  assert.match(installZig, /if: matrix\.portable_linux/);
+  assert.match(release, /linux-x64\) matrix="\[\$linux_x64\]"/);
+  assert.match(release, /linux-arm64\) matrix="\[\$linux_arm64\]"/);
+  assert.match(release, /name: Build \(\$\{\{ matrix\.target \}\}\)$/m);
+
+  // Zig is what lowers the C runtime requirement to glibc 2.28, so it now runs
+  // for every Linux build rather than only for the retired portable variant.
+  assert.match(installZig, /if: runner\.os == 'Linux'/);
   assert.match(installZig, /python3 -m venv "\$RUNNER_TEMP\/ziglang"/);
   assert.match(installZig, /ziglang==0\.14\.1/);
   assert.match(
@@ -184,13 +191,31 @@ test("Linux keeps full-feature standard packages and publishes portable variants
   );
   assert.match(installZig, /cargo-zigbuild --version/);
   assert.doesNotMatch(installZig, /cargo zigbuild --version/);
-  assert.match(installPortable, /if: matrix\.portable_linux/);
-  assert.match(installPortable, /apt-get install -y binutils musl-tools/);
-  assert.match(build, /if \[ "\$\{\{ matrix\.portable_linux \}\}" = "true" \]/);
+  assert.doesNotMatch(release, /Install portable packaging dependencies/);
+  assert.doesNotMatch(release, /musl-tools/);
+
+  assert.match(build, /if \[ "\$\{\{ runner\.os \}\}" = "Linux" \]/);
   assert.match(
     build,
-    /cargo zigbuild[\s\S]*--release[\s\S]*-p main[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"[\s\S]*--no-default-features[\s\S]*--features wasm-components,shell-plugins/,
+    /cargo zigbuild[\s\S]*--release[\s\S]*-p main[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"/,
   );
+  // No platform drops the default feature set: `embedded-webview` is off in the
+  // default set itself (see main/Cargo.toml), so the shape that gets published is
+  // the plain default build on all three platforms. The guard for that lives in
+  // its own test below.
+  assert.doesNotMatch(build, /--no-default-features/);
+  // The Touch Bar workaround feature is switched off again: upstream zed#65186 fixed the
+  // root cause (accesskit's plain Adapter instead of the dynamically subclassed content
+  // view) and that fix ships in gpui-pre fork-0.3.124, so every platform closes windows by
+  // destroying them. If the fix is ever disproven on real hardware, re-adding
+  // `--features macos-touchbar-window-hide` for the affected target here is the whole
+  // change; the mechanism is still in the code behind `HIDE_WINDOWS_ON_CLOSE`.
+  assert.doesNotMatch(
+    build,
+    /--features/,
+    "the build step must not name features: the Intel Mac Touch Bar workaround is disabled now that upstream zed#65186 landed",
+  );
+  assert.doesNotMatch(build, /extra_features/);
   assert.match(
     build,
     /cargo build --release -p main --target "\$\{\{ matrix\.target \}\}"/,
@@ -199,28 +224,81 @@ test("Linux keeps full-feature standard packages and publishes portable variants
     build,
     /test -x "target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}"/,
   );
-  assert.match(verifyPortable, /if: matrix\.portable_linux/);
+
+  assert.match(verifyBaseline, /if: runner\.os == 'Linux'/);
   assert.match(
-    verifyPortable,
+    verifyBaseline,
     /script\/check-linux-glibc-baseline\.sh[\s\S]*target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}[\s\S]*2\.28/,
   );
+
+  assert.match(packageLinux, /mkdir -p package\/usr\/bin/);
   assert.match(
     packageLinux,
-    /if \[ "\$\{\{ matrix\.portable_linux \}\}" = "true" \]; then[\s\S]*script\/package-linux-portable\.sh/,
-  );
-  assert.match(
-    packageLinux,
-    /else[\s\S]*cp "target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}" package\/usr\/bin\//,
+    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}" package\/usr\/bin\//,
   );
   assert.match(packageLinux, /--sort=name/);
   assert.match(packageLinux, /--numeric-owner/);
+
+  // The portable archive carries the identical binary plus the marker file the
+  // application looks for next to the executable. It has to be produced from
+  // this step without a second compilation, and its marker name must match the
+  // constant the Rust side actually reads.
+  const appPathsSource = read("crates/core/src/app_paths.rs");
+  const markerDeclaration =
+    /pub const PORTABLE_MARKER_FILE: &str = "([^"]+)";/.exec(appPathsSource);
+  assert.ok(markerDeclaration, "app_paths.rs must declare PORTABLE_MARKER_FILE");
+  const markerFile = markerDeclaration[1];
+  // Portable mode exists at all only because this detection stays platform
+  // independent; a Windows-only guard here would make the Linux archive ship a
+  // marker file that nothing ever reads.
+  assert.match(appPathsSource, /join\(PORTABLE_MARKER_FILE\)\.is_file\(\)/);
+  assert.doesNotMatch(appPathsSource, /cfg\(windows\)/);
+  assert.doesNotMatch(appPathsSource, /cfg\(target_os = "windows"\)/);
+  assert.match(packageLinux, new RegExp(`PORTABLE_MARKER_FILE="${markerFile}"`));
+  assert.match(packageLinux, /rm -rf portable-package/);
+  assert.match(packageLinux, /mkdir -p portable-package/);
   assert.match(
-    packageInstallers,
-    /if: matrix\.target == 'x86_64-unknown-linux-gnu' && !matrix\.portable_linux/,
+    packageLinux,
+    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}" portable-package\//,
   );
+  assert.match(packageLinux, /: > "portable-package\/\$\{PORTABLE_MARKER_FILE\}"/);
+  assert.match(
+    packageLinux,
+    /-czf "\$\{PUBLIC_BASENAME\}-portable\.tar\.gz" \\\n\s+-C portable-package \./,
+  );
+  // Reusing the release binary is the whole point: no second compilation.
+  assert.doesNotMatch(packageLinux, /cargo (?:zig)?build/);
+  assert.match(
+    release,
+    /navop-\*-\$\{\{ matrix\.public_label \}\}-portable\.tar\.gz/,
+  );
+  // The Windows portable ZIP ships the same contract and hardcodes the same
+  // marker name, so both platforms have to agree with the Rust constant.
+  assert.match(
+    release,
+    new RegExp(`"portable-package/${markerFile.replace(/\./g, "\\.")}"`),
+  );
+
+  // The dependency stack is a second asset for the same target, built against
+  // the same glibc 2.28 baseline, and published under the versioned public name.
+  assert.match(packageGpuStack, /if: runner\.os == 'Linux'/);
+  assert.match(
+    packageGpuStack,
+    /script\/package-linux-gpu-stack-docker\.sh[\s\S]*--binary "target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}"[\s\S]*--target "\$\{\{ matrix\.target \}\}"[\s\S]*--output dist-gpu-stack/,
+  );
+  assert.match(
+    packageGpuStack,
+    /cp dist-gpu-stack\/navop-gpu-stack-linux-\*\.tar\.gz "\$\{PUBLIC_BASENAME\}-gpu-stack\.tar\.gz"/,
+  );
+  assert.match(
+    release,
+    /navop-\*-\$\{\{ matrix\.public_label \}\}-gpu-stack\.tar\.gz/,
+  );
+
+  assert.match(packageInstallers, /if: matrix\.target == 'x86_64-unknown-linux-gnu'/);
 });
 
-test("portable Linux disables WebView while standard builds keep it", () => {
+test("the embedded webview is an opt-in feature on every platform", () => {
   const workspaceCargo = read("Cargo.toml");
   const cargo = read("crates/ai_chat_view/Cargo.toml");
   const mainCargo = read("main/Cargo.toml");
@@ -236,12 +314,23 @@ test("portable Linux disables WebView while standard builds keep it", () => {
     "crates/terminal_view/Cargo.toml",
   ];
 
-  assert.match(cargo, /default = \["embedded-webview"\]/);
+  // The host webview (WebKitGTK 4.1 on Linux) cannot travel with the package, and
+  // an in-app HTML preview that works on two platforms but not the third is not
+  // worth a second release shape: the feature is off in the default set
+  // everywhere and has to be asked for explicitly.
+  assert.match(cargo, /^default = \[\]$/m);
   assert.match(
     cargo,
-    /embedded-webview = \["dep:gpui-wry", "dep:wry"\]/,
+    /embedded-webview = \["dep:gpui-webview", "dep:wry"\]/,
   );
-  assert.match(cargo, /gpui-wry = \{[^}]*optional = true[^}]*\}/);
+  // The dependency key is `gpui-webview`; the workspace manifest pins it to
+  // the gpui-kit fork rev that ships the post-rename crate. On GPUI Fast the
+  // whole UI stack (webview included) shares the same backend.
+  assert.match(cargo, /gpui-webview = \{[^}]*optional = true[^}]*\}/);
+  assert.match(
+    workspaceCargo,
+    /^gpui-webview = \{ git = "https:\/\/github.com\/feigeCode\/gpui-kit",[^}]*\}$/m,
+  );
   assert.match(cargo, /wry = \{[^}]*optional = true[^}]*\}/);
   assert.doesNotMatch(cargo, /target_arch = "aarch64"/);
   assert.match(
@@ -256,8 +345,9 @@ test("portable Linux disables WebView while standard builds keep it", () => {
   assert.match(htmlCodeBlock, /HtmlPreview\.webview_unavailable/);
   assert.match(
     mainCargo,
-    /default = \["wasm-components", "embedded-webview", "windows-native-rdp", "shell-plugins"\]/,
+    /^default = \["wasm-components", "windows-native-rdp", "shell-plugins"\]$/m,
   );
+  assert.doesNotMatch(mainCargo, /default = \[[^\]]*embedded-webview/);
   assert.match(
     mainCargo,
     /embedded-webview = \["ai_chat_view\/embedded-webview"\]/,
@@ -291,132 +381,306 @@ test("portable Linux disables WebView while standard builds keep it", () => {
   }
 });
 
-test("Linux portable packager uses a private loader and recursive ELF closure", () => {
-  const wrapperPath = "script/package-linux-portable.sh";
-  const packagerPath = "script/package-linux-portable.py";
-  const launcherPath = "script/linux-portable-launcher.c";
+test("no release build enables the embedded webview, while the opt-in path still compiles", () => {
+  const release = read(".github/workflows/release.yml");
+  const ci = read(".github/workflows/ci.yml");
 
-  for (const file of [wrapperPath, packagerPath, launcherPath]) {
+  // WebKitGTK 4.1 cannot travel with the package: the distributions that carry it
+  // sit on glibc 2.39+, and `WebKitWebProcess` is resolved through a compile-time
+  // path. Instead of giving Linux a feature set of its own, the feature is off in
+  // the default set (see main/Cargo.toml), so all three platforms publish the same
+  // shape and there is no per-platform list to keep in sync.
+  assert.doesNotMatch(release, /--features[^\n]*embedded-webview/);
+  const build = workflowStep(release, "Build release binary");
+  assert.doesNotMatch(build, /--no-default-features/);
+  assert.doesNotMatch(build, /--features[^\n]*embedded-webview/);
+  assert.doesNotMatch(build, /--features[^\n]*wasm-components/);
+  assert.match(
+    build,
+    /cargo zigbuild[\s\S]*--release[\s\S]*-p main[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"/,
+  );
+
+  // Windows 32-bit is the one platform that has to name features explicitly (it
+  // cannot build shell-plugins). Its list must stay "the default set minus
+  // shell-plugins" instead of growing a webview back in.
+  assert.match(
+    release,
+    /--features", "wasm-components,windows-native-rdp"\)/,
+  );
+
+  // `cargo test --all` compiles the default set, meaning the half of the code
+  // without the feature. CI checks the other half, so the opt-in path keeps
+  // compiling instead of rotting until someone asks for it.
+  const optIn = workflowStep(ci, "Check the opt-in embedded webview feature");
+  assert.match(
+    optIn,
+    /cargo check -p ai_chat_view --features embedded-webview --tests/,
+  );
+  assert.match(optIn, /cargo check -p main --features embedded-webview/);
+});
+
+test("Linux GPU dependency stack replaces the retired portable runtime", () => {
+  const packagerPath = "script/package-linux-gpu-stack.py";
+  const wrapperPath = "script/package-linux-gpu-stack.sh";
+  const buildPath = "script/package-linux-gpu-stack-build.sh";
+  const dockerPath = "script/package-linux-gpu-stack-docker.sh";
+  const installPath = "script/linux-gpu-stack-install.sh";
+
+  for (const file of [
+    packagerPath,
+    wrapperPath,
+    buildPath,
+    dockerPath,
+    installPath,
+  ]) {
     assert.ok(fs.existsSync(file), `${file} must exist`);
+  }
+  // The launcher and the packager that produced it are deliberately gone: the
+  // stack now lands on the host loader instead of wrapping the binary.
+  for (const retired of [
+    "script/package-linux-portable.py",
+    "script/package-linux-portable.sh",
+    "script/linux-portable-launcher.c",
+  ]) {
+    assert.equal(fs.existsSync(retired), false, `${retired} must be removed`);
   }
 
   const wrapper = read(wrapperPath);
-  const packager = read(packagerPath);
-  const launcher = read(launcherPath);
+  const build = read(buildPath);
+  const docker = read(dockerPath);
   const help = spawnSync("python3", [packagerPath, "--help"], {
     encoding: "utf8",
   });
 
   assert.equal(help.status, 0, help.stderr);
-  assert.match(wrapper, /set -euo pipefail/);
-  assert.match(wrapper, /package-linux-portable\.py/);
-  assert.match(packager, /readelf/);
-  assert.match(packager, /PT_INTERP/);
-  assert.match(packager, /verify_binary_glibc_baseline/);
-  assert.match(packager, /binary_glibc_baseline/);
-  assert.match(
-    packager,
-    /the bundled "[\s\S]*"private runtime itself may be newer/,
-  );
-  assert.match(packager, /\\\(NEEDED\\\)/);
-  assert.match(packager, /ldconfig/);
-  assert.match(packager, /dpkg-query/);
-  assert.match(packager, /musl-gcc/);
-  assert.match(packager, /"-static"/);
-  assert.match(packager, /runtime-manifest\.json/);
-  assert.match(packager, /runtime-packages\.txt/);
-  assert.match(packager, /runtime-licenses/);
-  assert.match(packager, /LICENSE-APACHE/);
-  assert.match(packager, /NAVOP_LICENSE/);
-  assert.match(packager, /libnss_dns\.so\.2/);
-  assert.match(packager, /libnss_files\.so\.2/);
-  assert.match(packager, /libnss_\*\.so\.2/);
-  assert.match(packager, /libwayland-client\.so\.0/);
-  assert.match(packager, /libwayland-cursor\.so\.0/);
-  assert.match(packager, /libwayland-egl\.so\.1/);
-  assert.match(packager, /missing required dlopen runtime library/);
-  assert.match(packager, /libvulkan_\*\.so\*/);
-  assert.match(help.stdout, /aarch64-unknown-linux-gnu/);
   assert.match(help.stdout, /x86_64-unknown-linux-gnu/);
-  assert.match(packager, /machine="AArch64"/);
-  assert.match(packager, /loader="ld-linux-aarch64\.so\.1"/);
-  assert.match(packager, /platform_token="aarch64"/);
-  assert.match(packager, /lib_token="lib"/);
-  assert.match(packager, /machine="Advanced Micro Devices X86-64"/);
-  assert.match(packager, /loader="ld-linux-x86-64\.so\.2"/);
-  assert.match(packager, /platform_token="x86_64"/);
-  assert.match(packager, /lib_token="lib64"/);
-  assert.match(packager, /launcher architecture mismatch/);
-  assert.match(packager, /launcher_machine/);
-  assert.match(packager, /gpu_policy/);
-  assert.match(packager, /nss_policy/);
-  assert.match(packager, /license_sources\[f"gconv\/\{relative\}"\]/);
+  assert.match(help.stdout, /aarch64-unknown-linux-gnu/);
+
+  assert.match(wrapper, /set -euo pipefail/);
+  assert.match(wrapper, /package-linux-gpu-stack\.py/);
+  // RHEL 8 images default to Python 3.6, so the wrapper must not trust it.
+  assert.match(wrapper, /sys\.version_info >= \(3, 9\)/);
+
+  // Only a RHEL 8 generation distribution ships a Mesa user space at the
+  // glibc 2.28 baseline Navop itself is built against, so dnf is what resolves
+  // the tree.
+  assert.match(build, /rpm -E %\{rhel\}/);
+  assert.match(build, /dnf install -y --setopt=install_weak_deps=False/);
+  assert.match(build, /dnf-plugins-core/);
+  assert.match(build, /dnf download --resolve/);
   assert.match(
-    packager,
-    /cannot publish a bundled runtime file without Debian package[\s\S]*ownership metadata/,
+    build,
+    /--releasever="\$release_version" --nogpgcheck --forcearch="\$rpm_arch"/,
   );
+  assert.match(build, /--installroot "\$empty_root"/);
+  assert.match(build, /filter_rpms_to_architecture/);
+  assert.match(build, /rpm -qp --qf '%\{ARCH\}'/);
+  assert.match(build, /rpm2cpio "\$rpm" \| cpio -idm --no-absolute-filenames/);
+  assert.match(build, /mesa-dri-drivers/);
+  assert.match(build, /libglvnd-egl/);
+  assert.match(build, /libwayland-client/);
+  // The bare "liblzma" name does not exist on RHEL 8; the package is xz-libs.
+  assert.match(build, /xz-libs/);
   assert.match(
-    packager,
-    /cannot publish bundled runtime package without its copyright[\s\S]*file/,
+    build,
+    /local archive="navop-gpu-stack-linux-\$\{asset_label\}\.tar\.gz"/,
   );
-  assert.match(launcher, /\/proc\/self\/exe/);
-  assert.match(launcher, /defined\(__aarch64__\)/);
-  assert.match(launcher, /defined\(__x86_64__\)/);
-  assert.match(launcher, /ld-linux-aarch64\.so\.1/);
-  assert.match(launcher, /ld-linux-x86-64\.so\.2/);
-  assert.match(launcher, /NAVOP_PORTABLE_LOADER/);
-  assert.match(launcher, /--inhibit-cache/);
-  assert.match(launcher, /--library-path/);
-  assert.match(launcher, /navop\.real/);
-  assert.match(launcher, /GCONV_PATH/);
-  assert.match(launcher, /unsetenv\("LD_PRELOAD"\)/);
-  assert.match(launcher, /unsetenv\("GLIBC_TUNABLES"\)/);
+  assert.match(build, /asset_label="x64"/);
+  assert.match(build, /asset_label="arm64"/);
+  assert.match(build, /--glibc-baseline "\$glibc_baseline"/);
+  assert.match(
+    build,
+    /--installer-source "\$repository_root\/script\/linux-gpu-stack-install\.sh"/,
+  );
+
+  // The host side mounts the repository read only plus the binary and the
+  // output directory, and must not rely on GNU-only find predicates.
+  assert.match(docker, /rockylinux:8/);
+  assert.match(docker, /-v "\$repository_root:\/workspace:ro"/);
+  assert.match(docker, /-v "\$binary_directory:\/binary:ro"/);
+  assert.match(docker, /-v "\$output:\/out"/);
+  assert.match(
+    docker,
+    /bash \/workspace\/script\/package-linux-gpu-stack-build\.sh/,
+  );
+  assert.match(docker, /navop-gpu-stack-linux-\*\.tar\.gz/);
+  assert.doesNotMatch(docker, /-newermt/);
 });
 
-test("Linux portable packager resolves Debian ownership across usrmerge aliases", () => {
-  const packagerPath = path.resolve("script/package-linux-portable.py");
+test("Linux GPU dependency stack packager separates host libraries from bundled ones", () => {
+  const packagerPath = "script/package-linux-gpu-stack.py";
   const python = String.raw`
 import importlib.util
-from pathlib import Path
-import subprocess
 import sys
 
-spec = importlib.util.spec_from_file_location("navop_portable_packager", sys.argv[1])
+spec = importlib.util.spec_from_file_location("navop_gpu_stack_packager", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
-loader_in_usr = Path("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
-loader_in_lib = Path("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+# Navop reaches EGL through dlopen, so these are roots rather than closure
+# members, and Mesa resolves its driver by file name rather than by SONAME.
+assert module.GPU_STACK_ENTRY_LIBRARIES == ("libEGL.so.1", "libEGL_mesa.so.0")
+assert module.GPU_STACK_DRI_DRIVERS == ("swrast_dri.so", "kms_swrast_dri.so")
+assert (
+    module.GPU_STACK_EGL_VENDOR_CONFIGURATION
+    == "/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+)
 
-usr_candidates = module.package_owner_query_paths(loader_in_usr)
-lib_candidates = module.package_owner_query_paths(loader_in_lib)
-assert loader_in_usr in usr_candidates
-assert loader_in_lib in usr_candidates
-assert loader_in_lib in lib_candidates
-assert loader_in_usr in lib_candidates
+# The C runtime stays on the host: bundling it would shadow system glibc with a
+# foreign copy.
+for soname in ("libc.so.6", "libm.so.6", "libpthread.so.0", "ld-linux-x86-64.so.2"):
+    assert module.is_host_provided(soname), soname
+assert module.is_host_provided("libnss_dns.so.2")
+assert not module.is_host_provided("libEGL.so.1")
 
-queries = []
-def fake_run(command, *, check=True, env=None):
-    queries.append(command)
-    if command == ["dpkg-query", "-S", str(loader_in_lib)]:
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=f"libc6:amd64: {loader_in_lib}\n",
-            stderr="",
-        )
-    return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+# The desktop stack integrates with the running session, so it is recorded as a
+# host requirement instead of being shipped from one distribution.
+for soname in (
+    "libgtk-3.so.0",
+    "libwebkit2gtk-4.1.so.0",
+    "libglib-2.0.so.0",
+    "libgobject-2.0.so.0",
+    "libpango-1.0.so.0",
+    "libcairo.so.2",
+):
+    assert module.is_host_desktop_library(soname), soname
+assert not module.is_host_desktop_library("libEGL.so.1")
 
-module.run = fake_run
-assert module.package_owner(loader_in_usr) == "libc6:amd64"
-assert ["dpkg-query", "-S", str(loader_in_lib)] in queries
+# RHEL 8 is merged-/usr: an RPM that owns /lib64/libgcc_s.so.1 has to match the
+# extracted /usr/lib64/libgcc_s.so.1, and the other way round.
+assert module.path_spellings("/lib64/libgcc_s.so.1") == [
+    "/lib64/libgcc_s.so.1",
+    "/usr/lib64/libgcc_s.so.1",
+]
+assert module.path_spellings("/usr/lib64/libfoo.so") == [
+    "/lib64/libfoo.so",
+    "/usr/lib64/libfoo.so",
+]
+
+for name, config in module.TARGET_CONFIGS.items():
+    assert config.libdir == "/usr/lib64", name
+    assert config.dri_dir == "/usr/lib64/dri", name
+    assert config.dri_driver_directories, name
+    assert any(entry.endswith("/dri") for entry in config.dri_driver_directories), name
+    assert config.architecture_label in ("aarch64", "x86_64"), name
 `;
   const result = spawnSync("python3", ["-c", python, packagerPath], {
     encoding: "utf8",
   });
-
   assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test("Linux GPU dependency stack installer is additive and reversibly removable", () => {
+  const installPath = "script/linux-gpu-stack-install.sh";
+  assert.ok(fs.existsSync(installPath), `${installPath} must exist`);
+  const installer = read(installPath);
+
+  assert.match(installer, /set -euo pipefail/);
+  assert.match(installer, /--dry-run/);
+  assert.match(installer, /--force/);
+  assert.match(installer, /--prefix/);
+  assert.match(installer, /--uninstall/);
+
+  // Everything lands on paths the loader already searches, so no package form
+  // needs environment variables to find it.
+  assert.match(installer, /resolve_package_root/);
+  assert.match(installer, /load_metadata/);
+  assert.match(installer, /verify_host_architecture/);
+  assert.match(installer, /ldconfig/);
+  assert.match(installer, /soname_is_resolved/);
+  assert.match(installer, /host_has_usable_gl/);
+  assert.match(installer, /host_has_dri_driver/);
+  assert.match(installer, /_dri\.so/);
+
+  // The host's own copy always wins: only gaps are filled.
+  assert.match(installer, /already provided by the host/);
+  assert.match(installer, /host copy kept/);
+  assert.match(installer, /install_gl=0/);
+
+  // Debian-style hosts do not search /usr/lib64, so it is registered, and the
+  // registration can be taken back.
+  assert.match(installer, /ensure_loader_configuration/);
+  assert.match(installer, /navop-gpu-stack\.conf/);
+  assert.match(installer, /\/etc\/ld\.so\.conf\.d/);
+  assert.match(installer, /drop_loader_configuration/);
+  assert.match(installer, /refresh_loader_cache/);
+
+  // Uninstall replays what this installer actually wrote, never the manifest it
+  // merely planned: that one also lists the entries the host already provided.
+  assert.match(installer, /installed\.tsv/);
+  assert.match(installer, /write_install_record/);
+  assert.match(installer, /KEPT_FILES\+=/);
+  assert.match(installer, /modified since installation/);
+  assert.match(installer, /no installation record at/);
+
+  const help = spawnSync("bash", [installPath, "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /--uninstall/);
+  // The help body is a sed range over the header comment; the last line must
+  // stay inside it.
+  assert.match(help.stdout, /\.\/install\.sh --help/);
+});
+
+test("Linux install guides document the GPU dependency stack and the portable archive", () => {
+  const guides = [
+    ["docs-site/docs/guide/install-update.md", /图形依赖包/],
+    ["docs-site/docs/en-US/guide/install-update.md", /graphics dependency package/],
+    ["docs-site/docs/zh-TW/guide/install-update.md", /圖形相依套件/],
+  ];
+
+  for (const [guidePath, heading] of guides) {
+    const guide = read(guidePath);
+    assert.match(guide, heading, `${guidePath} must document the dependency stack`);
+    assert.match(
+      guide,
+      /navop-<version>-linux-x64-gpu-stack\.tar\.gz/,
+      `${guidePath} must name the x86_64 dependency archive`,
+    );
+    assert.match(
+      guide,
+      /navop-<version>-linux-arm64-gpu-stack\.tar\.gz/,
+      `${guidePath} must name the arm64 dependency archive`,
+    );
+    // The documented flow has to match the archive layout, the installer name
+    // and the flags the script actually accepts.
+    assert.match(guide, /tar -xzf navop-<version>-linux-x64-gpu-stack\.tar\.gz -C navop-gpu-stack/);
+    assert.match(guide, /sudo navop-gpu-stack\/install\.sh/);
+    assert.match(guide, /--dry-run/);
+    assert.match(guide, /--force/);
+    assert.match(guide, /--uninstall/);
+    assert.match(guide, /installed\.tsv/);
+    assert.match(guide, /\/usr\/lib\/navop-gpu-stack\//);
+    assert.match(guide, /Failed to create surface/);
+    // The portable archive ships again, now as the very same binary plus a
+    // marker file instead of a private loader, so every guide has to describe
+    // the archive names and the marker contract.
+    assert.match(
+      guide,
+      /navop-<version>-linux-x64-portable\.tar\.gz/,
+      `${guidePath} must name the x86_64 portable archive`,
+    );
+    assert.match(
+      guide,
+      /navop-<version>-linux-arm64-portable\.tar\.gz/,
+      `${guidePath} must name the arm64 portable archive`,
+    );
+    assert.match(
+      guide,
+      /navop\.portable/,
+      `${guidePath} must document the marker file`,
+    );
+    assert.match(
+      guide,
+      /--portable\b/,
+      `${guidePath} must document the --portable flag`,
+    );
+    assert.match(
+      guide,
+      /NAVOP_PORTABLE/,
+      `${guidePath} must document the NAVOP_PORTABLE environment variable`,
+    );
+  }
 });
 
 test("glibc baseline checker rejects binaries above the configured version", () => {
@@ -545,7 +809,7 @@ test("Windows release publishes versioned Win32 artifacts while preserving updat
   );
   assert.match(
     release,
-    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_x64_portable,\$linux_arm64,\$linux_arm64_portable,\$windows_x64,\$windows_x86\]"/,
+    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_arm64,\$windows_x64,\$windows_x86\]"/,
   );
   assert.match(
     release,
@@ -792,6 +1056,28 @@ test("Windows MSI shortcuts use dedicated HKCU-keyed components", () => {
   }
 });
 
+test("Windows MSI shortcuts inherit the executable's embedded icon", () => {
+  const wix = read("installer/windows/navop.wxs");
+
+  // 快捷方式不能引用 Icon 表：MSI 会把 Icon 表里的图标另存成一份文件，该文件被清理或
+  // 图标缓存失效后，快捷方式图标会退化成通用白纸（issue #325）。目标 exe 已内嵌图标。
+  for (const id of ["StartMenuShortcut", "DesktopShortcut"]) {
+    const shortcut = wix.match(
+      new RegExp(`<Shortcut\\b[^>]*Id="${id}"[^>]*/>`),
+    );
+    assert.ok(shortcut, `missing ${id} shortcut`);
+    assert.doesNotMatch(shortcut[0], /\bIcon=/);
+  }
+
+  // 控制面板的卸载项仍走 Icon 表；快捷方式图标则由 exe 的内嵌资源提供。
+  assert.match(wix, /<Icon Id="NavopIcon" SourceFile="\$\(IconPath\)"\s*\/>/);
+  assert.match(wix, /<Property Id="ARPPRODUCTICON" Value="NavopIcon"\s*\/>/);
+  assert.match(
+    read("main/build.rs"),
+    /set_icon\("\.\.\/resources\/windows\/navop\.ico"\)/,
+  );
+});
+
 test("GitHub and R2 publish every installer while the updater manifest remains compatible", () => {
   const release = read(".github/workflows/release.yml");
   const upload = read(".github/workflows/upload-r2.yml");
@@ -801,8 +1087,9 @@ test("GitHub and R2 publish every installer while the updater manifest remains c
     /name: navop-\$\{\{ matrix\.public_label \}\}-packages[\s\S]*?navop-\*-\$\{\{ matrix\.public_label \}\}\.msi/,
   );
   assert.match(release, /new_files=\(artifacts\/navop-\* artifacts\/navop_\*\)/);
-  assert.match(release, /navop-aarch64-unknown-linux-gnu-portable\.tar\.gz/);
-  assert.match(release, /navop-x86_64-unknown-linux-gnu-portable\.tar\.gz/);
+  // Every asset, including the Linux GPU dependency stack, is matched by the
+  // release globs rather than being enumerated by hand.
+  assert.match(release, /navop-\*-\$\{\{ matrix\.public_label \}\}-gpu-stack\.tar\.gz/);
   assert.match(upload, /--pattern "navop-\*"/);
   assert.match(upload, /--pattern "navop_\*"/);
   assert.match(upload, /release_files=\(artifacts\/navop-\* artifacts\/navop_\*\)/);
@@ -814,6 +1101,15 @@ test("GitHub and R2 publish every installer while the updater manifest remains c
   assert.match(upload, /publicUpdaterAlternatives/);
   assert.match(upload, /`navop-\$\{version\}-win32\.zip`/);
   assert.match(upload, /\["win32", "i686-pc-windows-msvc"\]/);
+  // The portable archives and the dependency stack are extra assets for the
+  // same target, so they must map onto that target instead of falling through
+  // to "universal", and the distinguishing suffix has to survive in the target
+  // name so a download page can tell them apart.
+  assert.match(upload, /fileName\.includes\(`-\$\{label\}-gpu-stack\.`\)/);
+  assert.match(upload, /fileName\.includes\(`-\$\{label\}-portable\.`\)/);
+  assert.match(upload, /return `\$\{publicTarget\[1\]\}-portable`/);
+  assert.match(upload, /return `\$\{publicTarget\[1\]\}-gpu-stack`/);
+  assert.doesNotMatch(upload, /linux-x64-portable|linux-arm64-portable/);
   assert.match(upload, /\*\.dmg\) content_type="application\/x-apple-diskimage"/);
   assert.match(upload, /\*\.msi\) content_type="application\/x-msi"/);
   assert.match(upload, /\*\.exe\) content_type="application\/vnd\.microsoft\.portable-executable"/);
@@ -837,6 +1133,146 @@ test("R2 uploads are single-dispatch, revalidated, and verified after overwrite"
   assert.match(upload, /no-store, max-age=0/);
   assert.doesNotMatch(upload, /max-age=31536000/);
   assert.doesNotMatch(upload, /max-age=31536000, immutable/);
+});
+
+test("R2 keeps only the release it just uploaded", () => {
+  const upload = read(".github/workflows/upload-r2.yml");
+
+  // 清理必须排在上传与逐对象校验之后，而且不能总是执行：上传失败时一个对象
+  // 都不能删，否则桶里可能新旧两份都不完整。
+  assert.ok(
+    upload.indexOf("Prune older R2 releases") >
+      upload.indexOf("Upload update archives and manifest to R2"),
+  );
+  const pruneStep = workflowStep(upload, "Prune older R2 releases");
+  assert.doesNotMatch(pruneStep, /always\(\)/);
+  assert.doesNotMatch(pruneStep, /continue-on-error/);
+  assert.match(
+    pruneStep,
+    /if: \$\{\{ steps\.r2_config\.outputs\.skip != 'true' && steps\.release\.outputs\.skip != 'true' \}\}/,
+  );
+  // 只动 releases/<tag>/：updates/latest.json 是更新入口，任何时候都不能删。
+  assert.match(pruneStep, /prefix="releases"/);
+  assert.doesNotMatch(pruneStep, /updates\//);
+  // 只有稳定版本号才清理，预发布不能把上一个稳定版本的安装包带走。
+  assert.match(pruneStep, /=\~ \^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$ \]\]/);
+  assert.match(pruneStep, /Skipping R2 prune for non-stable release tag/);
+
+  const pruneRun = pruneStep
+    .match(/run: \|\n([\s\S]*)/)?.[1]
+    .split("\n")
+    .map((line) => line.replace(/^ {10}/, ""))
+    .join("\n");
+  assert.ok(pruneRun, "prune step must have a run script");
+
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "navop-r2-prune-"));
+  const statePath = path.join(fixtureDir, "bucket");
+  const deletedPath = path.join(fixtureDir, "deleted");
+  const fakeAws = path.join(fixtureDir, "aws");
+
+  // 假 aws 只实现这一步用到的两条命令：列出版本前缀、递归删掉一个前缀。删除
+  // 会真的从 fixture 里拿掉版本，所以脚本最后的复查也一起被验证到。
+  fs.writeFileSync(
+    fakeAws,
+    `#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-} \${2:-}" in
+  "s3api list-objects-v2")
+    # 必须带 delimiter，否则列出来的是对象而不是版本目录。
+    if [[ " $* " != *" --delimiter / "* ]]; then
+      echo "s3api list-objects-v2 without --delimiter: $*" >&2
+      exit 42
+    fi
+    # 跟真实 aws cli 一致：--output text 对扁平列表是「一行、tab 拼接」。
+    # 之前这里按一行一个写，恰好把真实现场的解析 bug 掩盖过去了。
+    separator=""
+    line=""
+    for tag in $(grep -v '^$' "\${FAKE_R2_STATE}"); do
+      line="\${line}\${separator}releases/\$tag/"
+      separator=\$'\t'
+    done
+    [[ -z "\$line" ]] || printf '%s\\n' "\$line"
+    ;;
+  "s3 rm")
+    target=""
+    for argument in "\$@"; do
+      case "\$argument" in s3://*) target="\$argument" ;; esac
+    done
+    key="\${target#s3://*/}"
+    key="\${key%/}"
+    echo "\$key" >> "\${FAKE_R2_DELETED}"
+    grep -Fxv "\${key#releases/}" "\${FAKE_R2_STATE}" > "\${FAKE_R2_STATE}.tmp"
+    mv "\${FAKE_R2_STATE}.tmp" "\${FAKE_R2_STATE}"
+    ;;
+  *)
+    echo "unexpected aws invocation: \$*" >&2
+    exit 42
+    ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+
+  const runPrune = (tags, releaseTag = "v0.19.5") => {
+    fs.writeFileSync(statePath, `${tags.join("\n")}\n`);
+    fs.writeFileSync(deletedPath, "");
+    const result = spawnSync("bash", ["-c", pruneRun], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${fixtureDir}:${process.env.PATH}`,
+        FAKE_R2_STATE: statePath,
+        FAKE_R2_DELETED: deletedPath,
+        CLOUDFLARE_ACCOUNT_ID: "test-account",
+        CLOUDFLARE_R2_BUCKET: "test-bucket",
+        RELEASE_TAG: releaseTag,
+      },
+    });
+    return {
+      result,
+      remaining: fs
+        .readFileSync(statePath, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean),
+      deleted: fs
+        .readFileSync(deletedPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .sort(),
+    };
+  };
+
+  try {
+    const pruned = runPrune(["v0.19.5", "v0.19.4", "v0.19.3"]);
+    assert.equal(pruned.result.status, 0, pruned.result.stderr);
+    assert.deepEqual(pruned.remaining, ["v0.19.5"]);
+    assert.deepEqual(pruned.deleted, [
+      "releases/v0.19.3",
+      "releases/v0.19.4",
+    ]);
+    assert.match(pruned.result.stdout, /R2 now keeps only releases\/v0\.19\.5\//);
+
+    // 本次 tag 不在桶里（上传其实没成功）时，一个旧版本都不能删。
+    const missing = runPrune(["v0.19.4", "v0.19.3"]);
+    assert.notEqual(missing.result.status, 0);
+    assert.match(missing.result.stdout, /Refusing to prune/);
+    assert.deepEqual(missing.deleted, []);
+    assert.deepEqual(missing.remaining, ["v0.19.4", "v0.19.3"]);
+
+    // 预发布不清理，既有稳定版本原样保留。
+    const prerelease = runPrune(["v0.19.5", "v0.19.4"], "v0.20.0-rc.1");
+    assert.equal(prerelease.result.status, 0, prerelease.result.stderr);
+    assert.deepEqual(prerelease.deleted, []);
+    assert.deepEqual(prerelease.remaining, ["v0.19.5", "v0.19.4"]);
+    assert.match(
+      prerelease.result.stdout,
+      /Skipping R2 prune for non-stable release tag/,
+    );
+  } finally {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });
 
 test("CNB release synchronization replaces moved tags before syncing assets", () => {
@@ -886,6 +1322,8 @@ test("Windows release validates the MSI installer with the shared validator", ()
   assert.match(validator, /DesktopShortcutRegistry/);
   assert.match(validator, /StartMenuShortcutRegistry/);
   assert.match(validator, /SELECT Component_ FROM Shortcut/);
+  assert.match(validator, /Assert-MsiEmptyValue/);
+  assert.match(validator, /SELECT Icon_ FROM Shortcut/);
   assert.match(validator, /SELECT KeyPath FROM Component/);
   assert.match(validator, /SELECT Root FROM Registry/);
   assert.match(validator, /\.Trim\(\)/);
@@ -916,9 +1354,7 @@ test("release builds are cacheable and individually repairable", () => {
     "macos-arm64",
     "macos-x64",
     "linux-x64",
-    "linux-x64-portable",
     "linux-arm64",
-    "linux-arm64-portable",
     "windows-x64",
     "windows-x86",
   ]) {
@@ -938,7 +1374,7 @@ test("release builds are cacheable and individually repairable", () => {
   assert.match(trigger, /-f platform=all/);
   assert.match(
     release,
-    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_x64_portable,\$linux_arm64,\$linux_arm64_portable,\$windows_x64,\$windows_x86\]"/,
+    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_arm64,\$windows_x64,\$windows_x86\]"/,
   );
   assert.equal(fs.existsSync(".github/workflows/build-arm-linux.yml"), false);
 });
@@ -996,4 +1432,107 @@ test("application updates prefer navop while accepting legacy package names", ()
     install,
     /\["usr\/bin\/navop", "navop", "usr\/bin\/onetcli", "onetcli"\]/,
   );
+});
+
+test("Windows 产物由宿主自己内嵌 Common-Controls v6 清单", () => {
+  const build = read("main/build.rs");
+  const manifest = read("resources/windows/navop.manifest.xml");
+  const release = read(".github/workflows/release.yml");
+
+  // 清单内容：gpui 的 Windows 层静态导入 comctl32!TaskDialogIndirect，缺了这条依赖声明
+  // 加载器只会给进程挂 System32 里的 comctl32 5.82（没有该导出），navop.exe 会在 main
+  // 之前以 0xC0000139 退出。
+  assert.match(manifest, /name="Microsoft\.Windows\.Common-Controls"/);
+  assert.match(manifest, /version="6\.0\.0\.0"/);
+  assert.match(manifest, /publicKeyToken="6595b64144ccf1df"/);
+  assert.match(manifest, /level="asInvoker"/);
+  assert.match(manifest, /supportedOS/);
+  // DPI / 堆设置不能省：gpui 的 Windows 层从不调用 SetProcessDpiAwareness（清单是 DPI 感知的
+  // 唯一来源），而 v0.20.0 是从 gpui 自带的清单里拿到 PerMonitorV2 + SegmentHeap 的。这里漏了
+  // 会让修复后的进程退回 DPI-unaware —— 高 DPI 下整窗被系统位图拉伸（模糊），
+  // 等于修好启动又引入一个新问题。
+  assert.match(manifest, /<dpiAware xmlns="[^"]*">true\/pm<\/dpiAware>/);
+  assert.match(
+    manifest,
+    /<dpiAwareness xmlns="[^"]*">PerMonitorV2<\/dpiAwareness>/,
+  );
+  assert.match(manifest, /<heapType xmlns="[^"]*">SegmentHeap<\/heapType>/);
+  // 不能带 XML 声明：winresource 按 RC 字符串逐行写入清单（每行前后各有一个空格），
+  // 声明前出现空白不是合法的 XML prolog。上游 Zed 的 gpui.manifest.xml 同样没有声明。
+  // （属性用双引号，上游那份用单引号，两者都是合法 XML；本文件的双引号路径是实测过的：
+  // winresource 的 escape_string 会把 `"` 写成 `""`，rc 能正确还原。）
+  assert.doesNotMatch(manifest, /<\?xml/);
+
+  // 上游 gpui-fast 只在宿主没声明「我自己提供清单」时才嵌（gpui-kit 声明了
+  // windows-manifest-provided-by-host，而 Cargo 特性只做并集、下游关不掉），
+  // 所以这份清单只能由 navop 自己嵌。
+  assert.match(
+    build,
+    /set_manifest\(include_str!\("\.\.\/resources\/windows\/navop\.manifest\.xml"\)\)/,
+  );
+  // winresource 只在 VersionInfo::FILETYPE 存在时才写清单块：漏了这行会静默不嵌。
+  assert.match(build, /set_version_info\(winresource::VersionInfo::FILETYPE/);
+  assert.match(
+    build,
+    /rerun-if-changed=\.\.\/resources\/windows\/navop\.manifest\.xml/,
+  );
+
+  // 发布流程必须在打包前校验真实产物（静态检查拦不住「清单被上游吃掉」这类回归）。
+  const validateStep = workflowStep(release, "Validate Windows executable manifest");
+  assert.match(validateStep, /node script\/validate-windows-exe\.mjs/);
+  assert.match(validateStep, /\$\{\{ matrix\.target \}\}\/release\/navop\.exe/);
+  assert.ok(
+    release.indexOf("- name: Validate Windows executable manifest") >
+      release.indexOf("- name: Build release binary (Windows)"),
+    "manifest validation must run after the Windows binary is built",
+  );
+  assert.ok(
+    release.indexOf("- name: Validate Windows executable manifest") <
+      release.indexOf("- name: Package (Windows)"),
+    "manifest validation must run before the binary is packaged",
+  );
+});
+
+test("Windows 清单门禁能识别缺失清单的 PE（含真实失败现象的判据）", () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "navop-manifest-"));
+  const goodExe = path.join(temporary, "good.exe");
+  const badExe = path.join(temporary, "bad.exe");
+  fs.writeFileSync(
+    goodExe,
+    peFixtureWithResource(read("resources/windows/navop.manifest.xml")),
+  );
+  // 真实坏产物的等价物：静态导入了 TaskDialogIndirect，但没有任何清单。
+  fs.writeFileSync(badExe, peFixtureWithResource("TaskDialogIndirect"));
+
+  try {
+    const ok = spawnSync(
+      process.execPath,
+      ["script/validate-windows-exe.mjs", goodExe],
+      { encoding: "utf8" },
+    );
+    assert.equal(ok.status, 0, ok.stderr || ok.stdout);
+
+    const bad = spawnSync(
+      process.execPath,
+      ["script/validate-windows-exe.mjs", badExe],
+      { encoding: "utf8" },
+    );
+    assert.equal(bad.status, 1, bad.stdout);
+    assert.match(bad.stderr, /Microsoft\.Windows\.Common-Controls/);
+    assert.match(bad.stderr, /TaskDialogIndirect/);
+    assert.match(bad.stderr, /0xC0000139/);
+
+    // 非 PE 输入也要报错而不是崩在解析上。
+    const notPe = path.join(temporary, "not-pe.exe");
+    fs.writeFileSync(notPe, "not a PE file");
+    const junk = spawnSync(
+      process.execPath,
+      ["script/validate-windows-exe.mjs", notPe],
+      { encoding: "utf8" },
+    );
+    assert.equal(junk.status, 1);
+    assert.match(junk.stderr, /不是 PE 文件/);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
 });

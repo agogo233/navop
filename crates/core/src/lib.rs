@@ -18,6 +18,8 @@ pub mod keybindings;
 pub mod layout;
 pub mod license;
 pub mod llm;
+pub mod master_key_meta;
+pub mod popup_lifecycle;
 pub mod popup_window;
 pub mod session_lock;
 pub mod sidebar_contribution;

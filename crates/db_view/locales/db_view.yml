@@ -258,6 +258,14 @@ ConnectionForm:
     en: Leave empty to use the database default
     zh-CN: 留空则使用数据库默认值
     zh-HK: 留空則使用資料庫預設值
+  request_timeout_secs:
+    en: Request Timeout (s)
+    zh-CN: 请求超时（秒）
+    zh-HK: 請求逾時（秒）
+  request_timeout_secs_placeholder:
+    en: "Blank: metadata 30s, queries 30 min; 0 = no limit"
+    zh-CN: "留空：元数据 30 秒、查询 30 分钟；0 = 不限制"
+    zh-HK: "留空：中繼資料 30 秒、查詢 30 分鐘；0 = 不限制"
   schema_filter_mode:
     en: Schema Filter
     zh-CN: Schema 过滤
@@ -303,9 +311,9 @@ ConnectionForm:
     zh-CN: 数据库文件路径
     zh-HK: 資料庫檔案路徑
   workspace:
-    en: Workspace
-    zh-CN: 工作区
-    zh-HK: 工作區
+    en: Group
+    zh-CN: 分组
+    zh-HK: 分組
   cloud_sync:
     en: Cloud Sync
     zh-CN: 云同步
@@ -953,6 +961,26 @@ Table:
     zh-HK: 匯入資料到表
 
   # 表设计器
+  loading_structure:
+    en: Loading table structure…
+    zh-CN: 正在加载表结构…
+    zh-HK: 正在載入表結構…
+  refresh_structure:
+    en: Refresh table structure
+    zh-CN: 刷新表结构
+    zh-HK: 刷新表結構
+  refresh_discard_changes_prompt:
+    en: Refreshing will discard unsaved changes in this designer.
+    zh-CN: 刷新会放弃当前设计器中未保存的更改。
+    zh-HK: 刷新會放棄目前設計器中未儲存的變更。
+  discard_and_refresh:
+    en: Discard and refresh
+    zh-CN: 放弃并刷新
+    zh-HK: 放棄並刷新
+  load_structure_failed:
+    en: "Failed to load table structure: %{error}"
+    zh-CN: "加载表结构失败：%{error}"
+    zh-HK: "載入表結構失敗：%{error}"
   table_name:
     en: Table Name
     zh-CN: 表名
@@ -1374,6 +1402,38 @@ Query:
     en: Run Statement at Cursor
     zh-CN: 运行当前光标的语句
     zh-HK: 執行目前游標的語句
+  show_hover_details:
+    en: Show Details
+    zh-CN: 查看对象详情
+    zh-HK: 查看物件詳情
+  object_details_title:
+    en: "Details: %{object}"
+    zh-CN: "对象详情: %{object}"
+    zh-HK: "物件詳情: %{object}"
+  copy_hover_ddl:
+    en: Copy DDL
+    zh-CN: 复制 DDL
+    zh-HK: 複製 DDL
+  ddl_copied:
+    en: DDL copied to clipboard
+    zh-CN: DDL 已复制到剪贴板
+    zh-HK: DDL 已複製到剪貼簿
+  object_details_ddl_loading:
+    en: Generating DDL…
+    zh-CN: DDL 生成中…
+    zh-HK: DDL 產生中…
+  object_details_ddl_failed:
+    en: "Failed to generate DDL: %{error}"
+    zh-CN: "生成 DDL 失败: %{error}"
+    zh-HK: "產生 DDL 失敗: %{error}"
+  object_details_view_ddl_unavailable:
+    en: Views have no CREATE TABLE DDL; the columns above come from the metadata.
+    zh-CN: 视图没有建表 DDL，上面的列信息来自元数据。
+    zh-HK: 檢視表沒有建表 DDL，上面的欄位資訊來自中繼資料。
+  no_hover_details_at_cursor:
+    en: No database object details at the cursor
+    zh-CN: 光标处没有可查看的数据库对象详情
+    zh-HK: 游標處沒有可查看的資料庫物件詳情
   please_select_sql_to_run:
     en: Please select SQL to run
     zh-CN: 请先选中要运行的 SQL
@@ -1462,10 +1522,18 @@ Query:
     en: "Failed to start transaction: %{error}"
     zh-CN: "启动事务失败：%{error}"
     zh-HK: "啟動交易失敗：%{error}"
+  auto_session_start_failed:
+    en: "Failed to start database session: %{error}"
+    zh-CN: "建立数据库会话失败：%{error}"
+    zh-HK: "建立資料庫工作階段失敗：%{error}"
   transaction_control_failed:
     en: Transaction command failed
     zh-CN: 事务控制命令执行失败
     zh-HK: 交易控制命令執行失敗
+  transaction_terminated_by_disconnect:
+    en: "Transaction was terminated by a dropped connection; the server rolled it back"
+    zh-CN: 连接已断开，事务已被服务器回滚终止
+    zh-HK: 連線已斷開，交易已被伺服器回滾終止
   transaction_control_unavailable:
     en: Transaction command is unavailable for this database
     zh-CN: 当前数据库不支持该事务控制命令
@@ -1941,6 +2009,10 @@ DbTree:
     en: Views
     zh-CN: 视图
     zh-HK: 視圖
+  MaterializedViews:
+    en: Materialized Views
+    zh-CN: 物化视图
+    zh-HK: 實體化檢視
   Functions:
     en: Functions
     zh-CN: 函数
@@ -2514,6 +2586,30 @@ TableData:
     zh-CN: 无法刷新数据
     zh-HK: 無法重新整理資料
 TableDataGrid:
+  view_mode:
+    en: Display mode
+    zh-CN: 显示方式
+    zh-HK: 顯示方式
+  view_mode_grid:
+    en: Grid
+    zh-CN: 表格
+    zh-HK: 表格
+  view_mode_vertical:
+    en: "Column: Value"
+    zh-CN: "列：值"
+    zh-HK: "欄：值"
+  vertical_record:
+    en: "Record %{index}"
+    zh-CN: "记录 %{index}"
+    zh-HK: "記錄 %{index}"
+  vertical_empty:
+    en: No rows to display
+    zh-CN: 暂无可显示的数据
+    zh-HK: 暫無可顯示的資料
+  vertical_loading:
+    en: Loading…
+    zh-CN: 正在加载…
+    zh-HK: 正在載入…
   load_data_failed:
     en: "Failed to load data: %{error}"
     zh-CN: "数据加载失败: %{error}"
@@ -2595,9 +2691,21 @@ TableDataGrid:
     zh-CN: 刷新
     zh-HK: 重新整理
   search_placeholder:
-    en: Search current page
-    zh-CN: 搜索当前页
-    zh-HK: 搜尋當前頁
+    en: Find in table...
+    zh-CN: 在表格中查找...
+    zh-HK: 在表格中尋找...
+  search_no_match:
+    en: No results
+    zh-CN: 无结果
+    zh-HK: 無結果
+  search_next:
+    en: Next match
+    zh-CN: 下一个匹配
+    zh-HK: 下一個符合
+  search_previous:
+    en: Previous match
+    zh-CN: 上一个匹配
+    zh-HK: 上一個符合
   add_row:
     en: Add Row
     zh-CN: 添加行
@@ -2614,6 +2722,14 @@ TableDataGrid:
     en: SQL Preview
     zh-CN: SQL预览
     zh-HK: SQL預覽
+  copy_sql:
+    en: Copy SQL
+    zh-CN: 复制 SQL
+    zh-HK: 複製 SQL
+  sql_copied:
+    en: SQL copied to clipboard
+    zh-CN: SQL 已复制到剪贴板
+    zh-HK: SQL 已複製到剪貼簿
   commit_changes:
     en: Commit Changes
     zh-CN: 提交更改
@@ -2622,6 +2738,38 @@ TableDataGrid:
     en: Open table designer
     zh-CN: 打开表设计
     zh-HK: 開啟表設計
+  column_visibility:
+    en: Filter fields
+    zh-CN: 字段过滤
+    zh-HK: 欄位過濾
+  column_visibility_search_placeholder:
+    en: Search fields…
+    zh-CN: 搜索字段…
+    zh-HK: 搜尋欄位…
+  column_visibility_keep_one_hint:
+    en: At least one field stays visible.
+    zh-CN: 至少保留一列可见。
+    zh-HK: 至少保留一欄可見。
+  show_all_columns:
+    en: Show all fields
+    zh-CN: 显示全部字段
+    zh-HK: 顯示全部欄位
+  unnamed_column:
+    en: (unnamed field)
+    zh-CN: （未命名字段）
+    zh-HK: （未命名欄位）
+  locate_column:
+    en: Locate field
+    zh-CN: 定位字段
+    zh-HK: 定位欄位
+  locate_column_hint:
+    en: Click a field to scroll it into view.
+    zh-CN: 点击字段即可把它带到眼前。
+    zh-HK: 點擊欄位即可帶到眼前。
+  locate_column_hidden:
+    en: hidden
+    zh-CN: 已隐藏
+    zh-HK: 已隱藏
   large_text_editor:
     en: Large Text Editor
     zh-CN: 大文本编辑器
@@ -2792,6 +2940,10 @@ SqlDump:
     en: "Found %{count} tables"
     zh-CN: "找到 %{count} 个表"
     zh-HK: "找到 %{count} 個表"
+  skipped_non_ddl_tables:
+    en: "Skipped %{count} object(s) without a plain table structure (foreign tables, etc.)"
+    zh-CN: "已跳过 %{count} 个没有普通表结构的对象（如外部表）"
+    zh-HK: "已略過 %{count} 個沒有普通資料表結構的物件（如外部表）"
   fetch_tables_failed:
     en: "Failed to fetch table list: %{error}"
     zh-CN: "获取表列表失败: %{error}"
@@ -2808,6 +2960,10 @@ SqlDump:
     en: "Dump to:"
     zh-CN: "转储到:"
     zh-HK: "轉儲到:"
+  rows_per_statement:
+    en: "Rows per statement:"
+    zh-CN: "每条语句的数据行数:"
+    zh-HK: "每條語句的資料行數:"
   processed_records:
     en: "Processed records:"
     zh-CN: "已处理记录:"
@@ -2858,6 +3014,22 @@ DbTreeView:
     en: Locate active tab in tree
     zh-CN: 在树中定位当前标签
     zh-HK: 在樹中定位目前標籤
+  search_match_case:
+    en: Match case
+    zh-CN: 区分大小写
+    zh-HK: 區分大小寫
+  search_whole_word:
+    en: Whole words
+    zh-CN: 全词匹配
+    zh-HK: 全詞比對
+  search_regex:
+    en: Regular expression
+    zh-CN: 正则表达式
+    zh-HK: 正規表達式
+  search_regex_invalid:
+    en: Invalid regular expression
+    zh-CN: 正则表达式无效
+    zh-HK: 正規表達式無效
 EditorView:
   form_tab:
     en: Form
@@ -3271,6 +3443,99 @@ SqlWorkflow:
     en: "Streaming error: %{error}"
     zh-CN: "流式生成错误: %{error}"
     zh-HK: "串流生成錯誤: %{error}"
+SqlLibrary:
+  title:
+    en: SQL Library
+    zh-CN: SQL 库
+    zh-HK: SQL 庫
+  new_file:
+    en: New SQL File
+    zh-CN: 新建 SQL 文件
+    zh-HK: 新增 SQL 檔案
+  new_file_in:
+    en: "New SQL file in %{path}"
+    zh-CN: "在 %{path} 中新建 SQL 文件"
+    zh-HK: "在 %{path} 中新增 SQL 檔案"
+  new_folder_in:
+    en: "New folder in %{path}"
+    zh-CN: "在 %{path} 中新建目录"
+    zh-HK: "在 %{path} 中新增目錄"
+  file_name:
+    en: File name (.sql optional)
+    zh-CN: 文件名（可省略 .sql）
+    zh-HK: 檔案名稱（可省略 .sql）
+  file_created:
+    en: SQL file created
+    zh-CN: SQL 文件已创建
+    zh-HK: SQL 檔案已建立
+  create_file_failed:
+    en: "Failed to create SQL file: %{error}"
+    zh-CN: "新建 SQL 文件失败：%{error}"
+    zh-HK: "新增 SQL 檔案失敗：%{error}"
+  create_folder_failed:
+    en: "Failed to create folder: %{error}"
+    zh-CN: "新建目录失败：%{error}"
+    zh-HK: "新增目錄失敗：%{error}"
+  rename:
+    en: Rename
+    zh-CN: 重命名
+    zh-HK: 重新命名
+  rename_folder:
+    en: Rename Folder
+    zh-CN: 重命名目录
+    zh-HK: 重新命名目錄
+  rename_placeholder:
+    en: New name
+    zh-CN: 新名称
+    zh-HK: 新名稱
+  renamed:
+    en: Renamed
+    zh-CN: 已重命名
+    zh-HK: 已重新命名
+  rename_failed:
+    en: "Failed to rename: %{error}"
+    zh-CN: "重命名失败：%{error}"
+    zh-HK: "重新命名失敗：%{error}"
+  delete_confirm:
+    en: "Delete \"%{name}\"?"
+    zh-CN: "确定删除「%{name}」？"
+    zh-HK: "確定刪除「%{name}」？"
+  deleted:
+    en: Deleted
+    zh-CN: 已删除
+    zh-HK: 已刪除
+  delete_failed:
+    en: "Failed to delete: %{error}"
+    zh-CN: "删除失败：%{error}"
+    zh-HK: "刪除失敗：%{error}"
+  unmount:
+    en: Remove from Library
+    zh-CN: 从库中移除
+    zh-HK: 從庫中移除
+  unmount_confirm:
+    en: "Remove \"%{name}\" from the SQL library? Files stay on disk."
+    zh-CN: "确定从 SQL 库中移除「%{name}」？磁盘上的文件不会被删除。"
+    zh-HK: "確定從 SQL 庫中移除「%{name}」？磁碟上的檔案不會被刪除。"
+  unmounted:
+    en: Removed from SQL library
+    zh-CN: 已从 SQL 库中移除
+    zh-HK: 已從 SQL 庫中移除
+  unmount_failed:
+    en: "Failed to remove directory: %{error}"
+    zh-CN: "移除目录失败：%{error}"
+    zh-HK: "移除目錄失敗：%{error}"
+  empty:
+    en: No SQL directory is available yet
+    zh-CN: 还没有可用的 SQL 目录
+    zh-HK: 還沒有可用的 SQL 目錄
+  load_failed:
+    en: "Failed to read the SQL library: %{error}"
+    zh-CN: "读取 SQL 库失败：%{error}"
+    zh-HK: "讀取 SQL 庫失敗：%{error}"
+  no_connection:
+    en: Select a database connection before running a library script
+    zh-CN: 请先在左侧选择一个数据库连接
+    zh-HK: 請先在左側選擇一個資料庫連線
 DatabaseTab:
   insert_editor:
     en: Insert into Editor

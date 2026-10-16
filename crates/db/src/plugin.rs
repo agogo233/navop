@@ -291,6 +291,58 @@ impl SqlCompletionInfo {
     }
 }
 
+fn table_like_node_type(object_type: TableObjectType) -> DbNodeType {
+    match object_type {
+        TableObjectType::ForeignTable => DbNodeType::ForeignTable,
+        _ => DbNodeType::Table,
+    }
+}
+
+/// 构建「物化视图」目录节点及其子节点。
+///
+/// `folder_id` 同时作为子节点 id 前缀，与其他目录（Views/Functions）保持一致。
+fn build_materialized_views_folder(
+    node: &DbNode,
+    base_metadata: &HashMap<String, String>,
+    views: Vec<ViewInfo>,
+    folder_id: String,
+) -> DbNode {
+    let mut folder = DbNode::new(
+        folder_id.clone(),
+        "DbTree.MaterializedViews".to_string(),
+        DbNodeType::MaterializedViewsFolder,
+        node.connection_id.clone(),
+        node.database_type.clone(),
+    )
+    .with_parent_context(node.id.clone())
+    .with_metadata(base_metadata.clone());
+
+    if !views.is_empty() {
+        let mut children: Vec<DbNode> = views
+            .into_iter()
+            .map(|view| {
+                let mut metadata = base_metadata.clone();
+                if let Some(comment) = view.comment.filter(|comment| !comment.is_empty()) {
+                    metadata.insert("comment".to_string(), comment);
+                }
+                DbNode::new(
+                    format!("{}:{}", folder_id, view.name),
+                    view.name.clone(),
+                    DbNodeType::MaterializedView,
+                    node.connection_id.clone(),
+                    node.database_type.clone(),
+                )
+                .with_parent_context(folder_id.clone())
+                .with_metadata(metadata)
+            })
+            .collect();
+        children.sort();
+        folder.set_children(children);
+    }
+
+    folder
+}
+
 fn routine_node(
     routine: FunctionInfo,
     node_type: DbNodeType,
@@ -383,6 +435,22 @@ pub trait DatabasePlugin: Send + Sync {
     /// Whether this database supports rowid for row identification (e.g., Oracle, SQLite)
     fn supports_rowid(&self) -> bool {
         false
+    }
+
+    /// Whether the given table actually exposes the rowid pseudo-column.
+    ///
+    /// `supports_rowid()` is a per-database default; some tables may still
+    /// lack the pseudo-column (e.g. SQLite `WITHOUT ROWID` tables and views).
+    /// Returning `false` makes `query_table_data` fall back to a plain
+    /// `SELECT *` projection instead of failing the whole preview.
+    async fn table_supports_rowid_projection(
+        &self,
+        _connection: &dyn DbConnection,
+        _database: &str,
+        _schema: Option<&str>,
+        _table: &str,
+    ) -> Result<bool> {
+        Ok(self.supports_rowid())
     }
 
     /// Get the rowid column name for this database
@@ -685,6 +753,30 @@ pub trait DatabasePlugin: Send + Sync {
         database: &str,
     ) -> Result<ObjectView>;
 
+    // === Materialized View Operations ===
+    /// 列举物化视图。
+    ///
+    /// 默认返回空集：只有支持物化视图的数据库（如 PostgreSQL）才需要重写，
+    /// 并需同时打开 `DatabaseUiCapabilities::supports_materialized_views`。
+    async fn list_materialized_views(
+        &self,
+        _connection: &dyn DbConnection,
+        _database: &str,
+        _schema: Option<String>,
+    ) -> Result<Vec<ViewInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// 物化视图对象列表视图（表格形式）。
+    async fn list_materialized_views_view(
+        &self,
+        _connection: &dyn DbConnection,
+        _database: &str,
+        _schema: Option<String>,
+    ) -> Result<ObjectView> {
+        Ok(ObjectView::default())
+    }
+
     // === Function Operations ===
 
     async fn list_functions(
@@ -888,6 +980,19 @@ pub trait DatabasePlugin: Send + Sync {
         connection: &dyn DbConnection,
         database: &str,
     ) -> Result<ObjectView>;
+
+    /// 带 schema 的序列对象视图：不传 schema 的实现会退回默认实现，
+    /// 但支持 schema 的驱动（如 PostgreSQL）必须用它，否则非 public schema
+    /// 下会列出 public 的序列。
+    async fn list_sequences_view_in_schema(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        schema: Option<String>,
+    ) -> Result<ObjectView> {
+        let _ = schema;
+        self.list_sequences_view(connection, database).await
+    }
 
     // === Helper Methods ===
     fn build_column_definition(&self, column: &ColumnInfo, include_name: bool) -> String;
@@ -1104,7 +1209,7 @@ pub trait DatabasePlugin: Send + Sync {
                     DbNode::new(
                         format!("{}:table_folder:{}", id, table_info.name),
                         table_info.name.clone(),
-                        DbNodeType::Table,
+                        table_like_node_type(table_info.object_type),
                         node.connection_id.clone(),
                         node.database_type.clone(),
                     )
@@ -1160,6 +1265,20 @@ pub trait DatabasePlugin: Send + Sync {
                 views_folder.set_children(children);
             }
             nodes.push(views_folder);
+        }
+
+        // Materialized views folder（仅支持物化视图的数据库，如 PostgreSQL）
+        if capabilities.supports_materialized_views {
+            let matviews = self
+                .list_materialized_views(connection, database, schema.clone())
+                .await
+                .unwrap_or_default();
+            nodes.push(build_materialized_views_folder(
+                node,
+                &metadata,
+                matviews,
+                format!("{}:matviews_folder", id),
+            ));
         }
 
         // Functions folder
@@ -1341,6 +1460,7 @@ pub trait DatabasePlugin: Send + Sync {
             }
             DbNodeType::TablesFolder
             | DbNodeType::ViewsFolder
+            | DbNodeType::MaterializedViewsFolder
             | DbNodeType::FunctionsFolder
             | DbNodeType::ProceduresFolder
             | DbNodeType::SequencesFolder => {
@@ -1393,7 +1513,35 @@ pub trait DatabasePlugin: Send + Sync {
                         DbNode::new(
                             format!("{}:{}", id, t.name),
                             t.name.clone(),
-                            DbNodeType::Table,
+                            table_like_node_type(t.object_type),
+                            node.connection_id.clone(),
+                            node.database_type.clone(),
+                        )
+                        .with_parent_context(id)
+                        .with_metadata(meta)
+                    })
+                    .collect();
+                children.sort();
+                Ok(children)
+            }
+            DbNodeType::MaterializedViewsFolder => {
+                if !self.capabilities().supports_materialized_views {
+                    return Ok(Vec::new());
+                }
+                let views = self
+                    .list_materialized_views(connection, database, schema)
+                    .await?;
+                let mut children: Vec<DbNode> = views
+                    .into_iter()
+                    .map(|v| {
+                        let mut meta = node.metadata.clone();
+                        if let Some(comment) = v.comment.filter(|comment| !comment.is_empty()) {
+                            meta.insert("comment".to_string(), comment);
+                        }
+                        DbNode::new(
+                            format!("{}:{}", id, v.name),
+                            v.name.clone(),
+                            DbNodeType::MaterializedView,
                             node.connection_id.clone(),
                             node.database_type.clone(),
                         )
@@ -1642,142 +1790,71 @@ pub trait DatabasePlugin: Send + Sync {
 
         let mut children = Vec::new();
 
+        // 表展开只查「字段」。
+        //
+        // 列是树里默认就要看到的内容，必须立即返回；其余四类元数据（索引 / 外键 /
+        // 触发器 / 检查约束）改为懒加载：这里只建文件夹节点，用户点开某个文件夹时
+        // 才真正查询，见 `load_table_folder_children`。
+        //
+        // 这样做的收益随数据库而定：某些服务端（例如 MySQL 5.7）单是外键那条
+        // information_schema 查询就要数秒，而绝大多数用户展开表时根本不看它们。
         let columns = self
             .list_columns(connection, db, schema.clone(), table)
             .await?;
-        children.push(
-            self.build_table_subfolder(
-                node,
-                id,
-                "columns_folder",
-                "DbTree.Columns",
-                DbNodeType::ColumnsFolder,
-                &folder_metadata,
-                columns
-                    .into_iter()
-                    .map(|c| {
-                        (c.name.clone(), DbNodeType::Column, {
-                            let mut m = folder_metadata.clone();
-                            m.insert("type".to_string(), c.data_type);
-                            m.insert("is_nullable".to_string(), c.is_nullable.to_string());
-                            m.insert("is_primary_key".to_string(), c.is_primary_key.to_string());
-                            m
-                        })
+        let mut columns_folder = self.build_table_subfolder(
+            node,
+            id,
+            "columns_folder",
+            "DbTree.Columns",
+            DbNodeType::ColumnsFolder,
+            &folder_metadata,
+            columns
+                .into_iter()
+                .map(|c| {
+                    (c.name.clone(), DbNodeType::Column, {
+                        let mut m = folder_metadata.clone();
+                        m.insert("type".to_string(), c.data_type);
+                        m.insert("is_nullable".to_string(), c.is_nullable.to_string());
+                        m.insert("is_primary_key".to_string(), c.is_primary_key.to_string());
+                        m
                     })
-                    .collect(),
-            ),
+                })
+                .collect(),
         );
+        // 列已经查过全量：空表也要标记成「已加载」，否则展开一个空文件夹还会再发一次请求。
+        if !columns_folder.children_loaded {
+            columns_folder.set_children(Vec::new());
+        }
+        children.push(columns_folder);
 
-        let indexes: Vec<_> = self
-            .list_indexes(connection, db, schema.clone(), table)
-            .await?
-            .into_iter()
-            .filter(|idx| idx.name.to_uppercase() != "PRIMARY")
-            .collect();
-        children.push(
-            self.build_table_subfolder(
-                node,
-                id,
+        // 以下是懒加载文件夹：不预置子项，展开时才查。
+        for (suffix, display_prefix, folder_type) in [
+            (
                 "indexes_folder",
                 "DbTree.Indexes",
                 DbNodeType::IndexesFolder,
-                &folder_metadata,
-                indexes
-                    .into_iter()
-                    .map(|idx| {
-                        (idx.name.clone(), DbNodeType::Index, {
-                            let mut m = folder_metadata.clone();
-                            m.insert("unique".to_string(), idx.is_unique.to_string());
-                            m.insert("columns".to_string(), idx.columns.join(", "));
-                            m
-                        })
-                    })
-                    .collect(),
             ),
-        );
-
-        let foreign_keys = self
-            .list_foreign_keys(connection, db, schema.clone(), table)
-            .await
-            .unwrap_or_default();
-        children.push(
-            self.build_table_subfolder(
-                node,
-                id,
+            (
                 "foreign_keys_folder",
                 "DbTree.ForeignKeys",
                 DbNodeType::ForeignKeysFolder,
-                &folder_metadata,
-                foreign_keys
-                    .into_iter()
-                    .map(|fk| {
-                        (fk.name.clone(), DbNodeType::ForeignKey, {
-                            let mut m = folder_metadata.clone();
-                            m.insert("columns".to_string(), fk.columns.join(", "));
-                            m.insert("ref_table".to_string(), fk.ref_table.clone());
-                            if let Some(schema) = fk.ref_schema.as_deref() {
-                                m.insert("ref_schema".to_string(), schema.to_string());
-                            }
-                            m.insert("ref_columns".to_string(), fk.ref_columns.join(", "));
-                            m
-                        })
-                    })
-                    .collect(),
             ),
-        );
-
-        let triggers = self
-            .list_table_triggers(connection, db, schema.clone(), table)
-            .await
-            .unwrap_or_default();
-        children.push(
-            self.build_table_subfolder(
-                node,
-                id,
+            (
                 "triggers_folder",
                 "DbTree.Triggers",
                 DbNodeType::TriggersFolder,
-                &folder_metadata,
-                triggers
-                    .into_iter()
-                    .map(|t| {
-                        (t.name.clone(), DbNodeType::Trigger, {
-                            let mut m = folder_metadata.clone();
-                            m.insert("event".to_string(), t.event.clone());
-                            m.insert("timing".to_string(), t.timing.clone());
-                            m
-                        })
-                    })
-                    .collect(),
             ),
-        );
-
-        let checks = self
-            .list_table_checks(connection, db, schema.clone(), table)
-            .await
-            .unwrap_or_default();
-        children.push(
-            self.build_table_subfolder(
+            ("checks_folder", "DbTree.Checks", DbNodeType::ChecksFolder),
+        ] {
+            children.push(self.build_deferred_table_subfolder(
                 node,
                 id,
-                "checks_folder",
-                "DbTree.Checks",
-                DbNodeType::ChecksFolder,
+                suffix,
+                display_prefix,
+                folder_type,
                 &folder_metadata,
-                checks
-                    .into_iter()
-                    .map(|c| {
-                        (c.name.clone(), DbNodeType::Check, {
-                            let mut m = folder_metadata.clone();
-                            if let Some(def) = &c.definition {
-                                m.insert("definition".to_string(), def.clone());
-                            }
-                            m
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+            ));
+        }
 
         Ok(children)
     }
@@ -1821,6 +1898,31 @@ pub trait DatabasePlugin: Send + Sync {
             folder.set_children(child_nodes);
         }
         folder
+    }
+
+    /// 建一个「子项尚未查询」的表子文件夹节点。
+    ///
+    /// 与 [`Self::build_table_subfolder`] 的区别是不预置 children，因此
+    /// `children_loaded` 保持为 `false`；树里会照常显示展开箭头，展开时由
+    /// `load_table_folder_children` 按需查询。
+    fn build_deferred_table_subfolder(
+        &self,
+        node: &DbNode,
+        parent_id: &str,
+        folder_suffix: &str,
+        display_prefix: &str,
+        folder_type: DbNodeType,
+        folder_metadata: &HashMap<String, String>,
+    ) -> DbNode {
+        DbNode::new(
+            format!("{}:{}", parent_id, folder_suffix),
+            display_prefix,
+            folder_type,
+            node.connection_id.clone(),
+            node.database_type.clone(),
+        )
+        .with_parent_context(parent_id)
+        .with_metadata(folder_metadata.clone())
     }
 
     async fn load_table_folder_children(
@@ -2051,12 +2153,24 @@ pub trait DatabasePlugin: Send + Sync {
             }
         };
 
-        // Query with pagination, include rowid if supported
-        let base_sql = if self.supports_rowid() {
+        // Query with pagination, project rowid only when the table exposes it
+        let rowid_projection = self
+            .table_supports_rowid_projection(
+                connection,
+                &request.database,
+                request.schema.as_deref(),
+                &request.table,
+            )
+            .await?;
+        let base_sql = if rowid_projection {
             let rowid_col = self.rowid_column_name();
             format!(
-                "SELECT {} AS __rowid__, t.* FROM {} t{}{}",
-                rowid_col, table_ref, where_clause, order_clause
+                "SELECT {} AS {}, t.* FROM {} t{}{}",
+                rowid_col,
+                self.rowid_column_alias(),
+                table_ref,
+                where_clause,
+                order_clause
             )
         } else {
             format!(
@@ -2631,15 +2745,22 @@ pub trait DatabasePlugin: Send + Sync {
     }
 
     // === Export Operations ===
-    /// Export table CREATE statement
+    /// Export table CREATE statement.
+    ///
+    /// 每个插件/驱动必须自己实现（服务器官方 `SHOW CREATE` / `DBMS_METADATA` /
+    /// catalog 原文等）。宿主不再提供共享拼装兑底：拼出来的结构会丢自增、
+    /// 精度等方言细节，错结构比报错更糟。
     async fn export_table_create_sql(
         &self,
-        connection: &dyn DbConnection,
-        database: &str,
-        schema: Option<&str>,
+        _connection: &dyn DbConnection,
+        _database: &str,
+        _schema: Option<&str>,
         table: &str,
     ) -> Result<String> {
-        default_export_table_create_sql(self, connection, database, schema, table).await
+        anyhow::bail!(
+            "this database type does not implement DDL export for table {table}; \
+             each plugin must provide its own server-side DDL"
+        )
     }
 
     /// Export table data as INSERT statements
@@ -2683,6 +2804,7 @@ pub trait DatabasePlugin: Send + Sync {
             self,
             &table_ident,
             &query_result,
+            crate::import_export::DEFAULT_ROWS_PER_INSERT_STATEMENT,
         )
     }
 
@@ -2825,6 +2947,31 @@ pub trait DatabasePlugin: Send + Sync {
 
     /// Rename table
     fn rename_table(&self, database: &str, old_name: &str, new_name: &str) -> String;
+
+    /// 删除外部表（`DROP FOREIGN TABLE`）。
+    ///
+    /// 默认退化为 `drop_table`：没有外部表概念的数据库不会走到这个分支。
+    fn drop_foreign_table(&self, database: &str, schema: Option<&str>, table: &str) -> String {
+        self.drop_table(database, schema, table)
+    }
+
+    /// 重命名外部表（`ALTER FOREIGN TABLE ... RENAME TO ...`）。
+    ///
+    /// `schema` 非空时限定旧表名，避免依赖会话 `search_path` 而改错 schema 下的同名表。
+    fn rename_foreign_table(
+        &self,
+        database: &str,
+        _schema: Option<&str>,
+        old_name: &str,
+        new_name: &str,
+    ) -> String {
+        self.rename_table(database, old_name, new_name)
+    }
+
+    /// 删除物化视图（`DROP MATERIALIZED VIEW`）。
+    fn drop_materialized_view(&self, database: &str, _schema: Option<&str>, view: &str) -> String {
+        self.drop_view(database, view)
+    }
 
     /// Build native backup-table SQL.
     /// 默认实现使用 `CREATE TABLE ... AS SELECT ...`，数据库插件可按方言覆盖。
@@ -3132,84 +3279,6 @@ pub trait DatabasePlugin: Send + Sync {
         config: &ExportConfig,
         progress_tx: Option<ExportProgressSender>,
     ) -> Result<ExportResult>;
-}
-
-/// Default column-based CREATE TABLE export shared by the `DatabasePlugin`
-/// trait default. Driver overrides that need to opt back into the generic
-/// builder (e.g. when the driver's own structure export is unavailable) call
-/// this free function directly: a `Trait::method(self)` call from inside an
-/// override would dispatch back to the override instead of the default body.
-pub(crate) async fn default_export_table_create_sql<P>(
-    plugin: &P,
-    connection: &dyn DbConnection,
-    database: &str,
-    schema: Option<&str>,
-    table: &str,
-) -> Result<String>
-where
-    P: DatabasePlugin + ?Sized,
-{
-    let columns = plugin
-        .list_columns(connection, database, schema.map(|s| s.to_string()), table)
-        .await?;
-    if columns.is_empty() {
-        return Ok(String::new());
-    }
-
-    let table_ref = plugin.format_export_table_reference(database, schema, table);
-    let mut definitions = columns
-        .iter()
-        .map(|column| format!("    {}", plugin.build_column_definition(column, true)))
-        .collect::<Vec<_>>();
-    let primary_keys = columns
-        .iter()
-        .filter(|column| column.is_primary_key)
-        .map(|column| plugin.quote_identifier(&column.name))
-        .collect::<Vec<_>>();
-    if !primary_keys.is_empty() {
-        definitions.push(format!("    PRIMARY KEY ({})", primary_keys.join(", ")));
-    }
-
-    let mut sql = format!(
-        "CREATE TABLE {} (\n{}\n)",
-        table_ref,
-        definitions.join(",\n")
-    );
-
-    // Best-effort table comment: drivers that cannot list table metadata are
-    // still able to export the structure (columns + primary key + column comments).
-    let mut statements = Vec::new();
-    if let Ok(tables) = plugin
-        .list_tables(connection, database, schema.map(|s| s.to_string()))
-        .await
-    {
-        if let Some(comment) = tables
-            .iter()
-            .find(|info| info.name == table)
-            .and_then(|info| info.comment.clone())
-        {
-            statements.push(format!(
-                "COMMENT ON TABLE {} IS {}",
-                table_ref,
-                plugin.escape_sql_value(&comment)
-            ));
-        }
-    }
-    statements.extend(columns.iter().filter_map(|column| {
-        column.comment.as_ref().map(|comment| {
-            format!(
-                "COMMENT ON COLUMN {}.{} IS {}",
-                table_ref,
-                plugin.quote_identifier(&column.name),
-                plugin.escape_sql_value(comment)
-            )
-        })
-    }));
-    if !statements.is_empty() {
-        sql.push('\n');
-        sql.push_str(&statements.join(";\n"));
-    }
-    Ok(sql)
 }
 
 fn foreign_key_action_sql(action: &str) -> Option<String> {
@@ -3865,6 +3934,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             })
             .collect();
         let row = vec![None, Some(String::new()), Some("NULL".to_string())];
@@ -3899,6 +3969,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
             ColumnInfo {
                 name: "enabled".to_string(),
@@ -3909,6 +3980,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
         ];
         let request = CopySqlRequest::new("features", columns)
@@ -3933,6 +4005,7 @@ mod tests {
                 comment: None,
                 charset: Some("utf8mb4".to_string()),
                 collation: Some("utf8mb4_0900_ai_ci".to_string()),
+                is_auto_increment: false,
             },
             ColumnInfo {
                 name: "payload".to_string(),
@@ -3943,6 +4016,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: Some("binary".to_string()),
+                is_auto_increment: false,
             },
         ];
         let current = vec![
@@ -3991,6 +4065,7 @@ mod tests {
             comment: None,
             charset: Some("utf8mb4".to_string()),
             collation: Some("utf8mb4_0900_ai_ci".to_string()),
+            is_auto_increment: false,
         })
         .collect();
         let request = CopySqlRequest::new("typed_values", columns).with_typed_rows(vec![vec![
@@ -4019,6 +4094,7 @@ mod tests {
             comment: None,
             charset: None,
             collation: None,
+            is_auto_increment: false,
         }];
 
         let mismatched = CopySqlRequest::new("items", columns.clone())
@@ -4060,6 +4136,7 @@ mod tests {
             comment: None,
             charset: None,
             collation: None,
+            is_auto_increment: false,
         }];
         let request = CopySqlRequest::new("items", columns)
             .with_typed_original_rows(vec![vec![TableCellValue::Text("42".to_string())]]);

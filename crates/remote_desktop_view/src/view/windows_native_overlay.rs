@@ -52,6 +52,13 @@ pub(crate) struct WindowsNativeOverlay {
     generation: u64,
     last_bounds: Option<WindowsNativeOverlayBounds>,
     requested_visible: bool,
+    /// Whether the window is currently DWM-cloaked, i.e. taken off screen while
+    /// DirectComposition presents its content.
+    cloaked: bool,
+    /// Whether `WS_EX_LAYERED` is currently applied. It is only ever set while
+    /// the session is composed, because a layered window that nothing composes
+    /// never becomes visible.
+    layered: bool,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 

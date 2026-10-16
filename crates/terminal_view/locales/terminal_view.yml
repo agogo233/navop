@@ -217,6 +217,14 @@ SSH:
     en: The password will not be saved. Enter it on the first connection and every manual reconnect.
     zh-CN: 密码不会保存；首次连接及每次手动重连时都需要重新输入。
     zh-HK: 密碼不會儲存；首次連線及每次手動重新連線時都需要重新輸入。
+  password_and_private_key:
+    en: Password + Private Key
+    zh-CN: 密码 + 密钥
+    zh-HK: 密碼 + 金鑰
+  password_and_private_key_hint:
+    en: The server asks for both a password and a private key. The actual order follows what the server requires.
+    zh-CN: 服务器要求同时提供密码与私钥（双因素）。实际认证顺序以服务器要求为准。
+    zh-HK: 伺服器要求同時提供密碼與私鑰（雙因素）。實際認證順序以伺服器要求為準。
   private_key:
     en: Private Key File
     zh-CN: 私钥文件
@@ -274,9 +282,9 @@ SSH:
     zh-CN: 启用
     zh-HK: 啟用
   keyboard_interactive_desc:
-    en: Allow Keyboard-Interactive prompts such as OTP, hardware tokens, and challenge-response.
-    zh-CN: 允许服务器通过 Keyboard-Interactive 请求 OTP、硬件令牌或质询响应。
-    zh-HK: 允許伺服器透過 Keyboard-Interactive 要求 OTP、硬件權杖或質詢回應。
+    en: Allow Keyboard-Interactive prompts such as OTP, hardware tokens, and challenge-response. Enable it when the server demands keyboard-interactive (MFA/OTP authentication); some switches deliver the normal password prompt this way, but most devices accept plain password authentication. If the server drops the connection during the keyboard-interactive exchange, navop retries once with password authentication.
+    zh-CN: 允许服务器通过 Keyboard-Interactive 请求 OTP、硬件令牌或质询响应。服务器要求 keyboard-interactive（二次认证/OTP）时请开启；部分交换机用它下发普通密码提示，但多数设备也支持普通密码认证。若服务器在 keyboard-interactive 往返中直接断开连接，navop 会自动改用密码认证重试一次。
+    zh-HK: 允許伺服器透過 Keyboard-Interactive 要求 OTP、硬體權杖或質詢回應。伺服器要求 keyboard-interactive（二次認證/OTP）時請開啟；部分交換器用它下發一般密碼提示，但多數設備也支援一般密碼認證。若伺服器在 keyboard-interactive 往返中直接中斷連線，navop 會自動改用密碼認證重試一次。
   terminal_encoding:
     en: Terminal Encoding
     zh-CN: 终端字符集
@@ -314,9 +322,9 @@ SSH:
     zh-CN: 请等待远端 Shell 集成卸载完成后再保存。
     zh-HK: 請等待遠端 Shell 整合解除安裝完成後再儲存。
   workspace:
-    en: Workspace
-    zh-CN: 工作区
-    zh-HK: 工作區
+    en: Group
+    zh-CN: 分组
+    zh-HK: 分組
   validation_error:
     en: Please fill in all required fields
     zh-CN: 请填写所有必填字段
@@ -603,6 +611,14 @@ SSH:
     en: Forward remote X11 graphical applications to the local X server. macOS requires XQuartz to be installed and running. Applies to new terminal sessions.
     zh-CN: 将远端 X11 图形应用转发到本机 X server。macOS 需要安装并启动 XQuartz。对新开的终端会话生效。
     zh-HK: 將遠端 X11 圖形應用轉發到本機 X server。macOS 需要安裝並啟動 XQuartz。對新開的終端工作階段生效。
+  forward_agent:
+    en: SSH Agent Forwarding
+    zh-CN: SSH Agent 转发
+    zh-HK: SSH Agent 轉發
+  forward_agent_desc:
+    en: Forward the local ssh-agent to the remote host (ForwardAgent), letting it authenticate to deeper hosts using your local keys. Applies to new terminal sessions.
+    zh-CN: 将本地 ssh-agent 转发给远端主机（ForwardAgent），使远端可代表你用本机私钥向更内层主机认证。对新开的终端会话生效。
+    zh-HK: 將本機 ssh-agent 轉發給遠端主機（ForwardAgent），使遠端可代表你用本機私鑰向更內層主機認證。對新開的終端工作階段生效。
   xquartz_not_installed:
     en: XQuartz was not detected. Install and start XQuartz before using X11 forwarding on macOS, then reconnect the SSH session.
     zh-CN: 未检测到 XQuartz。请先安装并启动 XQuartz，再重新建立 SSH 连接以使用 X11 转发。
@@ -666,6 +682,18 @@ Settings:
     en: Suggestion popup
     zh-CN: 弹框候选词
     zh-HK: 彈框候選詞
+  suggestion_popup_opacity:
+    en: Popup background
+    zh-CN: 弹层背景不透明度
+    zh-HK: 彈層背景不透明度
+  suggestion_popup_opacity_value:
+    en: "%{percent}%"
+    zh-CN: "%{percent}%"
+    zh-HK: "%{percent}%"
+  suggestion_popup_opacity_help:
+    en: Higher values hide more of the terminal text behind the popup.
+    zh-CN: 数值越高，弹层越不透出下层终端文字。
+    zh-HK: 數值越高，彈層越不透出下層終端文字。
   title:
     en: Settings
     zh-CN: 设置
@@ -1208,6 +1236,14 @@ TerminalView:
     en: Paste as single line
     zh-CN: 合并为单行粘贴
     zh-HK: 合併為單行貼上
+  paste_open_settings:
+    en: Open Settings
+    zh-CN: 打开设置
+    zh-HK: 開啟設定
+  paste_dont_ask_again:
+    en: Don't Ask Again
+    zh-CN: 不再提示
+    zh-HK: 不再提示
   large_paste_title:
     en: Confirm Large Paste
     zh-CN: 确认大段粘贴
@@ -1605,9 +1641,9 @@ TerminalCommandBar:
     zh-CN: 命令输入
     zh-HK: 命令輸入
   placeholder:
-    en: Enter commands, one per line. Shift+Enter for newline, Enter to run lines one by one
-    zh-CN: 输入命令，每行一条，Enter 逐条执行，Shift+Enter 换行
-    zh-HK: 輸入命令，每行一條，Enter 逐條執行，Shift+Enter 換行
+    en: One command per line · Up/Down select · Tab complete · Enter run · Shift+Enter newline
+    zh-CN: 输入命令，每行一条 · ↑/↓ 选择 · Tab 补全 · Enter 逐条执行 · Shift+Enter 换行
+    zh-HK: 輸入命令，每行一條 · ↑/↓ 選擇 · Tab 補全 · Enter 逐條執行 · Shift+Enter 換行
   search_quick_commands:
     en: Search quick commands
     zh-CN: 搜索快捷指令
@@ -1640,10 +1676,10 @@ TerminalCommandBar:
     en: History
     zh-CN: 历史
     zh-HK: 歷史
-  keyboard_hint:
-    en: Up/Down select · Tab complete · Enter run · Shift+Enter newline
-    zh-CN: ↑/↓ 选择 · Tab 补全 · Enter 逐条执行 · Shift+Enter 换行
-    zh-HK: ↑/↓ 選擇 · Tab 補全 · Enter 逐條執行 · Shift+Enter 換行
+  collapsed_hint:
+    en: Click to expand · Command input runs multiple commands
+    zh-CN: 点击展开 · 命令输入支持批量执行
+    zh-HK: 點擊展開 · 命令輸入支援批次執行
   expand:
     en: Expand command input
     zh-CN: 展开命令输入
@@ -1750,9 +1786,9 @@ Telnet:
     zh-CN: 钥匙串
     zh-HK: 鑰匙圈
   workspace:
-    en: Workspace
-    zh-CN: 工作区
-    zh-HK: 工作區
+    en: Group
+    zh-CN: 分组
+    zh-HK: 分組
   remark:
     en: Remark
     zh-CN: 备注
@@ -1891,9 +1927,9 @@ Serial:
     zh-CN: 流控
     zh-HK: 流控
   workspace:
-    en: Workspace
-    zh-CN: 工作区
-    zh-HK: 工作區
+    en: Group
+    zh-CN: 分组
+    zh-HK: 分組
   remark:
     en: Remark
     zh-CN: 备注
@@ -2288,6 +2324,10 @@ FileManager:
     en: Sync Terminal Directory
     zh-CN: 同步终端目录
     zh-HK: 同步終端目錄
+  locate_terminal_dir:
+    en: Locate Current Directory in Terminal
+    zh-CN: 定位到终端目录
+    zh-HK: 定位到終端目錄
   follow_terminal_dir_on:
     en: "Following terminal directory: on. Click to stop auto-following."
     zh-CN: "已跟随终端目录：开启。点击可停止自动跟随。"
@@ -2806,9 +2846,9 @@ Ftp:
     zh-CN: 钥匙串
     zh-HK: 鑰匙圈
   workspace:
-    en: Workspace
-    zh-CN: 工作区
-    zh-HK: 工作區
+    en: Group
+    zh-CN: 分组
+    zh-HK: 分組
   remark:
     en: Remark
     zh-CN: 备注

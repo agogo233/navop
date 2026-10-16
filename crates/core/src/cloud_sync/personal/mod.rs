@@ -14,6 +14,8 @@ mod planner;
 mod runtime;
 mod state;
 mod store;
+mod webdav_secret;
+mod webdav_store;
 mod worker;
 
 #[cfg(test)]
@@ -43,4 +45,9 @@ pub use planner::*;
 pub use runtime::*;
 pub use state::*;
 pub use store::*;
+pub use webdav_secret::{
+    open as open_webdav_password, reseal_with_keys as reseal_webdav_password_with_keys,
+    seal as seal_webdav_password,
+};
+pub use webdav_store::*;
 pub use worker::*;

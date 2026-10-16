@@ -83,6 +83,17 @@ pub enum LargeTextCellEditorOpenMode {
     Dialog,
 }
 
+/// 数据表格的显示方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableViewMode {
+    /// 网格：行列平铺，可编辑、可排序
+    #[default]
+    Grid,
+    /// 纵向：每条记录按「列名：值」逐行展开，宽表更易读
+    Vertical,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupDefaultPage {
@@ -240,6 +251,27 @@ impl LargeTextCellEditorOpenMode {
             "dialog" => LargeTextCellEditorOpenMode::Dialog,
             _ => LargeTextCellEditorOpenMode::SidebarPreview,
         }
+    }
+}
+
+impl TableViewMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TableViewMode::Grid => "grid",
+            TableViewMode::Vertical => "vertical",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "vertical" => TableViewMode::Vertical,
+            _ => TableViewMode::Grid,
+        }
+    }
+
+    /// 是否处于纵向「列：值」形态。
+    pub fn is_vertical(&self) -> bool {
+        matches!(self, TableViewMode::Vertical)
     }
 }
 
@@ -673,6 +705,7 @@ pub enum PersonalSyncBackendKind {
     #[default]
     Folder,
     Git,
+    Webdav,
 }
 
 impl PersonalSyncBackendKind {
@@ -680,12 +713,14 @@ impl PersonalSyncBackendKind {
         match self {
             Self::Folder => "folder",
             Self::Git => "git",
+            Self::Webdav => "webdav",
         }
     }
 
     pub fn from_str(value: &str) -> Self {
         match value {
             "git" => Self::Git,
+            "webdav" => Self::Webdav,
             _ => Self::Folder,
         }
     }
@@ -739,6 +774,8 @@ pub struct PersonalSyncSettings {
     pub auto_sync: bool,
     #[serde(default)]
     pub git: PersonalGitSyncSettings,
+    #[serde(default)]
+    pub webdav: PersonalWebdavSyncSettings,
 }
 
 impl Default for PersonalSyncSettings {
@@ -748,7 +785,41 @@ impl Default for PersonalSyncSettings {
             path: String::new(),
             auto_sync: default_true(),
             git: PersonalGitSyncSettings::default(),
+            webdav: PersonalWebdavSyncSettings::default(),
         }
+    }
+}
+
+/// WebDAV 个人同步后端的连接配置。
+///
+/// `password` 在落盘前由调用方经 `cloud_sync::personal::seal_webdav_password` 加密，
+/// 这里保存的是 `ENC:` 前缀密文而非明文；读取时用 `open_webdav_password` 还原。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalWebdavSyncSettings {
+    /// WebDAV 根目录地址，例如 `https://dav.jianguoyun.com/dav/navop/`
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+    /// 加密后的密码（或历史遗留的明文，读取时自动兼容）。
+    #[serde(default)]
+    pub password: String,
+}
+
+impl Default for PersonalWebdavSyncSettings {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
+impl PersonalWebdavSyncSettings {
+    /// 三个字段都非空才算配置完整，此时 `test_connection` / `sync_now` 才可用。
+    pub fn is_complete(&self) -> bool {
+        !self.url.trim().is_empty() && !self.username.trim().is_empty() && !self.password.is_empty()
     }
 }
 
@@ -962,6 +1033,9 @@ pub struct AppSettings {
     pub sql_editor_font_family: String,
     #[serde(default = "default_sql_editor_font_size")]
     pub sql_editor_font_size: f64,
+    /// SQL 编辑器鼠标 hover 是否显示对象详情（需停留约 0.6s）。
+    #[serde(default = "default_sql_editor_hover_enabled")]
+    pub sql_editor_hover_enabled: bool,
     #[serde(default = "default_monospace_font_family")]
     pub table_preview_font_family: String,
     #[serde(default = "default_monospace_font_family")]
@@ -982,6 +1056,14 @@ pub struct AppSettings {
     pub terminal_enable_autocomplete: bool,
     #[serde(default = "default_true")]
     pub terminal_show_suggestion_popup: bool,
+    /// 命令提示 / cd 补全 / 历史搜索下拉弹层的背景不透明度。
+    ///
+    /// 弹层背景画在终端内容之上，下层文字以 (1 - α) 的权重透进弹层：0.72
+    /// 会透出 28%，与弹层自身文字的对比度同量级，亮色主题下几乎不可读
+    /// （issue #73）；1.0 则完全遮挡终端内容（issue #5）。两个诉求相反，
+    /// 因此暴露给用户自己定，默认 0.96（透出 4%）。
+    #[serde(default = "default_terminal_suggestion_popup_opacity")]
+    pub terminal_suggestion_popup_opacity: f32,
     #[serde(default = "default_true")]
     pub terminal_middle_click_paste: bool,
     #[serde(default)]
@@ -1073,9 +1155,21 @@ pub struct AppSettings {
     /// 表格行高（像素），默认44
     #[serde(default = "default_table_row_height")]
     pub table_row_height: u32,
+    /// 数据表格的显示方式：网格（默认）或纵向「列：值」
+    #[serde(default)]
+    pub table_view_mode: TableViewMode,
+    /// 在数据表格列头下方常驻显示字段注释，默认关闭
+    #[serde(default)]
+    pub table_show_column_comment: bool,
     /// SQL 查询默认最大返回行数，0 表示不限制
     #[serde(default = "default_sql_query_max_rows")]
     pub sql_query_max_rows: u32,
+    /// 导出/转储 SQL 时每一条 INSERT 语句合并的数据行数，`1` 表示一行一条语句。
+    ///
+    /// 用作「导出 SQL 文件」窗口里该参数的初始值，并在每次导出时写回，默认与
+    /// Navicat 的「每条语句的数据行数」一致（100）。
+    #[serde(default = "default_sql_export_rows_per_statement")]
+    pub sql_export_rows_per_statement: usize,
     /// SQL 美化格式化设置
     #[serde(default)]
     pub sql_format: SqlFormatSettings,
@@ -1086,6 +1180,8 @@ pub struct AppSettings {
 pub(crate) const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
 pub(crate) const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
 pub const DEFAULT_SQL_QUERY_MAX_ROWS: u32 = 1000;
+/// SQL 导出每条语句默认合并的数据行数，与 Navicat 的默认值一致。
+pub const DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT: usize = 100;
 pub const DEFAULT_TERMINAL_THEME: &str = "application";
 
 fn default_font_family() -> String {
@@ -1133,6 +1229,11 @@ fn default_ui_scale_percent() -> u32 {
 
 fn default_sql_editor_font_size() -> f64 {
     14.0
+}
+
+/// hover 默认关闭：用户此前反馈鼠标滑过即弹详情太吵，需在设置里显式开启。
+fn default_sql_editor_hover_enabled() -> bool {
+    false
 }
 
 fn default_monospace_font_family() -> String {
@@ -1321,6 +1422,10 @@ fn default_terminal_scrollback_lines() -> usize {
     AppSettings::DEFAULT_TERMINAL_SCROLLBACK_LINES
 }
 
+fn default_terminal_suggestion_popup_opacity() -> f32 {
+    AppSettings::DEFAULT_TERMINAL_SUGGESTION_POPUP_OPACITY
+}
+
 fn default_terminal_theme() -> String {
     DEFAULT_TERMINAL_THEME.to_string()
 }
@@ -1349,6 +1454,10 @@ fn default_sql_query_max_rows() -> u32 {
     DEFAULT_SQL_QUERY_MAX_ROWS
 }
 
+fn default_sql_export_rows_per_statement() -> usize {
+    DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -1369,6 +1478,7 @@ impl Default for AppSettings {
             ui_scale_percent: default_ui_scale_percent(),
             sql_editor_font_family: default_monospace_font_family(),
             sql_editor_font_size: default_sql_editor_font_size(),
+            sql_editor_hover_enabled: default_sql_editor_hover_enabled(),
             table_preview_font_family: default_monospace_font_family(),
             terminal_font_family: default_monospace_font_family(),
             custom_fonts: Vec::new(),
@@ -1377,6 +1487,7 @@ impl Default for AppSettings {
             terminal_auto_copy: default_true(),
             terminal_enable_autocomplete: default_true(),
             terminal_show_suggestion_popup: default_true(),
+            terminal_suggestion_popup_opacity: default_terminal_suggestion_popup_opacity(),
             terminal_middle_click_paste: default_true(),
             terminal_right_click_paste: false,
             terminal_paste_image_upload: default_true(),
@@ -1417,7 +1528,10 @@ impl Default for AppSettings {
             system_hotkey_macos: default_system_hotkey_macos(),
             system_hotkey_other: default_system_hotkey_other(),
             table_row_height: default_table_row_height(),
+            table_view_mode: TableViewMode::default(),
+            table_show_column_comment: false,
             sql_query_max_rows: default_sql_query_max_rows(),
+            sql_export_rows_per_statement: default_sql_export_rows_per_statement(),
             sql_format: SqlFormatSettings::default(),
             custom_keybindings: HashMap::new(),
         }
@@ -1479,6 +1593,10 @@ impl AppSettings {
     pub const DEFAULT_TERMINAL_SCROLLBACK_LINES: usize = 100_000;
     pub const MIN_TERMINAL_SCROLLBACK_LINES: usize = 1_000;
     pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+    /// 命令提示下拉弹层背景不透明度的默认值：透出权重 4%。
+    pub const DEFAULT_TERMINAL_SUGGESTION_POPUP_OPACITY: f32 = 0.96;
+    pub const MIN_TERMINAL_SUGGESTION_POPUP_OPACITY: f32 = 0.5;
+    pub const MAX_TERMINAL_SUGGESTION_POPUP_OPACITY: f32 = 1.0;
 
     pub fn master_key_on_startup_required(&self) -> bool {
         crate::app_paths::master_key_on_startup_required(
@@ -1533,9 +1651,22 @@ impl AppSettings {
         )
     }
 
+    pub fn normalize_terminal_suggestion_popup_opacity(opacity: f32) -> f32 {
+        if opacity.is_finite() {
+            opacity.clamp(
+                Self::MIN_TERMINAL_SUGGESTION_POPUP_OPACITY,
+                Self::MAX_TERMINAL_SUGGESTION_POPUP_OPACITY,
+            )
+        } else {
+            Self::DEFAULT_TERMINAL_SUGGESTION_POPUP_OPACITY
+        }
+    }
+
     pub fn normalize_terminal_settings(&mut self) {
         self.terminal_scrollback_lines =
             Self::normalize_terminal_scrollback_lines(self.terminal_scrollback_lines);
+        self.terminal_suggestion_popup_opacity =
+            Self::normalize_terminal_suggestion_popup_opacity(self.terminal_suggestion_popup_opacity);
         let terminal_theme = self.terminal_theme.trim();
         self.terminal_theme = if terminal_theme.is_empty() {
             default_terminal_theme()
@@ -1740,14 +1871,15 @@ mod tests {
     use super::{
         AiChatSettings, AiChatToolExecutionMode, AppSettings, CloseButtonBehavior,
         ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
-        DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_TERMINAL_THEME, HomeConnectionLayout,
-        LOCALE_SYSTEM, LargeTextCellEditorOpenMode, LocalTerminalProfileKind,
-        LocalTerminalProfileSettings, MAX_AI_REQUEST_TIMEOUT_SECS, MAX_CUSTOM_SYSTEM_PROMPT_CHARS,
-        MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState, McpPermissionMode, McpServerMode,
-        PersonalSyncBackendKind, RemoteFileOpenMode, SqlFormatSettings, SqlIndentStyle,
-        SqlKeywordCase, StartupDefaultPage, SyncProvider, default_grid_font_fallback_families,
-        default_grid_monospace_font_family, grid_monospace_font, installed_grid_monospace_font,
-        is_installed_font_family, resolve_installed_grid_monospace_font_family,
+        DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
+        DEFAULT_TERMINAL_THEME, HomeConnectionLayout, LOCALE_SYSTEM, LargeTextCellEditorOpenMode,
+        LocalTerminalProfileKind, LocalTerminalProfileSettings, MAX_AI_REQUEST_TIMEOUT_SECS,
+        MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState,
+        McpPermissionMode, McpServerMode, PersonalSyncBackendKind, RemoteFileOpenMode,
+        SqlFormatSettings, SqlIndentStyle, SqlKeywordCase, StartupDefaultPage, SyncProvider,
+        TableViewMode, default_grid_font_fallback_families, default_grid_monospace_font_family,
+        grid_monospace_font, installed_grid_monospace_font, is_installed_font_family,
+        resolve_installed_grid_monospace_font_family,
     };
 
     #[test]
@@ -2122,6 +2254,79 @@ mod tests {
     }
 
     #[test]
+    fn app_settings_default_batches_sql_export_statements() {
+        let settings = AppSettings::default();
+
+        assert_eq!(DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT, 100);
+        assert_eq!(
+            DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
+            settings.sql_export_rows_per_statement
+        );
+    }
+
+    #[test]
+    fn table_view_mode_round_trips_between_str_and_enum() {
+        // 设置页下拉用字符串读写，枚举与字符串必须一一对应；
+        // 认不出的值一律退回网格，避免坏掉的配置把表格渲成空白。
+        assert_eq!("grid", TableViewMode::Grid.as_str());
+        assert_eq!("vertical", TableViewMode::Vertical.as_str());
+        assert_eq!(TableViewMode::Grid, TableViewMode::from_str("grid"));
+        assert_eq!(TableViewMode::Vertical, TableViewMode::from_str("vertical"));
+        assert_eq!(TableViewMode::Grid, TableViewMode::from_str("unknown"));
+        assert!(!TableViewMode::Grid.is_vertical());
+        assert!(TableViewMode::Vertical.is_vertical());
+    }
+
+    #[test]
+    fn app_settings_defaults_to_the_grid_view() {
+        let settings = AppSettings::default();
+
+        assert_eq!(TableViewMode::Grid, settings.table_view_mode);
+    }
+
+    #[test]
+    fn app_settings_deserializes_missing_table_view_mode_as_grid() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("缺少 table_view_mode 的旧版 settings.json 应能读取");
+
+        assert_eq!(TableViewMode::Grid, settings.table_view_mode);
+    }
+
+    #[test]
+    fn app_settings_deserializes_the_vertical_table_view_mode() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "table_view_mode": "vertical"
+        }))
+        .expect("table_view_mode 应能从 settings.json 读回");
+
+        assert_eq!(TableViewMode::Vertical, settings.table_view_mode);
+    }
+
+    #[test]
+    fn table_column_comment_is_off_by_default_and_round_trips() {
+        assert!(
+            !AppSettings::default().table_show_column_comment,
+            "列头注释行默认关闭"
+        );
+
+        let legacy: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "table_row_height": 44
+        }))
+        .expect("缺少 table_show_column_comment 的旧版 settings.json 应能读取");
+        assert!(!legacy.table_show_column_comment);
+
+        let enabled: AppSettings = serde_json::from_value(serde_json::json!({
+            "table_show_column_comment": true
+        }))
+        .expect("table_show_column_comment 应能从 settings.json 读回");
+        assert!(enabled.table_show_column_comment);
+    }
+
+    #[test]
     fn app_settings_default_enables_terminal_file_manager_path_sync() {
         let settings = AppSettings::default();
 
@@ -2402,6 +2607,20 @@ mod tests {
         .expect("旧版 settings.json 应能读取");
 
         assert_eq!(1000, settings.sql_query_max_rows);
+    }
+
+    #[test]
+    fn app_settings_deserializes_missing_sql_export_rows_per_statement() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "locale": "en",
+            "theme_mode": "dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert_eq!(
+            DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
+            settings.sql_export_rows_per_statement
+        );
     }
 
     #[test]
@@ -2911,6 +3130,31 @@ mod tests {
         settings.terminal_scrollback_lines = 2_000_000;
         settings.normalize_terminal_settings();
         assert_eq!(1_000_000, settings.terminal_scrollback_lines);
+    }
+
+    #[test]
+    fn terminal_suggestion_popup_opacity_default_and_normalization_are_safe() {
+        let mut settings = AppSettings::default();
+
+        assert_eq!(0.96, settings.terminal_suggestion_popup_opacity);
+
+        settings.terminal_suggestion_popup_opacity = 0.05;
+        settings.normalize_terminal_settings();
+        assert_eq!(0.5, settings.terminal_suggestion_popup_opacity);
+
+        settings.terminal_suggestion_popup_opacity = 3.0;
+        settings.normalize_terminal_settings();
+        assert_eq!(1.0, settings.terminal_suggestion_popup_opacity);
+    }
+
+    #[test]
+    fn legacy_app_settings_receive_default_terminal_suggestion_popup_opacity() {
+        // issue #73：弹层不透明度是后加的字段，旧配置里没有，反序列化必须
+        // 落到 0.96（透出 4%）而不是 f32 的 0.0（弹层全透明、完全读不了）。
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({"locale": "zh-CN"}))
+            .expect("旧版设置应能反序列化");
+
+        assert_eq!(0.96, settings.terminal_suggestion_popup_opacity);
     }
 
     #[test]

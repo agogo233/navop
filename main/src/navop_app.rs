@@ -6,8 +6,8 @@ use crate::persistent_connection_sidebar::{
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, ExternalPaths, InteractiveElement, IntoElement,
-    KeyBinding, Keystroke, ParentElement, Render, Styled, Task, Window, actions, div,
+    App, AppContext, Context, Entity, ExternalPaths, InteractiveElement, IntoElement, KeyBinding,
+    Keystroke, ParentElement, Render, Styled, Task, Window, actions, div,
 };
 use gpui_component::{
     WindowExt,
@@ -16,6 +16,7 @@ use gpui_component::{
     dialog::{DialogButtonProps, DialogFooter},
     kbd::Kbd,
     notification::Notification,
+    render_dialog_layer, render_notification_layer, render_sheet_layer,
 };
 use one_core::gpui_tokio::{JoinError, Tokio};
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
@@ -52,6 +53,7 @@ actions!(
         OpenTabSwitcher,
         SwitchNextTab,
         SwitchPreviousTab,
+        CloseActiveTab,
         ToggleConnectionSidebar,
         CloseActiveWindow,
         QuitApp,
@@ -297,6 +299,16 @@ pub(crate) fn shutdown_application_resources_and_quit(cx: &mut App, reason: &'st
             );
         }
 
+        // 托盘与全局热键的句柄都是 `!Send` 的平台对象，只能留在创建它们的主线程上。
+        // 必须在 `cx.quit()` 之前显式释放，不能留给进程退出的 TLS 析构链：Linux(ksni)
+        // 的 `TrayIcon::drop` 会回到 async-io，而 async-io 的线程本地是在托盘安装过程中
+        // 才注册的，退出时反而先被销毁 —— 析构器撞上已销毁的 TLS 只能 panic → abort
+        // （issue #336）。详见 `system_tray::shutdown`。
+        let _ = cx.update(|_cx| {
+            crate::system_tray::shutdown();
+            crate::app_init::shutdown_system_hotkey();
+        });
+
         let _ = cx.update(|cx| cx.quit());
     })
     .detach();
@@ -361,12 +373,10 @@ fn initial_content_layout() -> InitialContentLayout {
 #[cfg(target_os = "macos")]
 use gpui::px;
 
+use gpui_component::ActiveTheme;
 use gpui_component::dock::ToggleZoom;
-use gpui_component::{ActiveTheme, Root};
 use one_core::llm::manager::GlobalProviderState;
-use one_core::llm::notifier::emit_provider_config_changed;
-use one_core::llm::storage::{ProviderRepository, refresh_navop_models};
-use one_core::settings::{AppSettings, GlobalCurrentUser, MainWindowState};
+use one_core::settings::{AppSettings, MainWindowState};
 use one_core::storage::manager::get_config_dir;
 use one_core::tab_container::{
     GlobalTabContainer, TabContainer, TabContainerEvent, TabContentRegistry, TabItem,
@@ -776,6 +786,24 @@ fn set_windows_always_on_top(hwnd: isize, always_on_top: bool) -> anyhow::Result
     Ok(())
 }
 
+fn close_active_tab(cx: &mut App) {
+    let Some(active_window) = cx.active_window() else {
+        return;
+    };
+    let Some(home) = cx.try_global::<GlobalHomePage>() else {
+        return;
+    };
+    let home_page = home.home_page.clone();
+
+    cx.defer(move |cx| {
+        _ = active_window.update(cx, |_, window, cx| {
+            home_page.update(cx, |hp, cx| {
+                hp.close_active_tab(window, cx);
+            });
+        });
+    });
+}
+
 fn duplicate_tab(cx: &mut App) {
     let Some(active_window) = cx.active_window() else {
         return;
@@ -916,51 +944,6 @@ fn rotate_oversized_log(path: &Path) {
     }
 }
 
-/// 内置 Navop AI 模型列表的定期刷新间隔（已登录时）。
-const NAVOP_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
-/// 未登录时检查登录态的轮询间隔。
-const NAVOP_MODEL_REFRESH_LOGIN_POLL: Duration = Duration::from_secs(30);
-/// 应用启动后首次拉取前的延迟，等待会话恢复与云客户端就绪。
-const NAVOP_MODEL_REFRESH_STARTUP_DELAY: Duration = Duration::from_secs(3);
-
-/// 启动后按固定间隔拉取内置 Navop AI 云端模型列表并持久化到本地。
-///
-/// 模型列表依赖云账号：未登录时仅以较短间隔轮询登录态、不做拉取；
-/// 一旦登录立即拉取一次，之后按固定间隔定期刷新，并通知 AI 面板更新模型选项。
-fn spawn_navop_model_refresh(cx: &mut App) {
-    let storage = cx.global::<GlobalStorageState>().storage.clone();
-    let provider_state = cx.global::<GlobalProviderState>().clone();
-
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        // 先等待云客户端 / 会话恢复就绪
-        cx.background_executor()
-            .timer(NAVOP_MODEL_REFRESH_STARTUP_DELAY)
-            .await;
-
-        loop {
-            let logged_in = cx.update(|cx| GlobalCurrentUser::get_user(cx).is_some());
-            let interval = if logged_in {
-                if let Some(repo) = storage.get::<ProviderRepository>() {
-                    match refresh_navop_models(&repo, &provider_state).await {
-                        Ok(Some(_)) => {
-                            cx.update(|cx| emit_provider_config_changed(cx));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!("内置 Navop AI 模型列表刷新失败: {e}");
-                        }
-                    }
-                }
-                NAVOP_MODEL_REFRESH_INTERVAL
-            } else {
-                NAVOP_MODEL_REFRESH_LOGIN_POLL
-            };
-            cx.background_executor().timer(interval).await;
-        }
-    })
-    .detach();
-}
-
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     gpui_component::init(cx);
     one_core::themes::load_bundled(cx);
@@ -973,7 +956,8 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     crate::ai_chat_acp::init(cx);
     one_ui::init_table_display_settings(
         cx,
-        one_ui::TableDisplaySettings::new(AppSettings::global(cx).table_row_height),
+        one_ui::TableDisplaySettings::new(AppSettings::global(cx).table_row_height)
+            .with_column_comment(AppSettings::global(cx).table_show_column_comment),
     );
     let table_keybindings = table_keybindings(cx);
     one_ui::init(cx, table_keybindings);
@@ -982,16 +966,13 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     crate::auth::init(cx);
     crate::license::init(cx);
     {
-        let auth_service = crate::auth::get_auth_service(cx);
         let global_provider_state = cx.global::<GlobalProviderState>().clone();
-        global_provider_state.set_cloud_client(auth_service.cloud_client());
         global_provider_state
             .set_proxy_settings(&AppSettings::global(cx).global_proxy)
             .expect("LLM 代理初始化失败");
         global_provider_state
             .set_request_timeout_secs(Some(AppSettings::global(cx).ai_chat.request_timeout_secs));
     }
-    spawn_navop_model_refresh(cx);
     db::init_cache(cx);
     // 启动后台磁盘缓存清理任务
     if let Some(cache) = cx.try_global::<db::GlobalNodeCache>() {
@@ -1038,7 +1019,6 @@ pub fn refresh_keybindings(cx: &mut App) {
     cx.bind_keys(refreshable_keybindings(cx));
     crate::home_tab::refresh_keybindings(cx);
     db_view::search_shortcut::refresh_keybindings(cx);
-    db_view::sql_editor_view::refresh_keybindings(cx);
     terminal_view::refresh_keybindings(cx);
     redis_view::refresh_keybindings(cx);
     remote_desktop_view::refresh_keybindings(cx);
@@ -1046,6 +1026,10 @@ pub fn refresh_keybindings(cx: &mut App) {
     one_ui::refresh_keybindings(cx, table_keybindings);
     remote_file_editor::refresh_keybindings(cx);
     notes::refresh_keybindings(cx);
+    // 必须排在 notes 之后：notes 的 `secondary-/` 是**无 context** 的全局绑定，
+    // 而 gpui 里无 context 等价于最深的 context、同深度后注册者胜；晚一步登记
+    // 才能让带 `SqlEditor` context 的注释快捷键在编辑器里胜出（#290 反馈）。
+    db_view::sql_editor_view::refresh_keybindings(cx);
 }
 
 fn table_keybindings(cx: &App) -> one_ui::TableKeybindings {
@@ -1067,6 +1051,23 @@ fn table_keybindings(cx: &App) -> one_ui::TableKeybindings {
             cx,
             action_id::TABLE_SELECT_ALL,
             &[table_shortcut("cmd-a", "ctrl-a")],
+        ),
+    )
+    .with_find(
+        shortcuts_for(
+            cx,
+            action_id::TABLE_FIND,
+            &[table_shortcut("cmd-f", "ctrl-f")],
+        ),
+        shortcuts_for(
+            cx,
+            action_id::TABLE_FIND_NEXT,
+            &[table_shortcut("cmd-g", "ctrl-g")],
+        ),
+        shortcuts_for(
+            cx,
+            action_id::TABLE_FIND_PREVIOUS,
+            &[table_shortcut("cmd-shift-g", "ctrl-shift-g")],
         ),
     )
 }
@@ -1191,6 +1192,15 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
     keybindings.extend(
         shortcuts_for(
             cx,
+            action_id::APP_CLOSE_ACTIVE_TAB,
+            &[default_shortcut("cmd-shift-w", "alt-shift-w")],
+        )
+        .into_iter()
+        .map(|key| KeyBinding::new(&key, CloseActiveTab, None)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
             action_id::APP_QUIT,
             &[default_shortcut("cmd-q", "alt-f4")],
         )
@@ -1278,6 +1288,13 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
     ));
     keybindings.extend(rebind_keybindings(
         cx,
+        action_id::APP_CLOSE_ACTIVE_TAB,
+        &[default_shortcut("cmd-shift-w", "alt-shift-w")],
+        None,
+        CloseActiveTab,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
         action_id::APP_QUIT,
         &[default_shortcut("cmd-q", "alt-f4")],
         None,
@@ -1302,6 +1319,7 @@ fn init_action_handlers(cx: &mut App) {
     cx.on_action(|_: &OpenTabSwitcher, cx| open_tab_switcher(cx));
     cx.on_action(|_: &SwitchNextTab, cx| switch_tab(TabCycleDirection::Next, cx));
     cx.on_action(|_: &SwitchPreviousTab, cx| switch_tab(TabCycleDirection::Previous, cx));
+    cx.on_action(|_: &CloseActiveTab, cx| close_active_tab(cx));
     cx.on_action(|_: &CloseActiveWindow, cx| close_active_window(cx));
     cx.on_action(|_: &QuitApp, cx| quit_app(cx));
     cx.on_action(|_: &OpenConnectionQuickOpen, cx| {
@@ -1877,6 +1895,80 @@ mod tests {
     use ssh::SshSessionServiceState;
     use std::io::Write;
 
+    /// gpui 的绑定优先级：**无 context 的绑定等价于最深的 context**，同深度
+    /// 后注册者胜。`notes::init`（main.rs 里排在 `navop_app::init` 之后）把
+    /// `secondary-/` 全局绑到了「切换源码模式」上，而 `navop_app::init` 里的
+    /// `sql_editor_view::init` 排在它前面 —— 于是焦点落在 SQL 编辑器里按
+    /// cmd+/ 时，先匹配到的是 notes 的动作，注释快捷键看起来「没绑上」。
+    #[gpui::test]
+    fn sql_editor_comment_shortcut_is_not_shadowed_by_notes_global_shortcut(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let winner = cx.update(|cx| {
+            gpui_component::init(cx);
+            // 复刻真实启动顺序：navop_app::init（内含 sql_editor_view::init）→ notes::init
+            db_view::sql_editor_view::init(cx);
+            notes::init(cx);
+            // main.rs 在同一位置再登记一次（见 sql_editor_keybindings_are_registered_after_notes_init）
+            db_view::sql_editor_view::refresh_keybindings(cx);
+            comment_shortcut_winner(cx)
+        });
+
+        assert!(
+            winner.as_ref().is_some_and(|binding| binding
+                .action()
+                .partial_eq(&db_view::sql_editor_view::ToggleLineComment)),
+            "焦点在 SQL 编辑器里按注释快捷键，第一个匹配的绑定必须是注释动作，实际是：{}",
+            winner
+                .map(|binding| binding.action().name().to_string())
+                .unwrap_or_else(|| "<无绑定>".to_string())
+        );
+    }
+
+    /// 焦点落在「SqlEditor > Input」时，注释快捷键的第一个匹配绑定。
+    ///
+    /// 直接向 keymap 要优先级列表：这比模拟按键先一步，能看出到底是谁赢了
+    /// 同深度的平局（`bindings_for_input` 已按优先级排好序）。
+    fn comment_shortcut_winner(cx: &gpui::App) -> Option<gpui::KeyBinding> {
+        let contexts = vec![
+            gpui::KeyContext::parse("Root").expect("valid context"),
+            gpui::KeyContext::parse("SqlEditor").expect("valid context"),
+            gpui::KeyContext::parse("Input").expect("valid context"),
+        ];
+        let keystroke = gpui::Keystroke::parse(comment_shortcut_spec()).expect("valid keystroke");
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let (bindings, _) = keymap.bindings_for_input(&[keystroke], &contexts);
+        bindings.first().cloned()
+    }
+
+    fn comment_shortcut_spec() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-/"
+        } else {
+            "ctrl-/"
+        }
+    }
+
+    /// 守卫：main.rs 里的登记顺序不能被改回去。
+    ///
+    /// 上面的行为用例只能证明「这个顺序下能赢」，证不了生产代码真用这个顺序（测试
+    /// 是自己拼的调用）。这里直接盯 main.rs 的源码：`notes::init` 之后必须紧跟
+    /// SQL 编辑器的重新登记。
+    #[test]
+    fn sql_editor_keybindings_are_registered_after_notes_init() {
+        let source = include_str!("main.rs");
+        let notes_init = source.find("notes::init(cx);").expect("notes::init");
+        let rebind = source
+            .find("db_view::sql_editor_view::refresh_keybindings(cx);")
+            .expect("SQL 编辑器快捷键重新登记");
+
+        assert!(
+            notes_init < rebind,
+            "SQL 编辑器的快捷键必须在 notes::init 之后重新登记，否则注释快捷键会被 notes 的全局 secondary-/ 挤掉"
+        );
+    }
+
     #[test]
     fn initial_layout_always_opens_home_without_the_ai_workbench() {
         let layout = initial_content_layout();
@@ -1989,6 +2081,35 @@ mod tests {
         assert!(close_handler.contains("one_core::window_close::request_close_window"));
         assert!(!close_handler.contains("remote_file_editor"));
         assert!(!close_handler.contains("window.remove_window()"));
+    }
+
+    #[test]
+    fn close_active_tab_shortcut_is_registered_and_avoids_single_ctrl_letter_defaults() {
+        let source = include_str!("navop_app.rs");
+        let keybindings = source
+            .split("fn init_keybindings(")
+            .nth(1)
+            .and_then(|source| source.split("\nfn refreshable_keybindings").next())
+            .expect("init_keybindings source");
+        let refreshable_keybindings = source
+            .split("fn refreshable_keybindings(")
+            .nth(1)
+            .and_then(|source| source.split("\nfn init_action_handlers").next())
+            .expect("refreshable_keybindings source");
+        let close_tab_handler = source
+            .split("fn close_active_tab(")
+            .nth(1)
+            .and_then(|source| source.split("\n}\n\n").next())
+            .expect("close_active_tab source");
+
+        assert!(keybindings.contains("action_id::APP_CLOSE_ACTIVE_TAB"));
+        assert!(keybindings.contains("CloseActiveTab"));
+        assert!(refreshable_keybindings.contains("action_id::APP_CLOSE_ACTIVE_TAB"));
+        assert!(keybindings.contains(r#"default_shortcut("cmd-shift-w", "alt-shift-w")"#));
+        assert!(
+            refreshable_keybindings.contains(r#"default_shortcut("cmd-shift-w", "alt-shift-w")"#)
+        );
+        assert!(close_tab_handler.contains("hp.close_active_tab(window, cx)"));
     }
 
     #[test]
@@ -2159,6 +2280,44 @@ mod tests {
         let update_dialog = include_str!("update/dialog.rs");
         assert!(update_dialog.contains("shutdown_application_resources_and_quit"));
         assert!(!update_dialog.contains("cx.quit()"));
+    }
+
+    /// 退出漏斗必须先把留在主线程 TLS 上的原生平台句柄释放掉，再调 `cx.quit()`。
+    ///
+    /// Linux(ksni) 的 `TrayIcon::drop` 会跑 `async_io::block_on()`，而 async-io 的线程
+    /// 本地 `driver::CACHE` 注册得比 `TRAY_ICON` 晚 ⇒ 进程退出时反而先被销毁；
+    /// 析构链走到 `TRAY_ICON` 时访问它就是 `AccessError` panic，而 TLS 析构器里不能
+    /// panic，只能 abort（issue #336：退出流程全部正常，进程却以 SIGABRT 收尾并留 core）。
+    #[test]
+    fn quit_path_releases_platform_handles_before_quitting() {
+        let source = include_str!("navop_app.rs").replace("\r\n", "\n");
+        let helper_start = source
+            .find("pub(crate) fn shutdown_application_resources_and_quit")
+            .expect("shared application resource shutdown helper");
+        let helper_end = source[helper_start..]
+            .find("\n}\n\n#[derive(Clone, Copy")
+            .map(|offset| helper_start + offset)
+            .expect("shared application resource shutdown helper end");
+        let helper = &source[helper_start..helper_end];
+
+        let tray_release = helper
+            .find("crate::system_tray::shutdown();")
+            .expect("tray handle release");
+        let hotkey_release = helper
+            .find("crate::app_init::shutdown_system_hotkey();")
+            .expect("global hotkey manager release");
+        let platform_quit = helper
+            .find("cx.update(|cx| cx.quit())")
+            .expect("platform quit");
+
+        assert!(
+            tray_release < platform_quit,
+            "托盘句柄必须在 cx.quit() 之前释放，否则退回 TLS 析构链就是 SIGABRT"
+        );
+        assert!(
+            hotkey_release < platform_quit,
+            "全局热键句柄必须在 cx.quit() 之前释放"
+        );
     }
 
     #[test]
@@ -2691,9 +2850,9 @@ mod tests {
 
 impl Render for NavopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sheet_layer = Root::render_sheet_layer(window, cx);
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
+        let sheet_layer = render_sheet_layer(window, cx);
+        let dialog_layer = render_dialog_layer(window, cx);
+        let notification_layer = render_notification_layer(window, cx);
         let main_content = self.tab_container.clone();
         // 全局导航布局仍需要 TabContainer 的收起/展开按钮；其他主页布局不重复显示。
         // home 是 pinned tab，active_tab() 只查普通 tabs，必须用 pinned 通道判断。

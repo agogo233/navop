@@ -12,7 +12,10 @@ use crate::{
     sql_editor_view::SqlEditorTab,
     table_designer_tab::{TableDesigner, TableDesignerConfig},
 };
-use db::{DbNode, DbNodeType, GlobalDbState, RoutineIdentity, SqlResult, schema_for_new_query};
+use db::{
+    DbNode, DbNodeType, GlobalDbState, RoutineIdentity, SqlResult, TableObjectType,
+    schema_for_new_query,
+};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, ParentElement, PathPromptOptions, Styled,
     Subscription, Window, div, px,
@@ -25,13 +28,24 @@ use one_core::storage::{
     import_query_sql_files,
 };
 use one_core::{
-    popup_window::{PopupWindowOptions, open_popup_window},
+    popup_window::{PopupWindowOptions, open_reusable_popup_window},
     tab_container::{TabContainer, TabItem},
 };
 use rust_i18n::t;
 use std::collections::{HashMap, HashSet};
 use tracing::log::{error, warn};
 use uuid::Uuid;
+
+/// 「导入数据 / 导出数据 / 运行 SQL 文件 / 转储 SQL 文件 / 数据比较 / 结构比较」这些弹窗的
+/// 复用键。macOS 上销毁原生窗口会踩到 Touch Bar KVO 竞态（`EXC_CRASH (SIGABRT)`），
+/// 所以它们统一改成关闭即隐藏；重新打开时用本次的参数重建 view，不会残留上一个表/连接的内容。
+/// 见 [`one_core::popup_window::open_reusable_popup_window`]。
+const IMPORT_DATA_WINDOW_KEY: &str = "db.import-data";
+const EXPORT_TABLE_WINDOW_KEY: &str = "db.export-table";
+const RUN_SQL_FILE_WINDOW_KEY: &str = "db.run-sql-file";
+const DUMP_SQL_FILE_WINDOW_KEY: &str = "db.dump-sql-file";
+const COMPARE_DATA_WINDOW_KEY: &str = "db.compare-data";
+const COMPARE_SCHEMA_WINDOW_KEY: &str = "db.compare-schema";
 
 const TAB_META_NODE_ID: &str = "node_id";
 const TAB_META_KIND: &str = "kind";
@@ -116,8 +130,8 @@ impl DatabaseEventHandler {
 
     fn format_query_table_reference(node: &DbNode, global_state: &GlobalDbState) -> Option<String> {
         let table = match node.node_type {
-            DbNodeType::Table => node.get_table_name()?,
-            DbNodeType::View => node.name.clone(),
+            DbNodeType::Table | DbNodeType::ForeignTable => node.get_table_name()?,
+            DbNodeType::View | DbNodeType::MaterializedView => node.name.clone(),
             _ => return None,
         };
         let plugin = global_state
@@ -140,9 +154,19 @@ impl DatabaseEventHandler {
         })
     }
 
+    fn table_object_type_for_node(node: &DbNode) -> TableObjectType {
+        match node.node_type {
+            DbNodeType::ForeignTable => TableObjectType::ForeignTable,
+            _ => TableObjectType::Table,
+        }
+    }
+
     fn query_title_for_node(node: &DbNode, database: Option<&str>) -> String {
         match node.node_type {
-            DbNodeType::Table | DbNodeType::View => format!("{} - Query", node.name),
+            DbNodeType::Table
+            | DbNodeType::ForeignTable
+            | DbNodeType::View
+            | DbNodeType::MaterializedView => format!("{} - Query", node.name),
             _ => format!("{} - Query", database.unwrap_or("New Query")),
         }
     }
@@ -885,6 +909,8 @@ impl DatabaseEventHandler {
         );
         let tab_id_clone = tab_id.clone();
         let conn_id_clone = connection_id.clone();
+        // 详情页签是编辑器页签的兄弟：先把这个容器句柄带进内层闭包。
+        let host_tab_container = tab_container.clone();
 
         tab_container.update(cx, |container, cx| {
             container.activate_or_add_tab_lazy(
@@ -902,6 +928,7 @@ impl DatabaseEventHandler {
                                 initial_database: database.clone(),
                                 initial_schema: schema.clone(),
                                 execution_history: execution_history.clone(),
+                                tab_container: host_tab_container.clone(),
                             },
                             window,
                             cx,
@@ -1379,6 +1406,7 @@ impl DatabaseEventHandler {
                         let tab_id_for_item = tab_id.clone();
                         let connection_id_for_item = connection_id.clone();
                         let tab_metadata = tab_metadata.clone();
+                        let host_tab_container = tab_container.clone();
                         tab_container.update(cx, |container, cx| {
                             container.activate_or_add_tab_lazy(
                                 tab_id.clone(),
@@ -1397,6 +1425,7 @@ impl DatabaseEventHandler {
                                                 initial_database: Some(database.clone()),
                                                 initial_schema: schema.clone(),
                                                 execution_history: execution_history.clone(),
+                                                tab_container: host_tab_container.clone(),
                                             },
                                             window,
                                             cx,
@@ -1472,6 +1501,7 @@ impl DatabaseEventHandler {
                         let tab_id_for_item = tab_id.clone();
                         let connection_id_for_item = connection_id.clone();
                         let tab_metadata = tab_metadata.clone();
+                        let host_tab_container = tab_container.clone();
                         tab_container.update(cx, |container, cx| {
                             container.activate_or_add_tab_lazy(
                                 tab_id.clone(),
@@ -1490,6 +1520,7 @@ impl DatabaseEventHandler {
                                                 initial_database: Some(database.clone()),
                                                 initial_schema: schema.clone(),
                                                 execution_history: execution_history.clone(),
+                                                tab_container: host_tab_container.clone(),
                                             },
                                             window,
                                             cx,
@@ -1663,9 +1694,10 @@ impl DatabaseEventHandler {
             cx,
         );
 
-        open_popup_window(
+        open_reusable_popup_window(
             PopupWindowOptions::new(t!("Table.import_data_to_table").to_string())
                 .size(900.0, 600.0),
+            IMPORT_DATA_WINDOW_KEY,
             move |_window, _cx| import_view.clone(),
             Some(window),
             cx,
@@ -1726,8 +1758,9 @@ impl DatabaseEventHandler {
         })
         .detach();
 
-        open_popup_window(
+        open_reusable_popup_window(
             PopupWindowOptions::new(t!("ImportExport.export_table").to_string()).size(800.0, 600.0),
+            EXPORT_TABLE_WINDOW_KEY,
             move |_window, _cx| export_view.clone(),
             Some(window),
             cx,
@@ -3092,12 +3125,13 @@ impl DatabaseEventHandler {
                                 };
 
                             let task = state
-                                .drop_table(
+                                .drop_table_like(
                                     &mut cx.clone(),
                                     node.connection_id.clone(),
                                     database,
                                     schema,
                                     table_name.clone(),
+                                    Self::table_object_type_for_node(&node),
                                 )
                                 .await;
 
@@ -3204,14 +3238,27 @@ impl DatabaseEventHandler {
                                 .get("database")
                                 .map(|s| s.to_string())
                                 .unwrap_or_default();
-                            let result = state
-                                .drop_view(
-                                    cx,
-                                    node.connection_id.clone(),
-                                    database,
-                                    node.name.clone(),
-                                )
-                                .await;
+                            let schema = node.get_schema_name();
+                            let result = if node.node_type == DbNodeType::MaterializedView {
+                                state
+                                    .drop_materialized_view(
+                                        cx,
+                                        node.connection_id.clone(),
+                                        database,
+                                        schema,
+                                        node.name.clone(),
+                                    )
+                                    .await
+                            } else {
+                                state
+                                    .drop_view(
+                                        cx,
+                                        node.connection_id.clone(),
+                                        database,
+                                        node.name.clone(),
+                                    )
+                                    .await
+                            };
                             match result {
                                 Ok(_) => removed.push(node.id.clone()),
                                 Err(error) => {
@@ -3388,6 +3435,7 @@ impl DatabaseEventHandler {
         let database_name = node.get_database_name();
         let schema_name = node.get_schema_name();
         let table_name = node.get_table_name();
+        let object_type = Self::table_object_type_for_node(&node);
         let window_id = cx.active_window();
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
@@ -3443,12 +3491,13 @@ impl DatabaseEventHandler {
                         };
 
                         let task = state
-                            .drop_table(
+                            .drop_table_like(
                                 &mut cx.clone(),
                                 conn_id.clone(),
                                 database,
                                 schema,
                                 tbl_name_value.clone(),
+                                object_type,
                             )
                             .await;
 
@@ -3509,6 +3558,8 @@ impl DatabaseEventHandler {
         let connection_id = node.connection_id.clone();
         let old_table_name = node.name.clone();
         let metadata = node.metadata.clone();
+        let object_type = Self::table_object_type_for_node(&node);
+        let schema = node.get_schema_name();
 
         // 创建输入框状态
         let input_state = cx.new(|cx| {
@@ -3522,6 +3573,7 @@ impl DatabaseEventHandler {
             let conn_id = connection_id.clone();
             let old_name = old_table_name.clone();
             let meta = metadata.clone();
+            let schema = schema.clone();
             let state = global_state.clone();
             let input = input_state.clone();
             let tree = tree_view.clone();
@@ -3566,6 +3618,7 @@ impl DatabaseEventHandler {
                     let conn_id = conn_id.clone();
                     let old_name = old_name.clone();
                     let meta = meta.clone();
+                    let schema = schema.clone();
                     let state = state.clone();
                     let tree = tree.clone();
 
@@ -3579,12 +3632,14 @@ impl DatabaseEventHandler {
                         let db_node_id = format!("{}:{}", conn_id, database);
 
                         let task = state
-                            .rename_table(
+                            .rename_table_like(
                                 cx,
                                 conn_id.clone(),
                                 database,
+                                schema,
                                 old_name.clone(),
                                 new_name.clone(),
+                                object_type,
                             )
                             .await;
                         match task {
@@ -3919,12 +3974,15 @@ impl DatabaseEventHandler {
         let view_name = node.name.clone();
         let view_node_id = node.id.clone();
         let metadata = node.metadata.clone();
+        let schema = node.get_schema_name();
+        let is_materialized = node.node_type == DbNodeType::MaterializedView;
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let conn_id = connection_id.clone();
             let v_name = view_name.clone();
             let v_node_id = view_node_id.clone();
             let meta = metadata.clone();
+            let schema = schema.clone();
             let state = global_state.clone();
             let v_name_display = view_name.clone();
             let tree = tree_view.clone();
@@ -3951,6 +4009,7 @@ impl DatabaseEventHandler {
                     let v_name = v_name.clone();
                     let v_node_id = v_node_id.clone();
                     let meta = meta.clone();
+                    let schema = schema.clone();
                     let state = state.clone();
                     let v_name_log = v_name.clone();
                     let tree = tree.clone();
@@ -3961,9 +4020,21 @@ impl DatabaseEventHandler {
                             .get("database")
                             .map(|s| s.to_string())
                             .unwrap_or_default();
-                        let result = state
-                            .drop_view(cx, conn_id.clone(), database, v_name.clone())
-                            .await;
+                        let result = if is_materialized {
+                            state
+                                .drop_materialized_view(
+                                    cx,
+                                    conn_id.clone(),
+                                    database,
+                                    schema,
+                                    v_name.clone(),
+                                )
+                                .await
+                        } else {
+                            state
+                                .drop_view(cx, conn_id.clone(), database, v_name.clone())
+                                .await
+                        };
 
                         match result {
                             Ok(_) => {
@@ -4033,6 +4104,7 @@ impl DatabaseEventHandler {
             let tab_id_clone = tab_id.clone();
             let conn_id_clone = connection_id.clone();
             let tab_metadata_clone = tab_metadata.clone();
+            let host_tab_container = tab_container.clone();
 
             tab_container.update(cx, |container, cx| {
                 container.activate_or_add_tab_lazy(
@@ -4050,6 +4122,7 @@ impl DatabaseEventHandler {
                                     initial_database: database.clone(),
                                     initial_schema: schema.clone(),
                                     execution_history: execution_history.clone(),
+                                    tab_container: host_tab_container.clone(),
                                 },
                                 window,
                                 cx,
@@ -4317,9 +4390,20 @@ impl DatabaseEventHandler {
             None
         };
 
-        open_popup_window(
+        open_reusable_popup_window(
             PopupWindowOptions::new(t!("ImportExport.run_sql_file").to_string()).size(800.0, 520.0),
-            move |window, cx| SqlRunView::new(connection_id, database, schema, window, cx),
+            RUN_SQL_FILE_WINDOW_KEY,
+            // factory 会被多次调用（每次重新显示都重建 view），所以在里面 clone，
+            // 让外层闭包保持 `Fn`。
+            move |window, cx| {
+                SqlRunView::new(
+                    connection_id.clone(),
+                    database.clone(),
+                    schema.clone(),
+                    window,
+                    cx,
+                )
+            },
             Some(_window),
             cx,
         );
@@ -4378,18 +4462,20 @@ impl DatabaseEventHandler {
                     let table = table.clone();
 
                     cx.update_window(window_id, |_entity, _window, cx| {
-                        open_popup_window(
+                        open_reusable_popup_window(
                             PopupWindowOptions::new(t!("ImportExport.dump_sql_file").to_string())
                                 .size(800.0, 510.0),
+                            DUMP_SQL_FILE_WINDOW_KEY,
+                            // factory 会被多次调用（每次重新显示都重建 view），所以在里面 clone。
                             move |window, cx| {
                                 SqlDumpView::new(
                                     crate::import_export::sql_dump_view::SqlDumpViewParams {
-                                        connection_id: config_id,
-                                        server_info,
-                                        database,
-                                        schema,
-                                        table,
-                                        output_path,
+                                        connection_id: config_id.clone(),
+                                        server_info: server_info.clone(),
+                                        database: database.clone(),
+                                        schema: schema.clone(),
+                                        table: table.clone(),
+                                        output_path: output_path.clone(),
                                         mode,
                                     },
                                     window,
@@ -4443,8 +4529,9 @@ impl DatabaseEventHandler {
 
         let title = DataCompareWindow::popup_title_for(&node);
         let compare_view = DataCompareWindow::new(node, window, cx);
-        open_popup_window(
+        open_reusable_popup_window(
             PopupWindowOptions::new(title).size(1100.0, 780.0),
+            COMPARE_DATA_WINDOW_KEY,
             move |_window, _cx| compare_view.clone(),
             Some(window),
             cx,
@@ -4457,8 +4544,9 @@ impl DatabaseEventHandler {
 
         let title = SchemaCompareWindow::popup_title_for(&node);
         let compare_view = SchemaCompareWindow::new(node, window, cx);
-        open_popup_window(
+        open_reusable_popup_window(
             PopupWindowOptions::new(title).size(1100.0, 780.0),
+            COMPARE_SCHEMA_WINDOW_KEY,
             move |_window, _cx| compare_view.clone(),
             Some(window),
             cx,

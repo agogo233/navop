@@ -14,6 +14,7 @@ use crate::db_tree_view::{DbTreeView, DbTreeViewEvent, SqlDumpMode};
 use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::sidebar::{DatabaseSidebar, DatabaseSidebarEvent};
 use crate::sql_editor_view::SqlEditorTab;
+use crate::sql_library::{SqlLibraryEvent, SqlLibraryPanel};
 use ai_chat_view::{CodeBlockAction, LanguageMatcher};
 use db::{
     DbNodeType, GlobalDbState,
@@ -199,6 +200,8 @@ impl DatabaseTabView {
             move |cx| ExecutionHistoryPanel::new(connection_ids, cx)
         });
 
+        let sql_library = cx.new(SqlLibraryPanel::new);
+
         let event_handler = cx.new(|cx| {
             DatabaseEventHandler::new(
                 &db_tree_view,
@@ -216,6 +219,7 @@ impl DatabaseTabView {
                 connections.clone(),
                 active_conn_id,
                 execution_history.clone(),
+                sql_library.clone(),
                 window,
                 cx,
             )
@@ -231,6 +235,14 @@ impl DatabaseTabView {
         );
 
         let mut subscriptions = Vec::new();
+        subscriptions.push(cx.subscribe_in(
+            &sql_library,
+            window,
+            |this, _library, event: &SqlLibraryEvent, window, cx| {
+                let SqlLibraryEvent::OpenSqlFile(path) = event;
+                this.open_sql_library_file(path.clone(), window, cx);
+            },
+        ));
         subscriptions.push(
             cx.subscribe(
                 &sidebar,
@@ -320,6 +332,90 @@ impl DatabaseTabView {
         cx.notify();
     }
 
+    /// SQL 库文件默认用的连接：当前选中节点所属连接，否则第一个连接。
+    fn library_connection(&self, cx: &Context<Self>) -> Option<(String, DbConnectionConfig)> {
+        let selected_id = self.db_tree_view.read(cx).selected_or_first_connection_id();
+        let connection = self
+            .connections
+            .iter()
+            .find(|connection| {
+                connection.id.map(|id| id.to_string()).as_deref() == selected_id.as_deref()
+            })
+            .or_else(|| self.connections.first())?
+            .clone();
+        let connection_id = connection.id.map(|id| id.to_string()).unwrap_or_default();
+        let config = connection.to_db_connection().ok()?;
+        Some((connection_id, config))
+    }
+
+    /// 用 SQL 编辑器打开 SQL 库里的文件。
+    ///
+    /// 库文件不绑定连接：默认用当前选中的连接（可在编辑器里再切），
+    /// 同一个文件复用同一个页签。
+    fn open_sql_library_file(
+        &mut self,
+        file_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((connection_id, config)) = self.library_connection(cx) else {
+            window.push_notification(
+                Notification::info(t!("SqlLibrary.no_connection").to_string()),
+                cx,
+            );
+            return;
+        };
+
+        let title: SharedString = file_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file_path.display().to_string())
+            .into();
+        let tab_id = format!("sql-library-{}", file_path.display());
+        let tab_id_for_tab = tab_id.clone();
+        let connection_id_for_tab = connection_id.clone();
+        let available_connection_ids = self
+            .connections
+            .iter()
+            .filter_map(|connection| connection.id.map(|id| id.to_string()))
+            .collect::<Vec<_>>();
+        let execution_history = self.sidebar.read(cx).execution_history();
+        let host_tab_container = self.tab_container.clone();
+
+        self.tab_container.update(cx, |container, cx| {
+            container.activate_or_add_tab_lazy(
+                tab_id,
+                move |window, cx| {
+                    let editor = cx.new(|cx| {
+                        SqlEditorTab::new_with_config(
+                            crate::sql_editor_view::SqlEditorTabConfig {
+                                title: title.clone(),
+                                connection_id: connection_id.clone(),
+                                available_connection_ids: available_connection_ids.clone(),
+                                database_type: config.database_type.clone(),
+                                file_path: Some(file_path.clone()),
+                                new_file_directory: None,
+                                initial_database: None,
+                                initial_schema: None,
+                                execution_history: execution_history.clone(),
+                                tab_container: host_tab_container.clone(),
+                            },
+                            window,
+                            cx,
+                        )
+                    });
+                    TabItem::new(
+                        tab_id_for_tab.clone(),
+                        connection_id_for_tab.clone(),
+                        editor,
+                    )
+                },
+                window,
+                cx,
+            );
+        });
+    }
+
     /// 注册 SQL 代码块操作
     fn register_sql_code_block_actions(
         sidebar: &Entity<DatabaseSidebar>,
@@ -386,6 +482,8 @@ impl DatabaseTabView {
                 let code_clone = code.clone();
                 let available_connection_ids = available_connection_ids.clone();
                 let execution_history = execution_history_for_new.clone();
+                // 详情页签是编辑器页签的兄弟：先把这个容器句柄带进内层闭包。
+                let host_tab_container = tab_container_for_new.clone();
 
                 tab_container_for_new.update(cx, |container, cx| {
                     container.activate_or_add_tab_lazy(
@@ -403,6 +501,7 @@ impl DatabaseTabView {
                                         initial_database: None,
                                         initial_schema: None,
                                         execution_history,
+                                        tab_container: host_tab_container.clone(),
                                     },
                                     window,
                                     cx,
