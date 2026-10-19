@@ -123,6 +123,12 @@ fn composer_editor_height(state: &EditorState) -> Pixels {
 ///
 /// 不带 `⌄`：整块卡片原来有六条小箭头，一起消失是这次减线里最见效的一步。
 /// “可点”改由 hover 底色与 tooltip 表达。
+///
+/// 字号与图标尺寸跟着**同一行**的基准走：标签 `sp(12.5)`（= 身份行与上下文行
+/// 的字号）、图标 14（`.small()`）。早前标签写 `text_xs()`（0.75rem）、图标写
+/// `.xsmall()`（12），两样都比同一行里的身份行小一档多 —— 参数行和上下文行
+/// 因此读起来像“附注”，而模型那串（组件库 `Select` 的 `text_sm`）反而成了最大
+/// 的字。同一块卡片里的 chrome 不该有第三种字号。
 fn composer_chip_label(
     icon: IconName,
     icon_color: gpui::Hsla,
@@ -135,11 +141,18 @@ fn composer_chip_label(
         .gap_1()
         .child(
             Icon::new(icon)
-                .xsmall()
+                .small()
                 .flex_shrink_0()
                 .text_color(icon_color),
         )
-        .child(div().flex_1().min_w_0().truncate().text_xs().child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(sp(12.5))
+                .child(label),
+        )
 }
 
 /// 参数行统一的 ghost chip：无描边、无底色，hover 才浮一层 `overlay`。
@@ -1217,7 +1230,7 @@ impl AcpAgentInput {
             .text_size(sp(12.5))
             .child(
                 Icon::new(IconName::Bot)
-                    .xsmall()
+                    .small()
                     .flex_shrink_0()
                     .text_color(theme.accent),
             )
@@ -1278,7 +1291,7 @@ impl AcpAgentInput {
                 } else {
                     IconName::ChevronDown
                 })
-                .xsmall()
+                .small()
                 .size(sp(COMPOSER_CHIP_HEIGHT))
                 .flex_shrink_0()
                 .tooltip(tooltip)
@@ -1378,9 +1391,9 @@ impl AcpAgentInput {
                         .min_w_0()
                         .items_center()
                         .gap_1()
-                        .text_xs()
+                        .text_size(sp(12.5))
                         .text_color(theme.muted_foreground)
-                        .child(Icon::new(icon).xsmall().flex_shrink_0())
+                        .child(Icon::new(icon).small().flex_shrink_0())
                         .child(div().truncate().child(label)),
                 ),
             &theme,
@@ -1936,6 +1949,7 @@ impl AcpAgentInput {
                     .debug_selector(|| "agent-input-attach".to_string())
                     .icon(IconName::File)
                     .xsmall()
+                    .glyph_size(px(16.0))
                     .size(action_button_size)
                     .flex_shrink_0()
                     .tooltip(attach_tooltip)
@@ -1958,6 +1972,7 @@ impl AcpAgentInput {
                                 .icon(IconName::ArrowUp)
                                 .primary()
                                 .small()
+                                .glyph_size(px(16.0))
                                 .size(action_button_size)
                                 .rounded(px(TOOLBAR_ACTION_BUTTON_SIZE / 2.0))
                                 .tooltip(t!("AgentUi.queue_for_next_turn").to_string())
@@ -1978,6 +1993,7 @@ impl AcpAgentInput {
                                 .icon(IconName::Close)
                                 .danger()
                                 .small()
+                                .glyph_size(px(16.0))
                                 .size(action_button_size)
                                 .rounded(px(TOOLBAR_ACTION_BUTTON_SIZE / 2.0))
                                 .tooltip(t!("AgentUi.stop").to_string())
@@ -1997,6 +2013,7 @@ impl AcpAgentInput {
                             .icon(IconName::ArrowUp)
                             .primary()
                             .small()
+                            .glyph_size(px(16.0))
                             .size(action_button_size)
                             .rounded(px(TOOLBAR_ACTION_BUTTON_SIZE / 2.0))
                             .tooltip(t!("AgentUi.send").to_string())
