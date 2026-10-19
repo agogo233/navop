@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cloud_sync::models::{CloudSyncData, WorkspaceParentLink};
 use crate::cloud_sync::service::SyncError;
-use crate::storage::{Workspace, WorkspaceRepository};
+use crate::storage::{ConnectionRepository, StoredConnection, Workspace, WorkspaceRepository};
 
 /// 按「祖先先于后代」稳定排序
 ///
@@ -132,6 +132,61 @@ pub(crate) fn reconcile_parent_links(
     Ok(updated)
 }
 
+/// 按云端记录把连接所属的分组对齐，返回实际写入的行数
+///
+/// 与分组层级同理：下载顺序不保证「分组先于连接落地」，连接可能在一分组缺位时被
+/// 写成根节点。条目在这一轮里无法判定（分组还没落地）时保留本地归属。
+/// 幂等：只有解析结果与本地现有值不同才写库，且不改动 `updated_at`。
+pub(crate) fn reconcile_connection_workspaces(
+    repo: &ConnectionRepository,
+    connections: &[StoredConnection],
+    workspaces: &[Workspace],
+    links: &[(String, WorkspaceParentLink)],
+) -> Result<usize, SyncError> {
+    let local_ids = local_ids_by_cloud_id(workspaces);
+    let connection_by_cloud_id: HashMap<&str, &StoredConnection> = connections
+        .iter()
+        .filter_map(|connection| connection.cloud_id.as_deref().map(|id| (id, connection)))
+        .collect();
+
+    let mut updated = 0;
+    for (cloud_id, link) in links {
+        let Some(target_workspace) = resolve_local_parent_id(link, &local_ids) else {
+            continue;
+        };
+        let Some(connection) = connection_by_cloud_id.get(cloud_id.as_str()) else {
+            continue;
+        };
+        if !workspace_link_reconcilable(connection) || connection.workspace_id == target_workspace {
+            continue;
+        }
+        let Some(local_id) = connection.id else {
+            continue;
+        };
+
+        repo.update_workspace_id(local_id, target_workspace)
+            .map_err(|error| SyncError::StorageError(error.to_string()))?;
+        tracing::info!(
+            "[同步] 对齐连接分组: {} {:?} -> {:?}",
+            cloud_id,
+            connection.workspace_id,
+            target_workspace
+        );
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+/// 只有「未被本地改动、且仍开启同步」的连接才按云端收敛
+///
+/// 否则会把还没上传的本地移动（例如刚拖进另一个分组）改回去，
+/// 或者让已关闭同步的连接被远端牵着走。
+fn workspace_link_reconcilable(connection: &StoredConnection) -> bool {
+    connection.sync_enabled
+        && connection.updated_at.unwrap_or(0) <= connection.last_synced_at.unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +222,205 @@ mod tests {
             .iter()
             .map(|workspace| workspace.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn connection_links_align_to_cloud_workspace() {
+        let (_temp, repo, connections) = linked_repositories();
+        let workspace_id = insert_workspace(&repo, "group", None, Some("cloud-group"));
+        let connection_id = insert_connection(&connections, "cloud-conn", None);
+
+        let updated = reconcile_connection_workspaces(
+            &connections,
+            &connections.list_personal().expect("connections"),
+            &repo.list().expect("workspaces"),
+            &[(
+                "cloud-conn".to_string(),
+                WorkspaceParentLink::Cloud("cloud-group".to_string()),
+            )],
+        )
+        .expect("reconcile succeeds");
+
+        let stored = connections
+            .get(connection_id)
+            .expect("connection load")
+            .expect("connection exists");
+        assert_eq!(1, updated);
+        assert_eq!(Some(workspace_id), stored.workspace_id);
+    }
+
+    #[test]
+    fn connection_links_keep_local_move_when_upload_is_pending() {
+        let (_temp, repo, connections) = linked_repositories();
+        insert_workspace(&repo, "group", None, Some("cloud-group"));
+        let connection_id = insert_connection(&connections, "cloud-conn", None);
+        connections
+            .update_sync_status_with_updated_at(
+                connection_id,
+                Some("cloud-conn".to_string()),
+                Some(100),
+                200,
+            )
+            .expect("pending local change");
+
+        let updated = reconcile_connection_workspaces(
+            &connections,
+            &connections.list_personal().expect("connections"),
+            &repo.list().expect("workspaces"),
+            &[(
+                "cloud-conn".to_string(),
+                WorkspaceParentLink::Cloud("cloud-group".to_string()),
+            )],
+        )
+        .expect("reconcile succeeds");
+
+        let stored = connections
+            .get(connection_id)
+            .expect("connection load")
+            .expect("connection exists");
+        assert_eq!(0, updated);
+        assert_eq!(None, stored.workspace_id);
+    }
+
+    #[test]
+    fn connection_links_move_back_to_root_when_cloud_says_root() {
+        let (_temp, repo, connections) = linked_repositories();
+        let workspace_id = insert_workspace(&repo, "group", None, Some("cloud-group"));
+        let connection_id = insert_connection(&connections, "cloud-conn", Some(workspace_id));
+
+        let updated = reconcile_connection_workspaces(
+            &connections,
+            &connections.list_personal().expect("connections"),
+            &repo.list().expect("workspaces"),
+            &[("cloud-conn".to_string(), WorkspaceParentLink::Root)],
+        )
+        .expect("reconcile succeeds");
+
+        let stored = connections
+            .get(connection_id)
+            .expect("connection load")
+            .expect("connection exists");
+        assert_eq!(1, updated);
+        assert_eq!(None, stored.workspace_id);
+    }
+
+    #[test]
+    fn connection_links_stay_when_workspace_has_not_landed() {
+        let (_temp, repo, connections) = linked_repositories();
+        let workspace_id = insert_workspace(&repo, "local group", None, Some("cloud-group"));
+        let connection_id = insert_connection(&connections, "cloud-conn", Some(workspace_id));
+
+        let updated = reconcile_connection_workspaces(
+            &connections,
+            &connections.list_personal().expect("connections"),
+            &repo.list().expect("workspaces"),
+            &[(
+                "cloud-conn".to_string(),
+                WorkspaceParentLink::Cloud("cloud-group-missing".to_string()),
+            )],
+        )
+        .expect("reconcile succeeds");
+
+        let stored = connections
+            .get(connection_id)
+            .expect("connection load")
+            .expect("connection exists");
+        assert_eq!(0, updated);
+        assert_eq!(Some(workspace_id), stored.workspace_id);
+    }
+
+    #[test]
+    fn connection_links_skip_disabled_sync() {
+        let (_temp, repo, connections) = linked_repositories();
+        insert_workspace(&repo, "group", None, Some("cloud-group"));
+        let mut connection = stored_connection("cloud-conn", None);
+        connection.sync_enabled = false;
+        let connection_id = connections.insert(&mut connection).expect("insert");
+
+        let updated = reconcile_connection_workspaces(
+            &connections,
+            &connections.list_personal().expect("connections"),
+            &repo.list().expect("workspaces"),
+            &[(
+                "cloud-conn".to_string(),
+                WorkspaceParentLink::Cloud("cloud-group".to_string()),
+            )],
+        )
+        .expect("reconcile succeeds");
+
+        let stored = connections
+            .get(connection_id)
+            .expect("connection load")
+            .expect("connection exists");
+        assert_eq!(0, updated);
+        assert_eq!(None, stored.workspace_id);
+    }
+
+    /// 分组与连接共享同一个库：连接指向的分组必须真实存在（外键约束）。
+    fn linked_repositories() -> (tempfile::TempDir, WorkspaceRepository, ConnectionRepository) {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let connection = SqliteConnection::open(temp.path().join("sync.db")).expect("open sqlite");
+        connection
+            .with_connection(run_migrations)
+            .expect("migrations run");
+        (
+            temp,
+            WorkspaceRepository::new(connection.clone()),
+            ConnectionRepository::new(connection),
+        )
+    }
+
+    fn insert_workspace(
+        repo: &WorkspaceRepository,
+        name: &str,
+        parent_id: Option<i64>,
+        cloud_id: Option<&str>,
+    ) -> i64 {
+        let mut workspace = stored_workspace(0, name, parent_id, cloud_id);
+        repo.insert(&mut workspace).expect("workspace insert")
+    }
+
+    fn insert_connection(
+        repo: &ConnectionRepository,
+        cloud_id: &str,
+        workspace_id: Option<i64>,
+    ) -> i64 {
+        let mut connection = stored_connection(cloud_id, workspace_id);
+        let id = repo.insert(&mut connection).expect("connection insert");
+        // 默认把连接当成「刚同步过」，否则会被当成待上传的本地改动而不再收敛。
+        let updated_at = repo
+            .get(id)
+            .expect("connection load")
+            .expect("connection exists")
+            .updated_at
+            .unwrap_or(0);
+        repo.update_sync_status(id, Some(cloud_id.to_string()), Some(updated_at))
+            .expect("mark synced");
+        id
+    }
+
+    fn stored_connection(cloud_id: &str, workspace_id: Option<i64>) -> StoredConnection {
+        let params = crate::storage::DbConnectionConfig {
+            id: String::new(),
+            database_type: crate::storage::DatabaseType::SQLite,
+            name: format!("conn-{cloud_id}"),
+            host: ":memory:".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: Some(":memory:".to_string()),
+            service_name: None,
+            sid: None,
+            workspace_id: None,
+            proxy: None,
+            extra_params: Default::default(),
+            credential_reference: None,
+        };
+        let mut connection =
+            StoredConnection::new_database(format!("conn-{cloud_id}"), params, workspace_id);
+        connection.cloud_id = Some(cloud_id.to_string());
+        connection.last_synced_at = Some(0);
+        connection
     }
 
     #[test]

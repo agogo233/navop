@@ -4,6 +4,62 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [v0.20.3] - 2026-10-19
+
+#### 更新内容
+
+- 终端可以用键盘回看历史输出：`Ctrl+Shift+↑/↓` 逐行滚动，`Shift+PageUp/PageDown` 按屏翻页，快捷键可在设置里修改（#409）。
+- Auto 模式的 SQL 编辑器改为粘性会话：同一页签内的多次执行复用同一条数据库连接，`SET @变量` 这类会话状态不再跨执行丢失（issue #312）。
+- 笔记 / Markdown 编辑器新增右侧可折叠大纲面板（`Cmd/Ctrl+Shift+O`），并新增 Markdown 代码字体设置；同步上游 velotype 的改进，包括双击按词选择、输入法相关崩溃修复，以及 `div` 块内图片与链接的排版（#406）。
+- SFTP 本地栏恢复磁盘下拉（仅 Windows），地址栏可以直接输入 `C:` 这样的裸盘符路径（issue #276、#375）。
+- 同一条 SSH 连接上的文件传输从单并发改为 3 条并发车道，一个卡住的上传不再拖死同服务器上的其它传输（#418）。
+
+#### 修复与优化
+
+- Redis：「启用 TLS」此前必然失败——客户端根本没有编译 TLS 支持，连 URL 解析阶段就报错，与服务器、证书、网络无关；现在可以正常连接 TLS 服务端。集群模式会汇总所有 master 节点（SCAN / TYPE / DEL 与键计数跨节点生效，并处理 MOVED 重定向，issue #414）。同时修复切换到空库时应用崩溃，以及 zset 类型徽章出现时的同类崩溃（issue #416）。
+- SFTP：上传卡在无响应的服务器上时可以立即取消并快速失败，单条请求超时由 300 秒缩短到 60 秒；包含符号链接的目录上传不再整体失败，文件链接按真实大小上传，目录链接与坏链跳过（#417）。
+- 数据库：清空表（TRUNCATE 或全表 DELETE）后自动刷新表数据页签（#413）；修复结果集编辑网格保存时库名前缀被重复拼接、导致 MySQL 报 `Table ... doesn't exist`（42S02 / 1146）的问题。
+- 剪贴板：复制 JSON 字段不再额外包一层引号，粘贴出来的内容与存储原文一致（#412）。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.20.3) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- Terminals can scroll back with the keyboard: `Ctrl+Shift+Up/Down` moves one line, `Shift+PageUp/PageDown` moves a screen, and both are rebindable in Settings (#409).
+- The Auto-mode SQL editor now keeps a sticky session per tab: repeated runs reuse one database connection, so session state such as `SET @var` survives across executions (issue #312).
+- The Notes / Markdown editor gains a collapsible outline panel on the right (`Cmd/Ctrl+Shift+O`) and a dedicated Markdown code font setting; upstream velotype improvements are included — double-click word selection, the IME-related crash fix, and image/link layout inside `div` blocks (#406).
+- The SFTP local pane restores the disk dropdown on Windows, and the address bar accepts bare drive letters such as `C:` (issues #276, #375).
+- File transfers on a single SSH connection now use three concurrent lanes, so one stalled upload no longer blocks the others to the same server (#418).
+
+#### Fixes and Improvements
+
+- Redis: "Enable TLS" used to fail unconditionally — the client was built without TLS support at all, so it errored while parsing the URL before any network request, regardless of server, certificate or network; TLS servers now connect. Cluster mode aggregates every master node (SCAN / TYPE / DEL and key counts span nodes, with MOVED redirection handled, issue #414). Also fixed the crash when switching to an empty database and the same crash triggered when the zset type badge appears (issue #416).
+- SFTP: an upload stuck on an unresponsive server can be cancelled immediately and fails fast, and the single-request timeout drops from 300s to 60s; directory uploads containing symlinks no longer fail as a whole — file links upload at their real size while directory links and broken links are skipped (#417).
+- Database: truncating a table (TRUNCATE or a full-table DELETE) now refreshes the table data tab (#413); saving edits from the result grid no longer repeats the schema prefix and fails with MySQL `Table ... doesn't exist` (42S02 / 1146).
+- Clipboard: copying a JSON field no longer wraps it in an extra pair of quotes, so the pasted content matches the stored value (#412).
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.20.2...v0.20.3
+
+## [v0.20.2] - 2026-10-13
+
+#### 修复与优化
+
+- 修复 Windows 版安装后无法启动（issue #397）：v0.20.1 的 Windows 产物漏掉了应用程序清单，程序在 `main` 之前就以「无法定位程序输入点 TaskDialogIndirect」退出，exe、MSI 与便携版全部受影响。现在 navop.exe 自行嵌入 Common-Controls v6 清单（含 asInvoker、Windows 10 兼容声明与 PerMonitorV2 DPI 感知），发布流水线同时新增清单校验，避免它再次被静默丢掉。
+- 「检查更新」不再点了没反应：检查期间按钮显示加载态并自动防重复点击，整轮检查加 20 秒总超时（超时给出明确提示，而不是无限转圈），说明行常驻显示「上次检查」的时间与结果（已是最新 / 发现新版本 / 检查失败 / 检查超时）。顺带修掉一个隐患：主窗口在检查期间被关闭会让 future 一起丢弃，按钮永久转圈且再也回不来。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.20.2) 下载桌面端安装包
+
+---
+
+#### Fixes and Improvements
+
+- Fixed the Windows build failing to start after installation (issue #397): the v0.20.1 Windows artifacts shipped without an application manifest, so the executable exited before `main` with "the procedure entry point TaskDialogIndirect could not be located" — the exe, MSI and portable packages were all affected. navop.exe now embeds its own Common-Controls v6 manifest (asInvoker, Windows 10 compatibility, PerMonitorV2 DPI awareness), and the release pipeline validates the manifest so it cannot go missing silently again.
+- "Check for updates" no longer appears to do nothing: the button shows a loading state while checking (which also prevents duplicate clicks), the whole check is bounded by a 20-second timeout that reports a clear message instead of spinning forever, and a persistent line reports when the last check ran and what it found (up to date / new version available / failed / timed out). This also fixes a latent case where closing the main window mid-check discarded the future and left the button spinning forever.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.20.1...v0.20.2
+
 ## [v0.20.1] - 2026-10-13
 
 #### 更新内容

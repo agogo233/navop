@@ -46,6 +46,21 @@ fn escapes_only_when_needed() {
     assert_eq!("\"\"\"quoted\"\"\"", escape_tsv_field("\"quoted\""));
 }
 
+/// 复制 JSON 字段时剪贴板必须等于存储原文：引号只有在字段开头才有语法意义，
+/// 值中间的 `"` 不构成需要包裹的冲突。
+#[test]
+fn json_values_copy_verbatim() {
+    const JSON: &str = r#"{"name":"张三","tags":["a","b"]}"#;
+
+    assert_eq!(JSON, escape_tsv_field(JSON));
+    assert_eq!(r#"say "hi""#, escape_tsv_field(r#"say "hi""#));
+    assert_eq!(format!("1\t{JSON}"), encode_tsv_row(["1", JSON]));
+    assert_eq!(
+        vec![vec!["1".to_string(), JSON.to_string()]],
+        round_trip(&[vec!["1", JSON]])
+    );
+}
+
 #[test]
 fn single_value_without_separators_stays_verbatim() {
     assert_eq!(vec![vec!["\"json 片段\""]], parse_tsv_rows("\"json 片段\""));

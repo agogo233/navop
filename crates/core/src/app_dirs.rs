@@ -38,7 +38,10 @@ pub(crate) fn installed_data_dir() -> Option<PathBuf> {
 }
 
 pub fn migrate_legacy_directories() -> Result<()> {
-    if crate::app_paths::initialized_paths().is_some_and(|paths| paths.is_portable()) {
+    // 便携与 debug 开发目录都不该触碰生产安装目录。
+    if crate::app_paths::initialized_paths()
+        .is_some_and(|paths| !paths.uses_installed_directories())
+    {
         return Ok(());
     }
 

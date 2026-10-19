@@ -47,6 +47,7 @@ use db::{
 use gpui_component::button::ButtonVariants;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use one_core::connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifier};
 use one_core::gpui_tokio::Tokio;
 use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
 use one_core::settings::{
@@ -1346,6 +1347,8 @@ pub struct DataGrid {
     pub(crate) table: Entity<EditTableState<EditorTableDelegate>>,
     /// 表格事件订阅
     _table_sub: Option<Subscription>,
+    /// 全局连接通知订阅（整表清空 → 数据网格自动刷新）
+    _connection_event_sub: Option<Subscription>,
     /// 表格实体的通知订阅：纵向视图的行是自绘的，部分状态变化（例如 Escape
     /// 取消编辑）只 `notify` 不 `emit`，只能靠观察实体补上重画。
     _table_observe_sub: Option<Subscription>,
@@ -1443,6 +1446,7 @@ impl DataGrid {
             config,
             table,
             _table_sub: None,
+            _connection_event_sub: None,
             _table_observe_sub: None,
             focus_handle,
             table_data_info,
@@ -1477,9 +1481,52 @@ impl DataGrid {
                 .update(cx, |state, cx| state.set_find_hosted(true, cx));
             result.bind_filter_event(window, cx);
             result.bind_find_event(window, cx);
+            // 监听整表清空（TRUNCATE / 无 WHERE 的 DELETE）通知，
+            // 让已打开的数据网格立即反映清空结果，而不是停留在旧数据。
+            result.bind_connection_data_event(window, cx);
             result.load_data_with_clauses(1, cx);
         }
         result
+    }
+
+    /// 订阅全局连接通知，精确匹配到当前网格的表被整表清空时自动刷新。
+    ///
+    /// 按 `connection_id + database + schema + table` 四元组匹配，
+    /// 其余表的清空事件不会引起本网格任何刷新。
+    fn bind_connection_data_event(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notifier) = cx.try_global::<GlobalConnectionNotifier>().cloned() else {
+            self._connection_event_sub = None;
+            return;
+        };
+
+        self._connection_event_sub = Some(cx.subscribe_in(
+            &notifier.0,
+            window,
+            |this, _notifier, event: &ConnectionDataEvent, _window, cx| {
+                let ConnectionDataEvent::TableDataCleared {
+                    connection_id,
+                    database,
+                    schema,
+                    table,
+                } = event
+                else {
+                    return;
+                };
+                if connection_id != &this.config.connection_id
+                    || database != &this.config.database_name
+                    || schema.as_deref() != this.config.schema_name.as_deref()
+                    || table != &this.config.table_name
+                {
+                    return;
+                }
+                // 清空后回到第一页重新拉取；保留用户的过滤/排序条件，
+                // 结果集自然为空。正在加载时跳过，避免与进行中的请求互踩。
+                if this.table.read(cx).delegate().is_loading() {
+                    return;
+                }
+                this.load_data_with_clauses(1, cx);
+            },
+        ));
     }
 
     fn bind_table_event(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4858,6 +4905,8 @@ impl Clone for DataGrid {
             table: self.table.clone(),
             _table_sub: None,
             _table_observe_sub: None,
+            // 连接数据事件订阅同理：副本由 `new()` 重新绑定，这里置 None。
+            _connection_event_sub: None,
             focus_handle: self.focus_handle.clone(),
             table_data_info: self.table_data_info.clone(),
             filter_editor: self.filter_editor.clone(),

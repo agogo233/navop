@@ -1109,6 +1109,8 @@ impl DbTreeView {
                     }
                 }
             }
+            // 数据级事件：表数据被清空不影响树结构，树无需刷新
+            ConnectionDataEvent::TableDataCleared { .. } => {}
             ConnectionDataEvent::CredentialCreated { .. }
             | ConnectionDataEvent::CredentialUpdated { .. }
             | ConnectionDataEvent::CredentialDeleted { .. }

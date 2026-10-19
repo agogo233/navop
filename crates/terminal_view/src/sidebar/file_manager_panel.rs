@@ -6242,10 +6242,10 @@ mod tests {
     use sftp::DirectoryConflictPolicy;
     use sftp::ProgressCallback;
     use sftp_transfer::{
-        SftpConnectionIdentity, SftpDeleteRemoteExecution, SftpDownloadExecution,
-        SftpRemoteDeleteEntry, SftpTransferEvent, SftpTransferExecutor, SftpTransferId,
-        SftpTransferOperation, SftpTransferProvider, SftpTransferState, SftpUploadConnection,
-        SftpUploadExecution, delete_remote_task_key,
+        MAX_CONCURRENT_TRANSFERS_PER_CONNECTION, SftpConnectionIdentity, SftpDeleteRemoteExecution,
+        SftpDownloadExecution, SftpRemoteDeleteEntry, SftpTransferEvent, SftpTransferExecutor,
+        SftpTransferId, SftpTransferOperation, SftpTransferProvider, SftpTransferState,
+        SftpUploadConnection, SftpUploadExecution, delete_remote_task_key,
     };
     use ssh::{HostKeyVerifier, SshAuth, SshConnectConfig, SshSessionManager};
     use std::collections::{HashMap, HashSet};
@@ -6253,7 +6253,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::oneshot;
 
     fn test_download_task(id: usize, cancelled: bool) -> TransferTask {
@@ -7066,38 +7066,62 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().expect("create fixture temp dir");
         let (provider, _executor, panel, _window) = file_manager_fixture(&mut cx, &temp_dir);
 
+        // 每连接车道容量为 3：先把车位全部占满，随后提交的删除才会真正排队，
+        // 这样才能验证删除与上传共用同一条连接车道（而不是各走一条队列）。
         panel.update(cx, |this, cx| {
-            this.enqueue_pending_uploads(
-                vec![PendingUpload {
-                    name: "first.txt".to_string(),
-                    local_path: PathBuf::from("/tmp/first.txt"),
-                    remote_path: "/remote/first.txt".to_string(),
+            let uploads = (0..MAX_CONCURRENT_TRANSFERS_PER_CONNECTION)
+                .map(|index| PendingUpload {
+                    name: format!("filler-{index}.txt"),
+                    local_path: PathBuf::from(format!("/tmp/filler-{index}.txt")),
+                    remote_path: format!("/remote/filler-{index}.txt"),
                     is_dir: false,
                     has_conflict: false,
                     directory_conflict_policy: DirectoryConflictPolicy::Merge,
-                }],
-                cx,
-            );
-        });
-        let delete_id = submit_delete(&mut cx, &panel);
-        wait_until(&mut cx, |_| provider.started().first().is_some());
-        let upload_id = provider.started()[0];
-        wait_until(&mut cx, |test_cx| {
-            provider.operation(upload_id) == Some(FileManagerTestOperation::Upload)
-                && panel.read_with(test_cx, |panel, cx| {
-                    panel
-                        .global_executor
-                        .read(cx)
-                        .pending_count(&SftpConnectionIdentity::Local(7))
-                        == 1
                 })
+                .collect();
+            this.enqueue_pending_uploads(uploads, cx);
         });
-        assert_eq!(provider.delete_entries(delete_id), None);
 
-        provider.complete(upload_id, Ok(()));
         wait_until(&mut cx, |_| {
-            provider.operation(delete_id) == Some(FileManagerTestOperation::DeleteRemote)
+            provider.started().len() == MAX_CONCURRENT_TRANSFERS_PER_CONNECTION
         });
+
+        let delete_id = submit_delete(&mut cx, &panel);
+        cx.run_until_parked();
+        assert_eq!(
+            provider.delete_entries(delete_id),
+            None,
+            "lane is full, the delete must wait for a free slot"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .global_executor
+                    .read(cx)
+                    .pending_count(&SftpConnectionIdentity::Local(7))
+            }),
+            1
+        );
+
+        // 释放一个车位后，排队中的删除必须作为同一车道上的下一个任务启动。
+        // 放行发生在真实 Tokio 任务完成之后：CI 上整个测试二进制共用同一个
+        // Tokio runtime，完成通知可能晚于默认的 500ms 预算，因此这里给足余量；
+        // 失败时带上执行器侧状态，便于区分「车道没有放行」和「只是调度慢」。
+        let upload_id = provider.started()[0];
+        provider.complete(upload_id, Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if provider.operation(delete_id) == Some(FileManagerTestOperation::DeleteRemote) {
+                break;
+            }
+            let state = executor_state(&cx, &panel, delete_id);
+            assert!(
+                Instant::now() < deadline,
+                "queued delete must start once a lane slot frees; executor state: {state:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             executor_state(&cx, &panel, delete_id),
             Some(SftpTransferState::Running)

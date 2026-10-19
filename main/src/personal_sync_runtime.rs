@@ -715,6 +715,7 @@ pub(crate) fn personal_sync_event_from_connection_event(
             Some(PersonalSyncEvent::FullScan)
         }
         ConnectionDataEvent::SchemaChanged { .. }
+        | ConnectionDataEvent::TableDataCleared { .. }
         | ConnectionDataEvent::CloudSyncRequested
         | ConnectionDataEvent::TeamCacheUpdated => None,
     }

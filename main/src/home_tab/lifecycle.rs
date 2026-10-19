@@ -207,9 +207,11 @@ impl HomePage {
                     ConnectionDataEvent::CredentialCreated { .. }
                     | ConnectionDataEvent::CredentialUpdated { .. }
                     | ConnectionDataEvent::CredentialDeleted { .. }
-                    | ConnectionDataEvent::SchemaChanged { .. } => {
+                    | ConnectionDataEvent::SchemaChanged { .. }
+                    | ConnectionDataEvent::TableDataCleared { .. } => {
                         // 钥匙串增量同步由 personal_sync_runtime 处理；
                         // SchemaChanged 由 db_tree_view 处理，此处无需操作。
+                        // TableDataCleared 属于数据级事件，由表数据页签处理。
                     }
                     ConnectionDataEvent::CloudSyncRequested => {
                         this.trigger_sync(cx);

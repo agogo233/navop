@@ -45,6 +45,17 @@ pub enum ConnectionDataEvent {
         database: String,
         schema: Option<String>,
     },
+    /// 表数据被整表清空（TRUNCATE 或无 WHERE 的 `DELETE FROM` 执行成功后触发）
+    ///
+    /// 只代表数据变化，表结构未变：打开的表数据网格应重新拉取数据，
+    /// 树结构、元数据缓存均无需刷新。订阅方按 `connection_id + database +
+    /// schema + table` 精确匹配，避免无关页签无谓刷新。
+    TableDataCleared {
+        connection_id: String,
+        database: String,
+        schema: Option<String>,
+        table: String,
+    },
     /// 请求执行一次云同步（由表单等非首页入口触发）
     CloudSyncRequested,
     /// 团队缓存已刷新，打开的表单应重新读取团队选项

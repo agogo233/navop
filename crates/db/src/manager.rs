@@ -1,5 +1,7 @@
 use crate::cache::CacheContext;
-use crate::cache_manager::{GlobalNodeCache, SchemaInvalidationPlan, SqlInvalidationContext};
+use crate::cache_manager::{
+    GlobalNodeCache, SchemaInvalidationPlan, SchemaInvalidationScope, SqlInvalidationContext,
+};
 use crate::clickhouse::ClickHousePlugin;
 use crate::connection::{DbConnection, DbError, StreamingProgress};
 use crate::connection_config_resolver::ConnectionConfigResolver;
@@ -23,8 +25,10 @@ use crate::{
     TableObjectType, TableSaveResponse,
 };
 use dashmap::DashMap;
-use gpui::{AppContext, AsyncApp, Global, Task};
-use one_core::connection_notifier::{ConnectionDataEvent, GlobalConnectionNotifier};
+use gpui::{AppContext, AsyncApp, Context, Global, Task};
+use one_core::connection_notifier::{
+    ConnectionDataEvent, ConnectionDataNotifier, GlobalConnectionNotifier,
+};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::{ConnectionRepository, DatabaseType, DbConnectionConfig};
 use std::collections::{HashMap, HashSet};
@@ -1141,7 +1145,7 @@ enum StreamingExecutionOutcome {
 }
 
 impl StreamingExecutionRequest {
-    async fn run(mut self) -> Vec<(String, String, Option<String>)> {
+    async fn run(mut self) -> Vec<SchemaInvalidationScope> {
         let total_size = self
             .source
             .as_ref()
@@ -1328,7 +1332,7 @@ impl StreamingExecutionRequest {
         outcome: StreamingExecutionOutcome,
         confirmed_plan: SchemaInvalidationPlan,
         had_successful_progress: bool,
-    ) -> Vec<(String, String, Option<String>)> {
+    ) -> Vec<SchemaInvalidationScope> {
         let Some(cache) = self.cache.as_ref() else {
             return Vec::new();
         };
@@ -1419,6 +1423,34 @@ fn should_conservatively_invalidate_streaming(
     }
 }
 
+/// 根据失效范围发射对应的通知事件。
+///
+/// 数据级范围（TRUNCATE / 无 WHERE 的整表 DELETE，`data_only == true`）发
+/// `TableDataCleared`，让打开的表数据网格重新拉取；结构级范围发
+/// `SchemaChanged`，触发树/元数据刷新。`data_only` 但缺表名的异常范围
+/// 按结构级兜底，保证通知不丢。
+fn emit_invalidation_scope_event(
+    connection_id: &str,
+    scope: &SchemaInvalidationScope,
+    cx: &mut Context<ConnectionDataNotifier>,
+) {
+    if let (true, Some(table)) = (scope.data_only, scope.table.as_deref()) {
+        cx.emit(ConnectionDataEvent::TableDataCleared {
+            connection_id: connection_id.to_string(),
+            database: scope.database.clone(),
+            schema: scope.schema.clone(),
+            table: table.to_string(),
+        });
+        return;
+    }
+
+    cx.emit(ConnectionDataEvent::SchemaChanged {
+        connection_id: connection_id.to_string(),
+        database: scope.database.clone(),
+        schema: scope.schema.clone(),
+    });
+}
+
 async fn send_streaming_error(
     tx: &mpsc::Sender<StreamingProgress>,
     message: String,
@@ -1486,22 +1518,23 @@ impl GlobalDbState {
     }
 
     /// Apply a previously built schema invalidation plan and return every scope
-    /// that should emit a `SchemaChanged` notification.
+    /// that should emit a notification.
+    ///
+    /// 调用方按范围分类发事件：`data_only == true` 的范围发
+    /// `ConnectionDataEvent::TableDataCleared`（携带 `table`），
+    /// 其余发 `ConnectionDataEvent::SchemaChanged`。
     pub async fn apply_sql_cache_invalidation_plan(
         &self,
         cache: &GlobalNodeCache,
         connection_id: &str,
         plan: &SchemaInvalidationPlan,
-    ) -> Vec<(String, String, Option<String>)> {
+    ) -> Vec<SchemaInvalidationScope> {
         let cache_ctx = self
             .get_config(connection_id)
             .map(|config| CacheContext::from_config(&config));
         cache
             .apply_invalidation_plan(connection_id, plan, cache_ctx.as_ref())
             .await
-            .into_iter()
-            .map(|scope| (connection_id.to_string(), scope.database, scope.schema))
-            .collect()
     }
 
     /// Invalidate metadata for SQL executed on a caller-owned session.
@@ -1516,7 +1549,7 @@ impl GlobalDbState {
         script: &str,
         database: Option<&str>,
         schema: Option<&str>,
-    ) -> Option<(String, String, Option<String>)> {
+    ) -> Option<SchemaInvalidationScope> {
         let plan = self.plan_sql_cache_invalidation(cache, connection_id, script, database, schema);
         self.apply_sql_cache_invalidation_plan(cache, connection_id, &plan)
             .await
@@ -2319,10 +2352,11 @@ impl GlobalDbState {
 
         // Process DDL cache invalidation after successful execution.
         if let Some(cache) = cache {
-            let ddl_info = Tokio::spawn_result(cx, async move {
+            let ddl_config_id = config_id.clone();
+            let ddl_scopes = Tokio::spawn_result(cx, async move {
                 Ok(cache
                     .process_sql_for_invalidation(
-                        &config_id,
+                        &ddl_config_id,
                         &script_for_ddl,
                         &current_database,
                         current_schema.as_deref(),
@@ -2333,18 +2367,20 @@ impl GlobalDbState {
             })
             .await;
 
-            // Emit a SchemaChanged event when DDL changes are detected.
-            if let Ok(Some((conn_id, database, schema))) = ddl_info {
-                if let Some(notifier) = notifier {
-                    cx.update(|cx| {
-                        notifier.0.update(cx, |_, cx| {
-                            cx.emit(ConnectionDataEvent::SchemaChanged {
-                                connection_id: conn_id,
-                                database,
-                                schema,
+            // Emit notifications for each detected scope: data-only scopes
+            // (TRUNCATE / full DELETE) tell open table-data grids to reload,
+            // structural scopes trigger schema refreshes.
+            if let Ok(scopes) = ddl_scopes {
+                if !scopes.is_empty() {
+                    if let Some(notifier) = notifier {
+                        cx.update(|cx| {
+                            notifier.0.update(cx, |_, cx| {
+                                for scope in scopes {
+                                    emit_invalidation_scope_event(&config_id, &scope, cx);
+                                }
                             });
                         });
-                    });
+                    }
                 }
             }
         }
@@ -2423,12 +2459,8 @@ impl GlobalDbState {
                 if let Some(notifier) = notifier {
                     cx.update(|cx| {
                         notifier.0.update(cx, |_, cx| {
-                            for (connection_id, database, schema) in scopes {
-                                cx.emit(ConnectionDataEvent::SchemaChanged {
-                                    connection_id,
-                                    database,
-                                    schema,
-                                });
+                            for scope in scopes {
+                                emit_invalidation_scope_event(&connection_id, &scope, cx);
                             }
                         });
                     });

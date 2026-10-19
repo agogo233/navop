@@ -217,7 +217,18 @@ dashmap = "5.5.3"
 moka = { version = "0.12", features = ["sync"] }
 thiserror="2.0.14"
 llm-connector = { path = "crates/llm-connector", features = ["streaming"] }
-redis_client = { package = "redis", version = "0.27", features = ["tokio-comp", "cluster-async", "connection-manager"] }
+# `use_tls` 会拼出 `rediss://` URL，必须启用 rustls 的异步 TLS 支持（tokio-rustls-comp
+# 隐含 tokio-comp 与 tls-rustls），否则 `Client::open` 直接返回
+# `InvalidClientConfig("can't connect with TLS, the feature is not enabled")`。
+# 刻意不启用 `tls-rustls-webpki-roots`：redis-rs 一旦启用它就不再加载系统根证书
+# （见 `create_rustls_config`），企业私有 CA 装的根证书会全部失效；保留 native-certs
+# 才能同时信任公共 CA 与用户自行安装的私有 CA。
+redis_client = { package = "redis", version = "0.27", features = [
+    "tokio-comp",
+    "tokio-rustls-comp",
+    "cluster-async",
+    "connection-manager",
+] }
 
 # SSH and SFTP
 # dsa feature enables verifying/offering the legacy ssh-dss host-key algorithm.

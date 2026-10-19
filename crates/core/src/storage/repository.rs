@@ -501,6 +501,20 @@ impl ConnectionRepository {
         })
     }
 
+    /// 对齐连接所属的工作空间（同步时按云端记录解析结果写入）
+    ///
+    /// 与 [`Self::update_sync_status`] 不同，这里刻意不改动 `updated_at`：
+    /// 归属对齐属于同步过程自身的收敛动作，不应该看起来像一次本地修改。
+    pub fn update_workspace_id(&self, id: i64, workspace_id: Option<i64>) -> Result<()> {
+        self.conn.with_connection(|conn| {
+            conn.execute(
+                "UPDATE connections SET workspace_id = ?1 WHERE id = ?2",
+                params![workspace_id, id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// 记录连接最近一次被打开的时间，不影响内容更新时间和云同步判断。
     pub fn touch_last_used(&self, id: i64) -> Result<()> {
         let ts = now();

@@ -48,6 +48,16 @@ pub enum DdlEvent {
         schema: Option<String>,
         table: String,
     },
+    /// 整表数据清空（无 WHERE 子句的 `DELETE FROM <table>`）
+    ///
+    /// 与 [`DdlEvent::TruncateTable`] 等价的数据效果，但属于 DML：
+    /// SQLite/DuckDB 等不支持 TRUNCATE 的数据库生成的清空语句走这里。
+    /// 表结构未变，只触发数据级通知，不做元数据失效。
+    DeleteAllRows {
+        database: String,
+        schema: Option<String>,
+        table: String,
+    },
     /// 重命名表
     RenameTable {
         database: String,
@@ -158,9 +168,9 @@ impl DdlInvalidator {
 
     /// 使用数据库方言解析 SQL 中的所有 DDL 事件（支持多语句）。
     ///
-    /// 先用流式语句切分器线性扫描脚本，只把以 DDL 关键字开头的语句交给
-    /// sqlparser 构建 AST。这样包含超大 INSERT/UPDATE 的混合脚本不会为了缓存
-    /// 失效而再次构建完整 DML AST。
+    /// 先用流式语句切分器线性扫描脚本，只把以 DDL 关键字开头（或疑似整表
+    /// `DELETE`）的语句交给 sqlparser 构建 AST。这样包含超大 INSERT/UPDATE
+    /// 的混合脚本不会为了缓存失效而再次构建完整 AST。
     pub fn parse_ddl_events_for_database(
         sql: &str,
         current_database: &str,
@@ -191,7 +201,8 @@ impl DdlInvalidator {
 
         for statement in parser {
             let statement = statement?;
-            if Self::starts_with_ddl_keyword(&statement) {
+            if Self::starts_with_ddl_keyword(&statement) || Self::is_full_table_delete(&statement)
+            {
                 candidates.push(statement);
             }
         }
@@ -241,6 +252,18 @@ impl DdlInvalidator {
         DDL_KEYWORDS
             .iter()
             .any(|keyword| first_word.eq_ignore_ascii_case(keyword))
+    }
+
+    /// 廉价预筛：是否疑似「整表清空」的 `DELETE FROM <table>`。
+    ///
+    /// 只有语句整体不含 `WHERE` 字样时才算候选（子串匹配，不做词法分析）：
+    /// - 带 WHERE 的条件删除一定被排除，不会为大体积条件删除构建 AST；
+    /// - 整表 `DELETE` 的字符串字面量里恰好出现 "WHERE" 时会被漏判，
+    ///   代价只是数据页签少一次自动刷新，用户手动刷新即可，可接受。
+    /// 精确判定交给 sqlparser AST（`selection == None`）。
+    fn is_full_table_delete(sql: &str) -> bool {
+        let upper = sql.to_uppercase();
+        upper.trim_start().starts_with("DELETE FROM") && !upper.contains("WHERE")
     }
 
     fn parse_ddl_candidate(
@@ -493,6 +516,33 @@ impl DdlInvalidator {
                 })
             }
 
+            // 无 WHERE 的 `DELETE FROM <table>`：整表数据清空（SQLite/DuckDB
+            // 等不支持 TRUNCATE 的数据库生成的清空语句）。带 WHERE 的条件删除
+            // 不产生任何事件。
+            Statement::Delete(delete) => {
+                let is_unconditional = delete.selection.is_none();
+                let first_table = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables) => tables.first(),
+                    sqlparser::ast::FromTable::WithoutKeyword(tables) => tables.first(),
+                };
+                let table = first_table.and_then(|table_with_joins| {
+                    match &table_with_joins.relation {
+                        sqlparser::ast::TableFactor::Table { name, .. } => {
+                            Some(Self::extract_object_name_from_ast(name))
+                        }
+                        _ => None,
+                    }
+                });
+                match (is_unconditional, table) {
+                    (true, Some(table)) => Some(DdlEvent::DeleteAllRows {
+                        database: current_database.to_string(),
+                        schema: current_schema.map(|s| s.to_string()),
+                        table,
+                    }),
+                    _ => None,
+                }
+            }
+
             Statement::RenameTable(operations) => {
                 let first = operations.first()?;
                 let old_table = Self::extract_object_name_from_ast(&first.old_name);
@@ -677,6 +727,17 @@ impl DdlInvalidator {
         if upper.starts_with("TRUNCATE") && !upper.starts_with("TRUNCATE TABLE") {
             let table = Self::extract_object_name(sql_trimmed, "TRUNCATE")?;
             return Some(DdlEvent::TruncateTable {
+                database: current_database.to_string(),
+                schema: current_schema.map(|s| s.to_string()),
+                table,
+            });
+        }
+
+        // 无 WHERE 的 DELETE FROM：整表数据清空（与 is_full_table_delete 的
+        // 候选条件保持一致，见该函数注释）。
+        if upper.starts_with("DELETE FROM") && !upper.contains("WHERE") {
+            let table = Self::extract_object_name(sql_trimmed, "DELETE FROM")?;
+            return Some(DdlEvent::DeleteAllRows {
                 database: current_database.to_string(),
                 schema: current_schema.map(|s| s.to_string()),
                 table,
@@ -1197,6 +1258,11 @@ impl DdlInvalidator {
                 let key = CacheKey::schemas(connection_id, database);
                 cache.invalidate(&key).await;
             }
+
+            // 整表数据清空不改变表结构与元数据，无需失效任何缓存；
+            // 它只会通过 SchemaInvalidationScope 的 data_only 标记触发
+            // TableDataCleared 数据刷新通知。
+            DdlEvent::DeleteAllRows { .. } => {}
         }
     }
 }
@@ -1341,6 +1407,93 @@ mod tests {
     fn test_parse_truncate_table() {
         let event = DdlInvalidator::parse_ddl_event("TRUNCATE TABLE users", "mydb", None);
         assert!(matches!(event, Some(DdlEvent::TruncateTable { table, .. }) if table == "users"));
+    }
+
+    #[test]
+    fn test_parse_full_table_delete() {
+        // 无 WHERE 的 DELETE：与 TRUNCATE 等价的整表清空（SQLite/DuckDB 生成）
+        let event = DdlInvalidator::parse_ddl_event("DELETE FROM users", "mydb", None);
+        assert!(
+            matches!(event, Some(DdlEvent::DeleteAllRows { table, .. }) if table == "users")
+        );
+
+        // schema 限定：表名取最后一段
+        let event = DdlInvalidator::parse_ddl_event("DELETE FROM public.users", "mydb", None);
+        assert!(
+            matches!(event, Some(DdlEvent::DeleteAllRows { table, .. }) if table == "users")
+        );
+
+        // 带引号标识符
+        let event = DdlInvalidator::parse_ddl_event("DELETE FROM `users`", "mydb", None);
+        assert!(
+            matches!(event, Some(DdlEvent::DeleteAllRows { table, .. }) if table == "users")
+        );
+
+        // 大小写不敏感
+        let event = DdlInvalidator::parse_ddl_event("delete from users", "mydb", None);
+        assert!(matches!(event, Some(DdlEvent::DeleteAllRows { .. })));
+
+        // 当前 schema 透传
+        let event = DdlInvalidator::parse_ddl_event("DELETE FROM users", "mydb", Some("public"));
+        assert!(
+            matches!(event, Some(DdlEvent::DeleteAllRows { schema, .. }) if schema == Some("public".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_conditional_delete_is_not_detected() {
+        // 带 WHERE 的条件删除不属于整表清空，不应产生任何事件
+        let event =
+            DdlInvalidator::parse_ddl_event("DELETE FROM users WHERE id = 1", "mydb", None);
+        assert!(event.is_none());
+
+        // 候选预筛必须排除带 WHERE 的删除，避免为大体积条件删除构建 AST
+        assert!(!DdlInvalidator::is_full_table_delete(
+            "DELETE FROM users WHERE id = 1"
+        ));
+        assert!(DdlInvalidator::is_full_table_delete("DELETE FROM users"));
+        assert!(DdlInvalidator::is_full_table_delete("  delete from users"));
+        // ORDER BY 不带 LIMIT 仍是整表删除；带 LIMIT 的部分删除会被预筛放行，
+        // 属于可接受的多刷新一次（见 is_full_table_delete 注释）。
+        assert!(DdlInvalidator::is_full_table_delete(
+            "DELETE FROM users ORDER BY id"
+        ));
+    }
+
+    #[test]
+    fn test_full_table_delete_in_mixed_script() {
+        let sql = "SELECT 1; DELETE FROM users; INSERT INTO logs VALUES (1);";
+        let events = DdlInvalidator::parse_ddl_events(sql, "mydb", None);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert!(matches!(&events[0], DdlEvent::DeleteAllRows { table, .. } if table == "users"));
+    }
+
+    #[tokio::test]
+    async fn delete_all_rows_does_not_invalidate_metadata() {
+        // 数据级事件只触发 TableDataCleared 通知，表结构/表列表缓存必须保留
+        let cache = memory_only_cache();
+        let invalidator = DdlInvalidator::new(cache.clone());
+        let tables_key = CacheKey::tables("connection", "database", Some("public"));
+
+        cache
+            .set(
+                &tables_key,
+                MetadataEntry::Tables(Vec::new()),
+                CacheLevel::Database,
+            )
+            .await;
+        invalidator
+            .invalidate(
+                "connection",
+                &DdlEvent::DeleteAllRows {
+                    database: "database".to_string(),
+                    schema: Some("public".to_string()),
+                    table: "users".to_string(),
+                },
+            )
+            .await;
+
+        assert!(cache.get(&tables_key).await.is_some());
     }
 
     #[test]

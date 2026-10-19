@@ -554,6 +554,14 @@ fn clipboard_tsv_round_trip_is_lossless() {
             ],
         ),
         (
+            "字段是 JSON",
+            vec![
+                Some("1".into()),
+                Some(r#"{"name":"张三","age":1}"#.into()),
+                Some("tail".into()),
+            ],
+        ),
+        (
             "含空值与 SQL NULL",
             vec![None, Some(String::new()), Some("\\N".into())],
         ),
@@ -612,6 +620,35 @@ fn clipboard_tsv_escapes_fields_with_separators() {
         CopyFormatter::format(CopyFormat::Tsv, context),
         "1\t\"a\tb\""
     );
+}
+
+/// 表数据里复制 JSON 字段（Ctrl/Cmd+C 与右键「复制」）时，剪贴板内容必须等于存储
+/// 原文；两侧再套一层引号会让粘到应用外的内容和库里的值不一致。
+#[test]
+fn clipboard_tsv_copies_json_cell_verbatim() {
+    const JSON: &str = r#"{"name":"张三","age":1}"#;
+    let columns = vec!["id".into(), "payload".into()];
+    let metadata = TableMetadata::new("t").with_columns(columns.clone());
+
+    let data = vec![vec![Some("1".into()), Some(JSON.into())]];
+    assert_eq!(
+        format!("1\t{JSON}"),
+        CopyFormatter::format(
+            CopyFormat::Tsv,
+            CopyFormatContext::new(&data, &columns, &metadata),
+        )
+    );
+
+    // 只复制这一个单元格时同样是原文。
+    let single = vec![vec![Some(JSON.into())]];
+    let one_column = vec!["payload".into()];
+    let single_metadata = TableMetadata::new("t").with_columns(one_column.clone());
+    let clipboard = CopyFormatter::format(
+        CopyFormat::Tsv,
+        CopyFormatContext::new(&single, &one_column, &single_metadata),
+    );
+    assert_eq!(JSON, clipboard);
+    assert_eq!(vec![vec![JSON.to_string()]], parse_tsv_rows(&clipboard));
 }
 
 /// 查询结果里的表名是 `库.表` 的拼接形式，复制出来的 SQL 必须逐段引用，
