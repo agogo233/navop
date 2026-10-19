@@ -17694,6 +17694,9 @@ mod tests {
                 current_dir: std::env::current_dir().unwrap_or_default(),
                 portable_environment: None,
                 data_dir_environment: None,
+                // 测试要的是"一切都钉在临时目录里"：debug 构建那套默认隔离目录
+                // 在这儿只会多一层不确定，显式关掉（真实路径仍由下面的 override 决定）。
+                development_data_dir: None,
             };
             let _ = one_core::app_paths::initialize_app_paths(
                 &one_core::app_paths::AppPathOverrides::with_data_dir(data_dir),
