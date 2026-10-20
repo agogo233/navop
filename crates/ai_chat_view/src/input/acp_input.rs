@@ -1431,7 +1431,7 @@ impl AcpAgentInput {
         div()
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
             .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
-            .flex_shrink(1.0)
+            .flex_shrink_0()
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .overflow_hidden()
             .child(
@@ -1493,7 +1493,7 @@ impl AcpAgentInput {
             .debug_selector(|| "agent-input-branch".to_string())
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
             .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
-            .flex_shrink(1.0)
+            .flex_shrink_0()
             .h(sp(COMPOSER_CHIP_HEIGHT))
             .rounded(px(COMPOSER_CHIP_RADIUS))
             .overflow_hidden()
@@ -1547,7 +1547,7 @@ impl AcpAgentInput {
         div()
             .debug_selector(|| "agent-input-worktree".to_string())
             .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
-            .flex_shrink(1.0)
+            .flex_shrink_0()
             .overflow_hidden()
             .child(ghost_chip_muted(
                 Button::new("acp-worktree-toggle")
@@ -1918,9 +1918,13 @@ impl AcpAgentInput {
         let is_git_repo =
             self.context.workspace.is_git_repo || !self.context.branch_options.is_empty();
 
+        // 一行放不下就换行，不横向硬挤：这三颗都是"要读得出内容"的元数据，
+        // 压到 44px 下限只剩省略号，等于没显示（窄面板下必然发生）。
         let mut group = h_flex()
             .debug_selector(|| "agent-input-context-group".to_string())
+            .flex_1()
             .min_w_0()
+            .flex_wrap()
             .items_center()
             .gap(sp(2.0))
             .child(self.render_workspace_menu(cx));
@@ -1934,16 +1938,15 @@ impl AcpAgentInput {
             .debug_selector(|| "agent-input-context-row".to_string())
             .w_full()
             .min_w_0()
-            .h(sp(COMPOSER_CONTEXT_ROW_HEIGHT))
+            .min_h(sp(COMPOSER_CONTEXT_ROW_HEIGHT))
             .items_center()
             .gap(sp(2.0))
+            .py(sp(1.0))
             .px(sp(COMPOSER_ROW_PADDING_X))
-            .overflow_hidden()
             .flex_shrink_0()
             .text_size(sp(12.5))
             .text_color(theme.muted_foreground)
             .child(group)
-            .child(div().flex_1().min_w_0())
             .children(self.render_usage_gauge(cx))
     }
 }

@@ -11388,6 +11388,98 @@ mod tests {
         );
     }
 
+    /// 上下文栏放不下三颗 chip 时要换行，不能把它们挤到 `min_w` 下限、
+    /// 只剩省略号——那是"显示不全"的根源。
+    #[gpui::test]
+    fn acp_context_row_wraps_instead_of_squeezing(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+        let source = ComposerContextSource {
+            snapshot: Arc::new(move |_: &mut gpui::App| ComposerContextSnapshot {
+                workspace: ComposerWorkspaceInfo {
+                    label: SharedString::from("navop-wt-ai-workbench"),
+                    path: Some(SharedString::from("/tmp/navop-wt-ai-workbench")),
+                    is_git_repo: true,
+                },
+                workspace_options: vec![ComposerWorkspaceOption::new(
+                    "navop-wt-ai-workbench",
+                    "/tmp/navop-wt-ai-workbench",
+                    true,
+                )],
+                branches: vec![ComposerBranchOption::new("impl/ai-workbench", true, false)],
+                worktree: ComposerWorktreeState {
+                    enabled: false,
+                    label: Some(SharedString::from("navop-wt-ai-workbench")),
+                    pending: false,
+                },
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+        refresh_frame(cx);
+
+        let chips = |cx: &mut VisualTestContext| {
+            [
+                "agent-input-workspace",
+                "agent-input-branch",
+                "agent-input-worktree",
+            ]
+            .map(|selector| cx.debug_bounds(selector).expect("三颗 chip 都应当渲染"))
+        };
+        // 宽窗：一行放得下，三颗同一中线。
+        let wide = chips(cx);
+        let center = wide[0].origin.y + wide[0].size.height / 2.0;
+        for bounds in wide {
+            assert!(
+                (bounds.origin.y + bounds.size.height / 2.0 - center).abs() <= px(2.0),
+                "宽窗下三颗应当在同一行：{bounds:?}"
+            );
+        }
+        let wide_widths: Vec<Pixels> = wide.iter().map(|bounds| bounds.size.width).collect();
+
+        // 收窄到放不下三颗：换成两行，而不是把每颗压到 `min_w`。
+        cx.simulate_resize(gpui::Size {
+            width: px(604.0),
+            height: px(900.0),
+        });
+        refresh_frame(cx);
+        let narrow = chips(cx);
+        for (index, bounds) in narrow.iter().enumerate() {
+            assert!(
+                bounds.size.width >= wide_widths[index] - px(0.5),
+                "窄窗下不该把 chip 压窄（第 {index} 颗）：wide={wide_widths:?}, narrow={bounds:?}"
+            );
+        }
+        let narrow_centers: Vec<Pixels> = narrow
+            .iter()
+            .map(|bounds| bounds.origin.y + bounds.size.height / 2.0)
+            .collect();
+        assert!(
+            narrow_centers
+                .windows(2)
+                .any(|pair| (pair[0] - pair[1]).abs() > px(2.0)),
+            "窄窗下应当换行，实际三颗仍在同一行：{narrow:?}"
+        );
+    }
+
     /// Worktree 从组件库 `Checkbox` 换成 chip 之后，点一下仍然要把**翻转后**的值
     /// 交给宿主：开关的语义搬到了 `☑/☐` 图标上，回路不变。
     #[gpui::test]
