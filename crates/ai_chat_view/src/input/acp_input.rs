@@ -291,8 +291,6 @@ pub struct AcpAgentInput {
     is_running: bool,
     /// 上层注入的展示上下文：会话标题、模式文案、用量读数、工作区与分支。
     context: AgentComposerContext,
-    /// agent 自己的名字（"Codex" / "连接中"），由上层注入。
-    agent_label: SharedString,
     /// 模型候选（agent 声明的 configOptions，由上层注入）。
     model_options: Vec<ComposerModelOption>,
     /// 模型下拉的组件库状态；注入点时拿不到窗口，置脏后在 `render` 里灌。
@@ -306,8 +304,6 @@ pub struct AcpAgentInput {
     open_menu: Option<AcpComposerMenu>,
     /// 用量详情 popover 的开合（受控：「查看历史」要能把它关上）。
     usage_detail_open: bool,
-    /// 是否折叠 ACP 头部。
-    header_collapsed: bool,
     /// 可选的局部主题（终端侧边栏会注入终端主题）。
     theme: Option<AgentChatTheme>,
     edge_to_edge: bool,
@@ -455,7 +451,6 @@ impl AcpAgentInput {
             pending_elicitation: None,
             is_running: false,
             context: AgentComposerContext::default(),
-            agent_label: SharedString::default(),
             model_options: Vec::new(),
             model_select,
             model_select_dirty: false,
@@ -464,7 +459,6 @@ impl AcpAgentInput {
             mode_options: Vec::new(),
             open_menu: None,
             usage_detail_open: false,
-            header_collapsed: false,
             theme: None,
             edge_to_edge: false,
             _subscriptions: vec![
@@ -491,14 +485,6 @@ impl AcpAgentInput {
     pub fn set_edge_to_edge(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.edge_to_edge = enabled;
         cx.notify();
-    }
-
-    /// 注入当前 agent 的名字（"Codex" / "连接中"）。
-    pub fn set_agent_label(&mut self, label: SharedString, cx: &mut Context<Self>) {
-        if self.agent_label != label {
-            self.agent_label = label;
-            cx.notify();
-        }
     }
 
     /// 更新 `/` 命令补全来源（ACP agent 推送的 `available_commands`）。
@@ -1202,111 +1188,6 @@ impl AcpAgentInput {
 // ---------------------------------------------------------------------------
 
 impl AcpAgentInput {
-    /// ACP 身份行：`[Bot] agent 名 · 会话标题 … [ⓘ][折叠开关]`。
-    ///
-    /// 这一行**始终**在：折叠收起的是能力栏（参数行里的计划 / 子代理两栏，见
-    /// [`Self::render_toolbar`]），用户任何时候都该看得见"现在在对讲的是哪个 agent、
-    /// 哪个会话"。
-    ///
-    /// 原先这里是「身份行 + 能力清单」两行，外带一条分隔线；清单现在收进 ⓘ 的
-    /// tooltip，线也跟着去掉——卡片里只剩一条外框。折叠开关从能力栏那一行搬到这里，
-    /// 成了身份行尾端的锚点，不再孤悬在一条自己撑起来的行上。
-    fn render_agent_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.local_theme(cx);
-        let session_title = self
-            .context
-            .target
-            .as_ref()
-            .map(|target| target.label.clone())
-            .unwrap_or_else(|| SharedString::from(t!("AgentUi.acp_session").to_string()));
-        let row = h_flex()
-            .debug_selector(|| "agent-input-acp-header".to_string())
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .pb(px(2.0))
-            .text_size(sp(12.5))
-            .child(
-                Icon::new(IconName::Bot)
-                    .small()
-                    .flex_shrink_0()
-                    .text_color(theme.accent),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(theme.foreground)
-                    .child(self.agent_label.clone()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(theme.muted_foreground)
-                    .child("·"),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(theme.muted_foreground)
-                    .child(session_title),
-            );
-
-        row.child(self.render_header_toggle(cx))
-    }
-
-    /// agent 声明的协议能力清单，拼成一行（没声明过就是空串）。
-    ///
-    /// 原先由身份行的 ⓘ 常驻承载；那个按钮去掉后，清单改挂在折叠键的 tooltip 上：
-    /// 背景信息留个入口就够，不值得再占一颗常驻按钮。
-    fn capabilities_summary(&self) -> SharedString {
-        SharedString::from(
-            self.context
-                .capabilities
-                .iter()
-                .map(|capability| capability.to_string())
-                .collect::<Vec<_>>()
-                .join(" · "),
-        )
-    }
-
-    /// 能力栏右侧的折叠开关：折起来之后参数行里的计划 / 子代理两栏收起。
-    fn render_header_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.local_theme(cx);
-        let summary = self.capabilities_summary();
-        let collapse_hint = t!("AgentUi.collapse_capabilities").to_string();
-        let tooltip = if summary.is_empty() {
-            collapse_hint
-        } else {
-            format!("{collapse_hint} · {summary}")
-        };
-        ghost_chip(
-            Button::new("acp-header-toggle")
-                .debug_selector(|| "agent-input-acp-header-toggle".to_string())
-                .icon(if self.header_collapsed {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .small()
-                .size(sp(COMPOSER_CHIP_HEIGHT))
-                .flex_shrink_0()
-                .tooltip(tooltip)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.header_collapsed = !this.header_collapsed;
-                    if this.header_collapsed {
-                        this.open_menu = None;
-                    }
-                    cx.notify();
-                })),
-            &theme,
-            cx,
-        )
-    }
-
     /// 计划栏：agent 报上来的待办（ACP 的 `Plan` 更新）。
     fn render_plan_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let view = cx.entity();
@@ -1934,12 +1815,11 @@ impl AcpAgentInput {
             // 极端窄宽度下宁可裁掉中段的尾巴，也不让内容画到输入卡片外面。
             .overflow_hidden()
             .flex_shrink_0();
-        if !self.header_collapsed {
-            row = row
-                .child(self.render_plan_tab(cx))
-                .child(self.render_subagent_tab(cx));
-        }
+        // 计划 / 子代理两栏始终在：折叠开关随身份行一起去掉之后，
+        // 这条参数行就是它们唯一的家。
         row = row
+            .child(self.render_plan_tab(cx))
+            .child(self.render_subagent_tab(cx))
             // 空白把“这一轮的待办”与“怎么跑”分开；两组之间不再画竖线。
             .child(div().flex_1().min_w_0())
             .child(self.render_model_menu(cx))
@@ -2327,7 +2207,6 @@ impl Render for AcpAgentInput {
             self.branch_select_dirty = false;
         }
 
-        let header = self.render_agent_header(cx);
         let attachments = self.render_attachments(cx);
         let queued_submissions = self.render_queued_submissions(cx);
         self.ensure_elicitation_inputs(window, cx);
@@ -2372,8 +2251,6 @@ impl Render for AcpAgentInput {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_dropped_paths(paths.paths(), window, cx);
             }))
-            // 顶部：身份行（agent · 会话 · ⓘ · 折叠键）
-            .child(header)
             // 附件紧贴输入框上方：它是“这一轮要发出去的东西”
             .children(attachments)
             .when_some(queued_submissions, |this, queued| this.child(queued))

@@ -4861,17 +4861,7 @@ impl AgentChatView {
         self.acp_input
             .update(cx, |input, cx| input.set_slash_commands(commands, cx));
         self.composer().set_context(ctx, cx);
-        // ACP 那份的抬头要摆「现在是哪个 agent」：与面板头部同一个来源
-        // （`current_agent_label`），连接中显示「连接中」，避免两处叫法打架。
         if self.backend == Backend::Acp {
-            let label = current_agent_label(
-                self.backend,
-                &self.acp_agents,
-                self.current_acp_id.as_ref(),
-                self.acp_connecting,
-            );
-            self.acp_input
-                .update(cx, |input, cx| input.set_agent_label(label, cx));
             // 模式与模型也都是 agent 声明的：在这里一次推齐。散在各条连接路径上推的话，
             // 总有一条路径只更新了面板字段（`self.tool_options`）而没推给输入框，
             // 结果下拉里留着的还是上一份列表——比如本地那套「任务类型 / 工具策略」。
@@ -11374,9 +11364,6 @@ mod tests {
         let toolbar = cx
             .debug_bounds("agent-input-toolbar")
             .expect("底栏应当渲染");
-        let header = cx
-            .debug_bounds("agent-input-acp-header")
-            .expect("ACP 抬头应当渲染");
         let mode = cx
             .debug_bounds("agent-input-acp-mode")
             .expect("模式 chip 应当渲染");
@@ -11384,7 +11371,6 @@ mod tests {
             .debug_bounds("agent-input-acp-model-control")
             .expect("模型下拉应当渲染");
 
-        let header_bottom = header.origin.y + header.size.height;
         let toolbar_bottom = toolbar.origin.y + toolbar.size.height;
         for control in [mode, model] {
             assert!(
@@ -11392,11 +11378,14 @@ mod tests {
                     && control.origin.y + control.size.height <= toolbar_bottom,
                 "模式与模型必须落在底栏那一行：control={control:?}, toolbar={toolbar:?}"
             );
-            assert!(
-                control.origin.y >= header_bottom,
-                "抬头里不该再放模式与模型：control={control:?}, header={header:?}"
-            );
         }
+
+        // 身份行已去掉：底栏之上不该再有第二行 chrome。
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("agent-input-acp-header").is_none(),
+            "身份行不应再渲染"
+        );
     }
 
     /// Worktree 从组件库 `Checkbox` 换成 chip 之后，点一下仍然要把**翻转后**的值
@@ -11471,11 +11460,10 @@ mod tests {
         );
     }
 
-    /// ACP 的能力栏：计划与子代理是参数行左端的两颗 chip，折叠开关收在身份行右端。
+    /// ACP 的参数行：计划与子代理是左端的两颗 chip，与模式同一根中线。
     ///
-    /// 与早前不同：这两栏不再是“撑满一行、外面还套个框”的能力栏，而是参数行里两颗
-    /// 普通 chip；折叠开关也搬到了身份行——它折的就是参数行左端那两颗 chip，因此
-    /// 必须在参数行之上一行，且始终可见。
+    /// 这两栏不再是“撑满一行、外面还套个框”的能力栏，而是参数行里两颗普通 chip；
+    /// 身份行与折叠开关都已去掉，它们没有收起状态、始终在。
     #[gpui::test]
     fn acp_composer_keeps_plan_and_subagent_tabs(cx: &mut TestAppContext) {
         init_test_ui(cx);
@@ -11490,9 +11478,6 @@ mod tests {
         });
         let cx: &mut VisualTestContext = cx;
 
-        let header = cx
-            .debug_bounds("agent-input-acp-header")
-            .expect("ACP 身份行应当渲染");
         let plan = cx
             .debug_bounds("acp-plan-trigger")
             .expect("计划 chip 应当渲染");
@@ -11502,9 +11487,6 @@ mod tests {
         let mode = cx
             .debug_bounds("agent-input-acp-mode")
             .expect("模式 chip 应当渲染");
-        let toggle = cx
-            .debug_bounds("agent-input-acp-header-toggle")
-            .expect("折叠开关应当渲染");
 
         // 参数行左端：计划 → 子代理 → … → 模式（右侧还有模型 / 附件 / 发送）。
         assert!(
@@ -11514,53 +11496,31 @@ mod tests {
         );
         // 三颗都是 26 高的 chip，真的同高，所以比中线就够。
         let row_center = plan.origin.y + plan.size.height / 2.0;
-        let header_bottom = header.origin.y + header.size.height;
         for bounds in [plan, subagents, mode] {
             let center = bounds.origin.y + bounds.size.height / 2.0;
             assert!(
                 (center - row_center).abs() <= px(2.0),
                 "计划、子代理与模式必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
             );
-            assert!(
-                bounds.origin.y >= header_bottom,
-                "参数行在身份行之下：{bounds:?}, header={header:?}"
-            );
         }
 
-        // 折叠开关在身份行里：同一根中线，且贴在该行右端。
-        let toggle_center = toggle.origin.y + toggle.size.height / 2.0;
-        let header_center = header.origin.y + header.size.height / 2.0;
-        assert!(
-            (toggle_center - header_center).abs() <= px(2.0),
-            "折叠开关必须与身份行同一中线：toggle={toggle:?}, header={header:?}"
-        );
-        assert!(
-            toggle.origin.x + toggle.size.width >= header.origin.x + header.size.width - px(20.0),
-            "折叠开关收在身份行右端：toggle={toggle:?}, header={header:?}"
-        );
-        assert!(
-            toggle.origin.y < plan.origin.y,
-            "折叠开关在参数行之上的身份行里：toggle={toggle:?}, plan={plan:?}"
-        );
-
-        // 折起来：两栏收起，开关与身份行留着——否则展开不回去。
-        cx.simulate_click(toggle.center(), Modifiers::default());
+        // 身份行与折叠开关一起没了：这两栏不再有收起状态，任何时刻都在。
         refresh_frame(cx);
         assert!(
-            cx.debug_bounds("acp-plan-trigger").is_none(),
-            "折起来之后计划栏应当收起"
+            cx.debug_bounds("agent-input-acp-header").is_none(),
+            "身份行不应再渲染"
         );
         assert!(
-            cx.debug_bounds("acp-subagents-trigger").is_none(),
-            "折起来之后子代理栏应当收起"
+            cx.debug_bounds("agent-input-acp-header-toggle").is_none(),
+            "折叠开关不应再渲染"
         );
         assert!(
-            cx.debug_bounds("agent-input-acp-header-toggle").is_some(),
-            "折叠开关必须留着"
+            cx.debug_bounds("acp-plan-trigger").is_some(),
+            "计划 chip 应当始终在"
         );
         assert!(
-            cx.debug_bounds("agent-input-acp-header").is_some(),
-            "身份行始终可见"
+            cx.debug_bounds("acp-subagents-trigger").is_some(),
+            "子代理 chip 应当始终在"
         );
     }
 
