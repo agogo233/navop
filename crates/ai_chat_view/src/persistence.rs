@@ -282,6 +282,9 @@ fn snapshot_workspace_root(root: Option<String>) -> Option<String> {
 ///
 /// 只从 id 的末段取名（`builtin.codex` → `codex`）：展示名在宿主的 agent 注册表里，
 /// 持久化层拿不到；写进快照又会因为改名而过期。
+///
+/// 末段带 `-acp` / `_acp` 后缀时去掉（`opencode-acp` → `opencode`）：这一行本来
+/// 就是 ACP 会话的列表，`acp` 在这里不带任何信息，只占掉会话标题的宽度。
 fn external_agent_label(agent_id: Option<String>) -> Option<gpui::SharedString> {
     let agent_id = agent_id?;
     let agent_id = agent_id.trim();
@@ -293,7 +296,22 @@ fn external_agent_label(agent_id: Option<String>) -> Option<gpui::SharedString> 
         .next()
         .filter(|segment| !segment.is_empty())
         .unwrap_or(agent_id);
-    Some(gpui::SharedString::from(label.to_string()))
+    Some(gpui::SharedString::from(
+        strip_acp_suffix(label).to_string(),
+    ))
+}
+
+/// 去掉末段的 `-acp` / `_acp` 后缀（大小写不敏感）。
+///
+/// 去完为空就原样返回：宁可留一条 `-acp` 的标记，也别把来源抹成空串。
+fn strip_acp_suffix(label: &str) -> &str {
+    let lowered = label.to_ascii_lowercase();
+    if !(lowered.ends_with("-acp") || lowered.ends_with("_acp")) {
+        return label;
+    }
+    // 后缀是 4 个 ASCII 字节，切点必然落在字符边界上。
+    let (head, _) = label.split_at(label.len() - 4);
+    if head.is_empty() { label } else { head }
 }
 
 fn load_legacy_chat_snapshot(cx: &App, uid: &str) -> Option<SessionSnapshot> {
@@ -903,17 +921,23 @@ mod tests {
         );
     }
 
-    /// 来源标记只取 id 末段；空 / 纯空白不算来源。
+    /// 来源标记只取 id 末段，并去掉末段的 `-acp` / `_acp`；空 / 纯空白不算来源。
     #[test]
     fn external_agent_labels_use_the_last_segment() {
+        let label = |raw: &str| external_agent_label(Some(raw.into())).map(|l| l.to_string());
+        assert_eq!(Some("codex".to_string()), label("builtin.codex"));
+        // 三家扩展的 id 都以 `-acp` 结尾：列表里只留前面的名字。
         assert_eq!(
-            Some("codex".to_string()),
-            external_agent_label(Some("builtin.codex".into())).map(|l| l.to_string())
+            Some("opencode".to_string()),
+            label("opencode-acp.opencode-acp")
         );
-        assert_eq!(
-            Some("opencode-acp".to_string()),
-            external_agent_label(Some("opencode-acp.opencode-acp".into())).map(|l| l.to_string())
-        );
+        assert_eq!(Some("claude".to_string()), label("claude-acp"));
+        assert_eq!(Some("codex".to_string()), label("codex_acp"));
+        assert_eq!(Some("codex".to_string()), label("codex-ACP"));
+        // 去掉之后会变空、或后缀不在末段：原样保留。
+        assert_eq!(Some("-acp".to_string()), label("-acp"));
+        assert_eq!(Some("acp".to_string()), label("acp"));
+        assert_eq!(Some("acp-tools".to_string()), label("acp-tools"));
         assert_eq!(None, external_agent_label(None));
         assert_eq!(None, external_agent_label(Some("  ".into())));
     }
