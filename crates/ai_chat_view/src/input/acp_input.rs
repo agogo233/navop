@@ -57,7 +57,7 @@ use crate::input::slash::{SlashCommandItem, SlashCompletionProvider};
 use crate::theme::{AgentChatTheme, active_agent_chat_theme, sp};
 use crate::usage::{ContextUsage, UsagePressure, format_token_count};
 
-const COMPOSER_EDITOR_MIN_ROWS: usize = 1;
+const COMPOSER_EDITOR_MIN_ROWS: usize = 3;
 const COMPOSER_EDITOR_MAX_ROWS: usize = 10;
 const COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT: f32 = 20.0;
 const COMPOSER_EDITOR_VERTICAL_PADDING: f32 = 12.0;
@@ -2221,15 +2221,6 @@ impl Render for AcpAgentInput {
         // 本地副本（Hsla 是 Copy），而不是把 `theme` 移进去。
         let drop_wash = theme.accent.opacity(0.08);
         let drop_ring = theme.accent;
-        // 聚焦反馈：卡片自己那条外框变 accent。卡片里已经没有内层描边了，
-        // 这是唯一的“现在焦点在这里”提示。`edge_to_edge` 下卡片没有外框
-        //（它嵌在别人的面板里），此时靠光标兜底。
-        let card_border = if input_focused && !self.edge_to_edge {
-            theme.accent
-        } else {
-            theme.border
-        };
-
         let card = v_flex()
             .debug_selector(|| "agent-input-card".to_string())
             .w_full()
@@ -2240,7 +2231,7 @@ impl Render for AcpAgentInput {
             .when(!self.edge_to_edge, |this| {
                 this.rounded(cx.theme().radius * 2.0)
                     .border_1()
-                    .border_color(card_border)
+                    .border_color(theme.border)
                     .shadow_sm()
             })
             .when(self.edge_to_edge, |this| this.min_h_0())
@@ -2256,7 +2247,9 @@ impl Render for AcpAgentInput {
             .when_some(queued_submissions, |this, queued| this.child(queued))
             // agent 提问：放在输入框正上方，答完才收起
             .when_some(pending_elicitation, |this, pending| this.child(pending))
-            // 中部：多行输入框。没有内层描边——卡片那条外框就是唯一的线。
+            // 中部：多行输入框。它自己带一个框——卡片那条外框颜色太淡，光靠它
+            // 看不出"该在这里打字"。与本地 agent 那份输入框同一套做法：聚焦时
+            // 这里的描边转 accent，卡片外框保持安静。
             .child(
                 div()
                     .debug_selector(|| "agent-input-editor".to_string())
@@ -2266,12 +2259,25 @@ impl Render for AcpAgentInput {
                     .pt(px(2.0))
                     .max_h(sp(220.0))
                     .child(
-                        Editor::new(&self.input_state)
+                        div()
                             .w_full()
-                            .h(editor_height)
-                            .appearance(false)
-                            .bordered(false)
-                            .text_color(theme.foreground),
+                            .min_w_0()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(if input_focused {
+                                theme.accent
+                            } else {
+                                theme.border
+                            })
+                            .bg(cx.theme().input_background())
+                            .child(
+                                Editor::new(&self.input_state)
+                                    .w_full()
+                                    .h(editor_height)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .text_color(theme.foreground),
+                            ),
                     ),
             )
             // 底部：计划 / 子代理 / 模型 / 模式 / 附件 / 发送，一整行
