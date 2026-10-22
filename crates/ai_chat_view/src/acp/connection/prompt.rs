@@ -20,9 +20,12 @@ use super::{
     connection_closed_error, new_acp_turn_id,
 };
 
+/// 启动一轮提示词失败的原因。
+///
+/// 同会话里已有轮次在飞**不在此列**：那是插话（steer），会并发入表并拿到自己的
+/// turn id（见 `a9701e307` / `1542a5eb5`）。这里只剩「连接不能开工」的几种情况。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpPromptStartError {
-    AlreadyRunning,
     NotReady,
     ImageUnsupported,
 }
@@ -30,9 +33,6 @@ pub enum AcpPromptStartError {
 impl fmt::Display for AcpPromptStartError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyRunning => {
-                write!(formatter, "{}", t!("AgentUi.acp_turn_already_running"))
-            }
             Self::NotReady => write!(formatter, "{}", t!("AgentUi.acp_not_ready")),
             Self::ImageUnsupported => {
                 write!(formatter, "{}", t!("AgentUi.acp_image_not_supported"))

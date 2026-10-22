@@ -163,10 +163,6 @@ AgentUi:
     en: "ACP Agent requests permission to run tool: %{tool}"
     zh-CN: "ACP Agent 请求执行工具：%{tool}"
     zh-HK: "ACP Agent 請求執行工具：%{tool}"
-  acp_turn_already_running:
-    en: ACP Agent already has a turn running
-    zh-CN: ACP Agent 已有一轮正在运行
-    zh-HK: ACP Agent 已有一輪正在執行
   acp_steer_sent:
     en: Message sent while a turn is running (steer); it will join the current turn
     zh-CN: 消息已插入正在进行的轮次（插话），将并入当前轮处理

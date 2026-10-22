@@ -283,8 +283,8 @@ impl AcpConnection {
     ///
     /// 与 [`claim_prompt_completion`] 的关键差别是**不产出任何终态事件**——迟到的
     /// 输出一律丢弃（视图那边已经没有对应的 owner 了）。必须做这一步，否则连接会
-    /// 一直记着「这一轮还在跑」：用户下一条消息会被 [`AcpPromptStartError::AlreadyRunning`]
-    /// 挡回来排进队列，而那一轮永远不会结束。
+    /// 一直记着「这一轮还在跑」：视图以为还有 owner 在发事件，那一轮永远不会结束，
+    /// 下一条消息也会被当成对它的插话。
     ///
     /// 返回是否真的放弃了；轮次对不上说明这一轮已经结束或已被换掉。
     pub fn abandon_active_turn(&self, turn_id: &TurnId) -> bool {

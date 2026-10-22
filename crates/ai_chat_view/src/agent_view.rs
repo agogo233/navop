@@ -457,9 +457,9 @@ fn acp_stop_action(
 
 fn submission_start_for_acp_error(error: AcpPromptStartError) -> SubmissionStart {
     match error {
-        AcpPromptStartError::AlreadyRunning | AcpPromptStartError::NotReady => {
-            SubmissionStart::RetryLater
-        }
+        // 同会话已有轮次在飞不再是错误（那是 steer 插话），能走到这里的只剩
+        // 「连接还没准备好」，退回队列等重连。
+        AcpPromptStartError::NotReady => SubmissionStart::RetryLater,
         AcpPromptStartError::ImageUnsupported => SubmissionStart::Rejected,
     }
 }
@@ -5595,8 +5595,9 @@ impl AgentChatView {
                             // 刚建好的会话要立刻出现在会话列表里：以前只有手动点刷新
                             // 或重连才会拉列表，用户会以为压根没建成。
                             this.reload_acp_sessions(cx);
-                            // 后台轮次还在飞时不推进队列：AlreadyRunning 会自己排队，
-                            // 终态后 `advance_acp_pending_after_terminal` 会补发。
+                            // 后台轮次还在飞时不推进队列：`start_next_pending` 先看
+                            // running_sessions，还在跑就直接 Blocked；终态后
+                            // `advance_acp_pending_after_terminal` 会补发。
                             this.start_next_pending(&session_uid, cx);
                         }
                         Err(err) => {
@@ -9475,10 +9476,6 @@ mod tests {
 
     #[test]
     fn acp_prompt_start_errors_have_explicit_queue_dispositions() {
-        assert_eq!(
-            SubmissionStart::RetryLater,
-            submission_start_for_acp_error(AcpPromptStartError::AlreadyRunning)
-        );
         assert_eq!(
             SubmissionStart::RetryLater,
             submission_start_for_acp_error(AcpPromptStartError::NotReady)

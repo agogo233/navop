@@ -5,8 +5,7 @@ use agent_client_protocol::schema::v1::{ContentBlock, SessionId, TextContent};
 use agent_runtime::RuntimeEvent;
 use ai_chat_view::{
     AcpAgentConfig, AcpConnectOutcome, AcpConnection, AcpConnectionPhase, AcpPermissionFuture,
-    AcpPermissionOutcome, AcpPermissionProvider, AcpPromptStartError, AcpSessionContinuity,
-    AcpTimeoutConfig,
+    AcpPermissionOutcome, AcpPermissionProvider, AcpSessionContinuity, AcpTimeoutConfig,
 };
 
 #[derive(Clone, Copy)]
@@ -298,50 +297,81 @@ async fn prompt_timeout_sends_cancel_and_returns_to_ready() {
     }
 }
 
+/// 同一协议会话在飞时，第二条提示词是**插话**，不再被 `AlreadyRunning` 拒绝。
+///
+/// 语义在 `a9701e307`（后台轮次不取消）与 `1542a5eb5`（steer 插话）里改掉了：连接层
+/// 允许同会话并发入表，相位仍归首个轮次；视图的 steer 分支据此把消息直接插进当前轮。
+/// 旧断言与代码相反，只会稳定失败。
 #[tokio::test]
-async fn a_second_prompt_is_rejected_without_emitting_a_fake_terminal_event() {
+async fn a_second_prompt_steers_the_in_flight_turn_instead_of_being_rejected() {
     let connection = ready_connection(Mode::PromptHang, Duration::from_secs(2)).await;
     let mut receiver = connection.subscribe();
     let first_turn = connection
         .try_prompt(text_prompt("first"))
         .expect("first prompt should start");
 
-    for _ in 0..2 {
-        receiver
-            .recv()
-            .await
-            .expect("turn start events should be emitted");
-    }
+    let first_start = receiver
+        .recv()
+        .await
+        .expect("turn start events should be emitted");
+    assert!(
+        matches!(first_start, RuntimeEvent::TurnStarted { ref turn_id, .. } if turn_id == &first_turn),
+        "first event should announce the first turn, got {first_start:?}"
+    );
+    let first_status = receiver
+        .recv()
+        .await
+        .expect("turn start events should be emitted");
+    assert!(
+        matches!(first_status, RuntimeEvent::Status { ref turn_id, .. } if turn_id == &first_turn),
+        "second event should be the first turn's status, got {first_status:?}"
+    );
 
-    assert_eq!(
-        Err(AcpPromptStartError::AlreadyRunning),
-        connection.try_prompt(text_prompt("second"))
+    let second_turn = connection
+        .try_prompt(text_prompt("second"))
+        .expect("a steer prompt should join the in-flight turn");
+    assert_ne!(
+        first_turn, second_turn,
+        "every prompt owns its own turn id, even when it steers into a running turn"
+    );
+
+    let second_start = receiver
+        .recv()
+        .await
+        .expect("steer must announce its own turn");
+    assert!(
+        matches!(second_start, RuntimeEvent::TurnStarted { ref turn_id, .. } if turn_id == &second_turn),
+        "steer turn must be announced with its own id, got {second_start:?}"
+    );
+    let second_status = receiver
+        .recv()
+        .await
+        .expect("steer must emit its own status");
+    assert!(
+        matches!(second_status, RuntimeEvent::Status { ref turn_id, .. } if turn_id == &second_turn),
+        "steer status must carry the steer turn id, got {second_status:?}"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), receiver.recv())
             .await
             .is_err(),
-        "rejected prompt must not emit a synthetic TurnFailed event"
+        "joining a running turn must not fabricate a terminal event for either turn"
     );
+
+    // 相位仍归首个轮次：状态机不允许 RunningTurn -> RunningTurn。
     assert_eq!(
         AcpConnectionPhase::RunningTurn {
             turn_id: first_turn.clone(),
         },
         connection.phase()
     );
+    // 两轮各自在飞：视图靠这张表决定 owner 归属与停止按钮作用域。
+    assert!(connection.turn_is_active(&first_turn));
+    assert!(connection.turn_is_active(&second_turn));
 
-    connection.cancel();
-    loop {
-        let event = receiver
-            .recv()
-            .await
-            .expect("cancelled prompt should finish normally");
-        if let RuntimeEvent::TurnCancelled { turn_id, .. } = event {
-            assert_eq!(first_turn, turn_id);
-            break;
-        }
-    }
-    tokio::task::yield_now().await;
+    // 清理不依赖 fake agent 的多轮 cancel 行为：本地放弃两轮，不产出终态事件。
+    assert!(connection.abandon_active_turn(&first_turn));
+    assert!(connection.abandon_active_turn(&second_turn));
     assert_eq!(AcpConnectionPhase::Ready, connection.phase());
 }
 
