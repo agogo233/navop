@@ -104,7 +104,7 @@ use crate::resource_display::first_visible_alias;
 use crate::session_shortcut::{NavigateSessionBack, NavigateSessionForward, ToggleSessionSwitcher};
 use crate::session_sidebar::{self, SessionRowStyle, SessionSummary};
 use crate::theme::{AgentChatTheme, resolve_agent_chat_theme, sp};
-use crate::transcript_scroll::TranscriptScrollState;
+use crate::transcript_scroll::{FOLLOW_THRESHOLD, TranscriptScrollState};
 use crate::transcript_search::TranscriptSearch;
 use crate::transcript_selection::{
     ClearTranscriptSelection, CopyTranscriptSelection, TranscriptSelectionHandle,
@@ -4085,7 +4085,7 @@ impl AgentChatView {
             if backend == Backend::Acp && is_real_terminal {
                 self.cancel_pending_acp_permissions(cx);
             }
-            if is_current_session {
+            if is_current_session && self.scroll.is_following() {
                 self.auto_scroll.request_settle();
             }
             let turn_finished = runtime_event_turn_id(&event).clone();
@@ -4110,8 +4110,9 @@ impl AgentChatView {
         }
         if is_current_session {
             self.sync_composer(cx);
-            // 跟随当前会话的流式输出 / 新卡片自动滚到底。
-            self.request_scroll_to_bottom();
+            // 跟随当前会话的流式输出 / 新卡片自动滚到底；
+            // 用户正在上翻读历史时不抢滚动位置。
+            self.follow_streaming_scroll();
         }
         if backend == Backend::Acp
             && is_real_terminal
@@ -4602,6 +4603,26 @@ impl AgentChatView {
         self.scroll.jump_to_tail();
         self.auto_scroll.request();
         self.scroll_handle.scroll_to_bottom();
+    }
+
+    /// 距底还剩多少。gpui 的 `offset` 是负的滚动位移（顶部 0、底部 `-max`），
+    /// 两者相加才是「还差多少滚到底」。
+    fn distance_from_bottom(&self) -> gpui::Pixels {
+        (self.scroll_handle.max_offset().y + self.scroll_handle.offset().y).max(gpui::px(0.0))
+    }
+
+    /// 流式输出 / 新卡片进场时的跟随滚动。
+    ///
+    /// 只有仍贴着底部（`FOLLOW_THRESHOLD` 以内）才抢滚动位置：用户上滚去读
+    /// 历史时，每一帧 token 都把他拽回底部等于没法看；等他滚回底部，下一帧
+    /// 输出自动接上跟随，不需要额外点「回到最新」。
+    fn follow_streaming_scroll(&mut self) {
+        let distance = self.distance_from_bottom();
+        if distance <= FOLLOW_THRESHOLD {
+            self.request_scroll_to_bottom();
+        } else {
+            self.scroll.on_scroll(distance);
+        }
     }
 
     fn request_scroll_to_bottom_until_layout_settles(&mut self) {
@@ -7676,7 +7697,8 @@ impl Render for AgentChatView {
         let show_scroll_to_latest = self
             .scroll
             .observe(
-                self.scroll_handle.offset().y,
+                // gpui 的 offset 是负的滚动位移，`observe` 要正数。
+                -self.scroll_handle.offset().y,
                 self.scroll_handle.max_offset().y,
             )
             .unwrap_or(false)
@@ -10263,6 +10285,93 @@ mod tests {
             view.on_sidebar_shown(cx);
             assert_eq!(5, view.auto_scroll.pending_bottom_scroll_frames);
         });
+    }
+
+    /// 流式输出跟随滚动：用户上翻读历史时，新到达的内容不抢滚动位置；
+    /// 滚回底部后，下一帧输出自动恢复跟随（不需要点「回到最新」）。
+    #[gpui::test]
+    fn streaming_follow_respects_reading_history_and_resumes_at_bottom(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .sidebar_mode(true);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            for index in 0..40 {
+                view.transcript.push_system(format!(
+                    "第 {index} 行：用于把消息列表撑到可滚动的长度。这是一段更长的内容，好让每条消息占多行高度，从而产生足够大的滚动空间。内容内容内容内容内容内容内容内容内容内容内容。"
+                ));
+            }
+            view.request_scroll_to_bottom();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (bottom, max) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_handle.offset().y,
+                view.scroll_handle.max_offset().y,
+            )
+        });
+        assert_eq!(-max, bottom, "起手应贴着底部");
+        assert!(view.read_with(cx, |view, _| view.scroll.is_following()));
+
+        let position = cx
+            .debug_bounds("ai-chat-messages")
+            .expect("消息区应已渲染")
+            .center();
+        // 手势要 Started 再 Moved：单独一条 Moved 会被当作续接而忽略。
+        for phase in [TouchPhase::Started, TouchPhase::Moved] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(600.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: phase,
+            });
+            cx.run_until_parked();
+        }
+        let reading = view.read_with(cx, |view, _| view.scroll_handle.offset().y);
+        assert!(
+            reading > bottom,
+            "上滚后位置应回退：{reading:?} vs {bottom:?}"
+        );
+        assert!(!view.read_with(cx, |view, _| view.scroll.is_following()));
+
+        // 读历史时来新内容：不许把用户拽回底部。
+        view.update(cx, |view, cx| {
+            view.transcript
+                .push_system("读历史时到达的新内容。".repeat(8));
+            view.follow_streaming_scroll();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let still_reading = view.read_with(cx, |view, _| view.scroll_handle.offset().y);
+        assert_eq!(reading, still_reading, "读历史时新内容不得抢滚动位置");
+
+        // 滚回底部后：自动恢复跟随。
+        for phase in [TouchPhase::Started, TouchPhase::Moved] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-5000.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: phase,
+            });
+            cx.run_until_parked();
+        }
+        view.update(cx, |view, cx| {
+            view.transcript
+                .push_system("回到底部后的新内容。".repeat(8));
+            view.follow_streaming_scroll();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (offset, max) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_handle.offset().y,
+                view.scroll_handle.max_offset().y,
+            )
+        });
+        assert_eq!(-max, offset, "回到底部后应重新跟随末尾");
+        assert!(view.read_with(cx, |view, _| view.scroll.is_following()));
     }
 
     #[test]
