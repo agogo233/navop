@@ -147,9 +147,10 @@ impl SyncEngine {
                     .crypto_service
                     .write()
                     .map_err(|_| SyncError::StorageError("同步服务锁获取失败".to_string()))?;
-                if !service_write.master_key_matches(&raw_key) {
+                if !service_write.master_key_pinned() && !service_write.master_key_matches(&raw_key)
+                {
                     tracing::info!("[同步引擎] 主密钥已变更，重新注入同步服务");
-                    service_write.set_master_key_directly(raw_key);
+                    service_write.set_master_key_from_local(raw_key);
                 }
             }
         }

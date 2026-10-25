@@ -433,13 +433,15 @@ fn master_key_setting_enabled(settings: &AppSettings, is_portable: bool) -> bool
 
 fn update_master_key_setting(is_portable: bool, enabled: bool, cx: &mut App) {
     let should_remember = if is_portable { enabled } else { !enabled };
-    let result = if should_remember {
-        crypto::remember_master_key_for_future_startups()
-    } else {
-        crypto::forget_persisted_master_key()
-    };
-    if let Err(error) = result {
-        // 当前没有内存主密钥时仍保留用户选择；下次成功设置或解锁后会再次尝试保存。
+    if should_remember {
+        // 系统凭据库不可用时保存必然失败：不把开关留在「已开启」，让界面如实反映
+        // 「主密钥没有被记住」。旧版固定密钥文件已停用写入，这里不做静默回退。
+        if let Err(error) = crypto::remember_master_key_for_future_startups() {
+            tracing::warn!("保存自动解锁主密钥失败，设置保持关闭: {error}");
+            return;
+        }
+    } else if let Err(error) = crypto::forget_persisted_master_key() {
+        // 删除失败不阻止用户表达意图：下次启动会再试一次
         tracing::warn!("更新自动解锁主密钥失败，设置会在后续主密钥操作时重试: {error}");
     }
 
@@ -548,11 +550,17 @@ impl SettingsPanel {
         } else {
             t!("Settings.General.Startup.require_master_key").to_string()
         };
-        let master_key_setting_description = if is_portable {
+        let mut master_key_setting_description = if is_portable {
             t!("Settings.General.Startup.remember_portable_master_key_desc").to_string()
         } else {
             t!("Settings.General.Startup.require_master_key_desc").to_string()
         };
+        if !one_core::key_storage::system_storage_supported() {
+            master_key_setting_description = format!(
+                "{master_key_setting_description} {}",
+                t!("Settings.General.Startup.system_key_storage_unavailable")
+            );
+        }
         let default_master_key_setting = master_key_setting_enabled(&default_settings, is_portable);
 
         let mut pages = vec![
@@ -4278,7 +4286,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_master_key_setting_explicitly_describes_the_recovery_risk() {
+    fn portable_master_key_setting_explicitly_describes_the_storage_boundary() {
         let source = include_str!("setting_tab.rs");
         let locales = include_str!("../locales/main.yml");
 
@@ -4287,9 +4295,11 @@ mod tests {
         let legacy_portable_override =
             ["let val = val || one_core::app_paths::", "is_portable()"].concat();
         assert!(!source.contains(&legacy_portable_override));
-        assert!(locales.contains("Anyone who obtains both the application"));
-        assert!(locales.contains("任何同时获得应用程序和完整 data 目录的人"));
-        assert!(locales.contains("任何同時取得應用程式和完整 data 目錄的人"));
+        // 记住主密钥改为系统凭据库后，文案必须说明「绑定设备/用户」与「无凭据库不保存」
+        assert!(locales.contains("system credential store"));
+        assert!(locales.contains("系统凭据库"));
+        assert!(locales.contains("系統憑證儲存庫"));
+        assert!(locales.contains("system_key_storage_unavailable"));
     }
 
     /// 切界面语言必须**叫醒已挂载的扩展页面**。

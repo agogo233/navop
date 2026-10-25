@@ -9,6 +9,8 @@
 //!   没有云端验证数据，设备间靠解密抽样判断，这里只记录本机最后一次写入的版本。
 //! - `pending_cloud_reencrypt` / `pending_cloud_wipe`：云端重加密 / 清空未完成。
 //!   网络中断时先记标记，下次同步前补做，避免把本地已经切好的密钥回滚掉。
+//! - `pending_kdf_upgrade`：验证信封已切到 Argon2id、但本地密文尚未全部重加密。
+//!   迁移顺序是先落盘新信封再轮换数据，中途退出时靠这个标记在下次解锁时补做。
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -29,6 +31,8 @@ pub struct MasterKeyMeta {
     pub pending_cloud_reencrypt: bool,
     #[serde(default)]
     pub pending_cloud_wipe: bool,
+    #[serde(default)]
+    pub pending_kdf_upgrade: bool,
 }
 
 fn default_key_version() -> u32 {
@@ -42,6 +46,7 @@ impl Default for MasterKeyMeta {
             personal_key_version: DEFAULT_KEY_VERSION,
             pending_cloud_reencrypt: false,
             pending_cloud_wipe: false,
+            pending_kdf_upgrade: false,
         }
     }
 }
@@ -68,7 +73,8 @@ pub fn load() -> MasterKeyMeta {
 /// 写入主密钥元信息
 pub fn save(meta: &MasterKeyMeta) -> Result<(), String> {
     let path = key_meta_path().ok_or_else(|| "无法获取密钥元信息路径".to_string())?;
-    let contents = serde_json::to_string(meta).map_err(|error| format!("序列化密钥元信息失败: {error}"))?;
+    let contents =
+        serde_json::to_string(meta).map_err(|error| format!("序列化密钥元信息失败: {error}"))?;
     crate::key_storage::atomic_write_file(&path, contents.as_bytes())
         .map_err(|error| format!("写入密钥元信息失败: {error}"))
 }
@@ -120,6 +126,17 @@ pub fn pending_cloud_wipe() -> bool {
     load().pending_cloud_wipe
 }
 
+/// 记录「验证信封已升级到 Argon2id，但本地密文尚未全部重加密」
+pub fn set_pending_kdf_upgrade(pending: bool) {
+    let mut meta = load();
+    meta.pending_kdf_upgrade = pending;
+    let _ = save(&meta);
+}
+
+pub fn pending_kdf_upgrade() -> bool {
+    load().pending_kdf_upgrade
+}
+
 /// 删除元信息文件：重置主密钥后本机回到全新安装状态
 pub fn clear() {
     if let Some(path) = key_meta_path() {
@@ -129,7 +146,7 @@ pub fn clear() {
 
 #[cfg(test)]
 mod tests {
-    use super::{MasterKeyMeta, DEFAULT_KEY_VERSION, load, save};
+    use super::{DEFAULT_KEY_VERSION, MasterKeyMeta, load, save};
 
     #[test]
     fn default_meta_starts_at_version_one() {
@@ -139,6 +156,7 @@ mod tests {
         assert_eq!(DEFAULT_KEY_VERSION, meta.personal_key_version);
         assert!(!meta.pending_cloud_reencrypt);
         assert!(!meta.pending_cloud_wipe);
+        assert!(!meta.pending_kdf_upgrade);
     }
 
     #[test]
@@ -148,6 +166,7 @@ mod tests {
             personal_key_version: 7,
             pending_cloud_reencrypt: true,
             pending_cloud_wipe: false,
+            pending_kdf_upgrade: true,
         };
 
         let json = serde_json::to_string(&meta).expect("serialize meta");
@@ -165,6 +184,7 @@ mod tests {
         assert_eq!(DEFAULT_KEY_VERSION, parsed.personal_key_version);
         assert!(!parsed.pending_cloud_reencrypt);
         assert!(!parsed.pending_cloud_wipe);
+        assert!(!parsed.pending_kdf_upgrade);
     }
 
     #[test]
