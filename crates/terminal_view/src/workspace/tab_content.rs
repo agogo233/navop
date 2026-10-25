@@ -5,10 +5,8 @@ use gpui::{
     Task, Window,
 };
 use gpui_component::Icon;
-use one_assets::IconName;
 use one_core::sidebar_contribution::SidebarContribution;
 use one_core::tab_container::{TabContent, TabContentEvent, TabContentView};
-use terminal::terminal::TerminalConnectionKind;
 
 use super::{TerminalWorkspace, TerminalWorkspaceEvent};
 use crate::view::TerminalView;
@@ -32,11 +30,7 @@ impl TabContent for TerminalWorkspace {
     }
 
     fn icon(&self, cx: &App) -> Option<Icon> {
-        match self.connection_kind(cx) {
-            TerminalConnectionKind::Serial => Some(IconName::SerialPort.color()),
-            TerminalConnectionKind::Telnet => Some(IconName::SquareTerminalColor.color()),
-            _ => Some(IconName::TerminalColor.color()),
-        }
+        self.active_pane().read(cx).icon(cx)
     }
 
     fn can_duplicate(&self, cx: &App) -> bool {

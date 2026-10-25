@@ -613,6 +613,171 @@ async fn list_columns_direct_on_runtime(
     .await
 }
 
+/// 并发读取 SQL 结果列来源分析涉及的所有基表列信息。
+///
+/// 返回顺序与 `tables` 一致；单表读取失败时对应位置为 `None`，不影响其它表。
+async fn load_lineage_table_columns_on_runtime(
+    cx: &mut AsyncApp,
+    global_state: GlobalDbState,
+    connection_id: String,
+    database_name: String,
+    schema_name: Option<String>,
+    tables: Vec<String>,
+) -> Vec<Option<Vec<ColumnInfo>>> {
+    let table_count = tables.len();
+    if table_count == 0 {
+        return Vec::new();
+    }
+
+    let result = Tokio::spawn_result(cx, async move {
+        Ok(futures::future::join_all(tables.into_iter().map(|table_name| {
+            let global_state = global_state.clone();
+            let connection_id = connection_id.clone();
+            let database_name = database_name.clone();
+            let schema_name = schema_name.clone();
+            async move {
+                let (database_name, schema_name, table_name) = resolve_metadata_table_identity(
+                    &global_state,
+                    &connection_id,
+                    database_name,
+                    schema_name,
+                    table_name,
+                );
+                global_state
+                    .list_columns_direct(&connection_id, &database_name, schema_name, &table_name)
+                    .await
+                    .ok()
+            }
+        }))
+        .await)
+    })
+    .await;
+
+    result.unwrap_or_else(|_| vec![None; table_count])
+}
+
+fn normalized_column_comment(comment: Option<&str>) -> Option<String> {
+    comment
+        .map(str::trim)
+        .filter(|comment| !comment.is_empty())
+        .map(str::to_string)
+}
+
+/// 按来源分析把表结构注释映射到结果列。
+///
+/// 分析不完整或展开后的列数与结果列数不一致时，退化为「列名在候选表中唯一」
+/// 的保守匹配。
+fn resolve_result_column_comments(
+    table_columns: &[Option<Vec<ColumnInfo>>],
+    lineage: &db::ResultColumnLineage,
+    result_column_names: &[String],
+) -> Vec<Option<String>> {
+    let mut resolved = Vec::new();
+    let mut aligned = lineage.complete;
+
+    for source in &lineage.columns {
+        match source {
+            db::ResultColumnSource::Refs(refs) => {
+                resolved.push(resolve_reference_comment(refs, table_columns));
+            }
+            db::ResultColumnSource::Wildcard { table } => {
+                match table_columns.get(*table).and_then(Option::as_ref) {
+                    Some(columns) => resolved.extend(
+                        columns
+                            .iter()
+                            .map(|column| normalized_column_comment(column.comment.as_deref())),
+                    ),
+                    None => aligned = false,
+                }
+            }
+            db::ResultColumnSource::Unknown => resolved.push(None),
+        }
+    }
+
+    if aligned && resolved.len() == result_column_names.len() {
+        return resolved;
+    }
+    resolve_column_comments_by_name(table_columns, result_column_names)
+}
+
+fn resolve_reference_comment(
+    refs: &[db::ColumnReference],
+    table_columns: &[Option<Vec<ColumnInfo>>],
+) -> Option<String> {
+    let mut resolved: Option<(usize, String)> = None;
+
+    for reference in refs {
+        if reference.tables.is_empty() {
+            return None;
+        }
+        let mut matches = Vec::new();
+        for &table in &reference.tables {
+            let Some(columns) = table_columns.get(table).and_then(Option::as_ref) else {
+                return None;
+            };
+            if let Some(column) = columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&reference.column))
+            {
+                matches.push((table, column));
+            }
+        }
+
+        match matches.len() {
+            0 => continue,
+            1 => {
+                let (table, column) = matches[0];
+                let identity = (table, column.name.to_ascii_lowercase());
+                match &resolved {
+                    Some(existing) if *existing != identity => return None,
+                    Some(_) => {}
+                    None => resolved = Some(identity),
+                }
+            }
+            // 多张候选表都包含该字段，无法唯一确定来源。
+            _ => return None,
+        }
+    }
+
+    let (table, name) = resolved?;
+    let columns = table_columns.get(table)?.as_ref()?;
+    let column = columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(&name))?;
+    normalized_column_comment(column.comment.as_deref())
+}
+
+fn resolve_column_comments_by_name(
+    table_columns: &[Option<Vec<ColumnInfo>>],
+    result_column_names: &[String],
+) -> Vec<Option<String>> {
+    // 任意一张表的元数据缺失时都无法排除同名冲突，宁可不显示。
+    if table_columns.iter().any(Option::is_none) {
+        return vec![None; result_column_names.len()];
+    }
+
+    result_column_names
+        .iter()
+        .map(|name| {
+            let mut matched = None;
+            let mut match_count = 0usize;
+            for columns in table_columns.iter().flatten() {
+                for column in columns {
+                    if column.name.eq_ignore_ascii_case(name) {
+                        match_count += 1;
+                        matched = Some(column);
+                    }
+                }
+            }
+            if match_count == 1 {
+                matched.and_then(|column| normalized_column_comment(column.comment.as_deref()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 async fn list_indexes_direct_on_runtime(
     cx: &mut AsyncApp,
     global_state: GlobalDbState,
@@ -2049,6 +2214,82 @@ impl DataGrid {
         .detach();
     }
 
+    /// 为 SQL 查询结果补全字段注释。
+    ///
+    /// 仅在「列头显示字段注释」打开时执行。分析结果不完整时会退化为按列名
+    /// 唯一匹配；关闭开关时不会产生任何额外元数据查询。
+    pub fn load_sql_result_column_comments(&self, cx: &mut App) {
+        if self.config.usage != DataGridUsage::SqlResult
+            || self.config.sql.is_empty()
+            || !one_ui::table_column_comment_in_header(cx)
+        {
+            return;
+        }
+
+        let global_state = cx.global::<GlobalDbState>().clone();
+        let Some(plugin) = global_state
+            .db_manager
+            .get_plugin(&self.config.database_type)
+            .ok()
+        else {
+            return;
+        };
+        let Some(lineage) = plugin.analyze_result_column_lineage(&self.config.sql) else {
+            return;
+        };
+        if lineage.tables.is_empty() {
+            return;
+        }
+
+        let result_column_names: Vec<String> = self
+            .table
+            .read(cx)
+            .delegate()
+            .column_meta()
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        if result_column_names.is_empty() {
+            return;
+        }
+
+        let connection_id = self.config.connection_id.clone();
+        let database_name = self.config.database_name.clone();
+        let schema_name = self.config.schema_name.clone();
+        let table = self.table.clone();
+        let data_generation = self.data_generation.clone();
+        let expected_generation = data_generation.load(Ordering::Acquire);
+
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            let table_columns = load_lineage_table_columns_on_runtime(
+                cx,
+                global_state,
+                connection_id,
+                database_name,
+                schema_name,
+                lineage.tables.clone(),
+            )
+            .await;
+            let comments =
+                resolve_result_column_comments(&table_columns, &lineage, &result_column_names);
+            if comments.iter().all(Option::is_none) {
+                return;
+            }
+
+            cx.update(|cx| {
+                if !data_generation_is_current(&data_generation, expected_generation) {
+                    return;
+                }
+                table.update(cx, |state, cx| {
+                    state.delegate_mut().set_column_comments(&comments);
+                    state.refresh(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     pub fn set_editable(&mut self, editable: bool, cx: &mut Context<Self>) {
         if self.config.editable == editable {
             return;
@@ -2766,6 +3007,15 @@ impl DataGrid {
         let need_authoritative_meta = self.config.database_type == DatabaseType::MySQL
             && self.config.schema_metadata_safe
             && !self.config.table_name.is_empty();
+        let comment_lineage = if one_ui::table_column_comment_in_header(cx) {
+            cx.global::<GlobalDbState>()
+                .db_manager
+                .get_plugin(&self.config.database_type)
+                .ok()
+                .and_then(|plugin| plugin.analyze_result_column_lineage(&sql))
+        } else {
+            None
+        };
 
         cx.spawn(async move |cx: &mut AsyncApp| {
             let result: Result<(SqlResult, Option<Vec<ColumnInfo>>), anyhow::Error> = async {
@@ -2810,6 +3060,25 @@ impl DataGrid {
                     }
                     let (result, column_meta) = results;
                     if let SqlResult::Query(query_result) = result {
+                        let comments = match &comment_lineage {
+                            Some(lineage) if !lineage.tables.is_empty() => {
+                                let table_columns = load_lineage_table_columns_on_runtime(
+                                    cx,
+                                    global_state.clone(),
+                                    connection_id.clone(),
+                                    database_name.clone(),
+                                    schema_name.clone(),
+                                    lineage.tables.clone(),
+                                )
+                                .await;
+                                resolve_result_column_comments(
+                                    &table_columns,
+                                    lineage,
+                                    &query_result.columns,
+                                )
+                            }
+                            _ => Vec::new(),
+                        };
                         let binary_cells = query_result.binary_cells.clone();
                         let columns: Vec<Column> = query_result
                             .columns
@@ -2851,6 +3120,9 @@ impl DataGrid {
                                     tracing::warn!(
                                         "failed to reconcile refreshed SQL result binary cells with metadata: {error}"
                                     );
+                                }
+                                if !comments.is_empty() {
+                                    state.delegate_mut().set_column_comments(&comments);
                                 }
                                 state.refresh(cx);
                             });
@@ -3591,6 +3863,7 @@ impl DataGrid {
                 transactional: true,
                 max_rows: None,
                 streaming: false,
+                reconnect_on_lost_connection: false,
             };
 
             let result = global_state
@@ -3742,6 +4015,7 @@ impl DataGrid {
                 transactional: true,
                 max_rows: None,
                 streaming: false,
+                reconnect_on_lost_connection: false,
             };
 
             let result = global_state
@@ -3937,6 +4211,7 @@ impl DataGrid {
             transactional: true,
             max_rows: None,
             streaming: false,
+            reconnect_on_lost_connection: false,
         };
 
         global_state
@@ -4957,7 +5232,7 @@ mod tests {
         DataGrid, ExportFormat, LargeTextEditorRoute, TableMetadata, build_header_order_by_clause,
         build_large_text_editor_title, collect_delete_row_indices, column_infos_from_query_meta,
         data_generation_is_current, query_result_for_export, resolve_large_text_editor_route,
-        result_set_export_exec_options, table_has_unsaved_changes,
+        resolve_result_column_comments, result_set_export_exec_options, table_has_unsaved_changes,
     };
     use crate::table_data::results_delegate::{CellChange, RowChange};
     use db::{
@@ -5007,6 +5282,172 @@ mod tests {
         assert!(!column_infos[0].is_primary_key);
         assert_eq!(column_infos[0].is_nullable, true);
         assert_eq!(column_infos[0].charset, None);
+    }
+
+    fn sample_column(name: &str, comment: Option<&str>) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: "TEXT".to_string(),
+            is_nullable: true,
+            is_primary_key: false,
+            default_value: None,
+            comment: comment.map(str::to_string),
+            charset: None,
+            collation: None,
+            is_auto_increment: false,
+        }
+    }
+
+    fn sample_lineage(
+        tables: Vec<&str>,
+        columns: Vec<db::ResultColumnSource>,
+        complete: bool,
+    ) -> db::ResultColumnLineage {
+        db::ResultColumnLineage {
+            tables: tables.into_iter().map(str::to_string).collect(),
+            columns,
+            complete,
+        }
+    }
+
+    fn reference(tables: Vec<usize>, column: &str) -> db::ResultColumnSource {
+        db::ResultColumnSource::Refs(vec![db::ColumnReference {
+            tables,
+            column: column.to_string(),
+        }])
+    }
+
+    #[test]
+    fn resolves_wildcard_comments_in_table_column_order() {
+        let table_columns = vec![Some(vec![
+            sample_column("id", Some("主键")),
+            sample_column("name", Some("名称")),
+        ])];
+        let lineage = sample_lineage(
+            vec!["users"],
+            vec![db::ResultColumnSource::Wildcard { table: 0 }],
+            true,
+        );
+
+        assert_eq!(
+            resolve_result_column_comments(
+                &table_columns,
+                &lineage,
+                &["id".to_string(), "name".to_string()]
+            ),
+            vec![Some("主键".to_string()), Some("名称".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolves_column_only_present_in_one_joined_table() {
+        let table_columns = vec![
+            Some(vec![sample_column("id", Some("用户ID"))]),
+            Some(vec![sample_column("amount", Some("金额"))]),
+        ];
+        let lineage = sample_lineage(
+            vec!["users", "orders"],
+            vec![reference(vec![0, 1], "amount")],
+            true,
+        );
+
+        assert_eq!(
+            resolve_result_column_comments(&table_columns, &lineage, &["amount".to_string()]),
+            vec![Some("金额".to_string())]
+        );
+    }
+
+    #[test]
+    fn leaves_ambiguous_column_without_comment() {
+        let table_columns = vec![
+            Some(vec![sample_column("id", Some("用户ID"))]),
+            Some(vec![sample_column("id", Some("订单ID"))]),
+        ];
+        let lineage = sample_lineage(
+            vec!["users", "orders"],
+            vec![reference(vec![0, 1], "id")],
+            true,
+        );
+
+        assert_eq!(
+            resolve_result_column_comments(&table_columns, &lineage, &["id".to_string()]),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn leaves_multi_field_expression_without_comment() {
+        let table_columns = vec![Some(vec![
+            sample_column("price", Some("单价")),
+            sample_column("qty", Some("数量")),
+        ])];
+        let lineage = sample_lineage(
+            vec!["items"],
+            vec![reference(vec![0], "price"), reference(vec![0], "qty")],
+            true,
+        );
+
+        assert_eq!(
+            resolve_result_column_comments(&table_columns, &lineage, &["total".to_string()]),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn single_field_expression_inherits_comment() {
+        let table_columns = vec![Some(vec![sample_column("name", Some("名称"))])];
+        // `name || name` 这类只引用同一个源字段的表达式继承该字段注释。
+        let source = db::ResultColumnSource::Refs(vec![
+            db::ColumnReference {
+                tables: vec![0],
+                column: "name".to_string(),
+            },
+            db::ColumnReference {
+                tables: vec![0],
+                column: "name".to_string(),
+            },
+        ]);
+        let lineage = sample_lineage(vec!["users"], vec![source], true);
+
+        assert_eq!(
+            resolve_result_column_comments(&table_columns, &lineage, &["upper".to_string()]),
+            vec![Some("名称".to_string())]
+        );
+    }
+
+    #[test]
+    fn incomplete_lineage_falls_back_to_unique_column_names() {
+        let table_columns = vec![
+            Some(vec![
+                sample_column("id", Some("用户ID")),
+                sample_column("name", Some("名称")),
+            ]),
+            Some(vec![sample_column("id", Some("订单ID"))]),
+        ];
+        let lineage = sample_lineage(vec!["users", "orders"], vec![], false);
+
+        assert_eq!(
+            resolve_result_column_comments(
+                &table_columns,
+                &lineage,
+                &["name".to_string(), "id".to_string()]
+            ),
+            vec![Some("名称".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn incomplete_lineage_with_missing_metadata_falls_back_to_no_comment() {
+        let table_columns = vec![
+            Some(vec![sample_column("name", Some("名称"))]),
+            None,
+        ];
+        let lineage = sample_lineage(vec!["users", "orders"], vec![], false);
+
+        assert_eq!(
+            resolve_result_column_comments(&table_columns, &lineage, &["name".to_string()]),
+            vec![None]
+        );
     }
 
     fn sample_export_input() -> (Vec<Vec<Option<String>>>, Vec<SharedString>, TableMetadata) {

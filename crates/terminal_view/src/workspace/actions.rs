@@ -46,13 +46,21 @@ impl TerminalWorkspace {
         let focus_subscription = cx.subscribe_in(
             &pane,
             window,
-            |this, pane, event: &TerminalPaneEvent, _window, cx| match event {
+            move |this, pane, event: &TerminalPaneEvent, window, cx| match event {
                 TerminalPaneEvent::Focused => this.activate_entity(pane.clone(), cx),
                 TerminalPaneEvent::OpenSftp(connection) => {
                     cx.emit(TerminalWorkspaceEvent::OpenSftp(connection.clone()));
                 }
                 TerminalPaneEvent::SaveAsConnection(connection) => {
                     cx.emit(TerminalWorkspaceEvent::SaveAsConnection(connection.clone()));
+                }
+                // Ctrl+D 断开后再按一次：单 pane 标签关整个标签页，多 pane 只关当前 pane。
+                TerminalPaneEvent::ClosePaneRequested => {
+                    if this.panes.len() <= 1 {
+                        cx.emit(TabContentEvent::CloseRequested);
+                    } else {
+                        this.request_close_pane(pane_id, window, cx);
+                    }
                 }
             },
         );

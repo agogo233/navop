@@ -5,6 +5,7 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
+tool_runtime = { workspace = true }
 one-assets = { workspace = true }
 anyhow.workspace = true
 agent_runtime.workspace = true

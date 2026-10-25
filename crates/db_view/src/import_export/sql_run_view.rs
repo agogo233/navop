@@ -121,6 +121,7 @@ impl SqlRunView {
             transactional: false,
             max_rows: None,
             streaming: false,
+            reconnect_on_lost_connection: false,
         }
     }
 

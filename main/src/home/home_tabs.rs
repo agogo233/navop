@@ -1403,8 +1403,9 @@ impl HomePage {
 
     pub(crate) fn add_ai_workbench_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tab_container = self.active_tab_container(cx);
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
         let (scope, catalog, mentions) =
-            ai_chat_view::build_workbench_resource_state(&self.connections);
+            ai_chat_view::build_workbench_resource_state(&self.connections, &ai_access_levels);
         window.defer(cx, move |window, cx| {
             tab_container.update(cx, |tabs, cx| {
                 if tabs.activate_pinned_tab_by_id("ai-workbench", window, cx) {

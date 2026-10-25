@@ -274,11 +274,29 @@ fn every_builtin_database_uses_its_typed_literals() {
         (DatabaseType::SQLite, "BOOLEAN", "1"),
         (DatabaseType::MSSQL, "BIT", "1"),
         (DatabaseType::Oracle, "BOOLEAN", "TRUE"),
-        (DatabaseType::ClickHouse, "Boolean", "true"),
     ];
     for (database_type, data_type, expected) in cases {
         assert_typed_insert(database_type, data_type, expected);
     }
+}
+
+#[test]
+fn clickhouse_driver_uses_clickhouse_typed_literals() {
+    // ClickHouse 已无内置原生插件,改由 clickhouse IPC 驱动提供;宿主按
+    // dialect.compatible_database_type 复用 ClickHouse 字面量格式化(布尔写作 true)。
+    let plugin = compatible_driver_plugin(DatabaseType::ClickHouse);
+    let data = vec![vec![Some("true".into())]];
+    let columns = vec!["enabled".into()];
+    let metadata = TableMetadata::new("flags")
+        .with_columns(columns.clone())
+        .with_column_meta(vec![column("enabled", "Boolean")]);
+
+    let sql = CopyFormatter::format(
+        CopyFormat::SqlInsert,
+        sql_context((&data, &columns, &metadata), &plugin),
+    );
+
+    assert!(sql.contains("VALUES\n(true);"), "{sql}");
 }
 
 #[test]

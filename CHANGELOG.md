@@ -4,6 +4,132 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [Unreleased]
+
+#### 修复与优化
+
+- 个人同步：修复引用了钥匙串凭据的连接在多设备间持续产生假冲突的问题。连接载荷里的凭据引用导出时保留了源设备的本地整数 ID，而每台设备的行号各不相同，导致同一条连接跨设备的 checksum 永不相等，被判定为「双方都改过」而反复冲突、来回覆盖。现在导出载荷统一只保留跨设备稳定的 `credential_cloud_id`，整数 ID 置零（下载时仍按云端 ID 映射回本机行号，行为不变）。
+- 首页：从标签栏「+」打开的「打开连接」列表里点一次不再新建两个 SSH 会话。此前同一行既挂了行内的打开回调，又有列表内建的点击 → `confirm` 打开路径，一次点击先后走完两条路径（已有 2 个标签时点一次直接变成 4 个）；现在点击与键盘回车统一只走 `confirm`，并补源码级回归测试守住「行渲染不得直接打开连接」（#461）。
+
+---
+
+#### Fixes and Improvements
+
+- Personal sync: fixed constantly recurring false conflicts for connections that reference keychain credentials. The exported payload kept the source device's local integer credential ID, which differs on every device, so the same logical connection never produced an equal checksum across devices and was repeatedly flagged as "modified on both sides", overwriting back and forth. Exports now carry only the device-stable `credential_cloud_id` with the integer ID zeroed (downloads still map the cloud ID back to the local row, unchanged behavior).
+- Home: clicking an entry in the “Open connection” list opened from the tab bar’s “+” no longer creates two SSH sessions. A row carried both its own open callback and the list’s built-in click → `confirm` open path, so a single click ran through both (going from 2 tabs to 4 in one click); clicks and the Enter key now share the single `confirm` path, guarded by a source-level regression test (#461).
+
+## [v0.21.1] - 2026-10-22
+
+#### 修复与优化
+
+- 连接表单：SSH、MySQL、Redis、MongoDB 表单里的「AI 访问」一行不再显示成 `ConnectionForm.ai_access` 这样的原始键名。此前四个 crate 各自拼这个 i18n 键，而语言包里只有提供该组件的 crate 定义了它，rust-i18n 查不到就把键名原样渲染出来；现在统一走 `connection_form` 的共享文案，并新增全仓契约测试守住同类漏键（同时修掉另外 16 处失效键，包括保存失败提示、文件操作、锁屏提示与 FTP 弹窗标题）。
+- 数据库：Auto（粘性）会话的空闲断连自愈改为「执行前探活」，不再在收到 `connection closed` 后重放整段脚本——同一句文案既可能表示请求没发出去，也可能表示语句已被服务端执行，重放就有重复写入的风险。现在取连接先本地判死（PostgreSQL）或有界 `ping`（MySQL 走驱动级 `COM_PING`），判死即就地重连，语句只在重连后的新连接上发出一次；服务端尚未恢复时建连上限也收紧到 10 秒，不至于每次执行都等满默认超时（#433、#447）。
+- 数据库：粘性会话与手动事务不再被后台清理强拆——页签钉住的会话挂机 30 分钟后首次执行不再报 `Session not found`，手动事务也不会被静默回滚，页签关闭时仍照常释放。
+- 设置：`settings.json` 解析失败时不再静默回落默认值、再被下一次保存全量覆盖。坏文件会先改名保留为 `settings.json.corrupt-<时间戳>` 便于定位是哪个字段解析失败，保存改为「临时文件 + rename」原子写并在覆盖前留一份 `.bak`；同时先按磁盘上的日志路径装好日志再加载设置，让解析错误真正落进日志文件。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.21.1) 下载桌面端安装包
+
+---
+
+#### Fixes and Improvements
+
+- Connection forms: the "AI Access" row in the SSH, MySQL, Redis and MongoDB forms no longer renders as a raw key such as `ConnectionForm.ai_access`. Each of those four crates assembled the i18n key by itself while only the crate that provides the widget defines it, so rust-i18n returned the key verbatim; the row now uses the shared text from `connection_form`, and a repository-wide contract test guards against the same class of miss (16 other broken keys are fixed as well, including the save-failure notice, file actions, the session lock banners and the FTP dialog titles).
+- Database: Auto (sticky) sessions now self-heal by probing the connection before running instead of replaying the batch after a `connection closed`. That single message can mean either "the request never left the client" or "the statement already ran on the server", so replaying risked duplicate writes. A pooled connection is now checked locally (PostgreSQL) or with a bounded `ping` (MySQL uses the driver-level `COM_PING`) and replaced in place when dead, so the statement goes out exactly once on the new connection; the connect timeout is also clamped to 10 seconds while the server stays down, instead of letting every run wait out the default timeout (#433, #447).
+- Database: sticky sessions and manual transactions are no longer torn down by background cleanup — a tab-pinned session idle for 30 minutes no longer fails its first run with `Session not found` and a manual transaction is not silently rolled back, while closing the tab still releases it.
+- Settings: a `settings.json` that fails to parse is no longer silently replaced by defaults and then overwritten wholesale by the next save. The bad file is renamed to `settings.json.corrupt-<timestamp>` so the offending field can be identified, saving is atomic (temp file + rename) with a `.bak` copy of the previous version, and logging is configured from the on-disk log path before settings load so the parse error actually reaches the log file.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.21.0...v0.21.1
+
+## [v0.21.0] - 2026-10-22
+
+#### 更新内容
+
+- 连接新增「AI 访问」策略（允许 / 只读 / 禁止），决定 AI 能否操作这条连接。策略分三层生效：被禁止的连接不进 AI 的资源目录、`connections.list` / `find` 也不返回；只读连接只保留读类工具；真正执行时统一复核 `connection`、`connection_id`、`target`、`session_id`，内置对话与外部 MCP 客户端共用同一道闸门，写操作直接拒绝而不是静默放宽。策略属于连接内容，随连接一起云同步，换机器后限制依然生效；侧栏徽标与右键菜单可以直接切换（#437）。
+- 扩展连接支持自定义图标：连接表单可选内置图标或本地图片，未选择时回退到扩展 manifest 声明的图标，表单与 manifest 也新增了 `Icon` 字段类型供扩展自带图标选择器。连接列表、卡片与终端标签页改用同一套解析，标签页不再一律显示通用图标——SSH 连接设置过的自定义图标现在也会出现在标签上（#438）。
+- AI 对话的模型下拉在选项超过 15 个时（例如 OpenRouter 这类聚合供应商的数百个模型）顶部出现搜索框，按供应商、模型名与提示词做不区分大小写的模糊过滤，模型名以关键字开头的排在前面；列表限高滚动，无匹配时显示空态（#405）。
+- 首页的「最近连接」分组现在可以关掉：设置 → 通用 →「连接显示」新增开关，关闭后首页只显示各分组内的连接，重启也不会再自己冒出来（#388）。
+- SQL 查询结果可以按来源补全字段注释：开启「列头显示字段注释」时，会分析查询涉及的基表、连接与别名，把源字段的注释映射到结果列；分析不完整时退化为「列名在候选表中唯一」的保守匹配，无法唯一确定就不显示，避免张冠李戴（#428）。
+- SQL 执行多了明确的运行态：发起后结果面板立即切到「运行中」并强制可见，工具栏同步显示旋转指示与「运行中...」，运行时间从执行开始就持续走动，大查询期间不会再看着像「点了没反应」。建立 Auto 会话与手动事务的建连阶段同样计入运行中，在这一阶段点取消会真正作废本次执行（#427）。
+
+#### 修复与优化
+
+- ClickHouse 改为扩展驱动（升级需先安装驱动）：内置插件已移除，连接、打开与表单统一走扩展市场的 clickhouse 驱动。历史连接记录仍然保留，但需要先安装该驱动才能打开；未安装时按 DuckDB / TDengine 的同一策略提示安装，新建入口在驱动安装后才出现（#436）。
+- 数据库：Auto（粘性）会话在空闲期被服务端或防火墙掐断后，不必再关掉连接重开。此前驱动把断连包成正常结果，断连信号只在错误时置位，编辑器于是一直复用死连接，每条语句都在几毫秒内失败。现在若整批结果都表明「语句还没发出去就已断连」，会就地替换会话的物理连接并重试一次，会话 id、页签状态与记住的 schema 都保留；中途断连（broken pipe / unexpected EOF）与手动事务不重试，避免语句被重放成重复写入（#447）。
+- 数据库：修复 Auto 模式选中 schema 后未限定表名的查询仍落在 `public`。建会话时只传了 database、没把 search_path 对齐到下拉框选中的 schema，后续执行又不会重放切换，选择形同无效；现在会话建立后先切 schema 再执行，且只在建会话时切一次，不覆盖用户手动的 `SET search_path`（#433）。
+- 数据库：结果操作（复制为 INSERT / UPDATE / DELETE）不再把表名拼成 `schema.schema.table` 导致执行报错——查询分析给出的表名本身可能已带 schema 前缀（#400）。
+- 笔记：打开外部 Markdown 文件后，文中的相对路径图片现在能正常渲染。此前编辑器创建时没有绑定文件路径，图片基准目录退回进程工作目录；现在打开即绑定绝对路径，在笔记内重命名文档时也会同步更新（#448）。
+- 设置 → MCP：「安装 Navop Skill」不再在 macOS 上以 `No such file or directory (os error 2)` 失败。从 Finder / Dock 启动的 GUI 进程只继承最小 PATH，裸调 `npx` 找不到，而 `npx` 的 shebang 还需要 `node`；现在按 PATH 加上 Homebrew、`/usr/local`、nvm / fnm / volta / asdf 等兜底目录解析启动器，并把所在目录补进子进程 PATH。MCP 运行时的要求状态改为真实探测，找不到启动器时给出可操作提示，而不是无条件显示「已就绪」（#449）。
+- 连接树分成「最近连接 / 分组 / 未分组」三段，未分组的连接不再堆在文件夹列表末尾，分区标题带计数，「最近连接」与「未分组」分区可折叠；分组同级排序统一为「自定义顺序 + 名称自然序」，修掉新建分组后层级与顺序漂移的问题。
+- 删除分组改为「提升一层」：子分组与直属连接迁移到被删分组的父级，不再凭空消失或跳到根级；右键「移动到分组」改成按层级展开的子菜单，同名分组会补上父路径，分组过多时给出提示。
+- 终端：SSH / 串口断开或 shell 已退出后，`Ctrl+D` 可以关闭当前标签页（单窗格关闭整页、分屏只关当前窗格、独立窗口关闭窗口），会话存活时 `Ctrl+D` 仍照常透传 EOF。此前该分支只判断终端类型是否支持实时输入，SSH 断开后这个值仍为 true，按键根本命中不到关闭逻辑。
+- 终端：分屏窗格的尺寸在切到其它标签再切回来时保持原比例，不再重新均分——尺寸此前只存在窗口元素缓存里，标签切走就丢了。
+- 终端：macOS 上粘贴到远程 bash 偶尔冒出 `[200~` 字面文本的问题已修复。此前按渲染帧快照判断是否用 bracketed paste 包装，而 bash 5.1+ 每次执行命令都会翻转该模式，快照滞后就会拿过期状态去包装；现在读取终端的实时模式，只有锁被解析线程占用时才回退快照（#198）。
+- 表设计器：SQL 预览与 DDL 页签可以复制 SQL，按钮移到工具栏紧邻「保存」，内容为空时置灰；两个页签的编辑器由禁用改为只读，可以直接选中片段复制，顺带修掉提示文案直接显示字面 key 的问题。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.21.0) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- Connections now carry an "AI Access" policy (Allowed / Read only / Denied) that decides whether AI may operate them. It applies in three layers: denied connections stay out of the AI resource catalog and are not returned by `connections.list` / `find`; read-only connections keep only read tools; and one guard re-checks `connection`, `connection_id`, `target` and `session_id` at execution time, shared by the built-in chat and external MCP clients, so writes are rejected outright instead of silently allowed. The policy is part of the connection, so it syncs to the cloud with the connection and still holds on another machine; the sidebar badge and context menu switch it directly (#437).
+- Extension connections support custom icons: the connection form offers built-in icons or a local image, falling back to the icon declared in the extension manifest, and forms and manifests gain an `Icon` field type so extensions can ship their own picker. Connection lists, cards and terminal tabs now share one resolution path, so tabs no longer always show the generic icon — an SSH connection's custom icon now appears on its tab as well (#438).
+- The model dropdown in AI chat shows a search box once it has more than 15 entries (OpenRouter and similar aggregators carry hundreds of models), filtering case-insensitively on provider, model name and hint and ranking model names that start with the query first; the list scrolls within a fixed height and shows an empty state when nothing matches (#405).
+- The home "Recent Connections" section can now be turned off: Settings → General → Connection display adds a switch, and with it off the home page lists only the connections inside their groups — it stays off after a restart (#388).
+- SQL results can now fill in column comments from their sources: with "show column comments in header" enabled, the query's base tables, joins and aliases are analyzed and source comments are mapped onto the result columns; when the analysis is incomplete it degrades to the conservative "column name is unique across the candidate tables" match and shows nothing rather than a comment it cannot attribute correctly (#428).
+- SQL execution now has a clear running state: the result panel switches to running and stays visible, the toolbar shows a spinner and "Running...", and the elapsed time starts ticking immediately, so a long query no longer looks like it was ignored. Establishing an Auto session or a manual transaction counts as running too, and cancelling during that phase really aborts the run (#427).
+
+#### Fixes and Improvements
+
+- ClickHouse now runs on an extension driver, and upgrading requires installing that driver: the built-in plugin is gone, so connecting, opening and forms go through the clickhouse driver from the extension market. Existing connection records are kept but need the driver installed before they can open; when it is missing the app offers to install it, following the same policy as DuckDB / TDengine, and the new-connection entry only appears once the driver is installed (#436).
+- Database: an Auto (sticky) session dropped while idle by the server or a firewall no longer requires closing and reopening the connection. The drivers report a disconnect as an ordinary result, the lost-connection signal was only raised on errors, and the editor kept reusing the dead connection so every statement failed within milliseconds. When an entire batch shows the statement never left the client, the session's physical connection is now replaced in place and the run retried once, keeping the session id, tab state and remembered schema; mid-flight disconnects (broken pipe / unexpected EOF) and manual transactions are not retried, so statements cannot be replayed into duplicate writes (#447).
+- Database: fixed unqualified queries landing in `public` even after a schema was picked in Auto mode. Session setup passed only the database and never aligned the search_path with the schema selected in the dropdown, and later runs do not replay the switch, so the choice had no effect; the schema is now switched before the run, once per session, without overriding a manual `SET search_path` (#433).
+- Database: result actions (copy as INSERT / UPDATE / DELETE) no longer build `schema.schema.table` and fail on execution — the table name coming from query analysis may already carry its schema prefix (#400).
+- Notes: images referenced by relative path now render when an external Markdown file is opened. The editor was created without a file path, so the image base directory fell back to the process working directory; it is now bound to the absolute path on open and updated when the document is renamed inside the app (#448).
+- Settings → MCP: "Install Navop Skill" no longer fails with `No such file or directory (os error 2)` on macOS. A GUI process launched from Finder or Dock inherits a minimal PATH, so a bare `npx` cannot be found — and `npx`'s shebang needs `node` — so the launcher is now resolved through PATH plus fallback directories (Homebrew, `/usr/local`, nvm / fnm / volta / asdf) and its directory is added to the child process PATH. The MCP runtime requirement status is probed for real now, with actionable guidance when the launcher is missing instead of an unconditional "ready" (#449).
+- The connection tree separates Recent connections / Groups / Unassigned, so ungrouped connections no longer pile up at the end of the folder list, and each section header shows a count, with the Recent and Unassigned sections collapsible. Sibling groups now sort consistently by custom order then natural name, fixing the hierarchy and order drifting after a new group was created.
+- Deleting a group now lifts its contents one level: child groups and direct connections move to the deleted group's parent instead of vanishing or jumping to the root. "Move to group" became a hierarchical submenu, with the parent path added to same-named groups and a hint when there are many of them.
+- Terminal: after an SSH or serial disconnect, or once the shell has exited, `Ctrl+D` closes the current tab (the whole tab for a single pane, only the focused pane in a split, and the window for a standalone terminal), while a live session still passes `Ctrl+D` through as EOF. The old branch only checked whether the terminal type accepts live input, which stays true after an SSH disconnect, so the key never reached the close logic.
+- Terminal: split pane sizes keep their proportions after switching to another tab and back instead of being reset to equal shares — the sizes only lived in the window element cache and were dropped when the tab was unmounted.
+- Terminal: pasting into a remote bash on macOS no longer occasionally leaks a literal `[200~`. The paste path used a rendering snapshot to decide whether to wrap the text in a bracketed-paste sequence, but bash 5.1+ toggles that mode around every command, so a stale snapshot wrapped when the remote had it off; the live terminal mode is now read directly, falling back to the snapshot only while the parser holds the lock (#198).
+- Table designer: the SQL preview and DDL tabs can copy their SQL, with the button moved to the toolbar next to Save and greyed out when there is nothing to copy; both editors became read-only rather than disabled so fragments can be selected, and the notice no longer displays a raw locale key.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.20.4...v0.21.0
+
+## [v0.20.4] - 2026-10-20
+
+#### 更新内容
+
+- 扩展连接新增「终端类型」：扩展只需在 `extension.json` 的 connection 贡献点里声明 `terminal`（command、args、env、title），不必再提供 provider 运行时，Navop 会直接用已保存的非敏感表单值解析模板并打开普通本地终端页签（例如 `tsh-ssh` 这类外部 CLI 工具，现在只要一个 `extension.json` 就够了）。出于安全考虑，模板参数若不以 `-` 开头，代入值也不允许以 `-` 开头，避免被同步或共享过来的连接数据注入命令行选项；空的可选参数与环境变量会被丢弃，控制字符一律拒绝。
+- 这类终端页签使用固定标题、支持复制，子进程退出后按回车即可重新启动。扩展连接表单对终端类型隐藏「测试」按钮。
+
+#### 修复与优化
+
+- Redis 集群：单键命令打到非所属 master 时自动按 `MOVED` 重定向到正确节点并重试一次（`GET` / `SET` / `DEL` / `EXPIRE` / `PERSIST` / `RENAME` / `HSET` / `HDEL` / `LPUSH` / `RPUSH` / `LSET` / `SADD` / `SREM` / `ZADD` / `ZREM` 以及键详情查看）。控制台里的原始命令仍保持直连，避免写命令被重放（#414 后续反馈）。
+- Redis：点刷新已加载的数据库不再闪退（#424）。行右侧的加载中 / 错误图标是条件插入的子元素，会让同排文本容器的布局序号漂移，导致布局测量缓存未命中并在预绘制阶段直接崩溃；现在这些容器使用稳定 ID。
+- 数据库：修复执行 SQL 成功后进程崩溃。缓存失效最终会走 `tokio::fs` 删目录，需要在 Tokio 运行时内轮询；此前它在前台任务里直接等待，release 构建（`panic = "abort"`）下只要有一条 DDL 成功就整进程退出。
+- 云同步：修复每次同步后连接总是掉回根目录、需要手动重新分组的问题。云端记录按更新时间倒序下发，连接常常先于所属分组落地而被写到根目录；收尾阶段新增连接层级对齐，在本地未被改动时把连接归位到云端所属分组。
+- 开发构建：debug 构建默认使用独立数据目录 `~/.navop-dev`，不再污染已安装的正式实例；`--data-dir`、`--portable`、`NAVOP_DATA_DIR`、`NAVOP_PORTABLE` 仍优先级更高。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.20.4) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- Extension connections can now declare a terminal instead of a provider runtime: a connection contribution in `extension.json` may specify `terminal` (command, args, env, title), and Navop resolves the templates against the saved non-secret form values and opens a regular local terminal tab — external CLI tools such as `tsh-ssh` need nothing but an `extension.json`. As a safety guard, an argument whose template does not start with `-` is rejected when the substituted value does, so shared or synced connection data cannot inject command-line options; empty optional arguments and env entries are dropped, and control characters are rejected.
+- Those terminal tabs get a fixed tab title, can be duplicated, and restart on Enter after the child process exits. The connection form hides its Test button for terminal connections.
+
+#### Fixes and Improvements
+
+- Redis cluster: single-key commands sent to a master that does not own the key now follow the `MOVED` redirection to the right node and retry once (`GET` / `SET` / `DEL` / `EXPIRE` / `PERSIST` / `RENAME` / `HSET` / `HDEL` / `LPUSH` / `RPUSH` / `LSET` / `SADD` / `SREM` / `ZADD` / `ZREM`, plus key detail lookup). Raw commands typed in the console stay direct so write commands are never replayed (#414 follow-up).
+- Redis: refreshing a loaded database no longer crashes (#424). The conditionally inserted loading / error icons shifted the layout index of the sibling text containers, so the measurement cache missed and prepaint crashed; those containers now carry stable IDs.
+- Database: fixed a process crash after a successful SQL execution. Cache invalidation eventually removes directories through `tokio::fs`, which must be polled inside the Tokio runtime; it used to be awaited from the foreground task, so with release builds (`panic = "abort"`) a single successful DDL terminated the whole process.
+- Cloud sync: fixed connections falling back to the root folder after every sync, which forced a manual regroup. Cloud records arrive in reverse update order, so a connection often lands before its group exists and gets written to the root; the finalize pass now re-aligns connections to their cloud group whenever the local copy was untouched.
+- Development builds: debug builds now default to an isolated data directory (`~/.navop-dev`) instead of polluting an installed release instance; `--data-dir`, `--portable`, `NAVOP_DATA_DIR` and `NAVOP_PORTABLE` still take precedence.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.20.3...v0.20.4
+
 ## [v0.20.3] - 2026-10-19
 
 #### 更新内容

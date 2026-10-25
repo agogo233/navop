@@ -41,6 +41,7 @@ use gpui_component::input::{
 };
 use gpui_component::notification::Notification;
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use gpui_component::spinner::Spinner;
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IndexPath, Sizable, Size, WindowExt, h_flex, v_flex,
 };
@@ -1240,6 +1241,14 @@ fn query_toolbar_action(is_executing: bool, has_selection: bool) -> QueryToolbar
     } else {
         QueryToolbarAction::Run
     }
+}
+
+/// 结果面板是否渲染。
+///
+/// 执行中必须渲染：面板里才有加载指示与实时运行时间，否则大查询期间界面上
+/// 没有任何反馈，会被误认为执行没有生效。其余情况沿用“有结果且用户未隐藏”。
+fn result_panel_visible(has_results: bool, is_visible: bool, is_executing: bool) -> bool {
+    is_executing || (has_results && is_visible)
 }
 
 /// 提交 / 回滚按钮的 loading 只属于正在收尾的那个动作：另一个按钮保持
@@ -3556,6 +3565,10 @@ impl SqlEditorTab {
         }
         let generation = self.auto_session_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.auto_session_starting = true;
+        // 建会话阶段也计入运行中：首次连接可能耗时数秒。
+        let pending_run = self
+            .sql_result_tab_container
+            .update(cx, |container, cx| container.begin_run_pending(cx));
         cx.notify();
 
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -3573,6 +3586,9 @@ impl SqlEditorTab {
                     Err(error) => {
                         let is_current = entity
                             .update(cx, |this, cx| {
+                                this.sql_result_tab_container.update(cx, |container, cx| {
+                                    container.end_run_pending(pending_run, cx);
+                                });
                                 if transaction_generation.load(Ordering::SeqCst) != generation {
                                     return false;
                                 }
@@ -3597,6 +3613,9 @@ impl SqlEditorTab {
                 || context_generation_guard.load(Ordering::SeqCst) != context_generation
             {
                 let _ = entity.update(cx, |this, cx| {
+                    this.sql_result_tab_container.update(cx, |container, cx| {
+                        container.end_run_pending(pending_run, cx);
+                    });
                     if transaction_generation.load(Ordering::SeqCst) == generation
                         && this.auto_session_starting
                     {
@@ -3607,6 +3626,44 @@ impl SqlEditorTab {
                 });
                 if let Err(error) = global_state.close_session(cx, session_id).await {
                     error!("Failed to close stale auto session: {:?}", error);
+                }
+                return;
+            }
+
+            // 粘性会话是跨语句复用的同一条物理连接：执行语句本身不会重放
+            // `SET search_path`，所以建会话后必须先把 schema 对齐到编辑器当前
+            // 选择，否则未限定表名的查询永远落在服务端默认 schema（通常是
+            // public）——issue #433。
+            if let Err(error) =
+                Self::prepare_auto_session(&global_state, &session_id, scope.schema.as_deref(), cx)
+                    .await
+            {
+                if let Err(close_error) = global_state.close_session(cx, session_id).await {
+                    error!("Failed to close unprepared auto session: {:?}", close_error);
+                }
+                let is_current = entity
+                    .update(cx, |this, cx| {
+                        this.sql_result_tab_container.update(cx, |container, cx| {
+                            container.end_run_pending(pending_run, cx);
+                        });
+                        if transaction_generation.load(Ordering::SeqCst) != generation
+                            || context_generation_guard.load(Ordering::SeqCst) != context_generation
+                            || !this.auto_session_starting
+                        {
+                            return false;
+                        }
+                        this.auto_session_starting = false;
+                        this.finalize_execution_marker(SqlGutterMarkerState::Failed, cx);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if is_current {
+                    Self::notify_async(
+                        cx,
+                        t!("Query.auto_session_start_failed", error = error.to_string())
+                            .to_string(),
+                    );
                 }
                 return;
             }
@@ -3647,6 +3704,9 @@ impl SqlEditorTab {
                 .unwrap_or(false);
             if !installed {
                 let _ = entity.update(cx, |this, cx| {
+                    this.sql_result_tab_container.update(cx, |container, cx| {
+                        container.end_run_pending(pending_run, cx);
+                    });
                     if transaction_generation.load(Ordering::SeqCst) == generation
                         && this.auto_session_starting
                     {
@@ -3769,6 +3829,10 @@ impl SqlEditorTab {
         let context_generation_guard = self.context_generation.clone();
         self.manual_transaction_starting = true;
         self.manual_transaction_finishing = None;
+        // 建事务会话阶段也计入运行中：首次连接可能耗时数秒。
+        let pending_run = self
+            .sql_result_tab_container
+            .update(cx, |container, cx| container.begin_run_pending(cx));
         cx.notify();
 
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -3784,6 +3848,9 @@ impl SqlEditorTab {
                 Err(error) => {
                     let is_current = entity
                         .update(cx, |this, cx| {
+                            this.sql_result_tab_container.update(cx, |container, cx| {
+                                container.end_run_pending(pending_run, cx);
+                            });
                             if transaction_generation.load(Ordering::SeqCst) != generation {
                                 return false;
                             }
@@ -3808,6 +3875,9 @@ impl SqlEditorTab {
                 || context_generation_guard.load(Ordering::SeqCst) != context_generation
             {
                 let _ = entity.update(cx, |this, cx| {
+                    this.sql_result_tab_container.update(cx, |container, cx| {
+                        container.end_run_pending(pending_run, cx);
+                    });
                     if is_current_manual_transaction_start(
                         generation,
                         transaction_generation.load(Ordering::SeqCst),
@@ -3843,6 +3913,9 @@ impl SqlEditorTab {
                 }
                 let is_current = entity
                     .update(cx, |this, cx| {
+                        this.sql_result_tab_container.update(cx, |container, cx| {
+                            container.end_run_pending(pending_run, cx);
+                        });
                         if !is_current_manual_transaction_start(
                             generation,
                             transaction_generation.load(Ordering::SeqCst),
@@ -3899,6 +3972,9 @@ impl SqlEditorTab {
                 Self::notify_async(cx, t!("Query.transaction_started").to_string());
             } else {
                 let _ = entity.update(cx, |this, cx| {
+                    this.sql_result_tab_container.update(cx, |container, cx| {
+                        container.end_run_pending(pending_run, cx);
+                    });
                     if is_current_manual_transaction_start(
                         generation,
                         transaction_generation.load(Ordering::SeqCst),
@@ -3918,6 +3994,33 @@ impl SqlEditorTab {
             }
         })
         .detach();
+    }
+
+    /// 建好粘性会话后先把服务端 schema 对齐到编辑器当前选择。
+    ///
+    /// 粘性会话复用的是同一条物理连接，`SET search_path` 之类的会话级设置会
+    /// 一直保留；而 `execute_session` 只发 SQL 本身，不会重放 schema 切换。
+    /// 因此这里不切 schema，未限定表名的查询就会落在服务端默认 schema（通常
+    /// 是 public），与下拉框选中的 schema 无关——issue #433。
+    ///
+    /// 只切一次而不是每条语句都切：用户手动 `SET search_path` 后应能继续按自己
+    /// 的设定执行，切换 schema 走的是丢弃会话重建（见 `auto_session_action_for`）。
+    async fn prepare_auto_session(
+        global_state: &GlobalDbState,
+        session_id: &str,
+        schema: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<()> {
+        let Some(schema) = schema.map(str::to_string) else {
+            // 该驱动不区分 schema（如 MySQL / SQLite），无需切换。
+            return Ok(());
+        };
+        let global_state = global_state.clone();
+        let session_id = session_id.to_string();
+        Tokio::spawn_result(cx, async move {
+            global_state.switch_session_schema(session_id, schema).await
+        })
+        .await
     }
 
     async fn prepare_manual_transaction_session(
@@ -4077,7 +4180,12 @@ impl SqlEditorTab {
                 let pending = std::mem::take(&mut *session.pending_invalidation.lock());
                 if let Some(cache) = cache {
                     let scopes = global_state
-                        .apply_sql_cache_invalidation_plan(&cache, &connection_id, &pending)
+                        .apply_sql_cache_invalidation_plan_on_runtime(
+                            cx,
+                            cache,
+                            connection_id.clone(),
+                            pending,
+                        )
                         .await;
                     emit_invalidation_events(cx, notifier.as_ref(), &connection_id, scopes);
                 }
@@ -4146,6 +4254,14 @@ impl SqlEditorTab {
         let cancelled = self
             .sql_result_tab_container
             .update(cx, |container, cx| container.cancel_execution(cx));
+        // Auto 粘性会话的建立阶段还没有已安装会话，取消键必须显式作废这次建立，
+        // 否则被停下的查询仍会在会话就绪后照常执行。
+        if cancelled && self.auto_session_starting {
+            self.auto_session_generation.fetch_add(1, Ordering::SeqCst);
+            self.auto_session_starting = false;
+            self.finalize_execution_marker(SqlGutterMarkerState::Cancelled, cx);
+            cx.notify();
+        }
         match manual_transaction_stop_action(
             cancelled,
             self.manual_transaction_starting,
@@ -4189,7 +4305,12 @@ impl SqlEditorTab {
                             schema.as_deref(),
                         );
                         let scopes = global_state
-                            .apply_sql_cache_invalidation_plan(&cache, &connection_id, &plan)
+                            .apply_sql_cache_invalidation_plan_on_runtime(
+                                cx,
+                                cache,
+                                connection_id.clone(),
+                                plan,
+                            )
                             .await;
                         emit_invalidation_events(cx, notifier.as_ref(), &connection_id, scopes);
                     }
@@ -4730,6 +4851,8 @@ impl SqlEditorTab {
         // Check if there are any results and if the panel is visible
         let has_results = self.sql_result_tab_container.read(cx).has_results(cx);
         let results_visible = self.sql_result_tab_container.read(cx).is_visible(cx);
+        let is_query_executing = self.sql_result_tab_container.read(cx).is_executing(cx);
+        let results_hidden = !result_panel_visible(has_results, results_visible, is_query_executing);
 
         v_flex()
             .size_full()
@@ -4746,7 +4869,7 @@ impl SqlEditorTab {
                             .key_context(SQL_EDITOR_CONTEXT)
                             .child(editor.clone()),
                     )
-                    .when(has_results && !results_visible, |this| {
+                    .when(has_results && results_hidden, |this| {
                         this.child(
                             h_flex().w_full().justify_end().child(
                                 Button::new("show-results")
@@ -4836,6 +4959,26 @@ impl SqlEditorTab {
                     cx.listener(Self::handle_run_query),
                     cx,
                 ),
+            })
+            // 运行中在工具栏上同步给出反馈：查询数据量大时面板可能被挤得很窄，
+            // 仅靠面板内的加载态不足以说明“执行已提交”。这里刻意不读
+            // `total_elapsed_ms`，避免编辑器（含 SQL 输入）被计时器每 100ms
+            // 重绘一次；实时耗时由结果面板内的“运行时间”滚动展示。
+            .when(toolbar_action == QueryToolbarAction::Stop, |toolbar| {
+                toolbar.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .px_1()
+                        .flex_shrink_0()
+                        .child(Spinner::new().with_size(Size::XSmall))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t!("Query.running").to_string()),
+                        ),
+                )
             })
             .child(Self::query_toolbar_button(
                 QueryToolbarButtonSpec {
@@ -5049,6 +5192,7 @@ impl Render for SqlEditorTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_results = self.sql_result_tab_container.read(cx).has_results(cx);
         let results_visible = self.sql_result_tab_container.read(cx).is_visible(cx);
+        let is_query_executing = self.sql_result_tab_container.read(cx).is_executing(cx);
         let view = cx.entity().clone();
 
         let mut div = v_flex()
@@ -5058,7 +5202,7 @@ impl Render for SqlEditorTab {
             .on_action(cx.listener(Self::handle_run_selected_sql_action))
             .on_action(cx.listener(Self::handle_run_cursor_statement_sql_action))
             .on_action(cx.listener(Self::handle_toggle_line_comment_action));
-        if has_results && results_visible {
+        if result_panel_visible(has_results, results_visible, is_query_executing) {
             div = div
                 .child(self.render_has_results(window, cx))
                 .child(ResizeEventHandler { view });
@@ -5301,7 +5445,8 @@ mod tests {
         manual_transaction_invalidation_mode, manual_transaction_stop_action,
         match_sql_to_statement_marker, metadata_scope_selection, preferred_default_database,
         query_connection_context_label, query_connection_ids, query_file_path_for_name,
-        query_toolbar_action, schema_changed_event_matches_scope, should_render_schema_select,
+        query_toolbar_action, result_panel_visible, schema_changed_event_matches_scope,
+        should_render_schema_select,
         sql_text_for_run_all, sql_text_for_toolbar_run, statement_for_gutter_marker,
         statement_marker_id, supports_manual_transactions, toggle_line_comment_defaults,
         toggle_sql_line_comments, transaction_action_loading, transaction_liveness,
@@ -5731,6 +5876,112 @@ mod tests {
     fn a_running_query_cannot_be_superseded_by_another_editor_action() {
         assert!(can_start_query_execution(false));
         assert!(!can_start_query_execution(true));
+    }
+
+    #[test]
+    fn executing_query_keeps_the_result_panel_visible() {
+        // 执行中即使还没有结果、用户此前关过面板，也必须渲染面板，
+        // 否则大查询期间界面上没有任何执行指示。
+        assert!(result_panel_visible(false, false, true));
+        assert!(result_panel_visible(true, true, true));
+        // 非执行态沿用“有结果且用户未隐藏”。
+        assert!(result_panel_visible(true, true, false));
+        assert!(!result_panel_visible(false, true, false));
+        assert!(!result_panel_visible(true, false, false));
+    }
+
+    /// 建会话阶段的运行指示必须有始有终：发起处启动，所有中断分支收尾，
+    /// 否则指示器会永远卡在“运行中”。
+    #[test]
+    fn session_start_run_feedback_is_started_and_always_ended() {
+        // 只看生产代码：本测试自身的字符串字面量也会被 matches 统计到。
+        let source = include_str!("sql_editor_view.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+
+        assert_eq!(
+            2,
+            production.matches("container.begin_run_pending(cx)").count(),
+            "Auto 与 Manual 两条建会话路径都要进入运行态"
+        );
+
+        for entry in [
+            "fn start_auto_session_and_run",
+            "fn start_manual_transaction_and_run",
+        ] {
+            let body = production
+                .split(entry)
+                .nth(1)
+                .unwrap()
+                .split("\n    fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("container.begin_run_pending(cx)"),
+                "{entry} 必须在建会话前启动运行指示"
+            );
+            assert!(
+                body.contains("container.end_run_pending(pending_run, cx)"),
+                "{entry} 的中断分支必须收尾运行指示"
+            );
+        }
+
+        assert_eq!(
+            8,
+            production
+                .matches("container.end_run_pending(pending_run, cx)")
+                .count(),
+            "建会话失败/过期/未安装/未对齐 schema 共 8 个分支都要收尾运行指示"
+        );
+    }
+
+    /// issue #433：Auto 粘性会话复用同一条物理连接，`execute_session` 不会重放
+    /// `SET search_path`。两条建会话路径都必须在执行 SQL 之前把 schema 对齐到
+    /// 编辑器当前选择，否则未限定表名的查询会一直落在服务端默认 schema。
+    #[test]
+    fn session_start_aligns_schema_before_running_sql() {
+        let source = include_str!("sql_editor_view.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+
+        for (entry, prepare_call, run_call) in [
+            (
+                "fn start_auto_session_and_run",
+                "Self::prepare_auto_session(",
+                "Self::run_session_sql(",
+            ),
+            (
+                "fn start_manual_transaction_and_run",
+                "Self::prepare_manual_transaction_session(",
+                "this.run_manual_sql_on_session(",
+            ),
+        ] {
+            let body = production
+                .split(entry)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{entry} 必须存在"))
+                .split("\n    fn ")
+                .next()
+                .unwrap();
+            let prepare_at = body
+                .find(prepare_call)
+                .unwrap_or_else(|| panic!("{entry} 建会话后必须对齐 schema"));
+            let run_at = body
+                .find(run_call)
+                .unwrap_or_else(|| panic!("{entry} 必须执行 SQL"));
+            assert!(prepare_at < run_at, "{entry} 必须先对齐 schema 再执行 SQL");
+        }
+
+        // 对齐动作本身必须真的切 schema，而不是只留一个空壳准备步骤。
+        let helper = production
+            .split("async fn prepare_auto_session(")
+            .nth(1)
+            .expect("prepare_auto_session 必须存在")
+            .split("\n    async fn ")
+            .next()
+            .unwrap();
+        assert!(
+            helper.contains("switch_session_schema("),
+            "prepare_auto_session 必须切换会话 schema"
+        );
     }
 
     #[test]

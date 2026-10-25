@@ -191,7 +191,7 @@ impl HomePage {
     }
 }
 
-fn sort_workspaces(workspaces: &mut [Workspace]) {
+pub(super) fn sort_workspaces(workspaces: &mut [Workspace]) {
     workspaces.sort_by(|left, right| {
         left.sort_order
             .cmp(&right.sort_order)

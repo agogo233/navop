@@ -1,3 +1,4 @@
+use super::data::sort_workspaces;
 use super::*;
 
 impl HomePage {
@@ -113,9 +114,9 @@ impl HomePage {
                         );
                     } else {
                         this.workspaces.push(workspace);
-                        this.workspaces.sort_by(|left, right| {
-                            crate::connection_sort::connection_name_cmp(&left.name, &right.name)
-                        });
+                        // 与 `load_workspaces` 复用同一套排序，保证展开后的同级顺序
+                        // 和重新加载后读到的 DB `sort_order` 顺序一致。
+                        sort_workspaces(&mut this.workspaces);
                         emit_connection_event(
                             ConnectionDataEvent::WorkspaceCreated { workspace_id },
                             cx,
@@ -232,7 +233,11 @@ impl HomePage {
             match result {
                 Ok(_) => {
                     _ = this.update(cx, |this, cx| {
-                        this.workspaces.retain(|w| w.id != Some(workspace_id));
+                        promote_workspace_children_in_memory(
+                            &mut this.workspaces,
+                            &mut this.connections,
+                            workspace_id,
+                        );
                         this.filtered_workspace_ids.remove(&workspace_id);
                         if let Some(cloud_id) = &cloud_id {
                             // 本地分组没了，遗留的冲突也就解不开了，删除时一并丢掉。
@@ -265,4 +270,31 @@ impl HomePage {
         })
         .detach();
     }
+}
+
+/// 把 `workspace_id` 的子分组和直属连接提升到它的父级，并移除该分组。
+///
+/// 与 `WorkspaceRepository::delete` 的 SQL 迁移保持一致，避免内存里的树出现
+/// "连接消失、子分组跳到根级"。根分组被删时提升到的父级为 `None`。
+pub(super) fn promote_workspace_children_in_memory(
+    workspaces: &mut Vec<Workspace>,
+    connections: &mut [StoredConnection],
+    workspace_id: i64,
+) -> Option<i64> {
+    let parent_id = workspaces
+        .iter()
+        .find(|workspace| workspace.id == Some(workspace_id))
+        .and_then(|workspace| workspace.parent_id);
+    for workspace in workspaces.iter_mut() {
+        if workspace.parent_id == Some(workspace_id) {
+            workspace.parent_id = parent_id;
+        }
+    }
+    for connection in connections.iter_mut() {
+        if connection.workspace_id == Some(workspace_id) {
+            connection.workspace_id = parent_id;
+        }
+    }
+    workspaces.retain(|workspace| workspace.id != Some(workspace_id));
+    parent_id
 }

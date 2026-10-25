@@ -14,6 +14,7 @@ use crate::plugin_manifest::{
     DatabaseCapabilities, DatabaseUiCapabilities, DatabaseUiManifest, FormSelectOption,
     ReferenceDataKind,
 };
+use crate::result_column_lineage::ResultColumnLineage;
 use crate::streaming_parser::StreamingSqlParser;
 use crate::types::*;
 use anyhow::{Error, Result, anyhow, bail};
@@ -632,6 +633,12 @@ pub trait DatabasePlugin: Send + Sync {
             table_name,
             schema_metadata_safe: false,
         }
+    }
+
+    /// Analyze result-column lineage so callers can enrich column comments
+    /// after executing a SELECT query.
+    fn analyze_result_column_lineage(&self, sql: &str) -> Option<ResultColumnLineage> {
+        crate::result_column_lineage::analyze_sql_lineage(self.sql_dialect().as_ref(), sql)
     }
 
     /// Check if a SELECT query might be editable.
@@ -2453,7 +2460,15 @@ pub trait DatabasePlugin: Send + Sync {
     }
 
     /// Format table name for copy SQL (with optional schema)
+    ///
+    /// SQL 结果网格里的表名来自查询分析（见 `direct_table_identity`），可能是
+    /// `schema.table` 拼接形式。这类限定名自带前缀，再拼一次 schema 会得到
+    /// `schema.schema.table` 这种重复引用（issue #400），所以限定名按段引用后
+    /// 直接使用；裸表名才拼 schema 前缀。
     fn format_copy_table_name(&self, schema: Option<&str>, table: &str) -> String {
+        if qualified_table_parts(table).is_some() {
+            return self.quote_qualified_table_name(table);
+        }
         let quoted_table = self.quote_identifier(table);
         match schema {
             Some(s) if !s.is_empty() => {
@@ -4789,5 +4804,49 @@ mod tests {
                 "orders".to_string()
             )
         );
+    }
+
+    /// 结果操作生成 SQL 时，查询分析给出的表名可能是 `schema.table` 拼接形式，
+    /// 再拼 schema 会得到 `schema.schema.table` 重复引用（issue #400）。
+    #[test]
+    fn copy_sql_qualified_table_name_is_not_prefixed_twice() {
+        let plugin = crate::postgresql::PostgresPlugin::new();
+        let request = CopySqlRequest {
+            schema: Some("ads".to_string()),
+            table: "ads.ads_tb_x".to_string(),
+            ..sample_copy_sql_request()
+        };
+        let sql = plugin.generate_copy_insert_sql(&request);
+        assert!(
+            sql.contains(r#""ads"."ads_tb_x""#),
+            "限定表名应按段引用且不重复拼 schema：{sql}"
+        );
+        assert!(
+            !sql.contains(r#""ads"."ads.ads_tb_x""#),
+            "不应出现重复 schema 引用：{sql}"
+        );
+    }
+
+    /// 裸表名仍保留 schema 前缀语义，回归保护。
+    #[test]
+    fn copy_sql_bare_table_name_keeps_schema_prefix() {
+        let plugin = crate::postgresql::PostgresPlugin::new();
+        let request = CopySqlRequest {
+            schema: Some("ads".to_string()),
+            table: "ads_tb_x".to_string(),
+            ..sample_copy_sql_request()
+        };
+        let sql = plugin.generate_copy_insert_sql(&request);
+        assert!(
+            sql.contains(r#""ads"."ads_tb_x""#),
+            "裸表名应拼上 schema 前缀：{sql}"
+        );
+    }
+
+    fn sample_copy_sql_request() -> CopySqlRequest {
+        use crate::TableCellValue;
+        CopySqlRequest::new("ads.ads_tb_x", vec![])
+            .with_typed_rows(vec![vec![TableCellValue::Text("1".to_string())]])
+            .with_column_names(vec!["id".to_string()])
     }
 }

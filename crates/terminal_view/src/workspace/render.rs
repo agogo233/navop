@@ -17,7 +17,7 @@ const TERMINAL_PANE_MIN_WIDTH: Pixels = px(240.0);
 const TERMINAL_PANE_MIN_HEIGHT: Pixels = px(160.0);
 impl TerminalWorkspace {
     pub(super) fn render_node(
-        &self,
+        &mut self,
         node: &TerminalSplitNode,
         path: &str,
         cx: &mut Context<Self>,
@@ -31,11 +31,19 @@ impl TerminalWorkspace {
             } => {
                 let id =
                     SharedString::from(format!("terminal-split-group-{}-{path}", split_id.value()));
-                let mut group = if *axis == Axis::Horizontal {
+                // 尺寸由工作区自己持有,不依赖窗口的元素缓存:否则切标签页后
+                // 元素被卸载,再切回来窗格尺寸会退回默认均分。
+                let state = self.split_sizing.state(
+                    *split_id,
+                    children.iter().map(TerminalSplitNode::child_id).collect(),
+                    cx,
+                );
+                let mut group = (if *axis == Axis::Horizontal {
                     h_resizable(id)
                 } else {
                     v_resizable(id)
-                };
+                })
+                .with_state(&state);
                 for (index, child) in children.iter().enumerate() {
                     let child_path = format!("{path}-{index}");
                     let min_size = if *axis == Axis::Horizontal {

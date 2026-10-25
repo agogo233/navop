@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use gpui::{
     AnyElement, AppContext, Context, Entity, EventEmitter, Hsla, InteractiveElement, IntoElement,
     ParentElement, Pixels, Styled, UniformListScrollHandle, Window, deferred, div, hsla, px,
@@ -117,10 +119,51 @@ pub(crate) struct PersistentConnectionSidebar {
     /// 避免在 HomePage 自身 render 租约内 read(home_page) 造成重入。
     home_embedded: bool,
     home_navigation_layout: bool,
+    /// 连接级 AI 访问策略缓存（issue #437）：侧栏行徽标用。
+    /// 只缓存「非默认」的级别，缺省即 `Allowed`。
+    pub(super) ai_access_levels: HashMap<i64, tool_runtime::AiAccessLevel>,
 }
 
 pub(crate) enum PersistentConnectionSidebarEvent {
     TreeVisibilityChanged { expanded: bool },
+}
+
+impl PersistentConnectionSidebar {
+    /// 批量读取连接级 AI 访问策略（只含「非默认」的项）。
+    fn refresh_ai_access_levels(&mut self, cx: &mut Context<Self>) {
+        self.ai_access_levels = load_ai_access_levels(cx);
+    }
+}
+
+/// 批量读取所有「非默认」的 AI 访问策略；存储不可用时返回空表（等价全部允许）。
+fn load_ai_access_levels(cx: &gpui::App) -> HashMap<i64, tool_runtime::AiAccessLevel> {
+    let Some(storage) = cx
+        .try_global::<one_core::storage::GlobalStorageState>()
+        .map(|state| state.storage.clone())
+    else {
+        return HashMap::new();
+    };
+    storage
+        .get::<one_core::storage::ConnectionRepository>()
+        .and_then(|repo| repo.ai_access_levels().ok())
+        .unwrap_or_default()
+}
+
+/// 读取单条连接的 AI 访问级别（右键菜单用，顺带避开可能过期的缓存）。
+pub(super) fn load_ai_access_level(
+    connection_id: i64,
+    cx: &gpui::App,
+) -> tool_runtime::AiAccessLevel {
+    let Some(storage) = cx
+        .try_global::<one_core::storage::GlobalStorageState>()
+        .map(|state| state.storage.clone())
+    else {
+        return tool_runtime::AiAccessLevel::default();
+    };
+    storage
+        .get::<one_core::storage::ConnectionRepository>()
+        .and_then(|repo| repo.ai_access_level(connection_id).ok())
+        .unwrap_or_default()
 }
 
 impl EventEmitter<PersistentConnectionSidebarEvent> for PersistentConnectionSidebar {}
@@ -205,7 +248,12 @@ impl PersistentConnectionSidebar {
     ) -> Self {
         // 主页任何状态变化（搜索词、类型筛选、批量选择、数据刷新）都需要重绘树；
         // 批量选择的失效裁剪由 HomePage::prune_connection_selection 在数据加载时完成。
-        cx.observe(&home_page, |_, _, cx| cx.notify()).detach();
+        // 保存/右键切换后都靠这次重读刷新徽标（连接列表数据本身已带策略）。
+        cx.observe(&home_page, |this, _, cx| {
+            this.refresh_ai_access_levels(cx);
+            cx.notify();
+        })
+        .detach();
         let search_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(rust_i18n::t!("Connection.search_placeholder").to_string())
@@ -234,6 +282,7 @@ impl PersistentConnectionSidebar {
             tree_scroll_handle: UniformListScrollHandle::new(),
             home_embedded: false,
             home_navigation_layout: false,
+            ai_access_levels: load_ai_access_levels(cx),
         }
     }
 

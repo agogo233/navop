@@ -60,6 +60,7 @@ mod tests {
 
     fn searched_team_ssh() -> StoredConnection {
         StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(50),
             credential_revision: Some(1),
             name: "186华为云服务器".to_string(),
@@ -131,6 +132,7 @@ mod tests {
                 id: 1,
                 parent_id: None,
                 name: "生产环境".to_string(),
+                sort_order: None,
             }];
             let mut tree_connections = vec![ConnectionNodeInput {
                 id: 50,

@@ -735,6 +735,10 @@ AgentUi:
     en: No matching resources
     zh-CN: 未匹配到资源
     zh-HK: 找不到符合的資源
+  no_matching_models:
+    en: No matching models
+    zh-CN: 未匹配到模型
+    zh-HK: 找不到符合的模型
   no_model_config:
     en: No model configuration is available
     zh-CN: 没有可用模型配置

@@ -442,6 +442,33 @@ fn recent_section_does_not_participate_in_search() {
 }
 
 #[test]
+fn recent_group_respects_home_show_recent_connections_setting() {
+    let settings = include_str!("../../../../crates/core/src/settings.rs");
+    let content = include_str!("../content.rs");
+    let display_group = include_str!("../../settings/connection_display_settings.rs");
+
+    // 设置字段默认开启,旧配置缺省字段时回退开启(向后兼容)。
+    assert!(settings.contains("home_show_recent_connections"));
+    assert!(settings.contains(r#"#[serde(default = "default_true")]"#));
+
+    // 分组内容区与导航主页两处最近连接渲染都被设置短路。
+    assert!(
+        content.contains(
+            "if !recent.is_empty() && AppSettings::global(cx).home_show_recent_connections"
+        )
+    );
+    let navigation = content
+        .split("fn render_navigation_home_content")
+        .nth(1)
+        .expect("navigation home content exists");
+    assert!(navigation.contains("home_show_recent_connections"));
+
+    // 设置页提供「连接显示」分组的开关,修改后立即持久化。
+    assert!(display_group.contains("home_show_recent_connections"));
+    assert!(display_group.contains("update_and_save"));
+}
+
+#[test]
 fn persistent_sidebar_supports_connection_group_drag_and_drop() {
     let rows = include_str!("../../persistent_connection_sidebar/rows.rs");
     let grouping = include_str!("../connection_grouping.rs");

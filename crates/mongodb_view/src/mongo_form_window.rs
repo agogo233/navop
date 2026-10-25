@@ -19,11 +19,12 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IndexPath, Sizable, Size,
+    ActiveTheme, Disableable, IndexPath, Sizable, Size, WindowExt,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputState},
+    notification::Notification,
     scroll::ScrollableElement,
     select::{Select, SelectItem, SelectState},
     tab::{Tab, TabBar},
@@ -38,6 +39,7 @@ use one_core::storage::{
     MongoDBParams, MongoDriverVariant, MongoSshTunnelConfig, StoredConnection, Workspace,
 };
 use rust_i18n::t;
+use tool_runtime::AiAccessLevel;
 use tracing::error;
 
 use crate::GlobalMongoState;
@@ -173,6 +175,12 @@ pub struct MongoFormWindow {
     team_select: Entity<SelectState<Vec<TeamSelectItem>>>,
     remark_input: Entity<InputState>,
     sync_enabled: bool,
+
+    /// 连接级 AI 访问策略（issue #437）：允许 / 只读 / 禁止。
+    ///
+    /// 级别保存在 `StoredConnection::ai_access_level` 上，随连接一起保存与同步；
+    /// 选项布局由 `connection_form::ai_access` 的通用组件统一渲染。
+    ai_access_level: Entity<AiAccessLevel>,
 
     is_testing: bool,
     test_result: Option<Result<(), String>>,
@@ -383,6 +391,12 @@ impl MongoFormWindow {
             .map(|connection| connection.sync_enabled)
             .unwrap_or(true);
 
+        // 新建连接默认「允许」；编辑已有连接时从连接字段回填。
+        let mut ai_access_level = AiAccessLevel::Allowed;
+        if let Some(connection) = connection_to_load.as_ref() {
+            ai_access_level = connection_form::ai_access::stored_level(connection.id, cx);
+        }
+
         let use_srv_record = existing_parameters
             .as_ref()
             .map(|parameters| parameters.use_srv_record)
@@ -483,6 +497,7 @@ impl MongoFormWindow {
             team_select,
             remark_input,
             sync_enabled,
+            ai_access_level: cx.new(|_| ai_access_level),
             is_testing: false,
             test_result: None,
             on_saved: config.on_saved,
@@ -742,6 +757,7 @@ impl MongoFormWindow {
             if value.is_empty() { None } else { Some(value) }
         };
         let sync_enabled = self.sync_enabled;
+        let ai_access_level = *self.ai_access_level.read(cx);
         let is_editing = self.is_editing;
         let editing_id = self.editing_id;
         let editing_cloud_id = self.editing_cloud_id.clone();
@@ -775,19 +791,38 @@ impl MongoFormWindow {
                 } else {
                     repo.insert(&mut connection)?;
                 }
-                Ok::<StoredConnection, anyhow::Error>(connection)
+
+                // 「AI 访问」级别已经在 `connection.ai_access_level` 上，随连接一起落库；
+                // 这里再显式写一次，兼容升级前把策略存在独立表里的旧数据迁移场景。
+                // 策略写失败不算连接保存失败（连接已经写进去了），把错误带出去交给表单显示，
+                // 不能让「限制没生效」被静默吞掉。
+                let connection_id = connection
+                    .id
+                    .ok_or_else(|| anyhow::anyhow!("connection id missing after save"))?;
+                let ai_access_error =
+                    connection_form::ai_access::write_level(&repo, connection_id, ai_access_level)
+                        .err();
+
+                Ok::<(StoredConnection, Option<String>), anyhow::Error>((
+                    connection,
+                    ai_access_error,
+                ))
             })
             .await;
 
             match result {
-                Ok(saved_conn) => {
+                Ok((saved_conn, ai_access_error)) => {
                     // 保存已经落地：把表单切到「已保存」，并**再关一次窗**。
                     // 前面那次关窗是同步发生的，窗口正常已经消失；只有隐藏失败时它会留在屏幕上
                     // （关闭漏斗返回 `Retained`）—— 那一次拿不到保存结果，所以提示要从这里发：
                     // 到这个点才知道「已保存」，也只有到这里下一次保存才会变成更新而不是新建。
+                    //
+                    // 「AI 访问」策略写失败时不关窗：把窗口留下来，让用户在表单里看到错误行。
                     _ = cx.update_window(window_handle, |_, window, cx| {
                         let _ = this.update(cx, |form, cx| form.mark_saved(&saved_conn, cx));
-                        let _ = one_core::window_close::close_window_after_save(window, cx);
+                        if ai_access_error.is_none() {
+                            let _ = one_core::window_close::close_window_after_save(window, cx);
+                        }
                     });
                     let _ = cx.update(|cx| {
                         if let Some(notifier) = get_notifier(cx) {
@@ -808,6 +843,20 @@ impl MongoFormWindow {
                             on_saved(saved_conn, cx);
                         }
                     });
+
+                    if let Some(ai_access_error) = ai_access_error {
+                        // 连接本身已经保存成功，只有「AI 访问」策略没写进去。这条失败必须可见：
+                        // 保存发生在窗口关闭之后，表单里的错误行只有窗口被保留时才看得到，
+                        // 所以除了错误行还要在活动窗口上弹一条通知，并把原文记进日志。
+                        let message =
+                            connection_form::ai_access::ai_access_save_failed(&ai_access_error);
+                        error!("{message}");
+                        let _ = this.update(cx, |form, cx| {
+                            form.test_result = Some(Err(message.clone()));
+                            cx.notify();
+                        });
+                        let _ = cx.update(|cx| notify_error_on_active_window(message, cx));
+                    }
                 }
                 Err(error) => {
                     error!(
@@ -945,6 +994,12 @@ impl MongoFormWindow {
                     ),
                 )
             })
+            // 连接级 AI 访问策略（issue #437）：布局与选项由通用组件统一渲染。
+            // 云同步被隐藏时这一项也照样显示 —— 它管的是 AI 能不能操作这个连接，与云端无关。
+            .child(self.render_form_row(
+                &connection_form::ai_access::ai_access_label(),
+                connection_form::ai_access::ai_access_selector(&self.ai_access_level, cx),
+            ))
     }
 
     fn render_cluster_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1017,6 +1072,18 @@ impl MongoFormWindow {
 impl Focusable for MongoFormWindow {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// 在活动窗口上弹一条错误通知；没有活动窗口时静默忽略。
+///
+/// 保存是异步完成的，等知道结果时连接表单窗口已经关掉了 —— 表单里的错误行用户看不到，
+/// 所以「AI 访问」策略写失败必须用通知再报一次，不能只写日志。
+fn notify_error_on_active_window(message: String, cx: &mut App) {
+    if let Some(window_handle) = cx.active_window() {
+        let _ = cx.update_window(window_handle, |_, window, cx| {
+            window.push_notification(Notification::error(message), cx);
+        });
     }
 }
 

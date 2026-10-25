@@ -325,6 +325,9 @@ pub struct ConnectionPlainData {
     /// 打开方式偏好（终端 / 双栏文件视图）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_open_mode: Option<crate::storage::PreferredOpenMode>,
+    /// AI 访问策略（缺省为「允许」，兼容旧载荷）
+    #[serde(default)]
+    pub ai_access_level: tool_runtime::AiAccessLevel,
 }
 
 /// 工作空间同步载荷的当前格式版本

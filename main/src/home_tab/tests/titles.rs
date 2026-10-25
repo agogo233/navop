@@ -159,6 +159,7 @@ fn screenshot_safe_feature_replaces_all_home_connection_info() {
     let mut names = std::collections::HashSet::new();
     for (offset, connection_type) in cases.into_iter().enumerate() {
         let connection = StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(offset as i64 + 1),
             credential_revision: None,
             name: "Sensitive connection name".to_string(),

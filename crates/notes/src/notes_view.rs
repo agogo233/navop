@@ -508,6 +508,45 @@ mod external_markdown_tests {
     }
 
     #[gpui::test]
+    fn standalone_markdown_binds_editor_to_the_opened_file(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("notes-root");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("with-image.md");
+        std::fs::write(&path, "# Notes\n\n![logo](./assets/logo.png)\n").unwrap();
+        let (window, view) = cx.update(|cx| {
+            let mut view = None;
+            let window = cx
+                .open_window(WindowOptions::default(), |window, cx| {
+                    let entity =
+                        cx.new(|cx| NotesView::new_for_markdown_file(path.clone(), window, cx));
+                    view = Some(entity.clone());
+                    cx.new(|cx| Root::new(entity, window, cx))
+                })
+                .unwrap();
+            (window, view.unwrap())
+        });
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let session = view
+                .markdown_sessions
+                .values()
+                .next()
+                .expect("markdown session must exist");
+            let editor = session.editor.read(cx);
+            // 编辑器必须绑定被打开文件的绝对路径，否则相对路径图片
+            // （如 ![logo](./assets/logo.png)）会退化为按进程 CWD 解析而无法渲染。
+            assert_eq!(Some(path.as_path()), editor.file_path());
+        });
+    }
+
+    #[gpui::test]
     fn source_toggle_is_visible_in_preview_and_returns_to_preview(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);

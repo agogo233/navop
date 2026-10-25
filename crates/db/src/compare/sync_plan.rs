@@ -5089,6 +5089,67 @@ mod tests {
     }
 
     #[test]
+    fn test_postgres_schema_sync_plan_quotes_numeric_default_for_text_column() {
+        // MySQL 的 varchar 列默认值在 information_schema 里是裸数值（`1`/`0`），
+        // PostgreSQL 不接受 `varchar(1) DEFAULT 1`，会以
+        // "column ... is of type character varying but default expression is of
+        // type integer" 整条拒绝建表，随后该表的 COMMENT 语句全部因表不存在而失败。
+        let result = added_table_result(
+            "sys_user_device",
+            vec![
+                ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    ..Default::default()
+                },
+                ColumnSchema {
+                    name: "status".to_string(),
+                    data_type: "varchar(1)".to_string(),
+                    default_value: Some("1".to_string()),
+                    ..Default::default()
+                },
+                ColumnSchema {
+                    name: "del_flag".to_string(),
+                    data_type: "varchar(1)".to_string(),
+                    default_value: Some("0".to_string()),
+                    ..Default::default()
+                },
+                ColumnSchema {
+                    name: "source_platform".to_string(),
+                    data_type: "varchar(64)".to_string(),
+                    default_value: Some("CDSS".to_string()),
+                    ..Default::default()
+                },
+            ],
+        );
+        let plugin = crate::postgresql::PostgresPlugin::new();
+
+        let plan = build_schema_sync_plan_with_plugin_for_source(
+            &result,
+            "app",
+            None,
+            &DatabaseType::MySQL,
+            &plugin,
+        );
+
+        assert!(
+            plan.sql_text.contains("DEFAULT '1'"),
+            "numeric default on text column must be quoted: {}",
+            plan.sql_text
+        );
+        assert!(
+            plan.sql_text.contains("DEFAULT '0'"),
+            "numeric default on text column must be quoted: {}",
+            plan.sql_text
+        );
+        assert!(
+            plan.sql_text.contains("DEFAULT 'CDSS'"),
+            "identifier default on text column must be quoted: {}",
+            plan.sql_text
+        );
+    }
+
+    #[test]
     fn test_sqlite_schema_sync_plan_reuses_table_designer_recreate_sql() {
         use super::super::{
             ColumnDiff, ColumnSchema, DiffStatus, SchemaCompareResult, TableDiff, TableSchema,
@@ -5762,80 +5823,9 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn test_clickhouse_schema_sync_plan_ignores_foreign_keys() {
-        use super::super::{
-            ColumnSchema, DiffStatus, ForeignKeySchema, SchemaCompareResult, TableDiff, TableSchema,
-        };
-
-        let source = TableSchema {
-            name: "events".to_string(),
-            columns: vec![
-                ColumnSchema {
-                    name: "id".to_string(),
-                    data_type: "UInt64".to_string(),
-                    nullable: false,
-                    default_value: None,
-                    comment: None,
-                    ..Default::default()
-                },
-                ColumnSchema {
-                    name: "order_id".to_string(),
-                    data_type: "UInt64".to_string(),
-                    nullable: false,
-                    default_value: None,
-                    comment: None,
-                    ..Default::default()
-                },
-            ],
-            indexes: vec![],
-            foreign_keys: vec![ForeignKeySchema {
-                name: "fk_events_order".to_string(),
-                columns: vec!["order_id".to_string()],
-                ref_table: "orders".to_string(),
-                ref_schema: None,
-                ref_columns: vec!["id".to_string()],
-                on_delete: Some("CASCADE".to_string()),
-                on_update: None,
-            }],
-            comment: None,
-            ..Default::default()
-        };
-        let result = SchemaCompareResult {
-            routine_diffs: vec![],
-            trigger_diffs: vec![],
-            table_failures: vec![],
-            table_diffs: vec![TableDiff {
-                name: "events".to_string(),
-                status: DiffStatus::Added,
-                source: Some(source),
-                target: None,
-                column_diffs: vec![],
-                index_diffs: vec![],
-                foreign_key_diffs: vec![],
-                comment_changed: false,
-                object_type: Default::default(),
-                changes: vec![],
-                table_options_changed: false,
-            }],
-            added_count: 1,
-            removed_count: 0,
-            modified_count: 0,
-        };
-        let plugin = crate::clickhouse::ClickHousePlugin::new();
-
-        let plan = build_schema_sync_plan_with_plugin(&result, "analytics", None, &plugin);
-        let sql = plan
-            .statements
-            .iter()
-            .map(|statement| statement.sql.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(1, sql.len());
-        assert!(sql[0].contains("CREATE TABLE `analytics`.`events`"));
-        assert!(!plan.sql_text.contains("FOREIGN KEY"));
-        assert!(!plan.sql_text.contains("fk_events_order"));
-    }
+    // ClickHouse 的 schema 同步 DDL 已随内置插件迁到 clickhouse IPC 驱动扩展
+    // (navop-extensions/extensions/ipc/clickhouse),外键忽略行为由扩展侧
+    // ddl 单测覆盖;宿主不再保留依赖已删插件的同构断言。
 
     #[test]
     fn schema_sync_plan_skips_views_without_table_ddl() {

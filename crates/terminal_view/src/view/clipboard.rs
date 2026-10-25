@@ -135,7 +135,8 @@ impl TerminalView {
         }
         let text = normalize_paste_line_endings(text);
         let text = text.as_ref();
-        let mode = self.terminal_frame_snapshot.mode;
+        // 粘贴决策读实时模式：渲染快照可能滞后于远端 2004 翻转（issue #198）。
+        let mode = self.live_term_mode(cx);
 
         // ALT_SCREEN（如 Vim、less）属于全屏交互程序，粘贴内容不会像 shell 那样直接执行。
         // 这里跳过高危/多行确认，避免编辑器场景误弹确认框。
@@ -202,7 +203,9 @@ impl TerminalView {
         let text = text.as_ref();
         // 仅在应用请求 bracketed paste 模式时才包装，避免把控制序列
         // 原样送进不支持的程序（例如 Vim 未开启时可能导致光标/位置异常）。
-        let mode = self.terminal_frame_snapshot.mode;
+        // 与 paste_text 相同：这里也必须读实时模式，弹窗确认期间模式可能
+        // 已被远端翻转（issue #198）。
+        let mode = self.live_term_mode(cx);
         self.apply_paste_to_history_prompt(text, cx);
         self.write_to_pty(terminal_paste_bytes(text, mode), cx);
         self.focus_terminal(window, cx);

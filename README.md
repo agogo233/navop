@@ -56,7 +56,7 @@
 
 ### Databases and data tools
 
-- Built-in support for MySQL, PostgreSQL, SQLite, DuckDB, SQL Server, Oracle, and ClickHouse; TDengine is provided as an installable extension driver, alongside Dameng DM, KingbaseES, GBase 8s, OceanBase, openGauss, Apache IoTDB, and Oscar.
+- Built-in support for MySQL, PostgreSQL, SQLite, DuckDB, SQL Server, and Oracle; ClickHouse and TDengine are provided as installable extension drivers, alongside Dameng DM, KingbaseES, GBase 8s, OceanBase, openGauss, Apache IoTDB, and Oscar.
 - Browse database objects, edit and run SQL with execution plans, import and export data, compare schemas and data, and visualize relationships with ER diagrams.
 - Dedicated Redis and MongoDB interfaces; middleware connections such as MQTT are provided through installable extensions (MQTT 3.1.1 over rustls, SSH tunneling, auto-resubscribe), with subscribe, messages, and publish views.
 - Table-data tabs support batch-editing selected cells, typed editors for date/time/numeric columns, and copying table or column names from context menus.

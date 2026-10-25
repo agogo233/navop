@@ -18,9 +18,23 @@ impl TerminalPaneId {
 pub struct TerminalSplitId(u64);
 
 impl TerminalSplitId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
     pub const fn value(self) -> u64 {
         self.0
     }
+}
+
+/// 一个拆分分组内「直接子节点」的稳定标识。
+///
+/// 子节点可能继续是拆分分组(垂直于父分组的再次拆分),所以不能只用
+/// `TerminalPaneId` 指代;分组按 id 区分。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TerminalSplitChild {
+    Pane(TerminalPaneId),
+    Group(TerminalSplitId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +50,14 @@ pub enum TerminalSplitNode {
 }
 
 impl TerminalSplitNode {
+    /// 该节点在父分组里的稳定标识。
+    pub fn child_id(&self) -> TerminalSplitChild {
+        match self {
+            Self::Pane { pane_id } => TerminalSplitChild::Pane(*pane_id),
+            Self::Group { split_id, .. } => TerminalSplitChild::Group(*split_id),
+        }
+    }
+
     fn contains(&self, pane_id: TerminalPaneId) -> bool {
         match self {
             Self::Pane { pane_id: current } => *current == pane_id,
@@ -51,6 +73,22 @@ impl TerminalSplitNode {
                     child.collect_panes(panes);
                 }
             }
+        }
+    }
+
+    fn collect_groups(&self, groups: &mut Vec<(TerminalSplitId, Vec<TerminalSplitChild>)>) {
+        let Self::Group {
+            split_id, children, ..
+        } = self
+        else {
+            return;
+        };
+        groups.push((
+            *split_id,
+            children.iter().map(TerminalSplitNode::child_id).collect(),
+        ));
+        for child in children {
+            child.collect_groups(groups);
         }
     }
 }
@@ -83,6 +121,13 @@ impl TerminalSplitTree {
         let mut panes = Vec::new();
         self.root.collect_panes(&mut panes);
         panes
+    }
+
+    /// 所有拆分分组及其直接子节点,按树的自顶向下顺序。
+    pub fn groups(&self) -> Vec<(TerminalSplitId, Vec<TerminalSplitChild>)> {
+        let mut groups = Vec::new();
+        self.root.collect_groups(&mut groups);
+        groups
     }
 
     pub fn transferable_pane(&self) -> Option<TerminalPaneId> {

@@ -6,6 +6,8 @@ pub(crate) enum TerminalPaneEvent {
     OpenSftp(StoredConnection),
     /// 把临时连接保存为正式连接（由上层写入数据库）
     SaveAsConnection(StoredConnection),
+    /// 请求关闭当前 pane：单 pane 标签由标签容器关闭整个标签页，多 pane 时只关这个 pane。
+    ClosePaneRequested,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,6 +79,9 @@ impl TerminalView {
         match source {
             TerminalDuplicateSource::Local(config) => {
                 Self::new_with_index(config, None, window, cx)
+            }
+            TerminalDuplicateSource::Launched { config, title, icon } => {
+                Self::new_launched(config, title, icon, None, window, cx)
             }
             TerminalDuplicateSource::Serial(connection) => {
                 Self::new_serial_with_index(connection, None, window, cx)

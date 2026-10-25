@@ -286,6 +286,7 @@ mod tests {
     #[test]
     fn favorite_connection_key_prefers_local_id_then_cloud_id_then_name() {
         let mut conn = StoredConnection {
+            ai_access_level: Default::default(),
             id: None,
             credential_revision: None,
             name: "prod".to_string(),

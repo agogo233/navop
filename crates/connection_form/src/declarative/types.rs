@@ -128,6 +128,10 @@ pub enum DeclarativeFieldType {
     /// 收集产物:`config[id] = {"credential_reference": {...}}` 或 `{"username": "..."}`,
     /// 手动密码进入 secrets,键为 `{id}.password`。
     Auth,
+    /// 连接图标选择器:自动 / 内置图标平铺 / 本地图片(与 SSH 连接一致)。
+    /// 收集产物:`config[id] = {"icon": "<内置图标 ID>"}` 或 `{"file": "<本地文件绝对路径>"}`;
+    /// 保持「自动」时不写入该键。本字段不参与必填校验。
+    Icon,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

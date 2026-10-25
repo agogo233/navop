@@ -23,6 +23,7 @@ palette = { workspace = true }
 ai_chat_view = { workspace = true, default-features = false }
 agent_runtime = { workspace = true }
 one-core = { workspace = true }
+tool_runtime = { workspace = true }
 one-ui = { workspace = true }
 connection-form = { workspace = true }
 # Terminal emulation

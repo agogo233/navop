@@ -70,11 +70,13 @@ impl DatabaseSidebar {
         let active_connection = active_conn_id
             .and_then(|id| connections.iter().find(|conn| conn.id == Some(id)))
             .or_else(|| connections.first());
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
         let chat_panel = if let Some(connection) = active_connection {
             let (scope, catalog, mentions) = build_sidebar_resource_state(
                 connection,
                 &connections,
                 DefaultTargetReason::CurrentDatabase,
+                &ai_access_levels,
             );
             cx.new(|cx| {
                 DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(
@@ -195,18 +197,20 @@ impl DatabaseSidebar {
         let active_connection = active_id
             .and_then(|id| self.connections.iter().find(|conn| conn.id == Some(id)))
             .or_else(|| self.connections.first());
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
         let (mut resources, mentions, catalog) = if let Some(connection) = active_connection {
             let (scope, catalog, mentions) = build_sidebar_resource_state(
                 connection,
                 &self.connections,
                 DefaultTargetReason::CurrentDatabase,
+                &ai_access_levels,
             );
             (scope.to_resource_context(), mentions, catalog)
         } else {
             (
                 ResourceContext::new(),
                 Vec::new(),
-                ResourceCatalog::new(build_resource_catalog(&self.connections)),
+                ResourceCatalog::new(build_resource_catalog(&self.connections, &ai_access_levels)),
             )
         };
         let resource_id = ResourceId::new(connection_id.to_string());
@@ -261,9 +265,7 @@ impl DatabaseSidebar {
                 IconName::BookOpen,
                 t!("DatabaseSidebar.execution_history").to_string(),
             ),
-            SidebarPanel::SqlLibrary => {
-                (IconName::SqlLibrary, t!("SqlLibrary.title").to_string())
-            }
+            SidebarPanel::SqlLibrary => (IconName::SqlLibrary, t!("SqlLibrary.title").to_string()),
         };
 
         IconButton::new(format!("database-sidebar-btn-{panel:?}"), Icon::new(icon))

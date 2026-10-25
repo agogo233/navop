@@ -1,3 +1,4 @@
+mod access_guard;
 mod config;
 mod connection_sessions;
 mod diagnostics;
@@ -159,7 +160,8 @@ pub fn agent_runtime_tool_registry(cx: &mut App) -> anyhow::Result<agent_runtime
     );
     if agent_database_enabled {
         if let Some(repo) = connection_repository(cx) {
-            let runtime_db_registry = navop_runtime::database_tools::database_tool_registry(repo);
+            let runtime_db_registry = navop_runtime::database_tools::database_tool_registry(repo)
+                .with_optional_access_guard(access_guard::connection_ai_access_guard(cx));
             let runtime_agent_db_registry = agent_runtime::tools::tool_runtime_agent_tool_registry(
                 runtime_db_registry,
                 tool_runtime::ToolAdapter::FunctionCalling,
@@ -174,7 +176,7 @@ pub fn agent_runtime_tool_registry(cx: &mut App) -> anyhow::Result<agent_runtime
     }
     if agent_sftp_enabled {
         if let Some(repo) = connection_repository(cx) {
-            register_runtime_sftp_tools(repo, &mut agent_registry)?;
+            register_runtime_sftp_tools(cx, repo, &mut agent_registry)?;
         } else {
             tracing::warn!("Agent SSH/SFTP tools enabled without ConnectionRepository");
         }
@@ -190,7 +192,8 @@ fn register_runtime_redis_tools(
         tracing::warn!("Agent Redis runtime tools enabled without ConnectionRepository");
         return Ok(());
     };
-    let runtime_redis_registry = navop_runtime::redis_tools::redis_tool_registry(repo);
+    let runtime_redis_registry = navop_runtime::redis_tools::redis_tool_registry(repo)
+        .with_optional_access_guard(access_guard::connection_ai_access_guard(cx));
     let runtime_agent_redis_registry = agent_runtime::tools::tool_runtime_agent_tool_registry(
         runtime_redis_registry,
         tool_runtime::ToolAdapter::FunctionCalling,
@@ -200,10 +203,12 @@ fn register_runtime_redis_tools(
 }
 
 fn register_runtime_sftp_tools(
+    cx: &App,
     repo: std::sync::Arc<one_core::storage::ConnectionRepository>,
     agent_registry: &mut agent_runtime::ToolRegistry,
 ) -> anyhow::Result<()> {
-    let runtime_sftp_registry = navop_runtime::sftp_tools::sftp_tool_registry(repo);
+    let runtime_sftp_registry = navop_runtime::sftp_tools::sftp_tool_registry(repo)
+        .with_optional_access_guard(access_guard::connection_ai_access_guard(cx));
     let runtime_agent_sftp_registry = agent_runtime::tools::tool_runtime_agent_tool_registry(
         runtime_sftp_registry,
         tool_runtime::ToolAdapter::FunctionCalling,

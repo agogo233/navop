@@ -324,6 +324,7 @@ mod tests {
     fn test_conflict_copy_naming() {
         let resolver = ConflictResolver::default();
         let conn = StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(1),
             credential_revision: Some(1),
             name: "Test Connection".to_string(),

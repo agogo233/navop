@@ -8,6 +8,7 @@
 // 扩展连接表单的国际化文案归本 crate 所有。
 rust_i18n::i18n!("locales", fallback = "en");
 
+mod connection_icon;
 mod extension_connection_form;
 mod extension_connection_tab;
 mod extension_resource;
@@ -19,6 +20,9 @@ mod shell_plugin_host;
 mod shell_plugin_tab;
 mod universal_plugins;
 
+pub use connection_icon::{
+    extension_connection_icon_or_default, resolve_extension_connection_icon,
+};
 pub use extension_connection_form::{ExtensionConnectionForm, ExtensionConnectionFormConfig};
 pub use extension_connection_tab::ExtensionConnectionTab;
 #[cfg(feature = "shell-plugins")]

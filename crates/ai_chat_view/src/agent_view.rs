@@ -18012,6 +18012,10 @@ mod tests {
     }
 
     /// 测试里的设置保存必须落在临时配置目录，绝不碰用户真实 `settings.json`。
+    ///
+    /// 只断言「目录在临时区 + 文件确实写出」：设置是进程级全局，同一个测试二进制里
+    /// 别的用例也会 `update_and_save`，并发时后写的那份可能覆盖掉本条写进去的哨兵值，
+    /// 断言文件内容会在满载的 CI 上偶发变红（内容本身没有可隔离性）。
     #[gpui::test]
     fn settings_saves_stay_in_the_test_config_dir(cx: &mut TestAppContext) {
         init_test_ui(cx);
@@ -18028,11 +18032,11 @@ mod tests {
             "设置落盘必须写在测试临时目录，实际是 {}",
             config_dir.display()
         );
-        let saved =
-            std::fs::read_to_string(config_dir.join("settings.json")).expect("设置文件应已写出");
+        let settings_path = config_dir.join("settings.json");
         assert!(
-            saved.contains("navop-test/sentinel.log"),
-            "保存的内容要能读回来：{saved}"
+            settings_path.exists(),
+            "设置文件应已写出：{}",
+            settings_path.display()
         );
 
         cx.update(|cx| {

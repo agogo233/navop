@@ -492,7 +492,9 @@ impl DefaultAgentChatPanel {
         let Some(connections) = list_connections(cx) else {
             return;
         };
-        let (_, catalog, mentions) = crate::build_workbench_resource_state(&connections);
+        let ai_access_levels = crate::load_ai_access_levels(cx);
+        let (_, catalog, mentions) =
+            crate::build_workbench_resource_state(&connections, &ai_access_levels);
         self.set_resource_catalog(mentions, catalog.resources, cx);
     }
 

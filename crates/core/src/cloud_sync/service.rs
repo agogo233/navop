@@ -394,6 +394,7 @@ impl CloudSyncService {
                 .unwrap_or(Value::Object(serde_json::Map::new())),
             owner_id: conn.owner_id.clone(),
             preferred_open_mode: conn.preferred_open_mode,
+            ai_access_level: conn.ai_access_level,
         };
 
         let plaintext = serde_json::to_string(&plain_data)
@@ -547,6 +548,7 @@ impl CloudSyncService {
                 team_id: cloud_data.team_id.clone(),
                 owner_id: plain_data.owner_id,
                 preferred_open_mode: plain_data.preferred_open_mode,
+                ai_access_level: plain_data.ai_access_level,
             },
             workspace_cloud_id,
         ))
@@ -681,6 +683,80 @@ impl CloudSyncService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tool_runtime::AiAccessLevel;
+
+    fn ai_access_connection(level: AiAccessLevel) -> StoredConnection {
+        StoredConnection {
+            ai_access_level: level,
+            id: Some(1),
+            credential_revision: Some(1),
+            name: "prod".to_string(),
+            connection_type: ConnectionType::Database,
+            params: r#"{"host":"localhost","port":5432}"#.to_string(),
+            workspace_id: None,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+            preferred_open_mode: None,
+        }
+    }
+
+    #[test]
+    fn connection_sync_payload_carries_ai_access_level() {
+        let mut service = CloudSyncService::new();
+        service.set_master_key_directly("test_blob_key".to_string());
+
+        let cloud_data = service
+            .prepare_sync_data_upload(&ai_access_connection(AiAccessLevel::Denied), None, &[])
+            .unwrap();
+        let plaintext = service
+            .decrypt_blob(&cloud_data.encrypted_data, None)
+            .unwrap();
+        // 载荷必须带级别，否则换设备/换客户端后策略会丢。
+        assert!(
+            plaintext.contains(r#""ai_access_level":"denied""#),
+            "payload should carry the level: {plaintext}"
+        );
+
+        let (decrypted, _) = service
+            .decrypt_sync_data_connection_with_workspace_cloud_id(&cloud_data)
+            .unwrap();
+        assert_eq!(AiAccessLevel::Denied, decrypted.ai_access_level);
+    }
+
+    #[test]
+    fn connection_sync_payload_defaults_missing_ai_access_level_to_allowed() {
+        let mut service = CloudSyncService::new();
+        service.set_master_key_directly("test_blob_key".to_string());
+
+        // 老客户端上传的载荷没有该字段：必须按默认「允许」解析，而不是报错。
+        let legacy_plain = r#"{"id":1,"name":"prod","connection_type":"Database","params":"{}"}"#;
+        let data = service.encrypt_blob(legacy_plain, None).unwrap();
+        let cloud_data = CloudSyncData {
+            id: "cloud-1".to_string(),
+            owner_id: "user-1".to_string(),
+            team_id: None,
+            data_type: data_type::CONNECTION.to_string(),
+            encrypted_data: data,
+            key_version: 1,
+            checksum: String::new(),
+            version: 1,
+            updated_at: 1,
+            deleted_at: None,
+        };
+        let (decrypted, _) = service
+            .decrypt_sync_data_connection_with_workspace_cloud_id(&cloud_data)
+            .unwrap();
+        assert_eq!(AiAccessLevel::Allowed, decrypted.ai_access_level);
+    }
 
     #[test]
     fn test_blob_encrypt_decrypt() {
@@ -737,6 +813,7 @@ mod tests {
         service.set_master_key_directly("test_blob_key".to_string());
 
         let conn = StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(1),
             credential_revision: Some(1),
             name: "db".to_string(),

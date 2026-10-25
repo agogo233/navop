@@ -92,6 +92,86 @@ fn terminal_paste_bytes_keeps_bracketed_wrap_untouched() {
     assert_eq!(b"\x1b[200~echo hi\x1b[201~".to_vec(), bytes);
 }
 
+/// 供 resolve_live_term_mode 测试使用的最小终端尺寸。
+struct PasteModeTestDimensions {
+    columns: usize,
+    screen_lines: usize,
+}
+
+impl alacritty_terminal::grid::Dimensions for PasteModeTestDimensions {
+    fn total_lines(&self) -> usize {
+        self.screen_lines
+    }
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+/// 构造一个不带 2004 模式的最小 Term，供模式解析测试使用。
+fn paste_mode_test_term() -> (
+    alacritty_terminal::sync::FairMutex<
+        alacritty_terminal::term::Term<terminal::pty_backend::GpuiEventProxy>,
+    >,
+    alacritty_terminal::vte::ansi::Processor<alacritty_terminal::vte::ansi::StdSyncHandler>,
+) {
+    use alacritty_terminal::sync::FairMutex;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+    use terminal::pty_backend::GpuiEventProxy;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    let (event_tx, _event_rx) = unbounded_channel();
+    let dimensions = PasteModeTestDimensions {
+        columns: 16,
+        screen_lines: 4,
+    };
+    let term = Term::new(
+        TermConfig::default(),
+        &dimensions,
+        GpuiEventProxy::new(event_tx),
+    );
+    (FairMutex::new(term), Processor::new())
+}
+
+#[test]
+fn resolve_live_term_mode_prefers_realtime_term_mode_over_stale_snapshot() {
+    let (locked, mut processor) = paste_mode_test_term();
+
+    // 远端开启 2004：实时读取应看到 ON，即便快照仍是过期的 OFF。
+    {
+        let mut term = locked.lock_unfair();
+        processor.advance(&mut *term, b"\x1b[?2004h");
+        assert!(term.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+    let resolved = resolve_live_term_mode(&locked, TermMode::empty());
+    assert!(resolved.contains(TermMode::BRACKETED_PASTE));
+
+    // 回归场景（issue #198）：快照停留在命令执行前的 ON，而远端 bash 已发
+    // 2004l 关闭。实时读取必须报告 OFF，粘贴才不会带 \x1b[200~ 字面泄漏。
+    {
+        let mut term = locked.lock_unfair();
+        processor.advance(&mut *term, b"\x1b[?2004l");
+        assert!(!term.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+    let stale_snapshot = TermMode::BRACKETED_PASTE;
+    let resolved = resolve_live_term_mode(&locked, stale_snapshot);
+    assert!(!resolved.contains(TermMode::BRACKETED_PASTE));
+}
+
+#[test]
+fn resolve_live_term_mode_falls_back_to_snapshot_when_term_locked() {
+    let (locked, _processor) = paste_mode_test_term();
+    // 模拟解析线程持锁：try_lock 失败时必须回退快照而不是 panic/阻塞。
+    let guard = locked.lock_unfair();
+    let fallback = TermMode::BRACKETED_PASTE;
+    let resolved = resolve_live_term_mode(&locked, fallback);
+    drop(guard);
+    assert!(resolved.contains(TermMode::BRACKETED_PASTE));
+}
+
 #[test]
 fn join_paste_as_single_line_collapses_blank_lines() {
     assert_eq!(

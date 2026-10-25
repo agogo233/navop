@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// TCP keepalive 空闲间隔（毫秒）：与 SSH 侧 keepalive 默认 30s 对齐。
 const TCP_KEEPALIVE_MS: u32 = 30_000;
@@ -592,6 +592,18 @@ impl DbConnection for MysqlDbConnection {
             results.len()
         );
         Ok(results)
+    }
+
+    /// 驱动级 `COM_PING`：不走查询通道、不进 general log，是 MySQL 探活的
+    /// 权威信号（dbx 的 keepalive 也用它）。连接已被驱动回收时返回
+    /// `NotConnected`，同样判死。
+    async fn ping(&self) -> Result<(), DbError> {
+        let mut guard = self.conn.lock().await;
+        let conn = guard.as_mut().ok_or(DbError::NotConnected)?;
+        conn.ping().await.map_err(|error| {
+            warn!("[MySQL] liveness ping failed: {error}");
+            DbError::connection(format!("connection ping failed: {error}"))
+        })
     }
 
     async fn query(&self, query: &str) -> Result<SqlResult, DbError> {

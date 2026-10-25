@@ -6,6 +6,7 @@ use one_core::storage::traits::Repository;
 use one_core::storage::{ConnectionRepository, DatabaseType, Workspace, WorkspaceRepository};
 use serde_json::json;
 use std::sync::Arc;
+use tool_runtime::AiAccessLevel;
 use tool_runtime::{ToolAdapter, ToolContext};
 
 #[test]
@@ -428,4 +429,88 @@ fn repos() -> (Arc<ConnectionRepository>, Arc<WorkspaceRepository>) {
         Arc::new(ConnectionRepository::new(conn.clone())),
         Arc::new(WorkspaceRepository::new(conn)),
     )
+}
+
+// --- 连接级 AI 访问策略（issue #437）：禁止 AI 的连接对管理工具不可见 ---
+
+fn denied_show_error(registry: &tool_runtime::ToolRegistry, input: serde_json::Value) -> String {
+    futures::executor::block_on(registry.call(
+        "connections.show",
+        input,
+        ToolContext::for_adapter(ToolAdapter::Mcp),
+    ))
+    .expect_err("被禁止 AI 操作的连接不应允许 show")
+    .to_string()
+}
+
+fn result_ids(result: &serde_json::Value, field: &str) -> Vec<i64> {
+    result[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} 应是数组: {result}"))
+        .iter()
+        .map(|item| item["id"].as_i64().expect("连接摘要应带有 id"))
+        .collect()
+}
+
+#[test]
+fn list_and_find_hide_connections_denied_for_ai() {
+    let (connection_repo, workspace_repo) = repos();
+    let registry =
+        connection_tool_registry_with_workspaces(connection_repo.clone(), Some(workspace_repo));
+    let allowed = create_mysql(&registry, "allowed-db", "10.0.0.1");
+    let denied = create_mysql(&registry, "denied-db", "10.0.0.2");
+    let read_only = create_mysql(&registry, "readonly-db", "10.0.0.3");
+    connection_repo
+        .set_ai_access_level(denied, AiAccessLevel::Denied)
+        .expect("策略应写入成功");
+    connection_repo
+        .set_ai_access_level(read_only, AiAccessLevel::ReadOnly)
+        .expect("策略应写入成功");
+
+    let list = call(&registry, "connections.list", json!({}));
+    let ids = result_ids(&list, "connections");
+    assert!(ids.contains(&allowed), "允许的连接应可见: {ids:?}");
+    assert!(
+        ids.contains(&read_only),
+        "只读连接仍应可见，只是能力被收窄: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&denied),
+        "禁止 AI 操作的连接不应出现在 connections.list: {ids:?}"
+    );
+
+    let find = call(&registry, "connections.find", json!({}));
+    let ids = result_ids(&find, "connections");
+    assert!(ids.contains(&allowed), "允许的连接应可被 find: {ids:?}");
+    assert!(ids.contains(&read_only), "只读连接仍应可被 find: {ids:?}");
+    assert!(
+        !ids.contains(&denied),
+        "禁止 AI 操作的连接不应出现在 connections.find: {ids:?}"
+    );
+}
+
+#[test]
+fn show_denied_connection_reports_actionable_error() {
+    let (connection_repo, workspace_repo) = repos();
+    let registry =
+        connection_tool_registry_with_workspaces(connection_repo.clone(), Some(workspace_repo));
+    let denied = create_mysql(&registry, "denied-db", "10.0.0.9");
+    connection_repo
+        .set_ai_access_level(denied, AiAccessLevel::Denied)
+        .expect("策略应写入成功");
+
+    for input in [
+        json!({ "connection": denied.to_string() }),
+        json!({ "connection": "denied-db" }),
+    ] {
+        let message = denied_show_error(&registry, input.clone());
+        assert!(
+            message.contains("禁止 AI 操作"),
+            "错误应说明该连接被禁止 AI 操作（输入 {input}）: {message}"
+        );
+        assert!(
+            message.contains("手动"),
+            "错误应引导用户手动操作（输入 {input}）: {message}"
+        );
+    }
 }

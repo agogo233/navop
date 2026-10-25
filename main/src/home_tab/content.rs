@@ -109,6 +109,11 @@ impl HomePage {
                     cx,
                 ));
             }
+        } else if !AppSettings::global(cx).home_show_recent_connections {
+            // 设置关闭「最近连接」分组后,导航布局与卡片布局保持一致:不渲染该分组。
+            if matching.is_empty() {
+                body = body.child(self.render_empty_home(cx));
+            }
         } else if recent.is_empty() {
             body = body.child(self.render_empty_home(cx));
         } else {
@@ -251,7 +256,7 @@ impl HomePage {
         if visible_count == 0 {
             body = body.child(self.render_empty_home(cx));
         }
-        if !recent.is_empty() {
+        if !recent.is_empty() && AppSettings::global(cx).home_show_recent_connections {
             body = body.child(self.render_recent_group(recent, selected, layout, card_width, cx));
         }
         for (id, title, connections) in groups {

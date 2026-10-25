@@ -1,3 +1,4 @@
+pub mod access;
 pub mod audit;
 pub mod descriptor;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod registry;
 pub mod resource;
 pub mod result;
 
+pub use access::*;
 pub use audit::*;
 pub use descriptor::*;
 pub use error::*;

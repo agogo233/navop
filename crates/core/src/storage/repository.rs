@@ -42,6 +42,7 @@ struct ConnectionRow {
     team_id: Option<String>,
     owner_id: Option<String>,
     preferred_open_mode: Option<String>,
+    ai_access_level: Option<String>,
 }
 
 impl FromSqliteRow for ConnectionRow {
@@ -68,6 +69,7 @@ impl FromSqliteRow for ConnectionRow {
             team_id: row.get("team_id").unwrap_or(None),
             owner_id: row.get("owner_id").unwrap_or(None),
             preferred_open_mode: row.get("preferred_open_mode").unwrap_or(None),
+            ai_access_level: row.get("ai_access_level").unwrap_or(None),
         })
     }
 }
@@ -97,6 +99,9 @@ impl From<ConnectionRow> for StoredConnection {
                 .as_deref()
                 .and_then(|mode| serde_json::from_str::<Option<PreferredOpenMode>>(mode).ok())
                 .flatten(),
+            ai_access_level: tool_runtime::AiAccessLevel::from_storage(
+                row.ai_access_level.as_deref(),
+            ),
         };
         // 从数据库读取后自动解密敏感字段
         conn.params = conn.decrypt_params();
@@ -172,6 +177,89 @@ impl ConnectionRepository {
         CredentialRepository::new(self.conn.clone())
     }
 
+    /// 连接级 AI 访问策略的读写入口（issue #437）。
+    ///
+    /// 策略是 `connections.ai_access_level` 列（`NULL` = 默认「允许」），随连接一起
+    /// 云同步与导入导出。
+    /// 读取连接的 AI 访问策略（`NULL` 按允许处理）。
+    pub fn ai_access_level(&self, connection_id: i64) -> Result<tool_runtime::AiAccessLevel> {
+        self.conn.with_connection(|conn| {
+            let level: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT ai_access_level FROM connections WHERE id = ?1",
+                    params![connection_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let level =
+                level.ok_or_else(|| anyhow::anyhow!("connection {connection_id} was not found"))?;
+            Ok(tool_runtime::AiAccessLevel::from_storage(level.as_deref()))
+        })
+    }
+
+    /// 批量读取连接的 AI 访问策略，只返回非默认档位的连接。
+    pub fn ai_access_levels(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, tool_runtime::AiAccessLevel>> {
+        self.conn.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, ai_access_level FROM connections WHERE ai_access_level IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            let mut levels = std::collections::HashMap::new();
+            for row in rows {
+                let (id, level) = row?;
+                levels.insert(
+                    id,
+                    tool_runtime::AiAccessLevel::from_storage(level.as_deref()),
+                );
+            }
+            Ok(levels)
+        })
+    }
+
+    /// 列出被限制（只读或禁止）AI 操作的连接，按策略从重到轻排序。
+    pub fn ai_access_restricted(&self) -> Result<Vec<tool_runtime::RestrictedConnection>> {
+        self.conn.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, ai_access_level FROM connections WHERE ai_access_level IS NOT NULL AND ai_access_level != 'allowed'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(tool_runtime::RestrictedConnection {
+                    connection_id: row.get(0)?,
+                    name: row.get(1)?,
+                    level: tool_runtime::AiAccessLevel::from_storage(
+                        row.get::<_, Option<String>>(2)?.as_deref(),
+                    ),
+                })
+            })?;
+            let mut restricted = Vec::new();
+            for row in rows {
+                restricted.push(row?);
+            }
+            Ok(restricted)
+        })
+    }
+
+    pub fn set_ai_access_level(
+        &self,
+        connection_id: i64,
+        level: tool_runtime::AiAccessLevel,
+    ) -> Result<()> {
+        // 「允许」写回 `NULL`，让默认值不落库（升级上来的旧行同样保持为空）。
+        let stored = (level != tool_runtime::AiAccessLevel::Allowed).then(|| level.as_str());
+        self.conn.with_connection(|conn| {
+            let updated = conn.execute(
+                "UPDATE connections SET ai_access_level = ?1 WHERE id = ?2",
+                params![stored, connection_id],
+            )?;
+            anyhow::ensure!(updated == 1, "Connection {connection_id} not found");
+            Ok(())
+        })
+    }
+
     pub fn resolve_extension_secret(&self, extension_id: &str, reference: &str) -> Result<Vec<u8>> {
         let (connection_id, field_id) = reference
             .split_once(':')
@@ -222,7 +310,7 @@ impl ConnectionRepository {
     ) -> Result<Option<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level
                  FROM connections
                  WHERE id = ?1
                    AND ((team_id = ?2) OR (team_id IS NULL AND ?2 IS NULL))
@@ -257,6 +345,9 @@ impl ConnectionRepository {
         let encrypted_params = item.try_encrypt_params()?;
         let sync_enabled = i64::from(item.sync_enabled);
         let preferred_open_mode = serialize_preferred_open_mode(item.preferred_open_mode)?;
+        // 默认「允许」写 `NULL`，与 `set_ai_access_level` 的语义保持一致。
+        let ai_access_level = (item.ai_access_level != tool_runtime::AiAccessLevel::Allowed)
+            .then(|| item.ai_access_level.as_str());
         let ts = now();
         let (id, credential_revision) = self.conn.with_connection(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
@@ -272,8 +363,8 @@ impl ConnectionRepository {
                 .optional()?;
             let id = if let Some(id) = existing_id {
                 let updated = tx.execute(
-                    "UPDATE connections SET name = ?1, connection_type = ?2, params = ?3, workspace_id = ?4, selected_databases = ?5, remark = ?6, sync_enabled = ?7, cloud_id = ?8, last_synced_at = ?9, team_id = ?10, owner_id = ?11, preferred_open_mode = ?12, updated_at = ?13, credential_revision = credential_revision + 1 WHERE id = ?14 AND credential_revision < ?15",
-                    params![item.name, connection_type, encrypted_params, item.workspace_id, item.selected_databases, item.remark, sync_enabled, cloud_id, item.last_synced_at, item.team_id, item.owner_id, preferred_open_mode, ts, id, i64::MAX],
+                    "UPDATE connections SET name = ?1, connection_type = ?2, params = ?3, workspace_id = ?4, selected_databases = ?5, remark = ?6, sync_enabled = ?7, cloud_id = ?8, last_synced_at = ?9, team_id = ?10, owner_id = ?11, preferred_open_mode = ?12, ai_access_level = ?13, updated_at = ?14, credential_revision = credential_revision + 1 WHERE id = ?15 AND credential_revision < ?16",
+                    params![item.name, connection_type, encrypted_params, item.workspace_id, item.selected_databases, item.remark, sync_enabled, cloud_id, item.last_synced_at, item.team_id, item.owner_id, preferred_open_mode, ai_access_level, ts, id, i64::MAX],
                 )?;
                 anyhow::ensure!(
                     updated == 1,
@@ -282,8 +373,8 @@ impl ConnectionRepository {
                 id
             } else {
                 tx.execute(
-                    "INSERT INTO connections (name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, preferred_open_mode, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                    params![item.name, connection_type, encrypted_params, item.workspace_id, item.selected_databases, item.remark, sync_enabled, cloud_id, item.last_synced_at, item.team_id, item.owner_id, preferred_open_mode, ts, ts],
+                    "INSERT INTO connections (name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, preferred_open_mode, ai_access_level, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![item.name, connection_type, encrypted_params, item.workspace_id, item.selected_databases, item.remark, sync_enabled, cloud_id, item.last_synced_at, item.team_id, item.owner_id, preferred_open_mode, ai_access_level, ts, ts],
                 )?;
                 tx.last_insert_rowid()
             };
@@ -336,13 +427,16 @@ impl Repository for ConnectionRepository {
         let last_synced_at = item.last_synced_at;
         let team_id = item.team_id.clone();
         let owner_id = item.owner_id.clone();
+        // 默认「允许」写 `NULL`，与 `set_ai_access_level` 的语义保持一致。
+        let ai_access_level = (item.ai_access_level != tool_runtime::AiAccessLevel::Allowed)
+            .then(|| item.ai_access_level.as_str());
         let ts = now();
 
         let id = self.conn.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO connections (name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![name, connection_type, params_str, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, ts, ts],
+                "INSERT INTO connections (name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, ai_access_level, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![name, connection_type, params_str, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, ai_access_level, ts, ts],
             )?;
             Ok(conn.last_insert_rowid())
         })?;
@@ -371,12 +465,15 @@ impl Repository for ConnectionRepository {
         let team_id = item.team_id.clone();
         let owner_id = item.owner_id.clone();
         let preferred_open_mode = serialize_preferred_open_mode(item.preferred_open_mode)?;
+        // 默认「允许」写 `NULL`，与 `set_ai_access_level` 的语义保持一致。
+        let ai_access_level = (item.ai_access_level != tool_runtime::AiAccessLevel::Allowed)
+            .then(|| item.ai_access_level.as_str());
         let ts = now();
 
         self.conn.with_connection(|conn| {
             let updated = conn.execute(
-                "UPDATE connections SET name = ?1, connection_type = ?2, params = ?3, workspace_id = ?4, selected_databases = ?5, remark = ?6, sync_enabled = ?7, cloud_id = ?8, last_synced_at = ?9, team_id = ?10, owner_id = ?11, preferred_open_mode = ?12, updated_at = ?13, credential_revision = credential_revision + 1 WHERE id = ?14 AND credential_revision < ?15",
-                params![name, connection_type, params_str, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, preferred_open_mode, ts, id, i64::MAX],
+                "UPDATE connections SET name = ?1, connection_type = ?2, params = ?3, workspace_id = ?4, selected_databases = ?5, remark = ?6, sync_enabled = ?7, cloud_id = ?8, last_synced_at = ?9, team_id = ?10, owner_id = ?11, preferred_open_mode = ?12, ai_access_level = ?13, updated_at = ?14, credential_revision = credential_revision + 1 WHERE id = ?15 AND credential_revision < ?16",
+                params![name, connection_type, params_str, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, team_id, owner_id, preferred_open_mode, ai_access_level, ts, id, i64::MAX],
             )?;
             anyhow::ensure!(
                 updated == 1,
@@ -396,7 +493,7 @@ impl Repository for ConnectionRepository {
     fn get(&self, id: i64) -> Result<Option<Self::Entity>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode FROM connections WHERE id = ?1",
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level FROM connections WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
@@ -410,7 +507,7 @@ impl Repository for ConnectionRepository {
     fn list(&self) -> Result<Vec<Self::Entity>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode FROM connections ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level FROM connections ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
             )?;
             let rows = stmt.query_map([], |row| ConnectionRow::from_row(row))?;
             let mut results = Vec::new();
@@ -445,9 +542,9 @@ impl ConnectionRepository {
     pub fn list_by_workspace(&self, workspace_id: Option<i64>) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let sql = if workspace_id.is_some() {
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode FROM connections WHERE workspace_id = ?1 ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC"
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level FROM connections WHERE workspace_id = ?1 ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC"
             } else {
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode FROM connections WHERE workspace_id IS NULL ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC"
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level FROM connections WHERE workspace_id IS NULL ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC"
             };
             let mut stmt = conn.prepare(sql)?;
 
@@ -556,7 +653,7 @@ impl ConnectionRepository {
     pub fn list_pending_sync(&self) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level
                  FROM connections
                  WHERE sync_enabled = 1 AND (cloud_id IS NULL OR updated_at > COALESCE(last_synced_at, 0))
                  ORDER BY updated_at DESC",
@@ -574,7 +671,7 @@ impl ConnectionRepository {
     pub fn get_by_cloud_id(&self, cloud_id: &str) -> Result<Option<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level
                  FROM connections WHERE cloud_id = ?1",
             )?;
             let mut rows = stmt.query(params![cloud_id])?;
@@ -620,7 +717,7 @@ impl ConnectionRepository {
     pub fn list_by_team(&self, team_id: &str) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode FROM connections WHERE team_id = ?1 ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level FROM connections WHERE team_id = ?1 ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
             )?;
             let rows = stmt.query_map(params![team_id], |row| ConnectionRow::from_row(row))?;
             let mut results = Vec::new();
@@ -635,7 +732,7 @@ impl ConnectionRepository {
     pub fn list_personal(&self) -> Result<Vec<StoredConnection>> {
         self.conn.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode FROM connections WHERE team_id IS NULL ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
+                "SELECT id, credential_revision, name, connection_type, params, workspace_id, selected_databases, remark, sync_enabled, cloud_id, last_synced_at, last_used_at, sort_order, created_at, updated_at, team_id, owner_id, preferred_open_mode, ai_access_level FROM connections WHERE team_id IS NULL ORDER BY COALESCE(last_used_at, updated_at, created_at) DESC, id DESC",
             )?;
             let rows = stmt.query_map([], |row| ConnectionRow::from_row(row))?;
             let mut results = Vec::new();
@@ -825,13 +922,28 @@ impl Repository for WorkspaceRepository {
     fn delete(&self, id: i64) -> Result<()> {
         self.conn.with_connection(|conn| {
             let transaction = conn.unchecked_transaction()?;
+            // 删除分组时把子分组和直属连接「提升一层」到被删分组的父级；
+            // 直接置 NULL 会让它们在连接树里跳到根级或随分组一起消失。
+            let Some(parent_id) = transaction
+                .query_row(
+                    "SELECT parent_id FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let ts = now();
+            // 提升属于真实的本地归属变更，需要刷新 updated_at 让云同步把它当作
+            // 待上传修改，否则下载端会把连接/子分组重新指回已删除的分组。
             transaction.execute(
-                "UPDATE connections SET workspace_id = NULL WHERE workspace_id = ?1",
-                params![id],
+                "UPDATE workspaces SET parent_id = ?1, updated_at = ?2 WHERE parent_id = ?3",
+                params![parent_id, ts, id],
             )?;
             transaction.execute(
-                "UPDATE workspaces SET parent_id = NULL WHERE parent_id = ?1",
-                params![id],
+                "UPDATE connections SET workspace_id = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+                params![parent_id, ts, id],
             )?;
             transaction.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
             transaction.commit()?;
@@ -995,6 +1107,160 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
 
+    fn ai_access_test_repository() -> (SqliteConnection, ConnectionRepository) {
+        let _crypto_guard = crate::crypto::crypto_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::crypto::set_master_key_for_session("ai-access-test-key").unwrap();
+        test_repository()
+    }
+
+    #[test]
+    fn ai_access_level_roundtrips_through_the_connection_row() {
+        let (conn, repo) = ai_access_test_repository();
+        let mut connection = ssh_connection("prod-db");
+        repo.insert(&mut connection).unwrap();
+        let id = connection.id.unwrap();
+
+        // 默认（NULL）按「允许」处理，且不出现批量映射里。
+        assert_eq!(
+            tool_runtime::AiAccessLevel::Allowed,
+            repo.ai_access_level(id).unwrap()
+        );
+        assert!(!repo.ai_access_levels().unwrap().contains_key(&id));
+
+        repo.set_ai_access_level(id, tool_runtime::AiAccessLevel::Denied)
+            .unwrap();
+        assert_eq!(
+            tool_runtime::AiAccessLevel::Denied,
+            repo.ai_access_level(id).unwrap()
+        );
+        assert_eq!(
+            Some(tool_runtime::AiAccessLevel::Denied),
+            repo.ai_access_levels().unwrap().get(&id).copied()
+        );
+        let stored: Option<String> = conn
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT ai_access_level FROM connections WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(Some("denied".to_string()), stored);
+
+        // 「允许」等价于默认值：列回到 NULL，批量映射里也不再出现。
+        repo.set_ai_access_level(id, tool_runtime::AiAccessLevel::Allowed)
+            .unwrap();
+        let stored: Option<String> = conn
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT ai_access_level FROM connections WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(None, stored);
+        assert!(!repo.ai_access_levels().unwrap().contains_key(&id));
+        assert_eq!(
+            tool_runtime::AiAccessLevel::Allowed,
+            repo.ai_access_level(id).unwrap()
+        );
+    }
+
+    #[test]
+    fn ai_access_level_survives_loading_and_updating_the_connection() {
+        let (_conn, repo) = ai_access_test_repository();
+        let mut connection = ssh_connection("prod-db");
+        repo.insert(&mut connection).unwrap();
+        let id = connection.id.unwrap();
+        repo.set_ai_access_level(id, tool_runtime::AiAccessLevel::ReadOnly)
+            .unwrap();
+
+        // SELECT 列清单漏了该列时这里会读到默认值，测试即失败。
+        let mut loaded = repo.get(id).unwrap().expect("connection");
+        assert_eq!(
+            tool_runtime::AiAccessLevel::ReadOnly,
+            loaded.ai_access_level
+        );
+
+        // 表单整体更新（改备注）不应把策略重置回默认。
+        loaded.remark = Some("touched".to_string());
+        repo.update(&loaded).unwrap();
+        assert_eq!(
+            tool_runtime::AiAccessLevel::ReadOnly,
+            repo.ai_access_level(id).unwrap()
+        );
+
+        // 通过结构体写回策略同样生效（表单/侧栏统一走这条路）。
+        loaded.ai_access_level = tool_runtime::AiAccessLevel::Denied;
+        repo.update(&loaded).unwrap();
+        assert_eq!(
+            tool_runtime::AiAccessLevel::Denied,
+            repo.ai_access_level(id).unwrap()
+        );
+    }
+
+    #[test]
+    fn ai_access_restricted_joins_connection_names() {
+        let (_conn, repo) = ai_access_test_repository();
+        let mut connection = ssh_connection("prod-bastion");
+        repo.insert(&mut connection).unwrap();
+        let id = connection.id.unwrap();
+        repo.set_ai_access_level(id, tool_runtime::AiAccessLevel::Denied)
+            .unwrap();
+
+        let restricted = repo.ai_access_restricted().unwrap();
+        assert_eq!(1, restricted.len());
+        assert_eq!(id, restricted[0].connection_id);
+        assert_eq!("prod-bastion", restricted[0].name);
+        assert_eq!(tool_runtime::AiAccessLevel::Denied, restricted[0].level);
+
+        repo.set_ai_access_level(id, tool_runtime::AiAccessLevel::Allowed)
+            .unwrap();
+        assert!(repo.ai_access_restricted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cloud_down_sync_applies_and_keeps_ai_access_level() {
+        let (_conn, repo) = ai_access_test_repository();
+        let mut from_cloud = ssh_connection("prod-db");
+        from_cloud.cloud_id = Some("cloud-prod".to_string());
+        from_cloud.ai_access_level = tool_runtime::AiAccessLevel::Denied;
+        repo.upsert_cloud_connection(&mut from_cloud).unwrap();
+
+        let local_id = from_cloud.id.expect("upsert assigns the local id");
+        assert_eq!(
+            tool_runtime::AiAccessLevel::Denied,
+            repo.ai_access_level(local_id).unwrap()
+        );
+
+        // 再次下行时本地 id 不变（云端 upsert 按 cloud_id 就地更新），策略随之更新。
+        let mut refresh = ssh_connection("prod-db");
+        refresh.cloud_id = Some("cloud-prod".to_string());
+        refresh.ai_access_level = tool_runtime::AiAccessLevel::ReadOnly;
+        repo.upsert_cloud_connection(&mut refresh).unwrap();
+        assert_eq!(local_id, refresh.id.expect("local id is preserved"));
+        assert_eq!(
+            tool_runtime::AiAccessLevel::ReadOnly,
+            repo.ai_access_level(local_id).unwrap()
+        );
+    }
+
+    #[test]
+    fn ai_access_level_reports_missing_connections() {
+        let (_conn, repo) = ai_access_test_repository();
+        assert!(repo.ai_access_level(424242).is_err());
+        assert!(
+            repo.set_ai_access_level(424242, tool_runtime::AiAccessLevel::Denied)
+                .is_err()
+        );
+    }
+
     #[test]
     fn extension_connections_use_standard_repository_and_scoped_secrets() {
         let _crypto_guard = crate::crypto::crypto_test_lock()
@@ -1153,6 +1419,63 @@ mod tests {
         repo.delete(parent_id).unwrap();
 
         assert_eq!(None, repo.get(child_id).unwrap().unwrap().parent_id);
+    }
+
+    #[test]
+    fn workspace_delete_promotes_children_and_connections_one_level() {
+        let (conn, connections) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut root = workspace("root");
+        let root_id = repo.insert(&mut root).unwrap();
+        let mut middle = workspace("middle");
+        middle.parent_id = Some(root_id);
+        let middle_id = repo.insert(&mut middle).unwrap();
+        let mut leaf = workspace("leaf");
+        leaf.parent_id = Some(middle_id);
+        let leaf_id = repo.insert(&mut leaf).unwrap();
+
+        let mut direct = ssh_connection("direct");
+        direct.workspace_id = Some(middle_id);
+        let direct_id = connections.insert(&mut direct).unwrap();
+        let mut nested = ssh_connection("nested");
+        nested.workspace_id = Some(leaf_id);
+        let nested_id = connections.insert(&mut nested).unwrap();
+
+        repo.delete(middle_id).unwrap();
+
+        assert!(repo.get(middle_id).unwrap().is_none());
+        assert_eq!(Some(root_id), repo.get(leaf_id).unwrap().unwrap().parent_id);
+        assert_eq!(
+            Some(root_id),
+            connections.get(direct_id).unwrap().unwrap().workspace_id
+        );
+        assert_eq!(
+            Some(leaf_id),
+            connections.get(nested_id).unwrap().unwrap().workspace_id
+        );
+    }
+
+    #[test]
+    fn workspace_delete_of_root_detaches_children_and_connections() {
+        let (conn, connections) = test_repository();
+        let repo = WorkspaceRepository::new(conn);
+        let mut root = workspace("root");
+        let root_id = repo.insert(&mut root).unwrap();
+        let mut child = workspace("child");
+        child.parent_id = Some(root_id);
+        let child_id = repo.insert(&mut child).unwrap();
+
+        let mut attached = ssh_connection("attached");
+        attached.workspace_id = Some(root_id);
+        let attached_id = connections.insert(&mut attached).unwrap();
+
+        repo.delete(root_id).unwrap();
+
+        assert_eq!(None, repo.get(child_id).unwrap().unwrap().parent_id);
+        assert_eq!(
+            None,
+            connections.get(attached_id).unwrap().unwrap().workspace_id
+        );
     }
 
     #[test]

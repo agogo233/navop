@@ -1,5 +1,34 @@
 use super::*;
 
+/// 断开态 Ctrl+D 的关闭目标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DisconnectedCtrlDCloseTarget {
+    /// 关闭所在标签页：交给宿主 TabContainer 走正常关闭生命周期。
+    Tab,
+    /// 独立窗口内的终端没有标签容器，退化为关闭窗口。
+    Window,
+}
+
+/// 断开态 Ctrl+D 判定：仅 ctrl+d，不带 alt/shift/platform 修饰键。
+pub(super) fn is_disconnected_ctrl_d(keystroke: &Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    modifiers.control
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.platform
+        && keystroke.key == "d"
+}
+
+/// 按终端渲染模式决定断开态 Ctrl+D 关闭什么。
+pub(super) fn disconnected_ctrl_d_close_target(
+    render_mode: TerminalRenderMode,
+) -> DisconnectedCtrlDCloseTarget {
+    match render_mode {
+        TerminalRenderMode::WorkspacePane => DisconnectedCtrlDCloseTarget::Tab,
+        TerminalRenderMode::Embedded => DisconnectedCtrlDCloseTarget::Window,
+    }
+}
+
 impl TerminalView {
     pub(super) fn write_to_pty(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
         if !self.accepts_live_terminal_input(cx) {
@@ -125,23 +154,30 @@ impl TerminalView {
             return;
         }
 
-        // Xshell 风格：会话未激活（未连接/已断开）时 Ctrl+D 关闭当前窗口；
-        // 会话存活时 Ctrl+D 照常透传为 EOF（\x04）退出 shell。
-        // 锁定会话不关闭窗口，仅拦截输入。
+        // Xshell / MobaXterm 风格：会话已断开（SSH/串口断开、shell 已退出）时，Ctrl+D
+        // 关闭当前标签页；会话存活时 Ctrl+D 照常透传为 EOF（\x04）结束 shell，第二次
+        // Ctrl+D 才命中这里。锁定会话不关闭标签页，仅拦截输入。
+        //
+        // 注意：`accepts_live_terminal_input` 只判断"终端类型是否支持实时输入"，SSH 会话
+        // 断开后它仍然为 true，因此必须叠加 `terminal_is_disconnected` 才覆盖断开态。
         let is_locked = self.terminal.read(cx).is_locked();
-        if !self.accepts_live_terminal_input(cx) && !is_locked {
-            let modifiers = event.keystroke.modifiers;
-            if modifiers.control
-                && !modifiers.alt
-                && !modifiers.shift
-                && !modifiers.platform
-                && event.keystroke.key == "d"
-            {
-                one_core::window_close::request_close_window(_window.window_handle(), cx);
+        let session_inactive =
+            self.terminal_is_disconnected(cx) || !self.accepts_live_terminal_input(cx);
+        if !is_locked && session_inactive && is_disconnected_ctrl_d(&event.keystroke) {
+            match disconnected_ctrl_d_close_target(self.render_mode) {
+                // 工作区标签内：由 TerminalWorkspace 决定关当前 pane 还是整个标签页。
+                DisconnectedCtrlDCloseTarget::Tab => {
+                    cx.emit(TerminalPaneEvent::ClosePaneRequested);
+                }
+                // 独立窗口里的终端没有标签容器，保持关闭窗口的兜底行为。
+                DisconnectedCtrlDCloseTarget::Window => {
+                    one_core::window_close::request_close_window(_window.window_handle(), cx);
+                }
             }
             return;
         }
 
+        // 不支持实时输入的终端（只读/录像回放）其余按键一律不透传。
         if !self.accepts_live_terminal_input(cx) {
             return;
         }

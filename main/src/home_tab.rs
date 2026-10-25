@@ -153,6 +153,21 @@ impl HomePage {
         cx.notify();
     }
 
+    /// 主页连接树的“未分组”分区是否折叠。
+    ///
+    /// 复用卡片/列表布局里 `collapsed_groups` 的 `None` 键（语义正是“未分组”），
+    /// 这样“全部折叠/全部展开”对三种布局同时生效，无需新增 HomePage 字段。
+    pub(crate) fn unassigned_connections_collapsed(&self) -> bool {
+        self.collapsed_groups.contains(&None)
+    }
+
+    pub(crate) fn toggle_unassigned_connections(&mut self, cx: &mut Context<Self>) {
+        if !self.collapsed_groups.remove(&None) {
+            self.collapsed_groups.insert(None);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn uses_global_navigation_layout(&self) -> bool {
         self.connection_layout == ConnectionLayout::Navigation
     }

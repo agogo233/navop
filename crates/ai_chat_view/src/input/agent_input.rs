@@ -166,6 +166,7 @@ impl QueuedPromptPreview {
 
 const CONTEXT_POPOVER_WIDTH: f32 = 400.0;
 const CONTEXT_TARGET_LIST_MAX_HEIGHT: f32 = 320.0;
+
 const CONTEXT_KIND_MAX_WIDTH: f32 = 92.0;
 const COMPOSER_EDITOR_MIN_ROWS: usize = 3;
 const COMPOSER_EDITOR_MAX_ROWS: usize = 10;

@@ -227,9 +227,75 @@ pub(super) fn connection_team_indicator(
     )
 }
 
+/// 侧栏「AI 访问受限」徽标（issue #437）。
+///
+/// 只读与禁止都要一眼看出来，允许（默认）不占位置；样式沿用类型标签的
+/// muted 小徽标，禁止用 danger 前景色强调。
+pub(super) fn connection_ai_access_badge(
+    level: tool_runtime::AiAccessLevel,
+    cx: &gpui::App,
+) -> Option<AnyElement> {
+    let (icon, key, color) = ai_access_badge_spec(level)?;
+    Some(
+        h_flex()
+            .flex_shrink_0()
+            .gap_1()
+            .items_center()
+            .px_1p5()
+            .py_0p5()
+            .rounded(px(4.0))
+            .bg(cx.theme().muted)
+            .child(Icon::new(icon).with_size(Size::XSmall))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(color(cx))
+                    .whitespace_nowrap()
+                    .child(t!(key).to_string()),
+            )
+            .into_any_element(),
+    )
+}
+
+/// 徽标的图标与文案键；`Allowed` 不显示徽标。
+fn ai_access_badge_spec(
+    level: tool_runtime::AiAccessLevel,
+) -> Option<(IconName, &'static str, fn(&gpui::App) -> Hsla)> {
+    match level {
+        tool_runtime::AiAccessLevel::Allowed => None,
+        tool_runtime::AiAccessLevel::ReadOnly => Some((
+            IconName::Eye,
+            "Connection.ai_access_read_only_badge",
+            |cx| cx.theme().muted_foreground,
+        )),
+        tool_runtime::AiAccessLevel::Denied => Some((
+            IconName::EyeOff,
+            "Connection.ai_access_denied_badge",
+            |cx| cx.theme().danger,
+        )),
+    }
+}
+
 fn tree_action_button(action: &'static str, id: i64, icon: IconName) -> Button {
     Button::new(format!("persistent-{action}-{id}"))
         .icon(icon)
         .ghost()
         .xsmall()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_level_renders_no_badge_and_restricted_levels_do() {
+        assert!(ai_access_badge_spec(tool_runtime::AiAccessLevel::Allowed).is_none());
+        let read_only =
+            ai_access_badge_spec(tool_runtime::AiAccessLevel::ReadOnly).expect("只读级别应有徽标");
+        let denied =
+            ai_access_badge_spec(tool_runtime::AiAccessLevel::Denied).expect("禁止级别应有徽标");
+        assert_ne!(read_only.1, denied.1, "两档受限级别的文案必须区分");
+        assert_ne!(read_only.0, denied.0, "两档受限级别的图标必须区分");
+    }
 }

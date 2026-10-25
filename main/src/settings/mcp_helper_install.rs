@@ -33,10 +33,21 @@ pub(crate) fn mcp_runtime_requirements_item_id() -> &'static str {
 
 fn runtime_requirements_status() -> String {
     let install = ClientConfigInstall::from_current_app();
-    t!(
-        "Settings.General.Mcp.runtime_requirements_ready",
-        command = install.launch_spec.command,
-        package = format!("@navop/mcp@{NAVOP_MCP_CLIENT_TAG}")
-    )
-    .to_string()
+    let command = install.launch_spec.command;
+    // GUI 进程的 PATH 往往看不到 Homebrew / nvm 安装的 npx，这里做真实探测，
+    // 避免在 npx 缺失时仍然显示「就绪」，把失败推迟到点击安装的那一刻。
+    match process_util::resolve_program(&command) {
+        Some(path) => t!(
+            "Settings.General.Mcp.runtime_requirements_ready",
+            command = command,
+            path = path.display().to_string(),
+            package = format!("@navop/mcp@{NAVOP_MCP_CLIENT_TAG}")
+        )
+        .to_string(),
+        None => t!(
+            "Settings.General.Mcp.runtime_requirements_missing",
+            command = command
+        )
+        .to_string(),
+    }
 }

@@ -154,10 +154,18 @@ Home:
     en: "Group"
     zh-CN: "分组"
     zh-HK: "分組"
+  groups_section:
+    en: "Groups"
+    zh-CN: "分组"
+    zh-HK: "分組"
   recent_connections:
     en: "Recent Connections"
     zh-CN: "最近连接"
     zh-HK: "最近連線"
+  unassigned_connections:
+    en: "Unassigned"
+    zh-CN: "未分组"
+    zh-HK: "未分組"
   recent_hint:
     en: "Sorted by last used · not affected by group filter"
     zh-CN: "按最近使用排序 · 不受分组筛选影响"
@@ -886,6 +894,18 @@ Home:
     en: Local changed, remote deleted
     zh-CN: 本地有更新，远端已删除
     zh-HK: 本地有更新，遠端已刪除
+  personal_sync_conflict_resolved:
+    en: "Resolved %{count} sync conflict(s)"
+    zh-CN: "已解决 %{count} 个同步冲突"
+    zh-HK: "已解決 %{count} 個同步衝突"
+  personal_sync_conflict_resolve_failed:
+    en: "Failed to resolve %{count} conflict(s): %{reason}"
+    zh-CN: "解决 %{count} 个冲突失败：%{reason}"
+    zh-HK: "解決 %{count} 個衝突失敗：%{reason}"
+  personal_sync_conflict_partially_resolved:
+    en: "Resolved %{succeeded} conflict(s), %{failed} failed: %{reason}"
+    zh-CN: "已解决 %{succeeded} 个冲突，%{failed} 个失败：%{reason}"
+    zh-HK: "已解決 %{succeeded} 個衝突，%{failed} 個失敗：%{reason}"
   sync_conflict_type:
     en: "Conflict type: %{conflict_type}"
     zh-CN: "冲突类型: %{conflict_type}"
@@ -1769,6 +1789,38 @@ Connection:
     en: "Fullscreen mode. Press Esc to exit fullscreen."
     zh-CN: "已进入全屏，按 Esc 退出全屏。"
     zh-HK: "已進入全螢幕，按 Esc 退出全螢幕。"
+  ai_access:
+    en: AI Access
+    zh-CN: AI 访问
+    zh-HK: AI 存取
+  ai_access_allowed:
+    en: Allowed
+    zh-CN: 允许
+    zh-HK: 允許
+  ai_access_read_only:
+    en: Read only
+    zh-CN: 只读
+    zh-HK: 唯讀
+  ai_access_denied:
+    en: Denied
+    zh-CN: 禁止
+    zh-HK: 禁止
+  ai_access_read_only_badge:
+    en: AI read-only
+    zh-CN: AI 只读
+    zh-HK: AI 唯讀
+  ai_access_denied_badge:
+    en: AI blocked
+    zh-CN: 禁止 AI
+    zh-HK: 禁止 AI
+  ai_access_save_failed:
+    en: "Failed to save the AI access policy: %{error}"
+    zh-CN: "AI 访问策略保存失败：%{error}"
+    zh-HK: "AI 存取策略儲存失敗：%{error}"
+  ai_access_storage_missing:
+    en: Local connection storage is unavailable, so the AI access policy could not be saved
+    zh-CN: 本地连接存储不可用，AI 访问策略未保存
+    zh-HK: 本機連線儲存不可用，AI 存取策略未儲存
   copy_connection:
     en: Copy Connection
     zh-CN: 复制连接
@@ -1905,6 +1957,18 @@ Connection:
     en: Move to Group
     zh-CN: 移动到分组
     zh-HK: 移動到分組
+  move_to_this_group:
+    en: Move to This Group
+    zh-CN: 移动到此分组
+    zh-HK: 移動到此分組
+  move_target_root_group:
+    en: Root Group
+    zh-CN: 根分组
+    zh-HK: 根分組
+  move_target_hint:
+    en: "%{count} groups, expanded by hierarchy"
+    zh-CN: "共 %{count} 个分组，按层级展开"
+    zh-HK: "共 %{count} 個分組，按層級展開"
   batch_selected:
     en: "%{count} selected"
     zh-CN: "已选择 %{count} 项"
@@ -2310,6 +2374,15 @@ NewConnection:
     en: "More Connections"
     zh-CN: "更多连接"
     zh-HK: "更多連線"
+  # 空类目的「+」安装入口（见 NewConnectionCategory::InstallCategoryExtensions）
+  more_middleware:
+    en: "More middleware"
+    zh-CN: "更多中间件"
+    zh-HK: "更多中介軟體"
+  more_time_series:
+    en: "More time series"
+    zh-CN: "更多时序数据库"
+    zh-HK: "更多時序資料庫"
   description_ssh:
     en: Remote server terminal and file connection
     zh-CN: 远程服务器终端与文件连接
@@ -2470,6 +2543,14 @@ Settings:
         en: Connections
         zh-CN: 连接显示
         zh-HK: 連線顯示
+      show_recent:
+        en: Show Recent Connections
+        zh-CN: 显示最近连接分组
+        zh-HK: 顯示最近連線分組
+      show_recent_desc:
+        en: Show the recent connections group on Home. Turn off to keep only grouped connections.
+        zh-CN: 在首页显示「最近连接」分组，关闭后仅显示各分组内的连接
+        zh-HK: 在首頁顯示「最近連線」分組，關閉後僅顯示各分組內的連線
       home_layout:
         en: Home Connection Layout
         zh-CN: 主页连接布局
@@ -3403,9 +3484,13 @@ Settings:
         zh-CN: 外部 MCP 客户端通过 npx 启动 @navop/mcp@latest；npm 按需解析并缓存当前包，无需从扩展市场安装
         zh-HK: 外部 MCP 客戶端透過 npx 啟動 @navop/mcp@latest；npm 按需解析並快取目前套件，無需從擴充功能市集安裝
       runtime_requirements_ready:
-        en: "%{package} will run on demand through %{command}; no global npm install is required"
-        zh-CN: "%{package} 将通过 %{command} 按需启动；无需全局安装 npm 包"
-        zh-HK: "%{package} 將透過 %{command} 按需啟動；無需全域安裝 npm 套件"
+        en: "%{command} found at %{path}; %{package} runs on demand through it and needs no global npm install"
+        zh-CN: "已找到 %{command}：%{path}；%{package} 将通过它按需启动，无需全局安装 npm 包"
+        zh-HK: "已找到 %{command}：%{path}；%{package} 將透過它按需啟動，無需全域安裝 npm 套件"
+      runtime_requirements_missing:
+        en: "%{command} was not found; install Node.js or add its bin directory to PATH before installing MCP client configs or the Navop Skill"
+        zh-CN: "未找到 %{command}；请先安装 Node.js，或把 Node.js 的 bin 目录加入 PATH，再安装 MCP 客户端配置或 Navop Skill"
+        zh-HK: "未找到 %{command}；請先安裝 Node.js，或把 Node.js 的 bin 目錄加入 PATH，再安裝 MCP 客戶端配置或 Navop Skill"
       install_codex_config:
         en: Codex MCP Configuration
         zh-CN: Codex MCP 配置
@@ -3459,9 +3544,9 @@ Settings:
         zh-CN: 为 Agents 安装 Navop Skill
         zh-HK: 為 Agents 安裝 Navop Skill
       install_skill_desc:
-        en: Install the Skill from @navop/cli@latest into the user Skill directory; npm downloads it on demand and Navop does not use a shell
-        zh-CN: 从 @navop/cli@latest 安装到用户 Skill 目录；npm 按需下载，Navop 不通过 shell 执行
-        zh-HK: 從 @navop/cli@latest 安裝到使用者 Skill 目錄；npm 按需下載，Navop 不透過 shell 執行
+        en: Install the Skill from @navop/cli@latest into the user Skill directory; Navop locates npx itself, including Homebrew and version-manager directories that GUI processes cannot see
+        zh-CN: 从 @navop/cli@latest 安装到用户 Skill 目录；Navop 会自动定位 npx，包括 GUI 进程看不到的 Homebrew、版本管理器目录
+        zh-HK: 從 @navop/cli@latest 安裝到使用者 Skill 目錄；Navop 會自動定位 npx，包括 GUI 進程看不到的 Homebrew、版本管理器目錄
       skill_status_installed:
         en: "Installed at %{path}; use Update to explicitly replace it with the recommended package copy"
         zh-CN: "已安装到 %{path}；点击更新才会明确替换为推荐 npm 包中的版本"
@@ -3490,6 +3575,10 @@ Settings:
         en: "Failed to install Navop Skill: %{error}"
         zh-CN: "Navop Skill 安装失败：%{error}"
         zh-HK: "Navop Skill 安裝失敗：%{error}"
+      skill_install_launcher_missing:
+        en: "Failed to install Navop Skill: %{command} was not found. Install Node.js or add Node.js to the app PATH."
+        zh-CN: "Navop Skill 安装失败：未找到 %{command}。请安装 Node.js，或将 Node.js 的 bin 目录加入 PATH。"
+        zh-HK: "Navop Skill 安裝失敗：未找到 %{command}。請安裝 Node.js，或將 Node.js 的 bin 目錄加入 PATH。"
       install_client_config_success:
         en: "MCP client config installed: %{path}"
         zh-CN: "MCP 客户端配置已安装：%{path}"
@@ -5536,3 +5625,15 @@ CredentialForm:
     en: Save
     zh-CN: 保存
     zh-HK: 儲存
+
+# FTP 连接表单的窗口标题由本 crate 组装（表单本体在 terminal_view 的 ftp_form_window），
+# 标题文案必须留在 main 自己的语言包里。
+Ftp:
+  new:
+    en: New FTP Connection
+    zh-CN: 新建 FTP 连接
+    zh-HK: 新建 FTP 連接
+  edit:
+    en: Edit FTP Connection
+    zh-CN: 编辑 FTP 连接
+    zh-HK: 編輯 FTP 連接

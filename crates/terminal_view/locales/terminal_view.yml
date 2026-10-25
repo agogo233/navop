@@ -2873,3 +2873,22 @@ Ftp:
     en: "Failed to save connection: %{error}"
     zh-CN: "保存连接失败：%{error}"
     zh-HK: "儲存連線失敗：%{error}"
+
+# 会话锁定：锁定后的占位文案由终端视图自己渲染，`t!` 只查本 crate 的语言包，
+# 不能指望 core 语言包里那份 SessionLock.*（见 crates/core/locales/core.yml）。
+SessionLock:
+  locked_notice:
+    en: "Session Locked"
+    zh-CN: "会话已锁定"
+    zh-HK: "會話已鎖定"
+  hidden_notice:
+    en: "Session Locked - Output Hidden"
+    zh-CN: "会话已锁定 - 输出已隐藏"
+    zh-HK: "會話已鎖定 - 輸出已隱藏"
+
+# 侧边栏文件管理器的操作菜单按钮
+File:
+  actions:
+    en: "File actions"
+    zh-CN: "文件操作"
+    zh-HK: "文件操作"

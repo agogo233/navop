@@ -195,9 +195,19 @@ impl HomePage {
                         }
                     }
                     ConnectionDataEvent::WorkspaceCreated { .. }
-                    | ConnectionDataEvent::WorkspaceUpdated { .. }
-                    | ConnectionDataEvent::WorkspaceDeleted { .. } => {
+                    | ConnectionDataEvent::WorkspaceUpdated { .. } => {
                         this.load_workspaces(cx);
+                        // 如果已登录且密钥已解锁，自动触发同步
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
+                            tracing::info!("工作区数据变化，自动触发云同步");
+                            this.trigger_sync(cx);
+                        }
+                    }
+                    ConnectionDataEvent::WorkspaceDeleted { .. } => {
+                        // 分组删除会把直属连接提升一层，连接归属随之变化；只重载
+                        // 分组会让连接继续指向已不存在的工作区，在树里凭空消失。
+                        this.load_workspaces(cx);
+                        this.load_connections(cx);
                         // 如果已登录且密钥已解锁，自动触发同步
                         if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("工作区数据变化，自动触发云同步");

@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod connection_icon;
 pub mod credential_vault;
 pub mod demo_database;
 pub mod manager;
@@ -35,6 +36,7 @@ mod rdp_settings_tests;
 mod master_key_rotation_tests;
 
 use anyhow::Result;
+pub use connection_icon::*;
 pub use credential_vault::*;
 use gpui::App;
 pub use manager::*;

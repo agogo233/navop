@@ -4,8 +4,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    RuntimeToolDescriptor, ToolAdapter, ToolAlias, ToolAnnotations, ToolDescriptor, ToolError,
-    ToolOrigin, ToolResult, ToolTargetSpec,
+    RuntimeToolDescriptor, ToolAccessGuard, ToolAdapter, ToolAlias, ToolAnnotations,
+    ToolDescriptor, ToolError, ToolOrigin, ToolResult, ToolTargetSpec,
 };
 
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'static>>;
@@ -96,6 +96,8 @@ impl Error for ToolRegistryError {}
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     handlers: Arc<Vec<Arc<dyn ToolHandler>>>,
+    /// 执行期访问策略校验（连接级 AI 访问限制）。`None` 表示不校验。
+    access_guard: Option<Arc<dyn ToolAccessGuard>>,
 }
 
 impl fmt::Debug for ToolRegistry {
@@ -103,6 +105,7 @@ impl fmt::Debug for ToolRegistry {
         formatter
             .debug_struct("ToolRegistry")
             .field("handler_count", &self.handlers.len())
+            .field("guarded", &self.access_guard.is_some())
             .finish()
     }
 }
@@ -119,7 +122,30 @@ impl ToolRegistry {
         }
         Ok(Self {
             handlers: Arc::new(handlers),
+            access_guard: None,
         })
+    }
+
+    /// 挂上执行期访问策略校验。
+    ///
+    /// 所有需要在执行前做连接级授权的 registry 都必须经过这里；合并后的 registry
+    /// 不会继承各子 registry 的 guard，需要显式再挂一次。
+    pub fn with_access_guard(mut self, guard: Arc<dyn ToolAccessGuard>) -> Self {
+        self.access_guard = Some(guard);
+        self
+    }
+
+    /// 挂上可选的访问策略校验；`None` 时保持不校验（无连接存储的环境）。
+    pub fn with_optional_access_guard(self, guard: Option<Arc<dyn ToolAccessGuard>>) -> Self {
+        match guard {
+            Some(guard) => self.with_access_guard(guard),
+            None => self,
+        }
+    }
+
+    /// 当前是否有访问策略校验，供启动阶段自检/测试断言。
+    pub fn has_access_guard(&self) -> bool {
+        self.access_guard.is_some()
     }
 
     pub fn merge(registries: Vec<Self>) -> Result<Self, ToolRegistryError> {
@@ -181,6 +207,10 @@ impl ToolRegistry {
                 id: id.to_string(),
                 adapter: context.adapter,
             });
+        }
+        // 连接级访问策略：必须在 handler 执行前拦截，且此时参数已完成 target 归一化。
+        if let Some(guard) = &self.access_guard {
+            guard.authorize(&descriptor, &input)?;
         }
         handler.call(input, context).await
     }

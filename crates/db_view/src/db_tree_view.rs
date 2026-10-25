@@ -3414,6 +3414,7 @@ mod tests {
 
     fn build_connection(id: i64, selected_databases: Option<Vec<&str>>) -> StoredConnection {
         StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(id),
             credential_revision: None,
             name: "conn".to_string(),

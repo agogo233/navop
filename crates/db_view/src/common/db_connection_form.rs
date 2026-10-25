@@ -50,6 +50,7 @@ use one_core::storage::{
     ProxyConfig, ProxyType, StoredConnection, Workspace, get_config_dir,
 };
 use rust_i18n::t;
+use tool_runtime::AiAccessLevel;
 use tracing::info;
 
 use super::connection_proxy::{self, ProxyValidationError};
@@ -1380,6 +1381,11 @@ pub struct DbConnectionForm {
     editing_connection: Option<StoredConnection>,
     /// Whether cloud sync is enabled.
     sync_enabled: Entity<bool>,
+    /// 连接级 AI 访问策略（issue #437）：允许 / 只读 / 禁止。
+    ///
+    /// 策略保存在 `StoredConnection::ai_access_level` 上，随连接一起保存与同步；
+    /// 表单保存连接成功后，再用连接 id 写入。写「允许」时后端会删除该记录。
+    ai_access_level: Entity<AiAccessLevel>,
     /// Oracle client detection status: Ok(version) / Err(error).
     oracle_client_status: Entity<Option<Result<String, String>>>,
     oracle_client_checking: Entity<bool>,
@@ -1511,6 +1517,8 @@ impl DbConnectionForm {
 
         // Enable cloud sync by default.
         let sync_enabled = cx.new(|_| true);
+        // 新建连接默认允许 AI 访问。
+        let ai_access_level = cx.new(|_| AiAccessLevel::Allowed);
         let oracle_client_status = cx.new(|_| None);
         let oracle_client_checking = cx.new(|_| false);
         let credential_picker = create_credential_picker(
@@ -1558,6 +1566,7 @@ impl DbConnectionForm {
             pending_file_path,
             editing_connection: None,
             sync_enabled,
+            ai_access_level,
             oracle_client_status,
             oracle_client_checking,
             oracle_driver_mode,
@@ -1710,6 +1719,13 @@ impl DbConnectionForm {
         // Load the sync state.
         self.sync_enabled.update(cx, |sync, cx| {
             *sync = connection.sync_enabled;
+            cx.notify();
+        });
+
+        // 回填连接级 AI 访问策略（保存在 `StoredConnection::ai_access_level` 上）。
+        let ai_access_level = connection_form::ai_access::stored_level(connection.id, cx);
+        self.ai_access_level.update(cx, |level, cx| {
+            *level = ai_access_level;
             cx.notify();
         });
 
@@ -2270,48 +2286,61 @@ impl DbConnectionForm {
         };
 
         let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let ai_access_level = *self.ai_access_level.read(cx);
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let repo_op = storage.get::<ConnectionRepository>();
             if let Some(repo) = repo_op {
                 let mut stored = stored;
-                if is_update {
-                    let re = repo.update(&stored);
-                    match re {
-                        Ok(..) => {
-                            let _ = this.update(cx, |form, cx| {
-                                // 保存已经落地：记住刚保存的连接，下一轮保存就是更新而不是新建 ——
-                                // 窗口因为隐藏失败留在屏幕上时（关闭漏斗返回 `Retained`）用户可能
-                                // 再点一次「保存」，没有这一步会插出第二条连接。
-                                form.editing_connection = Some(stored.clone());
-                                cx.emit(DbConnectionFormEvent::Saved(Box::new(stored)));
-                            });
-                        }
-                        Err(e) => {
-                            let error_msg = format!("{}: {}", t!("ConnectionForm.save_failed"), e);
-                            let _ = this.update(cx, |form, cx| {
-                                form.set_save_error(error_msg.clone(), cx);
-                                cx.emit(DbConnectionFormEvent::SaveError(error_msg));
-                            });
-                        }
-                    }
+                // 策略是连接自己的字段，改动一次就随连接一起写入。
+                stored.ai_access_level = ai_access_level;
+                let saved_id = if is_update {
+                    repo.update(&stored).map(|_| stored.id)
                 } else {
-                    let re = repo.insert(&mut stored);
-                    match re {
-                        Ok(id) => {
-                            let _ = this.update(cx, |form, cx| {
-                                stored.id = Some(id);
-                                // 同上面 update 分支：保存已经落地，下一轮保存要走更新。
-                                form.editing_connection = Some(stored.clone());
-                                cx.emit(DbConnectionFormEvent::Saved(Box::new(stored)));
-                            });
+                    repo.insert(&mut stored).map(Some)
+                };
+
+                match saved_id {
+                    Err(e) => {
+                        let error_msg = format!("{}: {}", t!("ConnectionForm.save_failed"), e);
+                        let _ = this.update(cx, |form, cx| {
+                            form.set_save_error(error_msg.clone(), cx);
+                            cx.emit(DbConnectionFormEvent::SaveError(error_msg));
+                        });
+                    }
+                    Ok(id) => {
+                        if let Some(id) = id {
+                            stored.id = Some(id);
                         }
-                        Err(e) => {
-                            let error_msg = format!("{}: {}", t!("ConnectionForm.save_failed"), e);
-                            let _ = this.update(cx, |form, cx| {
-                                form.set_save_error(error_msg.clone(), cx);
-                                cx.emit(DbConnectionFormEvent::SaveError(error_msg));
-                            });
+                        let _ = this.update(cx, |form, cx| {
+                            // 保存已经落地：记住刚保存的连接，下一轮保存就是更新而不是新建 ——
+                            // 窗口因为隐藏失败留在屏幕上时（关闭漏斗返回 `Retained`）用户可能
+                            // 再点一次「保存」，没有这一步会插出第二条连接。
+                            form.editing_connection = Some(stored.clone());
+                            cx.notify();
+                        });
+                        // 策略写失败时连接其实已经保存，但用户必须看到失败：沿用这个表单
+                        // 既有的错误行 + `SaveError` 事件，让窗口留在屏幕上重试。
+                        let policy_result = match stored.id {
+                            Some(id) => repo
+                                .set_ai_access_level(id, ai_access_level)
+                                .map_err(|e| e.to_string()),
+                            None => Err("connection id missing after save".to_string()),
+                        };
+                        match policy_result {
+                            Ok(()) => {
+                                let _ = this.update(cx, |_form, cx| {
+                                    cx.emit(DbConnectionFormEvent::Saved(Box::new(stored)));
+                                });
+                            }
+                            Err(e) => {
+                                let error_msg =
+                                    connection_form::ai_access::ai_access_save_failed(&e);
+                                let _ = this.update(cx, |form, cx| {
+                                    form.set_save_error(error_msg.clone(), cx);
+                                    cx.emit(DbConnectionFormEvent::SaveError(error_msg));
+                                });
+                            }
                         }
                     }
                 }
@@ -2769,6 +2798,17 @@ impl DbConnectionForm {
                         ),
                     )
                 })
+                // 连接级 AI 访问策略（issue #437）：布局与选项由通用组件统一渲染，
+                // 这里只把表单持有的实体交给它。
+                .child(
+                    field()
+                        .label(connection_form::ai_access::ai_access_label())
+                        .items_center()
+                        .child(connection_form::ai_access::ai_access_selector(
+                            &self.ai_access_level,
+                            cx,
+                        )),
+                )
                 .when(is_builtin_oracle, |form| {
                     let is_native = self.oracle_driver_mode == OracleDriverMode::Native;
                     let is_go = self.oracle_driver_mode == OracleDriverMode::Go;

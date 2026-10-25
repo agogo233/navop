@@ -1,4 +1,4 @@
-use super::{diagnostics, internal_functions, mongo, redis, resource_pool};
+use super::{access_guard, diagnostics, internal_functions, mongo, redis, resource_pool};
 use gpui::App;
 use one_core::settings::ToolExposureToolsetSettings;
 use one_core::tab_container::TabOpenMode;
@@ -147,8 +147,10 @@ fn build_tool_registry_for_surface(
         )));
     }
     if !runtime_registries.is_empty() {
-        let mut provider =
-            ToolRuntimeMcpProvider::new(tool_runtime::ToolRegistry::merge(runtime_registries)?);
+        // 连接级 AI 访问策略：合并后的 registry 不继承子 registry 的 guard，这里统一挂一次。
+        let registry = tool_runtime::ToolRegistry::merge(runtime_registries)?
+            .with_optional_access_guard(access_guard::connection_ai_access_guard(cx));
+        let mut provider = ToolRuntimeMcpProvider::new(registry);
         if let Some(resource_pool_provider) = resource_pool::app_resource_pool_provider(cx) {
             provider = provider.with_resource_pool_provider(resource_pool_provider);
         }
@@ -598,6 +600,71 @@ mod tests {
             vec!["df -h\n".to_string(), "df -h\n".to_string()],
             terminal.inserted()
         );
+    }
+
+    #[gpui::test]
+    fn denied_connection_blocks_tool_execution_until_reallowed(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            connections: false,
+            internal_functions: false,
+            ..Default::default()
+        };
+
+        let (registry, terminal, connection_id) = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            let terminal_registry =
+                terminal_view::public_mcp::registry(cx).expect("terminal registry should exist");
+            let repo = register_connection_repository(cx);
+            let connection_id = insert_ssh_connection(&repo, "仅手动管理的生产机", "10.2.4.54");
+            let terminal = FakeTerminalSession::new(
+                "ssh-terminal-manual",
+                Some(connection_id),
+                "prod-manual",
+                "root@manual:~",
+            );
+            terminal_registry.register(terminal.clone());
+            terminal_registry.register_terminal_exec(terminal.clone());
+            let registry = build_tool_registry(cx, &toolsets).expect("registry should build");
+            (registry, terminal, connection_id)
+        });
+
+        let repo = cx.update(|cx| {
+            cx.try_global::<GlobalStorageState>()
+                .expect("storage global")
+                .storage
+                .get::<ConnectionRepository>()
+                .expect("connection repository")
+        });
+        repo.set_ai_access_level(connection_id, tool_runtime::AiAccessLevel::Denied)
+            .expect("policy should save");
+
+        let denied = futures::executor::block_on(registry.call_tool(
+            "terminal.exec",
+            Some(serde_json::Map::from_iter([
+                ("target".to_string(), json!("ssh-terminal-manual")),
+                ("command".to_string(), json!("rm -rf /tmp/important")),
+                ("submit".to_string(), json!(true)),
+            ])),
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Allow,
+                approver: PublicMcpApprovalManager::new(Arc::new(AlwaysApprove)),
+            },
+        ));
+        let error = denied.expect_err("被禁止的连接不允许 AI 执行命令");
+        tracing::info!(error = %error, "denied error");
+        assert!(
+            terminal.inserted().is_empty(),
+            "被拒绝的命令不能真的送进终端: {:?}",
+            terminal.inserted()
+        );
+
+        // 策略回落为默认级别后，同一个 registry 实例应立即恢复可用（不需要重启运行时）。
+        repo.set_ai_access_level(connection_id, tool_runtime::AiAccessLevel::Allowed)
+            .expect("policy should clear");
+        let content = call_terminal_exec(&registry, "ssh-terminal-manual");
+        assert_eq!(json!("ssh-terminal-manual"), content["target"]);
+        assert_eq!(vec!["df -h\n".to_string()], terminal.inserted());
     }
 
     #[gpui::test]

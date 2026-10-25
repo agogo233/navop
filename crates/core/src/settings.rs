@@ -9,7 +9,7 @@ use gpui::{App, Font, FontFallbacks, Global, font, px};
 use gpui_component::{Theme, ThemeMode};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
@@ -1285,6 +1285,9 @@ pub struct AppSettings {
     pub portable_remember_master_key: bool,
     #[serde(default)]
     pub home_connection_layout: HomeConnectionLayout,
+    /// 首页是否显示「最近连接」分组
+    #[serde(default = "default_true")]
+    pub home_show_recent_connections: bool,
     /// 连接列表排序方式
     #[serde(default)]
     pub connection_sort_order: ConnectionSortOrder,
@@ -1671,6 +1674,7 @@ impl Default for AppSettings {
             require_master_key_on_startup: false,
             portable_remember_master_key: false,
             home_connection_layout: HomeConnectionLayout::default(),
+            home_show_recent_connections: true,
             connection_sort_order: ConnectionSortOrder::default(),
             connection_sidebar_expanded: true,
             connection_sidebar_tree_state: ConnectionSidebarTreeState::default(),
@@ -1894,7 +1898,40 @@ impl AppSettings {
             return Self::default();
         }
 
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&path)
+    }
+
+    /// 只把 settings.json 里的 `log_file_path` 取出来，不做整份反序列化。
+    ///
+    /// 启动期必须在 [`Self::load`] **之前**用它初始化 tracing：否则 `load()` 里的
+    /// "Failed to parse settings" 会发生在 subscriber 安装之前，被直接丢掉，生产上就只剩
+    /// 「设置被还原成默认值」这个结果，永远看不到原因。
+    pub fn peek_log_file_path() -> String {
+        let Some(path) = Self::config_path() else {
+            return String::new();
+        };
+
+        Self::peek_log_file_path_from(&path)
+    }
+
+    fn peek_log_file_path_from(path: &Path) -> String {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return String::new();
+        };
+
+        serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("log_file_path")
+                    .and_then(|path| path.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+    }
+
+    fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
                 Ok(mut settings) => {
                     info!("Settings loaded from {:?}", path);
@@ -1904,13 +1941,28 @@ impl AppSettings {
                     settings.normalize_terminal_settings();
                     settings
                 }
-                Err(e) => {
-                    error!("Failed to parse settings: {}", e);
+                Err(parse_error) => {
+                    // 解析失败绝不能静默回落默认值：里层是整份 `Default`，紧接着启动期任意
+                    // 一次 save() 就会把用户设置全量覆盖掉，现象就是「启动后被还原成默认值」。
+                    // 先把坏文件改名留作现场证据，再用 eprintln 兜底（此时 tracing 未必装好）。
+                    let quarantined = quarantine_corrupt_settings(path);
+                    let message = match &quarantined {
+                        Some(path) => format!(
+                            "Failed to parse settings: {parse_error} (坏文件已保留: {})",
+                            path.display()
+                        ),
+                        None => format!("Failed to parse settings: {parse_error}"),
+                    };
+                    error!("{message}");
+                    eprintln!("[settings] {message}");
                     Self::default()
                 }
             },
-            Err(e) => {
-                error!("Failed to read settings file: {}", e);
+            Err(read_error) => {
+                // 读不出来不等于内容坏了（可能是权限或文件被占用），保留原文件不动。
+                let message = format!("Failed to read settings file: {read_error}");
+                error!("{message}");
+                eprintln!("[settings] {message}");
                 Self::default()
             }
         }
@@ -1922,23 +1974,31 @@ impl AppSettings {
             return;
         };
 
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                error!("Failed to create config directory: {}", e);
-                return;
-            }
+        self.save_to(&path);
+    }
+
+    fn save_to(&self, path: &Path) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            error!("Failed to create config directory: {}", e);
+            return;
         }
 
-        match serde_json::to_string_pretty(self) {
-            Ok(content) => {
-                if let Err(e) = std::fs::write(&path, content) {
-                    error!("Failed to write settings file: {}", e);
-                } else {
-                    info!("Settings saved to {:?}", path);
-                }
-            }
+        let content = match serde_json::to_string_pretty(self) {
+            Ok(content) => content,
             Err(e) => {
                 error!("Failed to serialize settings: {}", e);
+                return;
+            }
+        };
+
+        match write_settings_atomically(path, &content) {
+            Ok(()) => info!("Settings saved to {:?}", path),
+            Err(write_error) => {
+                let message = format!("Failed to write settings file: {write_error}");
+                error!("{message}");
+                eprintln!("[settings] {message}");
             }
         }
     }
@@ -2016,6 +2076,50 @@ impl AppSettings {
     }
 }
 
+/// 原子写 settings.json，并在覆盖前保留上一份为 `settings.json.bak`。
+///
+/// 直接 `fs::write` 覆盖有两个老问题：写到一半崩溃会留下半截 JSON，而半截 JSON 会让
+/// [`AppSettings::load`] 走进 `Err` 分支、把整份设置回落成默认值；覆盖前也没有任何可回滚的副本。
+fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp_path, content)?;
+
+    if path.exists() {
+        let backup_path = path.with_file_name(format!("{file_name}.bak"));
+        // 备份失败不阻断主写入：保住用户这次的改动比保住旧副本更重要。
+        if let Err(e) = std::fs::copy(path, &backup_path) {
+            error!("Failed to back up settings file: {}", e);
+        }
+    }
+
+    std::fs::rename(&tmp_path, path)
+}
+
+/// 把无法解析的 settings.json 改名保留为 `settings.json.corrupt-<时间戳>`。
+///
+/// 只改名不删除：坏文件是「设置为什么被还原」的唯一现场证据。返回 `None` 表示改名失败
+/// （例如目录只读），调用方此时仍按默认值启动，但下一次保存会覆盖掉原文件。
+fn quarantine_corrupt_settings(path: &Path) -> Option<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let quarantined = path.with_file_name(format!("{file_name}.corrupt-{stamp}"));
+
+    match std::fs::rename(path, &quarantined) {
+        Ok(()) => Some(quarantined),
+        Err(e) => {
+            error!("Failed to quarantine corrupt settings file: {}", e);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::px;
@@ -2040,6 +2144,127 @@ mod tests {
     #[test]
     fn app_settings_disables_sync_by_default() {
         assert!(!AppSettings::default().sync_enabled);
+    }
+
+    #[test]
+    fn corrupt_settings_file_is_quarantined_instead_of_silently_reset() {
+        // 回归保护：解析失败若直接回落 Default、再被启动期任意一次 save() 全量覆盖，
+        // 用户的设置就永久丢失且不留任何现场证据（现象就是「启动后设置被还原」）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"font_size":"不是数字"}"#).expect("write corrupt settings");
+
+        let settings = AppSettings::load_from(&path);
+
+        assert!(
+            (settings.font_size - AppSettings::default().font_size).abs() < f64::EPSILON,
+            "解析失败应回落默认值"
+        );
+        assert!(!path.exists(), "坏文件应被改名挪走，避免下一次保存直接覆盖");
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "临时目录里应只剩坏文件副本: {names:?}");
+        assert!(
+            names[0].starts_with("settings.json.corrupt-"),
+            "坏文件应带 .corrupt- 前缀: {names:?}"
+        );
+    }
+
+    #[test]
+    fn save_writes_atomically_and_keeps_previous_file_as_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"font_size":21.0}"#).expect("write previous settings");
+
+        let settings = AppSettings {
+            font_size: 13.0,
+            ..AppSettings::default()
+        };
+        settings.save_to(&path);
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read saved settings"))
+                .expect("saved settings is json");
+        assert_eq!(saved["font_size"], serde_json::json!(13.0));
+        assert!(
+            !dir.path().join("settings.json.tmp").exists(),
+            "临时文件应在 rename 后消失"
+        );
+
+        let backup: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json.bak")).expect("read backup"),
+        )
+        .expect("backup is json");
+        assert_eq!(
+            backup["font_size"],
+            serde_json::json!(21.0),
+            "备份应保留覆盖前的上一份内容"
+        );
+    }
+
+    #[test]
+    fn peek_log_file_path_works_even_if_full_deserialize_fails() {
+        // 启动期要先靠它装好 tracing，才可能看见随后 load() 的解析错误。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"log_file_path":"/tmp/navop.log","font_size":"坏值"}"#,
+        )
+        .expect("write settings");
+
+        assert_eq!(AppSettings::peek_log_file_path_from(&path), "/tmp/navop.log");
+        assert!(
+            serde_json::from_str::<AppSettings>(
+                &std::fs::read_to_string(&path).expect("read settings")
+            )
+            .is_err(),
+            "整份反序列化应当失败，而 peek 仍要能取到日志路径"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_with_nested_objects_still_deserialize() {
+        // 回归保护：下面这些嵌套对象里存在没有 #[serde(default)] 的字段。一旦给它们新增必填
+        // 字段或改类型，旧配置文件会在加载时整份回落成默认值（「设置被还原」的真凶之一）。
+        let legacy = serde_json::json!({
+            "font_size": 13.0,
+            "main_window_state": {"x": 10.0, "y": 20.0, "width": 1200.0, "height": 800.0},
+            "sql_format": {"keyword_case": "upper", "indent": "tabs"},
+            "local_terminal_profile": {"kind": "system"},
+            "ai_chat": {"tool_execution_mode": "manual", "max_iterations": 32},
+            "unknown_field_from_a_newer_version": {"whatever": true}
+        });
+
+        let settings: AppSettings = serde_json::from_value(legacy).expect("历史配置应能解析");
+        assert!((settings.font_size - 13.0).abs() < f64::EPSILON);
+        assert_eq!(settings.sql_format.keyword_case, SqlKeywordCase::Upper);
+        assert_eq!(settings.sql_format.indent, SqlIndentStyle::Tabs);
+    }
+
+    #[test]
+    fn home_show_recent_connections_defaults_on_and_round_trips() {
+        // 默认开启(与历史行为一致)。
+        assert!(AppSettings::default().home_show_recent_connections);
+
+        // 关闭后序列化往返保持关闭。
+        let settings = AppSettings {
+            home_show_recent_connections: false,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize app settings");
+        assert!(json.contains(r#""home_show_recent_connections":false"#));
+        let restored: AppSettings = serde_json::from_str(&json).expect("roundtrip");
+        assert!(!restored.home_show_recent_connections);
+
+        // 旧配置文件缺省该字段时,反序列化回退到默认开启(向后兼容)。
+        let legacy_settings: AppSettings =
+            serde_json::from_value(serde_json::json!({})).expect("empty deserialize");
+        assert!(legacy_settings.home_show_recent_connections);
     }
 
     #[test]

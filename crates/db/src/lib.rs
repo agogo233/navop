@@ -17,6 +17,7 @@ pub mod metadata_read;
 pub mod plugin;
 pub mod plugin_manifest;
 pub mod query_result_normalization;
+pub mod result_column_lineage;
 mod runtime_contract;
 pub mod rustls_provider;
 pub mod schema_preferences;
@@ -29,7 +30,6 @@ pub mod streaming_parser;
 pub mod types;
 
 // Database implementations
-pub mod clickhouse;
 #[cfg(feature = "builtin-duckdb")]
 pub mod duckdb;
 mod max_rows;
@@ -53,6 +53,7 @@ pub use metadata_cache::*;
 pub use plugin::*;
 pub use plugin_manifest::*;
 pub use query_result_normalization::*;
+pub use result_column_lineage::*;
 pub use rustls_provider::*;
 pub use schema_preferences::*;
 pub use sql_format::*;

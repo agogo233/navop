@@ -155,7 +155,7 @@ impl NotesView {
             return;
         };
         self.remap_tree_paths(&old_path, &new_path);
-        if let Err(error) = self.remap_markdown_sessions(&old_path, &new_path) {
+        if let Err(error) = self.remap_markdown_sessions(&old_path, &new_path, cx) {
             notify_operation_error(window, cx, error);
         }
         self.finish_file_operation(Ok(()), window, cx);

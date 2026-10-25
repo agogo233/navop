@@ -68,6 +68,10 @@ impl TabContent for TerminalView {
     }
 
     fn icon(&self, cx: &App) -> Option<Icon> {
+        // 连接设置里选了图标(SSH 自定义 / 扩展 Icon 字段)时优先展示它。
+        if let Some(icon) = self.connection_icon.clone() {
+            return Some(icon);
+        }
         match self.connection_kind(cx) {
             TerminalConnectionKind::Serial => Some(IconName::SerialPort.color()),
             TerminalConnectionKind::Telnet => Some(IconName::SquareTerminalColor.color()),

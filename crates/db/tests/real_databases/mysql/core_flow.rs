@@ -298,6 +298,7 @@ async fn assert_error_and_transaction(
                 transactional: true,
                 max_rows: Some(10),
                 streaming: false,
+                reconnect_on_lost_connection: false,
             },
         )
         .await

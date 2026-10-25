@@ -944,6 +944,7 @@ impl SyncEngine {
             || snapshot.sync_enabled != current.sync_enabled
             || snapshot.team_id != current.team_id
             || snapshot.owner_id != current.owner_id
+            || snapshot.ai_access_level != current.ai_access_level
     }
 
     fn connection_has_local_changes(
@@ -1220,6 +1221,7 @@ mod tests {
 
     fn stored_connection(updated_at: i64) -> StoredConnection {
         StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(1),
             credential_revision: Some(1),
             name: "local".to_string(),
@@ -1254,6 +1256,24 @@ mod tests {
             updated_at: updated_at * 1000,
             deleted_at: None,
         }
+    }
+
+    #[test]
+    fn ai_access_level_change_requests_a_reupload() {
+        let snapshot = stored_connection(100);
+        let mut current = stored_connection(100);
+        assert_eq!(
+            None,
+            SyncEngine::pending_updated_at_after_cloud_write(&snapshot, &current, 100)
+        );
+
+        // 只把「AI 访问」改成禁止、连接其它内容不变，也必须重新上传，
+        // 否则团队冲突解决后策略会被云端旧值覆盖回「允许」。
+        current.ai_access_level = tool_runtime::AiAccessLevel::Denied;
+        assert_eq!(
+            Some(101),
+            SyncEngine::pending_updated_at_after_cloud_write(&snapshot, &current, 100)
+        );
     }
 
     #[test]

@@ -50,6 +50,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use terminal::{SshBackend, terminal::HostKeyVerificationReason};
+use tool_runtime::AiAccessLevel;
 
 use crate::host_key_dialog::{
     host_key_dialog_presentation, render_host_key_details_card, verifier_with_confirmed_host_key,
@@ -304,6 +305,11 @@ pub struct SshFormWindow {
 
     // 云同步开关
     sync_enabled: bool,
+
+    // 连接级 AI 访问策略（issue #437）：允许 / 只读 / 禁止。
+    /// 连接级 AI 访问策略（issue #437）：级别保存在 `StoredConnection::ai_access_level`
+    /// 上，随连接一起保存与同步；表单只持有待写入的级别。
+    ai_access_level: Entity<AiAccessLevel>,
 
     // 启用 X11 转发(需要本机有可用 X server,如 macOS 的 XQuartz)
     x11_forwarding: bool,
@@ -991,6 +997,7 @@ impl SshFormWindow {
         let mut enable_proxy = false;
         let mut proxy_type = ProxyTypeSelection::default();
         let mut sync_enabled = true; // 默认启用云同步
+        let mut ai_access_level = AiAccessLevel::Allowed; // 默认允许 AI 访问
         let mut x11_forwarding = false;
         let mut forward_agent = false;
         let mut allow_legacy_algorithms = false;
@@ -1007,6 +1014,9 @@ impl SshFormWindow {
         if let Some(conn) = config.connection_to_load() {
             // 加载同步状态
             sync_enabled = conn.sync_enabled;
+
+            // 回填连接级 AI 访问策略（连接字段，缺省即「允许」）。
+            ai_access_level = connection_form::ai_access::stored_level(conn.id, cx);
 
             // 加载打开方式偏好
             open_dual_pane_by_default =
@@ -1268,6 +1278,8 @@ impl SshFormWindow {
                 |_, _, _: &CredentialPickerEvent, cx| cx.notify(),
             ),
         ];
+        let ai_access_level = cx.new(|_| ai_access_level);
+
         Self {
             focus_handle: cx.focus_handle(),
             is_editing,
@@ -1339,6 +1351,7 @@ impl SshFormWindow {
             manual_icon,
             custom_icon_file_path,
             sync_enabled,
+            ai_access_level,
             x11_forwarding,
             forward_agent,
             is_testing: false,
@@ -2240,17 +2253,30 @@ impl SshFormWindow {
             .storage
             .clone();
         let is_editing = self.is_editing;
+        let ai_access_level = *self.ai_access_level.read(cx);
+        // 连接本身落库成功后的 id：AI 访问策略写失败时靠它把表单切到「已保存」，
+        // 否则用户重试「保存」会按「新建」再插一条连接。
+        let mut persisted_id: Option<i64> = None;
 
         let result: Result<StoredConnection, anyhow::Error> = (|| {
             let repo = storage
                 .get::<one_core::storage::ConnectionRepository>()
                 .ok_or_else(|| anyhow::anyhow!("ConnectionRepository not found"))?;
 
+            // 策略是连接自己的字段，改动一次就随连接一起写入。
+            conn.ai_access_level = ai_access_level;
             if is_editing {
                 repo.update(&mut conn)?;
             } else {
                 repo.insert(&mut conn)?;
             }
+            persisted_id = conn.id;
+            // 连接先落库拿到 id；再写一次是兜底：万一保存路径漏带 `ai_access_level`，
+            // 这里补上并把失败抛给表单，而不是让「限制没生效」被静默放宽。
+            let connection_id = conn
+                .id
+                .ok_or_else(|| anyhow::anyhow!("connection id missing after save"))?;
+            repo.set_ai_access_level(connection_id, ai_access_level)?;
             Ok(conn)
         })();
 
@@ -2280,7 +2306,14 @@ impl SshFormWindow {
                 let _ = one_core::window_close::close_window_after_save(window, cx);
             }
             Err(e) => {
-                let error_msg = t!("SSH.save_failed", error = e).to_string();
+                // 连接已经落库、只是策略没写成功时，文案要说清这一点，并让表单保持可重试。
+                let error_msg = if let Some(id) = persisted_id {
+                    self.is_editing = true;
+                    self.editing_id = Some(id);
+                    connection_form::ai_access::ai_access_save_failed(&e)
+                } else {
+                    t!("SSH.save_failed", error = e).to_string()
+                };
                 tracing::error!("{}", error_msg);
                 self.test_result = Some(Err(error_msg));
                 cx.notify();
@@ -2889,9 +2922,13 @@ impl SshFormWindow {
                     ),
                 )
             })
+            // 连接级 AI 访问策略（issue #437）：布局与选项由通用组件统一渲染。
+            .child(self.render_form_row(
+                &connection_form::ai_access::ai_access_label(),
+                connection_form::ai_access::ai_access_selector(&self.ai_access_level, cx),
+            ))
     }
 
-    /// 渲染初始化标签页
     /// 渲染初始化标签页：仅保留会话初始化本身。
     ///
     /// 远程文件相关（协议、SFTP 初始目录、FTP 参数）已收敛到「远程文件」页签，

@@ -10,6 +10,7 @@ impl TerminalView {
             terminal,
             connection_id,
             stored_connection,
+            connection_icon,
             sync_path_enabled,
             local_working_dir,
             workspace_source,
@@ -106,6 +107,11 @@ impl TerminalView {
                 editor,
                 backend,
             });
+
+        // 连接设置里选的图标(SSH 自定义 / 扩展 Icon 字段)。`stored_connection`
+        // 随后会移交给侧边栏;扩展终端没有它,图标由调用方解析后传入。
+        let connection_icon = connection_icon
+            .or_else(|| stored_connection.as_ref().and_then(stored_connection_icon));
 
         // 创建侧边栏（传递 StoredConnection 用于文件管理器）
         let sidebar = cx.new(|cx| {
@@ -225,6 +231,7 @@ impl TerminalView {
 
         let mut this = Self {
             terminal,
+            connection_icon,
             duplicate_source,
             recording_playback_name,
             session_log_name,

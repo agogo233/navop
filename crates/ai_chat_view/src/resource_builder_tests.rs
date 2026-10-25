@@ -2,6 +2,7 @@ use agent_runtime::{
     DefaultTargetReason, ResourceCapability, ResourceId, ResourceKind, ResourceScope,
 };
 use one_core::storage::{ConnectionType, StoredConnection};
+use tool_runtime::AiAccessLevel;
 
 use crate::{
     build_agent_context_all, build_agent_context_single_with_catalog,
@@ -10,6 +11,10 @@ use crate::{
     build_workbench_agent_context, build_workbench_resource_state,
 };
 
+fn no_levels() -> crate::AiAccessLevels {
+    crate::AiAccessLevels::new()
+}
+
 fn stored_connection(
     id: i64,
     name: &str,
@@ -17,6 +22,7 @@ fn stored_connection(
     params: &str,
 ) -> StoredConnection {
     StoredConnection {
+        ai_access_level: Default::default(),
         id: Some(id),
         credential_revision: None,
         name: name.to_string(),
@@ -47,7 +53,7 @@ fn single_connection_builds_context_with_one_resource() {
         r#"{"type":"postgres"}"#,
     );
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert_eq!(ctx.resources.len(), 1);
     assert_eq!(ctx.resources[0].label, "test-db");
@@ -63,7 +69,7 @@ fn database_connection_resource_has_database_capabilities() {
         r#"{"type":"postgres"}"#,
     );
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert!(
         ctx.resources[0]
@@ -86,7 +92,7 @@ fn saved_connection_resource_has_management_and_open_session_capabilities() {
         r#"{"type":"postgres"}"#,
     );
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert!(
         ctx.resources[0]
@@ -104,7 +110,7 @@ fn saved_connection_resource_has_management_and_open_session_capabilities() {
 fn ssh_sftp_connection_resource_has_file_capabilities() {
     let conn = stored_connection(42, "prod-a", ConnectionType::SshSftp, "{}");
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert!(
         ctx.resources[0]
@@ -136,7 +142,7 @@ fn all_connections_builds_context_with_multiple_resources() {
     ];
 
     let current = conns[0].clone();
-    let ctx = build_resource_context_all(Some(&current), conns);
+    let ctx = build_resource_context_all(Some(&current), conns, &no_levels());
 
     assert_eq!(ctx.resources.len(), 2);
     assert!(ctx.current.is_some());
@@ -147,7 +153,7 @@ fn all_connections_builds_context_with_multiple_resources() {
 fn single_connection_sets_connection_as_default_target() {
     let conn = stored_connection(42, "prod-a", ConnectionType::SshSftp, "{}");
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert_eq!(1, ctx.resources.len());
     assert_eq!(
@@ -165,7 +171,7 @@ fn connection_host_is_resource_alias() {
         r#"{"host":"10.2.4.54"}"#,
     );
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert_eq!(vec!["10.2.4.54".to_string()], ctx.resources[0].aliases);
     assert_eq!(
@@ -186,7 +192,7 @@ fn connection_host_is_in_mention_display_label() {
         r#"{"host":"10.2.4.54"}"#,
     );
 
-    let mention = build_mentions_single(&conn).remove(0);
+    let mention = build_mentions_single(&conn, &no_levels()).remove(0);
 
     assert_eq!("prod-a", mention.label);
     assert_eq!("prod-a · 10.2.4.54", mention.display_label);
@@ -203,9 +209,9 @@ fn mention_detail_hides_cloud_uuid_but_keeps_host_context() {
     );
     conn.cloud_id = Some("abfcee0a-2827-4588-9f6-587a7a95d1e9".to_string());
 
-    let mut ctx = build_resource_context_single(&conn);
+    let mut ctx = build_resource_context_single(&conn, &no_levels());
     let resource = ctx.resources.remove(0);
-    let mention = build_mentions_single(&conn).remove(0);
+    let mention = build_mentions_single(&conn, &no_levels()).remove(0);
 
     assert!(
         resource
@@ -230,7 +236,7 @@ fn all_connections_keep_all_resources_when_default_is_selected() {
     ];
 
     let current = conns[1].clone();
-    let ctx = build_resource_context_all(Some(&current), conns);
+    let ctx = build_resource_context_all(Some(&current), conns, &no_levels());
 
     assert_eq!(3, ctx.resources.len());
     assert_eq!(
@@ -256,7 +262,7 @@ fn connection_catalog_contains_all_saved_resources() {
         stored_connection(2, "prod-b", ConnectionType::SshSftp, "{}"),
     ];
 
-    let catalog = build_resource_catalog(&conns);
+    let catalog = build_resource_catalog(&conns, &no_levels());
 
     assert_eq!(2, catalog.len());
     assert_eq!("prod-a", catalog[0].label);
@@ -271,7 +277,8 @@ fn agent_context_single_can_receive_all_resources_as_catalog() {
     ];
     let current = conns[0].clone();
 
-    let (pool, mentions, catalog) = build_agent_context_single_with_catalog(&current, &conns);
+    let (pool, mentions, catalog) =
+        build_agent_context_single_with_catalog(&current, &conns, &no_levels());
 
     assert_eq!(1, pool.resources.len());
     assert_eq!(2, catalog.len());
@@ -289,7 +296,7 @@ fn connection_mentions_are_suggested_in_input() {
         r#"{"host":"127.0.0.1","port":6379}"#,
     );
 
-    let mentions = build_mentions_single(&conn);
+    let mentions = build_mentions_single(&conn, &no_levels());
 
     assert_eq!(1, mentions.len());
     assert_eq!("7", mentions[0].id);
@@ -310,7 +317,7 @@ fn connection_list_mentions_are_suggested_in_input() {
         stored_connection(2, "redis-1", ConnectionType::Redis, "{}"),
     ];
 
-    let mentions = build_mentions_from_connections(&conns);
+    let mentions = build_mentions_from_connections(&conns, &no_levels());
 
     assert_eq!(2, mentions.len());
     assert_eq!("1", mentions[0].id);
@@ -331,7 +338,7 @@ fn database_connection_scopes_include_selected_database_and_schema() {
     );
     conn.selected_databases = Some(r#"["ai_app"]"#.to_string());
 
-    let ctx = build_resource_context_single(&conn);
+    let ctx = build_resource_context_single(&conn, &no_levels());
 
     assert_eq!(
         vec![
@@ -349,7 +356,7 @@ fn agent_context_all_pairs_resources_with_mentions() {
         stored_connection(2, "ssh-1", ConnectionType::SshSftp, "{}"),
     ];
 
-    let (ctx, mentions) = build_agent_context_all(Some(&conns[1]), &conns);
+    let (ctx, mentions) = build_agent_context_all(Some(&conns[1]), &conns, &no_levels());
 
     assert_eq!(2, ctx.resources.len());
     assert_eq!(2, mentions.len());
@@ -373,7 +380,7 @@ fn workbench_agent_context_uses_all_connections_for_mentions_and_catalog() {
         stored_connection(3, "cache", ConnectionType::Redis, "{}"),
     ];
 
-    let (resources, mentions, catalog) = build_workbench_agent_context(&conns);
+    let (resources, mentions, catalog) = build_workbench_agent_context(&conns, &no_levels());
 
     assert_eq!(3, resources.resources.len());
     assert_eq!(
@@ -408,7 +415,7 @@ fn workbench_resource_state_has_catalog_but_empty_scope() {
         ),
     ];
 
-    let (scope, catalog, mentions) = build_workbench_resource_state(&conns);
+    let (scope, catalog, mentions) = build_workbench_resource_state(&conns, &no_levels());
 
     assert!(scope.selected.is_empty());
     assert!(scope.default_target.is_none());
@@ -434,8 +441,12 @@ fn sidebar_resource_state_keeps_current_connection_as_default_scope() {
         ),
     ];
 
-    let (scope, catalog, mentions) =
-        build_sidebar_resource_state(&conns[1], &conns, DefaultTargetReason::CurrentDatabase);
+    let (scope, catalog, mentions) = build_sidebar_resource_state(
+        &conns[1],
+        &conns,
+        DefaultTargetReason::CurrentDatabase,
+        &no_levels(),
+    );
 
     assert_eq!(1, scope.selected.len());
     assert_eq!("prod-db", scope.selected[0].label);
@@ -448,4 +459,117 @@ fn sidebar_resource_state_keeps_current_connection_as_default_scope() {
     );
     assert_eq!(2, catalog.resources.len());
     assert_eq!(2, mentions.len());
+}
+
+// --- 连接级 AI 访问策略（issue #437）：禁止 AI 的连接不进入资源池 ---
+
+fn ai_levels(pairs: &[(i64, AiAccessLevel)]) -> crate::AiAccessLevels {
+    pairs.iter().copied().collect()
+}
+
+fn database_connection(id: i64, name: &str) -> StoredConnection {
+    stored_connection(id, name, ConnectionType::Database, r#"{"type":"postgres"}"#)
+}
+
+#[test]
+fn denied_connection_is_hidden_from_catalog_and_mentions() {
+    let connections = vec![
+        database_connection(1, "allowed-db"),
+        database_connection(2, "denied-db"),
+    ];
+    let levels = ai_levels(&[(2, AiAccessLevel::Denied)]);
+
+    let catalog = build_resource_catalog(&connections, &levels);
+    assert_eq!(
+        1,
+        catalog.len(),
+        "被禁止的连接不应进入 catalog: {catalog:?}"
+    );
+    assert_eq!("allowed-db", catalog[0].label);
+
+    let mentions = build_mentions_from_connections(&connections, &levels);
+    assert_eq!(
+        vec!["allowed-db".to_string()],
+        mentions
+            .iter()
+            .map(|mention| mention.label.clone())
+            .collect::<Vec<_>>(),
+        "被禁止的连接不应出现在 @ 提及列表"
+    );
+
+    let (ctx, mentions) = build_agent_context_all(None, &connections, &levels);
+    assert_eq!(1, ctx.resources.len());
+    assert_eq!(1, mentions.len());
+
+    let (ctx, mentions, catalog) =
+        build_agent_context_single_with_catalog(&connections[0], &connections, &levels);
+    assert_eq!(1, ctx.resources.len());
+    assert_eq!(1, mentions.len());
+    assert_eq!(1, catalog.len());
+}
+
+#[test]
+fn denied_current_connection_yields_empty_sidebar_scope() {
+    let current = database_connection(2, "denied-db");
+    let connections = vec![database_connection(1, "allowed-db"), current.clone()];
+    let levels = ai_levels(&[(2, AiAccessLevel::Denied)]);
+
+    let (scope, catalog, mentions) = build_sidebar_resource_state(
+        &current,
+        &connections,
+        DefaultTargetReason::CurrentDatabase,
+        &levels,
+    );
+
+    assert!(
+        scope.selected.is_empty(),
+        "被禁止的连接不应成为默认目标: {:?}",
+        scope.selected
+    );
+    assert!(scope.default_target.is_none());
+    assert_eq!(1, catalog.resources.len(), "catalog 只保留允许的连接");
+    assert_eq!(1, mentions.len(), "提及列表只保留允许的连接");
+
+    let ctx = build_resource_context_single(&current, &levels);
+    assert!(ctx.resources.is_empty());
+    assert!(ctx.current.is_none());
+}
+
+#[test]
+fn read_only_connection_keeps_only_read_only_capabilities() {
+    let conn = database_connection(7, "readonly-db");
+    let levels = ai_levels(&[(7, AiAccessLevel::ReadOnly)]);
+
+    let ctx = build_resource_context_single(&conn, &levels);
+
+    assert_eq!(1, ctx.resources.len(), "只读连接仍应可见");
+    let capabilities = &ctx.resources[0].capabilities;
+    assert!(capabilities.contains(&ResourceCapability::DatabaseQuery));
+    assert!(
+        !capabilities.contains(&ResourceCapability::DatabaseExecute),
+        "只读连接不应暴露写能力: {capabilities:?}"
+    );
+    assert!(!capabilities.contains(&ResourceCapability::ManageConnection));
+    assert!(!capabilities.contains(&ResourceCapability::OpenSession));
+}
+
+#[test]
+fn read_only_ssh_connection_drops_write_capability() {
+    let conn = stored_connection(
+        9,
+        "prod-ssh",
+        ConnectionType::SshSftp,
+        r#"{"host":"10.0.0.9"}"#,
+    );
+    let levels = ai_levels(&[(9, AiAccessLevel::ReadOnly)]);
+
+    let catalog = build_resource_catalog(&[conn], &levels);
+
+    let capabilities = &catalog[0].capabilities;
+    assert!(capabilities.contains(&ResourceCapability::List));
+    assert!(capabilities.contains(&ResourceCapability::ReadFile));
+    assert!(
+        !capabilities.contains(&ResourceCapability::WriteFile),
+        "只读连接不应暴露写能力: {capabilities:?}"
+    );
 }

@@ -751,6 +751,13 @@
 - **注意事项**：`ctrl-tab` 在本应用是**工作台 Tab 切换的全局键**，会话切换器不能抢（用 `cmd-shift-j` / `ctrl-shift-j`），并把这条写成测试（`the_switcher_default_does_not_shadow_the_app_tab_switcher`）钉住，防止后人改回去。
 - **适用范围**：`crates/ai_chat_view/src/agent_view/session_navigation.rs`、`crates/ai_chat_view/src/agent_view/session_switcher.rs`，以及任何新增的视图级 overlay / 历史导航。新增这类文件**必须自己先跑 rustfmt 到 clean**（见上面格式化那条经验的双断言探针）。
 
+- **标题**：GUI 进程 spawn `npx` 必须先解析真实路径、再把程序目录补进子进程 PATH，否则设置页装 Skill 报 `os error 2`
+- **触发信号**：macOS 上从 Finder / Dock 启动的 Navop 点「安装 Navop Skill」失败，提示 `No such file or directory (os error 2)`；同一台机器在终端里跑同一条命令却成功。也适用于任何在 GUI 进程里 `Command::new("npx")` / `"node"` / `"pnpm"` 的后台调用。
+- **根因 / 约束**：GUI 进程继承的 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`（`ps eww <pid>` 可证），而 npx 一般只装在 `/opt/homebrew/bin`。**只把它解析成绝对路径还不够**：npx 的 shebang 是 `#!/usr/bin/env node`，子进程 PATH 仍缺 `/opt/homebrew/bin` 时 `env` 找不到 node（复现：`env -i PATH=/usr/bin:/bin /opt/homebrew/bin/npx --version` → `env: node: No such file or directory`）。裸 `Command::new("npx")` 的失败信息是 Rust 的 `No such file or directory (os error 2)`，别和 Node CLI 自己吐的 `ENOENT: no such file or directory, open ...` 混淆。
+- **正确做法**：别在这里写裸 `Command::new(launcher)`，用 `process_util::build_command(name, &args)`：它按「环境 PATH → 系统/家目录兜底目录（`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin`、nvm/fnm/volta/bun/pnpm 的 bin）→ 版本号降序」解析并校验可执行位，再把程序所在目录前置进子进程 PATH，之后照常 `configure_background_child`。持久化到 Codex / Claude 配置里的 `command = "npx"` **仍保持可移植的裸名**（`f821ed1b3` 的既有取舍），不要改成绝对路径。设置页的运行时状态也要用 `process_util::resolve_program` 真实探测，不要再无条件写「已就绪」。
+- **验证方式**：`cargo test -p process-util`（PATH 优先、兜底目录、跳过不可执行、子进程 PATH 去重）、`cargo test -p main mcp_skill_install`（`skill_install_resolves_the_launcher_before_spawning` 源码契约）；GUI 等价验证是把 PATH 设成 `/usr/bin:/bin:/usr/sbin:/sbin` 后跑解析并执行 `npx --version`。Windows 只有 `.cmd`/`.bat` 走 `cmd /C` 这一支，需实机确认。
+- **适用范围**：`crates/process-util/src/program.rs`、`main/src/settings/mcp_skill_install.rs`、`main/src/settings/mcp_helper_install.rs`，以及任何在 GUI 进程里 spawn 包管理器启动器的调用点。
+
 - **标题**：macOS 弹窗「关闭即复用」必须同时结束业务会话，并用计数把受控保留和泄漏分开
 - **触发信号**：把弹窗关闭从 `remove_window()` 改成隐藏复用（`orderOut`）后，内存采样里 `GPUIView`/`CAMetalLayer` 只增不减；或反过来为了「彻底释放」把复用窗口改回销毁，于是 Touch Bar 机型又出现关闭闪退（issue #262）。
 - **根因 / 约束**：隐藏的窗口仍然活在 GPUI 内容树里，而内容树**强引用** `PopupWindowContent.view`；复用注册表只存 `WeakEntity`，管不到这份强引用。所以「只隐藏不卸载」＝上一次的业务 view（含数据、任务句柄）被一直扣着，用户不再打开那类窗口时就是纯泄漏；而销毁原生窗口又会触发 AppKit Touch Bar 观察者向已 dealloc 的对象注销并抛 ObjC 异常。两件事必须拆开：**原生窗口**隐藏复用（受控保留，上限＝复用键数量 + 一次性弹窗的停放次数），**业务会话**关闭即结束。

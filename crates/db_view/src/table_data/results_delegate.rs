@@ -792,6 +792,18 @@ impl EditorTableDelegate {
         &self.column_meta
     }
 
+    /// 只更新列注释，保留结果集自带的列类型信息。
+    pub fn set_column_comments(&mut self, comments: &[Option<String>]) {
+        if comments.len() != self.column_meta.len() {
+            return;
+        }
+        for (meta, comment) in self.column_meta.iter_mut().zip(comments) {
+            if let Some(comment) = comment.as_ref().filter(|comment| !comment.trim().is_empty()) {
+                meta.comment = Some(comment.clone());
+            }
+        }
+    }
+
     // ========== 列显示/隐藏 ==========
 
     /// 确保 `column_order` 覆盖当前所有原始列，并保持已有顺序。

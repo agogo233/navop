@@ -1,3 +1,4 @@
+mod icon_picker;
 mod render;
 mod types;
 
@@ -20,6 +21,11 @@ pub use types::*;
 
 /// Auth 复合字段内部各子值的键后缀。
 fn auth_subkey(field_id: &str, part: &str) -> String {
+    format!("{field_id}.{part}")
+}
+
+/// Icon 字段内部子值的键:`icon`(内置图标 ID)与 `file`(本地图片路径)。
+pub(crate) fn icon_subkey(field_id: &str, part: &str) -> String {
     format!("{field_id}.{part}")
 }
 
@@ -64,6 +70,10 @@ impl DeclarativeForm {
                     window,
                     cx,
                 );
+                continue;
+            }
+            if field.field_type == DeclarativeFieldType::Icon {
+                Self::init_icon_field(field, initial, &mut values, cx);
                 continue;
             }
             let initial_value = initial
@@ -180,6 +190,45 @@ impl DeclarativeForm {
         self.textareas.get(id).cloned()
     }
 
+    fn init_icon_field(
+        field: &DeclarativeFormField,
+        initial: &Map<String, Value>,
+        values: &mut HashMap<String, Entity<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let (mut icon, mut file) = (String::new(), String::new());
+        if let Some(Value::Object(object)) = initial.get(&field.id) {
+            icon = object.get("icon").map(value_text).unwrap_or_default();
+            file = object.get("file").map(value_text).unwrap_or_default();
+        }
+        // 自定义图片优先于内置图标,两者互斥。
+        if !file.is_empty() {
+            icon.clear();
+        }
+        values.insert(icon_subkey(&field.id, "icon"), cx.new(|_| icon));
+        values.insert(icon_subkey(&field.id, "file"), cx.new(|_| file));
+    }
+
+    /// 收集 Icon 字段:图片路径优先,其次内置图标 ID;「自动」不写入任何键。
+    fn collect_icon(
+        &self,
+        field: &DeclarativeFormField,
+        config: &mut Map<String, Value>,
+        cx: &App,
+    ) {
+        let file = self.value(&icon_subkey(&field.id, "file"), cx);
+        let icon = self.value(&icon_subkey(&field.id, "icon"), cx);
+        let mut object = Map::new();
+        if !file.trim().is_empty() {
+            object.insert("file".into(), Value::String(file));
+        } else if !icon.trim().is_empty() {
+            object.insert("icon".into(), Value::String(icon));
+        }
+        if !object.is_empty() {
+            config.insert(field.id.clone(), Value::Object(object));
+        }
+    }
+
     fn init_auth_field(
         field: &DeclarativeFormField,
         initial: &Map<String, Value>,
@@ -288,6 +337,10 @@ impl DeclarativeForm {
             }
             if field.field_type == DeclarativeFieldType::Auth {
                 self.collect_auth(field, preserved, &mut config, &mut secrets, cx)?;
+                continue;
+            }
+            if field.field_type == DeclarativeFieldType::Icon {
+                self.collect_icon(field, &mut config, cx);
                 continue;
             }
             let value = self.value(&field.id, cx);
@@ -573,6 +626,79 @@ mod auth_tests {
         let root = window.root(cx).expect("表单根节点应存在");
         root.read_with(cx, |root, cx| root.form.read(cx).collect(cx))
             .expect("表单应可收集")
+    }
+
+    #[gpui::test]
+    fn icon_field_collects_builtin_icon_and_auto_omits_it(cx: &mut TestAppContext) {
+        let config = DeclarativeFormConfig {
+            tabs: vec![DeclarativeFormTab::new("general", "General").field(
+                DeclarativeFormField::new("icon", "Icon", DeclarativeFieldType::Icon),
+            )],
+        };
+        let open = |cx: &mut TestAppContext, initial: Map<String, Value>| {
+            cx.update(|cx| {
+                cx.set_global(one_core::settings::AppSettings::default());
+                gpui_component::init(cx);
+                cx.open_window(WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        let form =
+                            cx.new(|cx| DeclarativeForm::new(config.clone(), &initial, window, cx));
+                        AuthTestRoot { form }
+                    })
+                })
+            })
+            .expect("app context 应可用")
+        };
+        let collect = |cx: &mut TestAppContext, window: &gpui::WindowHandle<AuthTestRoot>| {
+            let root = window.root(cx).expect("表单根节点应存在");
+            root.read_with(cx, |root, cx| root.form.read(cx).collect(cx))
+                .expect("表单应可收集")
+                .0
+        };
+
+        let builtin = json!({ "icon": { "icon": "ubuntu" } });
+        let window = open(cx, builtin.as_object().cloned().unwrap());
+        assert_eq!(json!({ "icon": "ubuntu" }), collect(cx, &window)["icon"]);
+
+        let window = open(cx, Map::new());
+        assert!(
+            collect(cx, &window).get("icon").is_none(),
+            "「自动」不应写入配置"
+        );
+    }
+
+    #[gpui::test]
+    fn icon_field_prefers_local_file_over_builtin_icon(cx: &mut TestAppContext) {
+        let config = DeclarativeFormConfig {
+            tabs: vec![DeclarativeFormTab::new("general", "General").field(
+                DeclarativeFormField::new("icon", "Icon", DeclarativeFieldType::Icon),
+            )],
+        };
+        let initial = json!({ "icon": { "file": "/tmp/mine.svg", "icon": "ubuntu" } });
+        let window = cx
+            .update(|cx| {
+                cx.set_global(one_core::settings::AppSettings::default());
+                gpui_component::init(cx);
+                cx.open_window(WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        let form = cx.new(|cx| {
+                            DeclarativeForm::new(
+                                config.clone(),
+                                initial.as_object().unwrap(),
+                                window,
+                                cx,
+                            )
+                        });
+                        AuthTestRoot { form }
+                    })
+                })
+            })
+            .expect("app context 应可用");
+        let root = window.root(cx).expect("表单根节点应存在");
+        let (config, _) = root
+            .read_with(cx, |root, cx| root.form.read(cx).collect(cx))
+            .expect("表单应可收集");
+        assert_eq!(json!({ "file": "/tmp/mine.svg" }), config["icon"]);
     }
 
     #[gpui::test]

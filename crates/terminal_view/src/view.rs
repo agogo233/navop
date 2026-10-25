@@ -104,7 +104,9 @@ use one_core::background_tasks::BackgroundTaskId;
 use one_core::layout::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, TOOLBAR_WIDTH};
 use one_core::sidebar_contribution::{SidebarContribution, SidebarPlacement};
 use one_core::storage::models::{ActiveConnections, StoredConnection};
-use one_core::storage::{ConnectionRepository, GlobalStorageState, traits::Repository};
+use one_core::storage::{
+    ConnectionRepository, GlobalStorageState, stored_connection_icon, traits::Repository,
+};
 use one_core::tab_container::{TabContent, TabContentEvent, TabContentView};
 use one_ui::resize_handle::{HandlePlacement, ResizePanel, resize_handle};
 #[cfg(test)]
@@ -209,6 +211,9 @@ pub(crate) const TERMINAL_TOOLS_SIDEBAR_DEFAULT_WIDTH: Pixels = px(400.0);
 pub struct TerminalView {
     /// Terminal model entity
     terminal: Entity<Terminal>,
+    /// 连接自身保存的图标选择(SSH 自定义图标 / 扩展 `Icon` 字段);
+    /// 标签页图标优先用它,没有时回退到连接类型图标。
+    connection_icon: Option<Icon>,
     duplicate_source: Option<TerminalDuplicateSource>,
     recording_playback_name: Option<SharedString>,
     session_log_name: Option<SharedString>,

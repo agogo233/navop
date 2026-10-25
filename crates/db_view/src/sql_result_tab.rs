@@ -326,6 +326,108 @@ impl SqlResultTabContainer {
         }
     }
 
+    /// 进入运行态：把结果面板切到“执行中”并强制可见，同时启动 100ms 计时任务。
+    ///
+    /// 计时任务让“运行时间”在结果返回前就持续走动，而不是等查询结束才显示耗时；
+    /// 界面立即出现加载指示，避免大查询期间被误认为执行没有生效。
+    fn enter_running_state(&mut self, started_at: Instant, cx: &mut App) {
+        self.execution_start.update(cx, |start, cx| {
+            *start = Some(started_at);
+            cx.notify();
+        });
+        self.total_elapsed_ms.update(cx, |elapsed, cx| {
+            *elapsed = 0.0;
+            cx.notify();
+        });
+        self.execution_state.update(cx, |state, cx| {
+            *state = ExecutionState::Executing {
+                current: 0,
+                total: 0,
+            };
+            cx.notify();
+        });
+        self.active_result_tab.update(cx, |active, cx| {
+            *active = 0;
+            cx.notify();
+        });
+        self.tab_scroll_handle.scroll_to_item(0);
+        self.is_visible.update(cx, |visible, cx| {
+            *visible = true;
+            cx.notify();
+        });
+
+        // 停止之前的计时器
+        self.timer_stop_flag.store(true, Ordering::SeqCst);
+        // 创建新的停止标志
+        let new_stop_flag = Arc::new(AtomicBool::new(false));
+        self.timer_stop_flag = new_stop_flag.clone();
+
+        // 启动定时器，每100ms更新运行时间
+        let timer_self = self.clone();
+        let timer_stop = new_stop_flag;
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            loop {
+                Timer::after(Duration::from_millis(100)).await;
+
+                // 检查是否应该停止
+                if timer_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // 更新运行时间
+                let should_continue = cx.update(|cx| {
+                    let start_time = timer_self.execution_start.read(cx);
+                    if let Some(start) = *start_time {
+                        let elapsed = start.elapsed().as_millis() as f64;
+                        timer_self.total_elapsed_ms.update(cx, |ms, cx| {
+                            *ms = elapsed;
+                            cx.notify();
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 用户已发起执行、SQL 尚未送出（建会话 / 建事务阶段）时的可见运行态。
+    ///
+    /// 首次连接或新建事务会话可能耗时数秒，这一段同样要有“正在运行”的指示，
+    /// 否则用户会以为执行没生效。这里不清空上一轮结果：真正开始执行时才清，
+    /// 会话建立失败时旧结果得以保留。
+    ///
+    /// 返回该次执行的代次，供 [`Self::end_run_pending`] 判断是否仍是同一次运行。
+    pub fn begin_run_pending(&mut self, cx: &mut App) -> u64 {
+        let (generation, _cancellation) = self.begin_execution();
+        self.enter_running_state(Instant::now(), cx);
+        generation
+    }
+
+    /// 建会话 / 建事务失败或被打断：撤下运行态，避免指示器卡在“运行中”。
+    ///
+    /// 只有代次仍然匹配（期间没有真正开始执行）时才撤下，防止误清正在跑的查询。
+    pub fn end_run_pending(&mut self, generation: u64, cx: &mut App) {
+        if !self.is_current_execution(generation) || !self.is_executing(cx) {
+            return;
+        }
+        self.timer_stop_flag.store(true, Ordering::SeqCst);
+        self.execution_start.update(cx, |start, cx| {
+            *start = None;
+            cx.notify();
+        });
+        self.execution_state.update(cx, |state, cx| {
+            *state = ExecutionState::Idle;
+            cx.notify();
+        });
+    }
+
     /// 取消当前 SQL 执行。返回是否确实存在运行中的任务。
     pub fn cancel_execution(&mut self, cx: &mut App) -> bool {
         if !self.is_executing(cx) {
@@ -378,78 +480,9 @@ impl SqlResultTabContainer {
         let (generation, cancellation) = self.begin_execution();
 
         self.clear_results(cx);
-
-        self.execution_state.update(cx, |state, cx| {
-            *state = ExecutionState::Executing {
-                current: 0,
-                total: 0,
-            };
-            cx.notify();
-        });
-
-        self.active_result_tab.update(cx, |active, cx| {
-            *active = 0;
-            cx.notify();
-        });
-        self.tab_scroll_handle.scroll_to_item(0);
-
-        self.is_visible.update(cx, |visible, cx| {
-            *visible = true;
-            cx.notify();
-        });
-
         // 记录执行开始时间
         let execution_start = Instant::now();
-        self.execution_start.update(cx, |start, cx| {
-            *start = Some(execution_start);
-            cx.notify();
-        });
-
-        // 重置运行时间
-        self.total_elapsed_ms.update(cx, |elapsed, cx| {
-            *elapsed = 0.0;
-            cx.notify();
-        });
-
-        // 停止之前的计时器
-        self.timer_stop_flag.store(true, Ordering::SeqCst);
-        // 创建新的停止标志
-        let new_stop_flag = Arc::new(AtomicBool::new(false));
-        self.timer_stop_flag = new_stop_flag.clone();
-
-        // 启动定时器，每100ms更新运行时间
-        let timer_self = self.clone();
-        let timer_stop = new_stop_flag.clone();
-        cx.spawn(async move |cx: &mut AsyncApp| {
-            loop {
-                Timer::after(Duration::from_millis(100)).await;
-
-                // 检查是否应该停止
-                if timer_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                // 更新运行时间
-                let should_continue = cx.update(|cx| {
-                    let start_time = timer_self.execution_start.read(cx);
-                    if let Some(start) = *start_time {
-                        let elapsed = start.elapsed().as_millis() as f64;
-                        timer_self.total_elapsed_ms.update(cx, |ms, cx| {
-                            *ms = elapsed;
-                            cx.notify();
-                        });
-                        true
-                    } else {
-                        false
-                    }
-                });
-
-                if !should_continue {
-                    break;
-                }
-            }
-        })
-        .detach();
+        self.enter_running_state(execution_start, cx);
 
         cx.spawn(async move |cx: &mut AsyncApp| {
             let (global_state, database_type, max_rows) = cx.update(|cx| {
@@ -644,30 +677,7 @@ impl SqlResultTabContainer {
         let (generation, cancellation) = self.begin_execution();
 
         self.clear_results(cx);
-        self.timer_stop_flag.store(true, Ordering::SeqCst);
-        self.execution_start.update(cx, |start, cx| {
-            *start = Some(execution_start);
-            cx.notify();
-        });
-        self.total_elapsed_ms.update(cx, |elapsed, cx| {
-            *elapsed = 0.0;
-            cx.notify();
-        });
-        self.execution_state.update(cx, |state, cx| {
-            *state = ExecutionState::Executing {
-                current: 0,
-                total: 0,
-            };
-            cx.notify();
-        });
-        self.active_result_tab.update(cx, |active, cx| {
-            *active = 0;
-            cx.notify();
-        });
-        self.is_visible.update(cx, |visible, cx| {
-            *visible = true;
-            cx.notify();
-        });
+        self.enter_running_state(execution_start, cx);
 
         cx.spawn(async move |cx: &mut AsyncApp| {
             let (global_state, max_rows, cache, notifier) = cx.update(|cx| {
@@ -681,6 +691,9 @@ impl SqlResultTabContainer {
             let exec_opts = db::ExecOptions {
                 stop_on_error: false,
                 max_rows,
+                // 粘性会话（`connection_lost` 为 Some）允许 db 层在“语句根本没发出去”
+                // 的断连上就地重连并重试一次；Manual 事务不重试，新连接没有事务上下文。
+                reconnect_on_lost_connection: request.connection_lost.is_some(),
                 ..Default::default()
             };
             let session_id = request.session_id.clone();
@@ -705,7 +718,17 @@ impl SqlResultTabContainer {
             };
             let execution_result = execution_result.unwrap_or_else(Err);
             let results = match execution_result {
-                Ok(results) => results,
+                Ok(results) => {
+                    // 驱动把断连包成 `Ok(vec![SqlResult::Error])`（PostgreSQL、MySQL 都是），
+                    // 这不是 Err 但连接确实已经死了：同样置位信号，让持有方下次执行前
+                    // 重建会话，而不是一直复用死连接反复报 `connection closed`。
+                    if let Some(flag) = request.connection_lost.as_ref() {
+                        if results.iter().any(SqlResult::looks_like_connection_lost) {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    results
+                }
                 Err(error) => {
                     // 连接级失败（断连/会话丢失）：置位信号，粘性会话持有方
                     // 下次执行前重建；Manual 事务无信号，行为不变。
@@ -738,11 +761,14 @@ impl SqlResultTabContainer {
                 }
                 match &request.schema_invalidation {
                     SessionSchemaInvalidation::Immediate => {
+                        // 缓存失效会删除文件缓存（tokio::fs），必须在应用 Tokio
+                        // 运行时上轮询；前台 executor 没有运行时上下文会 panic。
                         let scopes = global_state
-                            .apply_sql_cache_invalidation_plan(
-                                &cache,
-                                &request.connection_id,
-                                &plan,
+                            .apply_sql_cache_invalidation_plan_on_runtime(
+                                cx,
+                                cache.clone(),
+                                request.connection_id.clone(),
+                                plan,
                             )
                             .await;
                         emit_invalidation_events(cx, notifier.as_ref(), &request.connection_id, scopes);
@@ -951,6 +977,7 @@ impl SqlResultTabContainer {
                     );
                     this.set_sql_result_column_meta(query_result.column_meta.clone(), cx);
                     this.load_column_meta_for_sql_result(cx);
+                    this.load_sql_result_column_comments(cx);
                 });
 
                 if editable

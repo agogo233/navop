@@ -9,6 +9,7 @@ use crate::settings::acp_agents_settings::AcpAgentsView;
 use crate::settings::agent_settings::agent_setting_group;
 use crate::settings::appearance::render as render_appearance_settings;
 use crate::settings::database_settings::database_setting_group;
+use crate::settings::connection_display_settings::connection_display_setting_group;
 use crate::settings::llm_providers_view::LlmProvidersView;
 use crate::settings::local_terminal_settings::local_terminal_setting_group;
 use crate::settings::mcp_settings::mcp_setting_group;
@@ -352,6 +353,10 @@ fn upsert_custom_font(
 }
 
 pub fn init_settings(cx: &mut App) {
+    // 先按磁盘上的 log_file_path 装好日志，再加载设置：`AppSettings::load()` 里的
+    // 「Failed to parse settings」如果发生在 subscriber 安装之前，会被直接丢掉，
+    // 生产上就只剩「设置被还原成默认值」这个结果，永远查不到原因。
+    init_tracing(&AppSettings::peek_log_file_path());
     let settings = AppSettings::load();
     // 初始化自动保存配置全局状态
     cx.set_global(AutoSaveConfig::new(
@@ -360,17 +365,16 @@ pub fn init_settings(cx: &mut App) {
     ));
     settings.apply(cx);
     load_custom_fonts(&settings.custom_fonts, cx);
-    init_tracing(&settings);
     let http_client = build_app_http_client(&settings.global_proxy).expect("HTTP 客户端初始化失败");
     cx.set_http_client(http_client);
     cx.set_global(settings);
 }
 
-fn init_tracing(settings: &AppSettings) {
+fn init_tracing(log_file_path: &str) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    match crate::navop_app::configured_log_file_path(&settings.log_file_path) {
+    match crate::navop_app::configured_log_file_path(log_file_path) {
         Ok(log_file_path) => match crate::navop_app::log_file_appender(&log_file_path) {
             Ok(file_appender) => {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -944,6 +948,7 @@ impl SettingsPanel {
                             .description(t!("Settings.General.Log.file_path_desc").to_string()),
                         ),
                     remote_file_editor_setting_group(&default_settings.remote_file_editor, cx),
+                    connection_display_setting_group(),
                     SettingGroup::new()
                         .title(t!("Settings.General.Proxy.group_title"))
                         .item(

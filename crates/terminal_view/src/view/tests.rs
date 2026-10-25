@@ -12,8 +12,8 @@ use super::{
     history_prompt_overlay_bounds, is_large_paste, join_paste_as_single_line,
     live_ssh_feature_supported, live_terminal_input_supported, mouse_button_code,
     multiline_non_empty_line_count, recording_playback_display_name, remote_clipboard_image_path,
-    resolve_ssh_reconnect_source, sgr_mouse_button_report, sgr_mouse_mode_enabled,
-    sgr_mouse_wheel_report, should_confirm_local_terminal_close,
+    resolve_live_term_mode, resolve_ssh_reconnect_source, sgr_mouse_button_report,
+    sgr_mouse_mode_enabled, sgr_mouse_wheel_report, should_confirm_local_terminal_close,
     should_defer_inline_history_prompt_input_to_text_system, should_defer_sgr_left_press,
     should_direct_paste_on_right_click, should_dismiss_history_prompt_for_keystroke,
     should_dismiss_history_prompt_for_mouse, should_dismiss_history_prompt_for_scroll,
@@ -39,6 +39,7 @@ use terminal::terminal::{ConnectionState, TerminalConnectionKind, TerminalModelE
 mod capabilities;
 mod connection_status;
 mod core;
+mod ctrl_d;
 mod history_availability;
 mod history_interaction;
 mod layout;

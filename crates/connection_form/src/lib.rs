@@ -1,6 +1,7 @@
 // Keep connection-form translations, including refresh labels, owned by this crate.
 rust_i18n::i18n!("locales", fallback = "en");
 
+pub mod ai_access;
 pub mod credential;
 pub mod declarative;
 pub mod middleware_form;

@@ -28,6 +28,9 @@ impl DeclarativeForm {
         if field_info.field_type == DeclarativeFieldType::Auth {
             return self.render_auth_field(field_info, cx);
         }
+        if field_info.field_type == DeclarativeFieldType::Icon {
+            return self.render_icon_field(field_info, cx);
+        }
         let id = field_info.id.clone();
         let checkbox_id = id.clone();
         vec![

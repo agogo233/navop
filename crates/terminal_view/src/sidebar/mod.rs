@@ -186,6 +186,7 @@ fn agent_theme_from_terminal_theme(
 fn build_terminal_ai_context(
     current_connection: &StoredConnection,
     all_connections: &[StoredConnection],
+    ai_access_levels: &ai_chat_view::AiAccessLevels,
 ) -> (
     agent_runtime::AgentResourceScope,
     agent_runtime::ResourceCatalog,
@@ -196,19 +197,21 @@ fn build_terminal_ai_context(
         current_connection,
         &catalog,
         agent_runtime::DefaultTargetReason::CurrentTerminal,
+        ai_access_levels,
     )
 }
 
 fn build_live_terminal_ai_context(
     current_terminal: agent_runtime::ResourceRef,
     all_connections: &[StoredConnection],
+    ai_access_levels: &ai_chat_view::AiAccessLevels,
 ) -> (
     agent_runtime::AgentResourceScope,
     agent_runtime::ResourceCatalog,
     Vec<MentionItem>,
 ) {
     let mut resources = vec![current_terminal.clone()];
-    resources.extend(build_resource_catalog(all_connections));
+    resources.extend(build_resource_catalog(all_connections, ai_access_levels));
     let catalog = agent_runtime::ResourceCatalog::new(resources);
     let scope = agent_runtime::AgentResourceScope::single_default(
         current_terminal.clone(),
@@ -224,7 +227,10 @@ fn build_live_terminal_ai_context(
         detail,
         current_terminal.kind.as_str(),
     )];
-    mentions.extend(build_mentions_from_connections(all_connections));
+    mentions.extend(build_mentions_from_connections(
+        all_connections,
+        ai_access_levels,
+    ));
     (scope, catalog, mentions)
 }
 
@@ -988,7 +994,9 @@ impl TerminalSidebar {
         });
         let ai_chat_panel = if let Some(connection) = stored_connection.as_ref() {
             let connections = load_terminal_ai_connections(cx);
-            let (scope, catalog, mentions) = build_terminal_ai_context(connection, &connections);
+            let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
+            let (scope, catalog, mentions) =
+                build_terminal_ai_context(connection, &connections, &ai_access_levels);
             cx.new(|cx| {
                 DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(
                     scope, catalog, mentions, window, cx,
@@ -996,8 +1004,9 @@ impl TerminalSidebar {
             })
         } else if let Some(terminal_resource) = terminal_ai_resource {
             let connections = load_terminal_ai_connections(cx);
+            let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
             let (scope, catalog, mentions) =
-                build_live_terminal_ai_context(terminal_resource, &connections);
+                build_live_terminal_ai_context(terminal_resource, &connections, &ai_access_levels);
             cx.new(|cx| {
                 DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(
                     scope, catalog, mentions, window, cx,
@@ -2038,6 +2047,7 @@ mod tests {
 
     fn stored_connection(id: i64, name: &str, connection_type: ConnectionType) -> StoredConnection {
         StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(id),
             credential_revision: None,
             name: name.to_string(),
@@ -2099,8 +2109,11 @@ mod tests {
                 .with_capability(ResourceCapability::TerminalControl);
         let saved = stored_connection(42, "prod", ConnectionType::SshSftp);
 
-        let (scope, catalog, mentions) =
-            build_live_terminal_ai_context(live_terminal.clone(), &[saved]);
+        let (scope, catalog, mentions) = build_live_terminal_ai_context(
+            live_terminal.clone(),
+            &[saved],
+            &ai_chat_view::AiAccessLevels::new(),
+        );
         let resources = scope.to_resource_context();
 
         assert_eq!(
@@ -2301,7 +2314,8 @@ mod tests {
             stored_connection(3, "cache", ConnectionType::Redis),
         ];
 
-        let (scope, catalog, mentions) = build_terminal_ai_context(&current, &connections);
+        let (scope, catalog, mentions) =
+            build_terminal_ai_context(&current, &connections, &ai_chat_view::AiAccessLevels::new());
 
         assert_eq!(1, scope.selected.len());
         assert_eq!(
