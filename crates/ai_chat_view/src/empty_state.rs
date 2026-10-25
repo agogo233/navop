@@ -32,15 +32,35 @@ const HINT_MAX_WIDTH: f32 = 360.0;
 /// 起手话条数。
 pub(crate) const STARTER_COUNT: usize = 3;
 
+/// 起手话按后端分口味。
+///
+/// 代码向的起手话（「讲讲这个项目」「找一处值得改进的代码」）假设后端能读仓库；
+/// 内置 One Agent 没有工作区读写工具，点了只会答非所问，所以给它一套不依赖
+/// 仓库的技能问答式起手话。外部 ACP agent 多半就是编码 agent，保留原文案。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StarterFlavor {
+    /// 内置 One Agent（navop 自研内核）。
+    Builtin,
+    /// 外部 ACP agent（编码 agent）。
+    Acp,
+}
+
 /// 第 `index` 句起手话。
 ///
 /// 单独成函数是为了让「点哪一句」这个下标成为唯一输入：渲染侧给 `ElementId`，
 /// 点击侧回传同一个下标再取文案，两边不会各写一份字符串表。
-pub(crate) fn starter_prompt(index: usize) -> String {
-    match index {
-        0 => t!("AgentUi.empty_starter_overview").to_string(),
-        1 => t!("AgentUi.empty_starter_improve").to_string(),
-        _ => t!("AgentUi.empty_starter_tests").to_string(),
+pub(crate) fn starter_prompt(flavor: StarterFlavor, index: usize) -> String {
+    match flavor {
+        StarterFlavor::Acp => match index {
+            0 => t!("AgentUi.empty_starter_overview").to_string(),
+            1 => t!("AgentUi.empty_starter_improve").to_string(),
+            _ => t!("AgentUi.empty_starter_tests").to_string(),
+        },
+        StarterFlavor::Builtin => match index {
+            0 => t!("AgentUi.empty_starter_capabilities").to_string(),
+            1 => t!("AgentUi.empty_starter_plan").to_string(),
+            _ => t!("AgentUi.empty_starter_troubleshoot").to_string(),
+        },
     }
 }
 
@@ -72,6 +92,7 @@ pub fn render_empty_state(
     theme: &AgentChatTheme,
     layout: MessageListLayout,
     compact: bool,
+    flavor: StarterFlavor,
     on_starter: Rc<dyn Fn(usize, &mut Window, &mut App)>,
 ) -> AnyElement {
     let mut body = v_flex()
@@ -111,7 +132,7 @@ pub fn render_empty_state(
                     .gap_2()
                     .children((0..STARTER_COUNT).map(|index| {
                         let on_starter = on_starter.clone();
-                        starter_chip(theme, index, move |window, cx| {
+                        starter_chip(theme, flavor, index, move |window, cx| {
                             on_starter(index, window, cx)
                         })
                     })),
@@ -132,6 +153,7 @@ pub fn render_empty_state(
 /// 不是执行——点下去就把消息发出去会让人来不及改。
 fn starter_chip(
     theme: &AgentChatTheme,
+    flavor: StarterFlavor,
     index: usize,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
@@ -154,7 +176,7 @@ fn starter_chip(
                 .border_color(theme.border_strong)
         })
         .on_click(move |_, window, cx| on_click(window, cx))
-        .child(starter_prompt(index))
+        .child(starter_prompt(flavor, index))
         .into_any_element()
 }
 
@@ -207,8 +229,26 @@ mod tests {
         );
     }
 
+    /// 起手话按后端分两套：内置 Agent 不该拿到「看看这个项目」这类要读仓库的提示。
+    #[test]
+    fn starters_are_flavored_by_backend() {
+        assert_eq!(
+            t!("AgentUi.empty_starter_capabilities").to_string(),
+            starter_prompt(StarterFlavor::Builtin, 0)
+        );
+        assert_eq!(
+            t!("AgentUi.empty_starter_overview").to_string(),
+            starter_prompt(StarterFlavor::Acp, 0)
+        );
+        assert_ne!(
+            starter_prompt(StarterFlavor::Builtin, 0),
+            starter_prompt(StarterFlavor::Acp, 0)
+        );
+    }
+
     struct EmptyStateRoot {
         compact: bool,
+        flavor: StarterFlavor,
         clicked: Rc<RefCell<Vec<usize>>>,
     }
 
@@ -220,6 +260,7 @@ mod tests {
                 &theme,
                 MessageListLayout::Centered,
                 self.compact,
+                self.flavor,
                 Rc::new(move |index, _window, _cx| clicked.borrow_mut().push(index)),
             )
         }
@@ -228,6 +269,7 @@ mod tests {
     fn mount(
         cx: &mut TestAppContext,
         compact: bool,
+        flavor: StarterFlavor,
     ) -> (Rc<RefCell<Vec<usize>>>, &mut VisualTestContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -237,6 +279,7 @@ mod tests {
         let clicked_for_root = clicked.clone();
         let (_, cx) = cx.add_window_view(move |_window, _cx| EmptyStateRoot {
             compact,
+            flavor,
             clicked: clicked_for_root,
         });
         (clicked, cx)
@@ -244,7 +287,7 @@ mod tests {
 
     #[gpui::test]
     fn full_width_panels_offer_starters(cx: &mut TestAppContext) {
-        let (clicked, cx) = mount(cx, false);
+        let (clicked, cx) = mount(cx, false, StarterFlavor::Acp);
 
         assert!(
             cx.debug_bounds("ai-chat-empty-state").is_some(),
@@ -261,7 +304,7 @@ mod tests {
 
     #[gpui::test]
     fn narrow_panels_keep_only_the_title(cx: &mut TestAppContext) {
-        let (_, cx) = mount(cx, true);
+        let (_, cx) = mount(cx, true, StarterFlavor::Builtin);
 
         assert!(
             cx.debug_bounds("ai-chat-empty-state").is_some(),

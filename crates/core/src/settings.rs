@@ -575,6 +575,20 @@ pub enum AiChatToolExecutionMode {
     Ask,
 }
 
+/// 用户在对话里最后选择的驱动后端。
+///
+/// 与 [`AiChatSettings::last_acp_agent_id`] 的区别：后者只记「上次用过的 ACP
+/// agent」，选回内置 One Agent 时无法表达；这个枚举把「内置」也当成一个明确的
+/// 选择记下来，启动时照它恢复，而不是永远回到 One Agent。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AiChatBackendSelection {
+    /// 内置 One Agent（navop 自研内核）。
+    Builtin,
+    /// 外部 ACP agent。
+    Acp { id: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiChatSettings {
     #[serde(default)]
@@ -600,6 +614,12 @@ pub struct AiChatSettings {
     pub request_timeout_secs: u64,
     #[serde(default)]
     pub last_acp_agent_id: Option<String>,
+    /// 上次在对话里明确选择的驱动后端（内置 One Agent 或某个 ACP agent）。
+    ///
+    /// `None` 表示旧配置里没有这条记录，启动时回落到 `last_acp_agent_id` 的
+    /// 旧行为（有值就恢复 ACP，没有就停在 One Agent）。
+    #[serde(default)]
+    pub last_backend: Option<AiChatBackendSelection>,
     #[serde(default)]
     pub acp_models: HashMap<String, String>,
     /// 内置会话 uid → ACP agent id → 该 agent 上次实际在用的协议会话 id。
@@ -782,6 +802,7 @@ impl Default for AiChatSettings {
             custom_system_prompt: String::new(),
             request_timeout_secs: default_ai_request_timeout_secs(),
             last_acp_agent_id: None,
+            last_backend: None,
             acp_models: HashMap::new(),
             acp_sessions: HashMap::new(),
             last_workspace_root: None,
@@ -2002,8 +2023,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        AiChatSettings, AiChatToolExecutionMode, AppSettings, CloseButtonBehavior,
-        ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+        AiChatBackendSelection, AiChatSettings, AiChatToolExecutionMode, AppSettings,
+        CloseButtonBehavior, ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
         DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
         DEFAULT_TERMINAL_THEME, HomeConnectionLayout, LOCALE_SYSTEM, LargeTextCellEditorOpenMode,
         LocalTerminalProfileKind, LocalTerminalProfileSettings, MAX_AI_REQUEST_TIMEOUT_SECS,
@@ -3180,6 +3201,33 @@ mod tests {
             settings.ai_chat.last_workspace_root,
             restored.ai_chat.last_workspace_root
         );
+    }
+
+    #[test]
+    fn ai_chat_backend_selection_round_trips_and_legacy_config_falls_back() {
+        let mut settings = AppSettings::default();
+        settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+            id: "builtin.codex".to_string(),
+        });
+
+        let json = serde_json::to_string(&settings).expect("serialize AI backend selection");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize AI backend selection");
+        assert_eq!(settings.ai_chat.last_backend, restored.ai_chat.last_backend);
+
+        settings.ai_chat.last_backend = Some(AiChatBackendSelection::Builtin);
+        let json = serde_json::to_string(&settings).expect("serialize builtin selection");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize builtin selection");
+        assert_eq!(
+            Some(AiChatBackendSelection::Builtin),
+            restored.ai_chat.last_backend
+        );
+
+        // 旧配置没有这条记录：保持 None，启动时回落到 last_acp_agent_id 的旧恢复路径。
+        let legacy: AiChatSettings =
+            serde_json::from_str("{}").expect("deserialize legacy ai_chat settings");
+        assert_eq!(None, legacy.last_backend);
     }
 
     #[test]

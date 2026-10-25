@@ -394,6 +394,11 @@ impl AgentChatView {
         AppSettings::update_and_save(cx, |settings| {
             settings.ai_chat.last_acp_agent_id =
                 self.current_acp_id.as_ref().map(ToString::to_string);
+            // 等鉴权也是用户明确选中的后端，下次启动照样直接用它。
+            settings.ai_chat.last_backend = self
+                .current_acp_id
+                .as_ref()
+                .map(|id| AiChatBackendSelection::Acp { id: id.to_string() });
         });
         if let Some(transcript) = self.transcript_for_open_session_mut(origin_session_uid) {
             transcript.set_acp_error(&error);

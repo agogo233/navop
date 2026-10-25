@@ -287,6 +287,18 @@ AgentUi:
     en: Add tests for what I just changed
     zh-CN: 给刚改的地方补测试
     zh-HK: 給剛改的地方補測試
+  empty_starter_capabilities:
+    en: What can you do for me?
+    zh-CN: 你能帮我做什么？
+    zh-HK: 你能幫我做什麼？
+  empty_starter_plan:
+    en: Break this request into steps before we start
+    zh-CN: 先把这件事拆成几步再动手
+    zh-HK: 先將這件事拆成幾步再動手
+  empty_starter_troubleshoot:
+    en: Explain this error and how I should troubleshoot it
+    zh-CN: 解释这段报错，告诉我该怎么排查
+    zh-HK: 解釋這段報錯，告訴我該怎麼排查
   palette_placeholder:
     en: Type a command or session name
     zh-CN: 输入命令或会话名

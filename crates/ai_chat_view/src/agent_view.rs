@@ -43,7 +43,7 @@ use one_assets::IconName;
 #[cfg(not(test))]
 use one_core::gpui_tokio::Tokio;
 use one_core::llm::{GlobalProviderState, LlmConnector, LlmProvider, ProviderConfig};
-use one_core::settings::{AiChatToolExecutionMode, AppSettings};
+use one_core::settings::{AiChatBackendSelection, AiChatToolExecutionMode, AppSettings};
 use one_core::sidebar_contribution::SidebarPlacement;
 use one_ui::{IconButton, IconButtonRole, PanelHeader, PanelHeaderVariant};
 use rust_i18n::t;
@@ -4937,11 +4937,18 @@ impl AgentChatView {
     }
 
     pub fn restore_persisted_acp(&mut self, cx: &mut Context<Self>) {
-        let Some(agent_id) = AppSettings::current(cx)
-            .ai_chat
-            .last_acp_agent_id
-            .map(SharedString::from)
-        else {
+        let persisted_agent: Option<SharedString> =
+            match AppSettings::current(cx).ai_chat.last_backend.clone() {
+                // 用户上次明确选了内置 One Agent：保持本地后端，别再去连 ACP。
+                Some(AiChatBackendSelection::Builtin) => return,
+                Some(AiChatBackendSelection::Acp { id }) => Some(SharedString::from(id)),
+                // 旧配置没有 last_backend：沿用 last_acp_agent_id 的旧恢复路径。
+                None => AppSettings::current(cx)
+                    .ai_chat
+                    .last_acp_agent_id
+                    .map(SharedString::from),
+            };
+        let Some(agent_id) = persisted_agent else {
             return;
         };
         if self
@@ -5662,14 +5669,41 @@ impl AgentChatView {
     }
 
     /// 切换驱动后端:`None` = One_Agent(自研);`Some(id)` = 对应 ACP agent。
+    ///
+    /// 这是「用户在 agent 菜单里主动挑了一个后端」的唯一入口（设置页对齐、
+    /// 启动恢复都直接调 `select_*_backend`），所以选择在这里落进设置——
+    /// 选完 ACP agent 再选回 One Agent 也记得住，下次启动直接用它。
     fn select_backend(&mut self, agent_id: Option<SharedString>, cx: &mut Context<Self>) {
         if !self.can_select_backend(agent_id.as_ref()) {
             return;
         }
+        self.persist_backend_selection(agent_id.as_ref(), cx);
         match agent_id {
             None => self.select_local_backend(cx),
             Some(id) => self.select_acp_backend(id, cx),
         }
+    }
+
+    /// 把用户挑的后端写进设置，供下次启动恢复。
+    ///
+    /// 选内置时把 `last_acp_agent_id` 一并清掉：设置页的「使用中」标记和
+    /// 旧的恢复路径都以它为事实源，留着会让界面显示「还是那个 ACP agent」。
+    fn persist_backend_selection(
+        &mut self,
+        agent_id: Option<&SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        AppSettings::update_and_save(cx, |settings| {
+            let (selection, last_acp_agent_id) = match agent_id {
+                Some(id) => (
+                    AiChatBackendSelection::Acp { id: id.to_string() },
+                    Some(id.to_string()),
+                ),
+                None => (AiChatBackendSelection::Builtin, None),
+            };
+            settings.ai_chat.last_backend = Some(selection);
+            settings.ai_chat.last_acp_agent_id = last_acp_agent_id;
+        });
     }
 
     fn can_select_backend(&self, agent_id: Option<&SharedString>) -> bool {
@@ -6089,11 +6123,20 @@ impl AgentChatView {
         }
     }
 
+    /// 起手话按后端分口味：内置 One Agent 没有工作区读写工具，代码向的
+    /// 「讲讲这个项目」对它就是坏提示；外部 ACP agent 恰恰相反。
+    fn starter_flavor(&self) -> crate::empty_state::StarterFlavor {
+        match self.backend {
+            Backend::Local => crate::empty_state::StarterFlavor::Builtin,
+            Backend::Acp => crate::empty_state::StarterFlavor::Acp,
+        }
+    }
+
     /// 点了空态里的起手话：填进输入框并把光标交回去，**不**直接发送。
     ///
     /// 直接发出去等于替用户按了发送键：起手话是给人改的草稿，不是命令。
     fn apply_starter_prompt(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = crate::empty_state::starter_prompt(index);
+        let prompt = crate::empty_state::starter_prompt(self.starter_flavor(), index);
         let composer = self.composer();
         composer.set_composer_text(&prompt, window, cx);
         composer.focus_input(window, cx);
@@ -7679,6 +7722,7 @@ impl Render for AgentChatView {
                 &chat_theme,
                 list_layout,
                 self.sidebar_mode,
+                self.starter_flavor(),
                 on_starter,
             ))
         } else {
@@ -12294,6 +12338,102 @@ mod tests {
             assert_eq!(Backend::Local, view.backend);
             assert!(!view.is_current_acp_operation(stale_operation));
             assert_eq!(None, view.acp_session_transition_phase(&session_uid));
+        });
+    }
+
+    /// 用户从 agent 菜单里选一次后端，就要记住这次选择。
+    ///
+    /// 以前只有 ACP 鉴权失败那条路径会写设置：选 Codex 连上了、重启却回到
+    /// One Agent。现在选择本身即持久化，选回内置也会把 ACP 选中项清掉。
+    #[gpui::test]
+    fn selecting_backend_persists_the_choice(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agent_id = SharedString::from("codex");
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_acp_agents(vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+                    agent_id.clone(),
+                    "Codex",
+                    "definitely-missing-acp-binary",
+                ))]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            AppSettings::update(cx, |settings| {
+                settings.ai_chat.last_acp_agent_id = Some(agent_id.to_string());
+                settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+                    id: agent_id.to_string(),
+                });
+            });
+
+            view.select_backend(None, cx);
+
+            assert_eq!(Backend::Local, view.backend);
+            let settings = AppSettings::current(cx);
+            assert_eq!(
+                Some(AiChatBackendSelection::Builtin),
+                settings.ai_chat.last_backend,
+                "选内置要记住"
+            );
+            assert_eq!(
+                None, settings.ai_chat.last_acp_agent_id,
+                "选内置时要清掉 ACP 选中项，否则设置页还标着旧 agent"
+            );
+        });
+    }
+
+    /// 上次选了内置 One Agent：启动恢复时留在本地后端，不去连 ACP。
+    #[gpui::test]
+    fn restoring_builtin_choice_keeps_local_backend(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agent_id = SharedString::from("codex");
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_acp_agents(vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+                    agent_id.clone(),
+                    "Codex",
+                    "definitely-missing-acp-binary",
+                ))]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            AppSettings::update(cx, |settings| {
+                settings.ai_chat.last_acp_agent_id = Some(agent_id.to_string());
+                settings.ai_chat.last_backend = Some(AiChatBackendSelection::Builtin);
+            });
+
+            view.restore_persisted_acp(cx);
+
+            assert_eq!(Backend::Local, view.backend);
+            assert_eq!(None, view.current_acp_id);
+            assert!(!view.acp_connecting);
+        });
+    }
+
+    /// 上次选的 ACP agent 已被删掉/禁用：安静地留在本地，不尝试连接。
+    #[gpui::test]
+    fn restoring_missing_acp_choice_leaves_local_backend(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            AppSettings::update(cx, |settings| {
+                settings.ai_chat.last_acp_agent_id = Some("removed-agent".to_string());
+                settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+                    id: "removed-agent".to_string(),
+                });
+            });
+
+            view.restore_persisted_acp(cx);
+
+            assert_eq!(Backend::Local, view.backend);
+            assert_eq!(None, view.current_acp_id);
+            assert!(!view.acp_connecting);
         });
     }
 
