@@ -890,6 +890,18 @@ Home:
     en: Local changed, remote deleted
     zh-CN: 本地有更新，远端已删除
     zh-HK: 本地有更新，遠端已刪除
+  personal_sync_conflict_resolved:
+    en: "Resolved %{count} sync conflict(s)"
+    zh-CN: "已解决 %{count} 个同步冲突"
+    zh-HK: "已解決 %{count} 個同步衝突"
+  personal_sync_conflict_resolve_failed:
+    en: "Failed to resolve %{count} conflict(s): %{reason}"
+    zh-CN: "解决 %{count} 个冲突失败：%{reason}"
+    zh-HK: "解決 %{count} 個衝突失敗：%{reason}"
+  personal_sync_conflict_partially_resolved:
+    en: "Resolved %{succeeded} conflict(s), %{failed} failed: %{reason}"
+    zh-CN: "已解决 %{succeeded} 个冲突，%{failed} 个失败：%{reason}"
+    zh-HK: "已解決 %{succeeded} 個衝突，%{failed} 個失敗：%{reason}"
   sync_conflict_type:
     en: "Conflict type: %{conflict_type}"
     zh-CN: "冲突类型: %{conflict_type}"

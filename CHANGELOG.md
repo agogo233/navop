@@ -4,6 +4,20 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [Unreleased]
+
+#### 修复与优化
+
+- 个人同步：修复引用了钥匙串凭据的连接在多设备间持续产生假冲突的问题。连接载荷里的凭据引用导出时保留了源设备的本地整数 ID，而每台设备的行号各不相同，导致同一条连接跨设备的 checksum 永不相等，被判定为「双方都改过」而反复冲突、来回覆盖。现在导出载荷统一只保留跨设备稳定的 `credential_cloud_id`，整数 ID 置零（下载时仍按云端 ID 映射回本机行号，行为不变）。
+- 首页：从标签栏「+」打开的「打开连接」列表里点一次不再新建两个 SSH 会话。此前同一行既挂了行内的打开回调，又有列表内建的点击 → `confirm` 打开路径，一次点击先后走完两条路径（已有 2 个标签时点一次直接变成 4 个）；现在点击与键盘回车统一只走 `confirm`，并补源码级回归测试守住「行渲染不得直接打开连接」（#461）。
+
+---
+
+#### Fixes and Improvements
+
+- Personal sync: fixed constantly recurring false conflicts for connections that reference keychain credentials. The exported payload kept the source device's local integer credential ID, which differs on every device, so the same logical connection never produced an equal checksum across devices and was repeatedly flagged as "modified on both sides", overwriting back and forth. Exports now carry only the device-stable `credential_cloud_id` with the integer ID zeroed (downloads still map the cloud ID back to the local row, unchanged behavior).
+- Home: clicking an entry in the “Open connection” list opened from the tab bar’s “+” no longer creates two SSH sessions. A row carried both its own open callback and the list’s built-in click → `confirm` open path, so a single click ran through both (going from 2 tabs to 4 in one click); clicks and the Enter key now share the single `confirm` path, guarded by a source-level regression test (#461).
+
 ## [v0.21.1] - 2026-10-22
 
 #### 修复与优化
