@@ -197,6 +197,10 @@ pub(super) struct EditorTab {
 
 impl EditorTab {
     pub(super) fn new(id: u64, document: PendingDocument) -> Self {
+        // 差异页默认换行：审阅面板是可调宽的侧栏（工作台右侧默认 400px），
+        // 长行不换行时只能横向拖动或把面板放大才看得全。普通代码文件保持
+        // 不换行（对齐比折行重要），需要时用工具栏的「换行」开关切换。
+        let soft_wrap = document.load_request.is_diff();
         Self {
             id,
             key: document.key,
@@ -214,7 +218,7 @@ impl EditorTab {
             policy: DocumentPolicy::Code,
             loading: true,
             saving: false,
-            soft_wrap: false,
+            soft_wrap,
             read_only: false,
             status_message: rust_i18n::t!("WorkspaceExplorer.status.loading").to_string(),
             status_presentation: StatusPresentation::Progress,

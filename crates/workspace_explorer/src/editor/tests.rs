@@ -265,6 +265,60 @@ fn diff_tabs_start_in_a_single_column(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn diff_tabs_open_soft_wrapped_and_file_tabs_do_not(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        notes::init(cx);
+    });
+    let path = test_file_path();
+    std::fs::write(&path, "fn main() { let line = \"a\".repeat(200); }\n").unwrap();
+    let (window, editor) = open_test_editor(cx);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+    editor.update_in(&mut cx, |editor, window, cx| {
+        editor.open_snapshot_diff("turn 0".to_string(), snapshot_patch(0), window, cx);
+    });
+    cx.run_until_parked();
+    let diff_wrap = editor.read_with(&cx, |editor, _| {
+        editor
+            .active_tab()
+            .expect("review tab should be active")
+            .soft_wrap
+    });
+    assert!(
+        diff_wrap,
+        "审阅页默认换行：它是 400px 级的可调宽侧栏，不换行时长行只能横向拖动，\
+         而横向滚动条默认是滚动时才浮现的浮动条"
+    );
+
+    // 文件页保持不换行——代码对齐比折行重要，要换行由用户自己按工具栏切换。
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| editor.open_file(path.clone(), window, cx));
+    });
+    cx.run_until_parked();
+    let file_wrap = editor.read_with(&cx, |editor, _| {
+        editor
+            .active_tab()
+            .expect("file tab should be active")
+            .soft_wrap
+    });
+    assert!(!file_wrap, "普通代码文件默认不换行");
+
+    // 开关必须真的改到 diff 页的 tab 状态（渲染层据此把 soft_wrap 透传给 Diff）。
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| editor.toggle_soft_wrap(window, cx));
+    });
+    let toggled = editor.read_with(&cx, |editor, _| {
+        editor
+            .active_tab()
+            .expect("file tab should be active")
+            .soft_wrap
+    });
+    assert!(toggled, "换行开关对文件页同样生效");
+    let _ = std::fs::remove_file(path);
+}
+
+#[gpui::test]
 fn reopening_a_file_keeps_unsaved_edits(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

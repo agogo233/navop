@@ -80,14 +80,14 @@ impl WorkspaceEditor {
         // Diff 组件原生支持多文件 Split,单文件与整轮快照 diff 都能并排。
         let side_by_side_available = tab.is_some_and(|tab| tab.diff_state.is_some());
         let side_by_side = side_by_side_available && tab.is_some_and(|tab| tab.diff_side_by_side);
-        h_flex()
+        // 侧栏收窄时按钮换行而不是被 overflow_hidden 裁掉：审阅页放在
+        // 400px 级的右边栏里，单行放不下 6 个动作（上一轮实测内容宽 500+px）。
+        let buttons = h_flex()
+            .flex_1()
+            .min_w_0()
             .items_center()
+            .flex_wrap()
             .gap_2()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.muted)
             .child(self.toolbar_button(EditorAction::Save, unavailable || read_only, cx))
             .child(self.toolbar_button(EditorAction::Search, unavailable, cx))
             .child(self.toolbar_button(EditorAction::Replace, unavailable || read_only, cx))
@@ -129,10 +129,19 @@ impl WorkspaceEditor {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_soft_wrap(window, cx);
                     })),
-            )
-            .child(div().flex_1())
+            );
+        h_flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.muted)
+            .child(buttons)
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(self.theme.muted_foreground)
                     .child(tab.map(|tab| policy_label(tab.policy)).unwrap_or_default()),
@@ -199,12 +208,14 @@ impl WorkspaceEditor {
         }
         if let Some(diff_state) = tab.diff_state.as_ref() {
             // Diff 组件自己滚动、自己虚拟化,给它一个有界的 flex 区域即可。
-            // 文件头(路径 + 增删统计)由组件绘制。
+            // 文件头(路径 + 增删统计)由组件绘制。`soft_wrap` 必须显式透传:
+            // 组件的横向滚动条默认是「滚动时才浮现」的浮动条,窄侧栏里不换行
+            // 就等于看不全长行。
             return v_flex()
                 .size_full()
                 .min_h_0()
                 .min_w_0()
-                .child(Diff::new(diff_state).size_full())
+                .child(Diff::new(diff_state).soft_wrap(tab.soft_wrap).size_full())
                 .into_any_element();
         }
         match tab.editor.as_ref() {
