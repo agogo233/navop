@@ -2,19 +2,23 @@
 //!
 //! 提供统一的密钥持久化接口，用于「记住主密码」功能。
 //!
-//! 默认后端是操作系统凭据库（macOS 钥匙串 / Windows 凭据管理器），由系统按当前
-//! 用户隔离，Navop 不再自己保管解密密钥。升级前写入的 `key_storage` 文件使用程序
-//! 内置固定密钥加密，等效于明文保存；读取到旧文件后会迁移到系统凭据库并删除旧文件。
-//! 系统凭据库不可用的平台只会读取旧文件用于兼容，新保存一律失败，由 UI 提示用户
-//! 手动输入主密码，绝不静默回退到弱存储。
+//! 支持两种后端，由设置项 `master_key_storage` 选择：
+//!
+//! - 系统凭据库（默认）：macOS 钥匙串 / Windows 凭据管理器，由操作系统按当前
+//!   用户隔离，Navop 不自己保管解密密钥。升级前写入的 `key_storage` 文件使用
+//!   程序内置固定密钥加密，等效于明文保存；读取到旧文件后会迁移到系统凭据库并
+//!   删除旧文件。
+//! - 本机文件：写在数据目录的 `key_storage` 里，沿用旧格式（程序内置固定密钥 +
+//!   AES-256-GCM）。它随数据目录一起被复制或备份，任何同时拿到程序和数据目录
+//!   的人都能恢复主密钥，因此只在用户显式选择时使用，UI 会给出风险提示。
+//!
+//! 系统凭据库不可用的平台只提供本机文件后端，不会静默改变用户的选择。
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-#[cfg(test)]
 use rand::RngCore;
-#[cfg(test)]
 use rand::rngs::OsRng;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -22,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+use crate::settings::MasterKeyStorage;
 
 #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 use keyring::Entry;
@@ -75,19 +81,24 @@ pub trait KeyStorage: Send + Sync {
 // LocalFileStorage 实现
 // ============================================================================
 
-/// 旧版本地文件存储实现
+/// 本机文件存储实现
 ///
-/// 只负责读取旧版 `key_storage` 文件（内置固定密钥 + AES-256-GCM）。
-/// 由于固定密钥随程序分发，任何拿到文件的攻击者都能解密，因此不再允许写入。
+/// 沿用旧版 `key_storage` 文件格式（内置固定密钥 + AES-256-GCM），写入数据目录。
+/// 由于固定密钥随程序分发，任何同时拿到程序和数据目录的攻击者都能解密，
+/// 只有在用户在设置里显式选择「本机文件」时才会写入。
 pub struct LocalFileStorage;
 
 impl KeyStorage for LocalFileStorage {
     fn name(&self) -> &'static str {
-        "本地文件"
+        "本机文件"
     }
 
-    fn save(&self, _master_key: &str) -> Result<(), String> {
-        Err("旧版固定密钥存储已停用；当前平台没有可用的系统凭据库，请手动输入主密钥".to_string())
+    fn save(&self, master_key: &str) -> Result<(), String> {
+        if !persistent_storage_allowed() {
+            return Err("当前运行模式不允许持久化主密钥".to_string());
+        }
+        let path = get_key_storage_path().ok_or_else(|| "无法定位数据目录".to_string())?;
+        save_master_key_to_path(&path, master_key)
     }
 
     fn load(&self) -> Option<String> {
@@ -117,9 +128,9 @@ impl KeyStorage for LocalFileStorage {
 // SystemKeyStorage 实现（macOS 钥匙串 / Windows 凭据管理器）
 // ============================================================================
 
-/// 系统凭据库是否可用于持久化主密钥
+/// 系统凭据库是否可用
 ///
-/// Linux 等未接入系统凭据库的平台返回 false：只读旧文件，不写弱存储。
+/// Linux 等未接入系统凭据库的平台返回 false：设置页只提供「本机文件」选项。
 pub fn system_storage_supported() -> bool {
     cfg!(any(test, target_os = "macos", target_os = "windows"))
 }
@@ -313,7 +324,7 @@ static SYSTEM_SECRET_TEST_STORE: Mutex<Option<String>> = Mutex::new(None);
 // 全局存储后端管理
 // ============================================================================
 
-/// 设置全局密钥存储后端
+/// 设置全局密钥存储后端（测试与迁移脚本可直接指定，绕开设置项）
 pub fn set_key_storage(storage: Arc<dyn KeyStorage>) {
     if let Ok(mut guard) = KEY_STORAGE.write() {
         tracing::info!("[密钥存储] 切换到「{}」后端", storage.name());
@@ -321,26 +332,48 @@ pub fn set_key_storage(storage: Arc<dyn KeyStorage>) {
     }
 }
 
+/// 「记住主密码」的保存位置偏好，由设置页写入
+static PREFERRED_BACKEND: RwLock<Option<MasterKeyStorage>> = RwLock::new(None);
+
+/// 设置保存位置偏好（只影响之后的读写，不搬运已有副本）
+pub fn set_preferred_backend(backend: MasterKeyStorage) {
+    if let Ok(mut guard) = PREFERRED_BACKEND.write() {
+        tracing::info!("[密钥存储] 保存位置切换为 {backend:?}");
+        *guard = Some(backend);
+    }
+}
+
+/// 当前保存位置偏好
+pub fn preferred_backend() -> MasterKeyStorage {
+    PREFERRED_BACKEND
+        .read()
+        .ok()
+        .and_then(|guard| *guard)
+        .unwrap_or_default()
+}
+
+/// 按保存位置构造后端（不修改当前偏好）
+pub fn storage_for(backend: MasterKeyStorage) -> Arc<dyn KeyStorage> {
+    match backend {
+        #[cfg(any(test, target_os = "macos", target_os = "windows"))]
+        MasterKeyStorage::SystemCredentialStore => Arc::new(SystemKeyStorage),
+        #[cfg(not(any(test, target_os = "macos", target_os = "windows")))]
+        MasterKeyStorage::SystemCredentialStore => {
+            tracing::warn!("当前平台未接入系统凭据库，改用本机文件保存主密钥");
+            Arc::new(LocalFileStorage)
+        }
+        MasterKeyStorage::LocalFile => Arc::new(LocalFileStorage),
+    }
+}
+
 /// 获取当前密钥存储后端
 ///
-/// 如果未设置，默认使用系统凭据库；平台不支持时退化为只读旧文件的
-/// `LocalFileStorage`，此时保存会明确失败。
+/// 优先使用显式设置的后端，否则按保存位置偏好（默认系统凭据库）构造。
 pub fn get_key_storage() -> Arc<dyn KeyStorage> {
     if let Some(storage) = KEY_STORAGE.read().ok().and_then(|guard| guard.clone()) {
         return storage;
     }
-    default_key_storage()
-}
-
-#[cfg(any(test, target_os = "macos", target_os = "windows"))]
-fn default_key_storage() -> Arc<dyn KeyStorage> {
-    Arc::new(SystemKeyStorage)
-}
-
-#[cfg(not(any(test, target_os = "macos", target_os = "windows")))]
-fn default_key_storage() -> Arc<dyn KeyStorage> {
-    tracing::warn!("当前平台未接入系统凭据库，自动解锁不可用；仅兼容读取旧版 key_storage 文件");
-    Arc::new(LocalFileStorage)
+    storage_for(preferred_backend())
 }
 
 // ============================================================================
@@ -349,6 +382,30 @@ fn default_key_storage() -> Arc<dyn KeyStorage> {
 
 #[cfg(test)]
 static TEST_DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 测试专用：把数据目录临时指向新建的临时目录，执行 `f` 后恢复
+///
+/// 供本模块与 crypto 的端到端测试共享，避免它们各自维护一套全局状态。
+#[cfg(test)]
+pub(crate) fn with_test_data_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    if let Ok(mut store) = SYSTEM_SECRET_TEST_STORE.lock() {
+        *store = None;
+    }
+    if let Ok(mut guard) = TEST_DATA_DIR.lock() {
+        *guard = Some(temp.path().to_path_buf());
+    }
+    let result = f(temp.path());
+    if let Ok(mut guard) = TEST_DATA_DIR.lock() {
+        *guard = None;
+    }
+    result
+}
 
 /// 获取数据目录路径
 fn get_data_dir() -> Option<PathBuf> {
@@ -370,8 +427,7 @@ pub(crate) fn key_storage_path_for_data_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(KEY_STORAGE_FILE)
 }
 
-/// 旧版格式写入（仅供测试构造历史数据，生产代码不再调用）
-#[cfg(test)]
+/// 本机文件格式写入（含旧版兼容读取的同一格式）
 fn save_master_key_to_path(path: &Path, master_key: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建密钥目录失败: {e}"))?;
@@ -519,34 +575,9 @@ fn persistent_storage_allowed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyStorage, LocalFileStorage, SYSTEM_SECRET_TEST_STORE, SystemKeyStorage, TEST_DATA_DIR,
-        delete_master_key_at_path, load_master_key_from_path, save_master_key_to_path,
+        KeyStorage, LocalFileStorage, SystemKeyStorage, delete_master_key_at_path,
+        load_master_key_from_path, save_master_key_to_path, with_test_data_dir,
     };
-    use std::sync::MutexGuard;
-
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_tests() -> MutexGuard<'static, ()> {
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn with_test_data_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = lock_tests();
-        let temp = tempfile::tempdir().expect("tempdir");
-        if let Ok(mut store) = SYSTEM_SECRET_TEST_STORE.lock() {
-            *store = None;
-        }
-        if let Ok(mut guard) = TEST_DATA_DIR.lock() {
-            *guard = Some(temp.path().to_path_buf());
-        }
-        let result = f(temp.path());
-        if let Ok(mut guard) = TEST_DATA_DIR.lock() {
-            *guard = None;
-        }
-        result
-    }
 
     #[test]
     fn local_file_storage_round_trips_without_writing_plaintext() {
@@ -638,9 +669,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_backend_refuses_to_persist_new_keys() {
-        let storage = LocalFileStorage;
-        assert!(storage.save("master-key").is_err());
+    fn local_file_backend_round_trips_when_selected() {
+        with_test_data_dir(|data_dir| {
+            let storage = LocalFileStorage;
+            storage.save("local-key").expect("写入本机文件");
+            assert!(data_dir.join("key_storage").exists());
+            assert_eq!(Some("local-key".to_string()), storage.load());
+            storage.delete().expect("删除本机文件");
+            assert!(!storage.exists());
+            assert_eq!(None, storage.load());
+        });
+    }
+
+    #[test]
+    fn storage_for_resolves_the_selected_backend() {
+        assert_eq!(
+            "本机文件",
+            super::storage_for(crate::settings::MasterKeyStorage::LocalFile).name()
+        );
+        #[cfg(any(test, target_os = "macos", target_os = "windows"))]
+        assert_eq!(
+            "系统凭据库",
+            super::storage_for(crate::settings::MasterKeyStorage::SystemCredentialStore).name()
+        );
     }
 
     #[test]
@@ -694,5 +745,37 @@ mod tests {
             assert!(!legacy_path.exists());
             assert_eq!(None, storage.load());
         });
+    }
+
+    #[test]
+    fn crypto_remembers_and_restores_through_the_selected_local_file_backend() {
+        let _crypto_guard = crate::crypto::crypto_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = super::preferred_backend();
+        with_test_data_dir(|data_dir| {
+            super::set_preferred_backend(crate::settings::MasterKeyStorage::LocalFile);
+            crate::crypto::reset_repo_password();
+            crate::crypto::set_master_key("local-backend-key").expect("设置主密钥");
+            crate::crypto::remember_master_key_for_future_startups().expect("保存到本机文件");
+            assert!(
+                data_dir.join("key_storage").exists(),
+                "选择本机文件后应写入数据目录"
+            );
+
+            // 模拟重启：只清内存，再从本机文件恢复
+            crate::crypto::clear_in_memory_master_key_for_tests();
+            assert!(!crate::crypto::has_master_key());
+            assert!(crate::crypto::try_restore_master_key());
+            assert_eq!(
+                Some("local-backend-key".to_string()),
+                crate::crypto::get_raw_master_key()
+            );
+
+            crate::crypto::forget_persisted_master_key().expect("删除本机文件副本");
+            assert!(!data_dir.join("key_storage").exists());
+            crate::crypto::reset_repo_password();
+        });
+        super::set_preferred_backend(previous);
     }
 }

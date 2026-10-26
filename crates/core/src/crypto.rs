@@ -821,6 +821,17 @@ pub fn clear_master_key() {
 }
 
 /// 检查是否已设置主密钥
+/// 测试专用：只清空内存中的主密钥，保留已持久化的副本（用于模拟重启）
+#[cfg(test)]
+pub(crate) fn clear_in_memory_master_key_for_tests() {
+    if let Ok(mut guard) = ENCRYPTION_KEY.write() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = RAW_MASTER_KEY.write() {
+        *guard = None;
+    }
+}
+
 pub fn has_master_key() -> bool {
     ENCRYPTION_KEY
         .read()
