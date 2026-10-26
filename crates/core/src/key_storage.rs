@@ -407,15 +407,25 @@ pub(crate) fn with_test_data_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
     result
 }
 
+/// 测试专用：当前是否把数据目录重定向到了临时目录。
+///
+/// crypto 的验证文件与 master_key_meta 的元信息同样落在数据目录下，必须
+/// 跟随同一个重定向，否则单元测试会覆盖真实用户的落盘状态。
+#[cfg(test)]
+pub(crate) fn test_data_dir_override() -> Option<PathBuf> {
+    TEST_DATA_DIR.lock().ok().and_then(|guard| guard.clone())
+}
+
 /// 获取数据目录路径
 fn get_data_dir() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Ok(guard) = TEST_DATA_DIR.lock()
-        && guard.is_some()
     {
-        return guard.clone();
+        test_data_dir_override().or_else(|| Some(crate::app_dirs::test_data_dir()))
     }
-    crate::app_dirs::data_dir()
+    #[cfg(not(test))]
+    {
+        crate::app_dirs::data_dir()
+    }
 }
 
 /// 获取本地密钥存储文件路径
@@ -757,6 +767,10 @@ mod tests {
             super::set_preferred_backend(crate::settings::MasterKeyStorage::LocalFile);
             crate::crypto::reset_repo_password();
             crate::crypto::set_master_key("local-backend-key").expect("设置主密钥");
+            assert!(
+                data_dir.join("key_verification").exists(),
+                "验证文件必须跟随测试数据目录，绝不能覆盖真实安装"
+            );
             crate::crypto::remember_master_key_for_future_startups().expect("保存到本机文件");
             assert!(
                 data_dir.join("key_storage").exists(),

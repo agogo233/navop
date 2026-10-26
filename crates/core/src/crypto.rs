@@ -279,7 +279,19 @@ pub(crate) fn crypto_test_lock() -> &'static std::sync::Mutex<()> {
 
 /// 获取数据目录路径
 fn get_data_dir() -> Option<PathBuf> {
-    crate::app_dirs::data_dir()
+    // 单元测试绝不能读写真实用户的数据目录。
+    //
+    // 此前 `reset_repo_password()` 会在测试里删掉真实安装的 key_verification，
+    // 随后的 `set_master_key()` 又用 KdfParams::for_tests() 把它重写成正式版
+    // 本读不懂的信封，导致已安装的 Navop 再也解不开自己的密码（2026-10-26）。
+    #[cfg(test)]
+    {
+        key_storage::test_data_dir_override().or_else(|| Some(crate::app_dirs::test_data_dir()))
+    }
+    #[cfg(not(test))]
+    {
+        crate::app_dirs::data_dir()
+    }
 }
 
 /// 获取密钥验证文件路径
@@ -1509,6 +1521,30 @@ mod tests {
         assert_eq!(decrypted, ""); // 未设置密钥时解密返回空
 
         clear_master_key();
+    }
+
+    #[test]
+    fn verification_files_stay_outside_the_real_data_dir() {
+        let isolated = get_data_dir().expect("isolated test data dir");
+
+        assert_ne!(
+            crate::app_dirs::data_dir().as_deref(),
+            Some(isolated.as_path()),
+            "单元测试的数据目录必须与真实用户数据目录隔离"
+        );
+        assert!(isolated.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn verification_files_follow_the_isolated_test_data_dir() {
+        let _guard = crypto_guard();
+        crate::key_storage::with_test_data_dir(|data_dir| {
+            assert_eq!(
+                Some(data_dir.join(KEY_VERIFICATION_FILE)),
+                get_verification_file_path(),
+                "with_test_data_dir 生效时验证文件必须跟着进临时目录"
+            );
+        });
     }
 
     #[test]

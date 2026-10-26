@@ -52,7 +52,16 @@ impl Default for MasterKeyMeta {
 }
 
 fn get_data_dir() -> Option<PathBuf> {
-    crate::app_dirs::data_dir()
+    // 与 crypto 一致：单元测试只动临时目录，绝不覆盖真实安装的 key_meta.json。
+    #[cfg(test)]
+    {
+        crate::key_storage::test_data_dir_override()
+            .or_else(|| Some(crate::app_dirs::test_data_dir()))
+    }
+    #[cfg(not(test))]
+    {
+        crate::app_dirs::data_dir()
+    }
 }
 
 fn key_meta_path() -> Option<PathBuf> {
@@ -185,6 +194,23 @@ mod tests {
         assert!(!parsed.pending_cloud_reencrypt);
         assert!(!parsed.pending_cloud_wipe);
         assert!(!parsed.pending_kdf_upgrade);
+    }
+
+    #[test]
+    fn saving_meta_in_tests_stays_outside_the_real_data_dir() {
+        let real = crate::app_dirs::data_dir();
+        let isolated = super::get_data_dir().expect("isolated test data dir");
+
+        assert_ne!(
+            real.as_deref(),
+            Some(isolated.as_path()),
+            "单元测试不得写入真实用户数据目录"
+        );
+        assert_eq!(
+            Some(isolated.join(super::KEY_META_FILE)),
+            super::key_meta_path(),
+            "key_meta.json 必须落在测试隔离目录下"
+        );
     }
 
     #[test]
