@@ -4,7 +4,7 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
-## [Unreleased]
+## [v0.21.2] - 2026-10-26
 
 #### 修复与优化
 
@@ -13,6 +13,8 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 - 安全：自动解锁用的主密钥不再默认用程序内置密钥加密写进 `data/state/key_storage`，改存系统凭据库（macOS 钥匙串 / Windows 凭据管理器）并自动迁移、删除旧文件；没有可用凭据库的平台改为每次启动手动输入，不再静默回退弱存储（#459）。
 - 设置：「记住主密码」新增「主密钥保存位置」选项，可在系统凭据库（macOS 显示「macOS 钥匙串」、Windows 显示「Windows 凭据管理器」）与「本机文件（数据目录）」之间切换，便携模式同样可选。切换时先把已记住的密钥写入新位置、成功后再删除旧副本；选择本机文件会显示内置密钥加密的风险提示（#459）。
 - 首页：从标签栏「+」打开的「打开连接」列表里点一次不再新建两个 SSH 会话。此前同一行既挂了行内的打开回调，又有列表内建的点击 → `confirm` 打开路径，一次点击先后走完两条路径（已有 2 个标签时点一次直接变成 4 个）；现在点击与键盘回车统一只走 `confirm`，并补源码级回归测试守住「行渲染不得直接打开连接」（#461）。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.21.2) 下载桌面端安装包
 
 ---
 
@@ -23,6 +25,8 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 - Security: the master key kept for automatic unlock is no longer encrypted into `data/state/key_storage` with an application-embedded key by default. It is stored in the system credential store (macOS Keychain / Windows Credential Manager), the legacy file is migrated and deleted, and platforms without an available credential store ask for the key on each start instead of silently falling back to the weak store (#459).
 - Settings: "remember master key" now has a storage location choice between the system credential store (shown as "macOS Keychain" on macOS and "Windows Credential Manager" on Windows) and a local file in the data directory, also in portable mode. Switching writes the remembered key to the new location first and only then deletes the old copy; the local file option shows the risk that it is encrypted with an application-embedded key (#459).
 - Home: clicking an entry in the “Open connection” list opened from the tab bar’s “+” no longer creates two SSH sessions. A row carried both its own open callback and the list’s built-in click → `confirm` open path, so a single click ran through both (going from 2 tabs to 4 in one click); clicks and the Enter key now share the single `confirm` path, guarded by a source-level regression test (#461).
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.21.1...v0.21.2
 
 ## [v0.21.1] - 2026-10-22
 
