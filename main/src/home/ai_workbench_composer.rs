@@ -774,8 +774,10 @@ mod tests {
         let switched = switched.expect("explorer is alive");
         assert_ne!(root, switched, "根必须切到新 worktree");
         let worktrees_root = std::fs::canonicalize(worktrees.path()).expect("canonical root");
+        // Windows 的 canonicalize 会返回 `\\?\C:\...` 形式，两侧先统一规范化再比前缀。
+        let switched_canonical = std::fs::canonicalize(&switched).expect("canonical switched root");
         assert!(
-            switched.starts_with(&worktrees_root),
+            switched_canonical.starts_with(&worktrees_root),
             "worktree 要建在注入的根下，实际落到了 {switched:?}"
         );
 

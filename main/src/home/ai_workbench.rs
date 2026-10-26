@@ -533,7 +533,8 @@ mod tests {
     #[test]
     fn filesystem_roots_are_not_workspaces() {
         assert!(!is_workspace_dir(Path::new("/")));
-        assert!(is_workspace_dir(Path::new("/tmp")));
+        // 不能写死 `/tmp`：Windows 上没有这个目录，用临时目录代表「普通目录」。
+        assert!(is_workspace_dir(&std::env::temp_dir()));
     }
 
     #[test]
