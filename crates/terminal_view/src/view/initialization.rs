@@ -119,7 +119,7 @@ impl TerminalView {
                 connection_id,
                 connection_kind,
                 stored_connection,
-                terminal_ai_resource,
+                terminal_ai_resource.clone(),
                 ssh_config,
                 ssh_session_manager,
                 local_workspace,
@@ -132,6 +132,14 @@ impl TerminalView {
                 cx,
             )
         });
+        // 侧边栏 AI 每轮重建资源上下文，才能看到终端的实时状态。
+        if let Some(resource) = terminal_ai_resource {
+            let refresher =
+                crate::sidebar::live_terminal_resource_refresher(terminal.clone(), resource);
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_ai_resource_context_refresher(refresher, cx);
+            });
+        }
         let sidebar_toolbar = cx.new(|_| TerminalSidebarToolbar::new(sidebar.clone()));
         // 临时连接等需要运行时凭据的 SSH 会话此时还没有 SSH 工具面板，
         // 等凭据提交后再补建（见 `TerminalView::ensure_ssh_tool_panels`）。

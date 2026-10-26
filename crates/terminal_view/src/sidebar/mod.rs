@@ -234,6 +234,34 @@ fn build_live_terminal_ai_context(
     (scope, catalog, mentions)
 }
 
+/// 构造「每轮发送前重建资源上下文」的回调：把终端此刻的现场写进资源池。
+///
+/// 资源池只在侧边栏创建时构建一次，之后终端的当前目录、是否运行全屏程序、
+/// 选中内容都会变；这个回调让每次发送都在主线程上重新读取一份最新状态，
+/// 模型本轮就能看到终端现状，不必先调用一次读取工具。
+pub(crate) fn live_terminal_resource_refresher(
+    terminal: Entity<crate::Terminal>,
+    current_terminal: agent_runtime::ResourceRef,
+) -> ai_chat_view::ResourceContextRefresher {
+    let terminal = terminal.downgrade();
+    Arc::new(move |cx: &App| {
+        // 终端已释放时不再刷新，避免读取已释放实体。
+        let terminal = terminal.upgrade()?;
+        let connections = load_terminal_ai_connections(cx);
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
+        let live_scopes = {
+            let terminal_ref = terminal.read(cx);
+            crate::ai_live_context::live_resource_scopes(terminal_ref)
+        };
+        let catalog = build_resource_catalog(&connections, &ai_access_levels);
+        Some(crate::ai_live_context::build_live_resource_context(
+            &current_terminal,
+            live_scopes,
+            catalog,
+        ))
+    })
+}
+
 fn terminal_ai_connection_catalog(
     current_connection: &StoredConnection,
     all_connections: &[StoredConnection],
@@ -832,6 +860,20 @@ impl TerminalSidebar {
             return;
         }
         cx.emit(TerminalSidebarEvent::SaveAsConnection);
+    }
+
+    /// 注入「每轮发送前重建资源上下文」的回调。
+    ///
+    /// 让 AI 面板每轮都能看到终端实时状态（当前目录、是否运行全屏程序、
+    /// 选中内容），而不是使用面板创建时的快照。
+    pub(crate) fn set_ai_resource_context_refresher(
+        &mut self,
+        refresher: ai_chat_view::ResourceContextRefresher,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_chat_panel.update(cx, |panel, cx| {
+            panel.set_resource_context_refresher(Some(refresher), cx);
+        });
     }
 
     /// 文件管理器 / 服务器监控面板是否都已可用（或本来就不适用）。

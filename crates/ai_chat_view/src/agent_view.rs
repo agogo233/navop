@@ -202,6 +202,15 @@ pub enum AgentChatViewEvent {
 pub type AgentRuntimeFactory =
     Arc<dyn Fn(&ComposerModelOption) -> anyhow::Result<Arc<Runtime>> + Send + Sync + 'static>;
 
+/// 每轮发送前重建资源上下文的回调。
+///
+/// 在 gpui 线程上调用，因此可以安全读取实体与全局的最新状态；返回 `None`
+/// 表示本轮沿用现有资源池。侧边栏用它把终端等资源的实时状态（当前目录、
+/// 是否运行全屏程序、选中内容）写进资源池，避免「资源快照只在面板创建时
+/// 构建一次」。
+pub type ResourceContextRefresher =
+    Arc<dyn Fn(&App) -> Option<agent_runtime::ResourceContext> + Send + Sync>;
+
 const MAX_CACHED_SESSION_TRANSCRIPTS: usize = 32;
 const MAX_RUNTIME_EVENT_BATCH_SIZE: usize = 64;
 
@@ -1256,6 +1265,8 @@ pub struct AgentChatView {
     session_id: SessionId,
     workspace_root: std::path::PathBuf,
     resources: ResourceContext,
+    /// 每轮发送前重建资源上下文的回调（侧边栏用它注入终端等实时状态）。
+    resource_context_refresher: Option<ResourceContextRefresher>,
     available_resources: Vec<ResourceRef>,
     transcript: AgentTranscript,
     input: Entity<AgentInput>,
@@ -1794,6 +1805,7 @@ impl AgentChatView {
             runtime,
             session_id,
             resources,
+            resource_context_refresher: None,
             available_resources,
             transcript,
             input,
@@ -3464,6 +3476,7 @@ impl AgentChatView {
                 return SubmissionStart::Rejected;
             }
         };
+        self.refresh_resources_before_turn(&session, cx);
         let mut resources = session.resources();
         if apply_mentioned_resources(
             &mut resources,
@@ -6699,6 +6712,36 @@ impl AgentChatView {
             input.set_target_options(target_options, cx);
         });
         self.composer().set_context(ctx, cx);
+    }
+
+    /// 注册「每轮发送前重建资源上下文」的回调。
+    ///
+    /// 侧边栏用它把终端等资源的实时状态注入本轮资源池：回调在主线程执行，
+    /// 因此可以读取实体最新状态；返回 `None` 时本轮沿用现有资源池。
+    pub fn set_resource_context_refresher(
+        &mut self,
+        refresher: Option<ResourceContextRefresher>,
+        cx: &mut Context<Self>,
+    ) {
+        self.resource_context_refresher = refresher;
+        cx.notify();
+    }
+
+    /// 发送前重建资源上下文，让本轮 prompt 带上资源的最新状态。
+    fn refresh_resources_before_turn(
+        &mut self,
+        session: &Arc<agent_runtime::Session>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(refresher) = self.resource_context_refresher.clone() else {
+            return;
+        };
+        let Some(resources) = refresher(cx) else {
+            return;
+        };
+        session.set_resources(resources.clone());
+        self.resources = resources;
+        self.sync_resource_targets(cx);
     }
 
     /// 更新可操作资源上下文与 `@` 提及项。

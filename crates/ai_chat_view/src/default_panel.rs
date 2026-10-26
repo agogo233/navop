@@ -126,6 +126,8 @@ pub struct DefaultAgentChatPanel {
         Vec<agent_runtime::ResourceRef>,
     )>,
     pending_resource_catalog: Option<(Vec<MentionItem>, Vec<agent_runtime::ResourceRef>)>,
+    /// 每轮发送前重建资源上下文的回调（侧边栏用它注入终端等实时状态）。
+    resource_context_refresher: Option<crate::ResourceContextRefresher>,
     pending_code_block_actions: Vec<CodeBlockAction>,
     pending_sidebar_shown: bool,
     connection_subscription: Option<Subscription>,
@@ -286,6 +288,7 @@ impl DefaultAgentChatPanel {
                 available_resources.clone(),
             )),
             pending_resource_catalog: None,
+            resource_context_refresher: None,
             pending_code_block_actions: Vec::new(),
             pending_sidebar_shown: false,
             connection_subscription: None,
@@ -524,6 +527,22 @@ impl DefaultAgentChatPanel {
     ) {
         let available_resources = resources.resources.clone();
         self.set_resource_context_with_catalog(resources, mentions, available_resources, cx);
+    }
+
+    /// 注册「每轮发送前重建资源上下文」的回调。
+    ///
+    /// 视图尚未建好时先存下来，建好视图后立刻生效。
+    pub fn set_resource_context_refresher(
+        &mut self,
+        refresher: Option<crate::ResourceContextRefresher>,
+        cx: &mut Context<Self>,
+    ) {
+        self.resource_context_refresher = refresher.clone();
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_resource_context_refresher(refresher, cx);
+            });
+        }
     }
 
     pub fn set_resource_context_with_catalog(
@@ -962,6 +981,11 @@ impl DefaultAgentChatPanel {
                                 view.update(cx, |view, cx| view.on_sidebar_shown(cx));
                             }
                             view.update(cx, |view, cx| view.restore_persisted_acp(cx));
+                            if let Some(refresher) = panel.resource_context_refresher.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_resource_context_refresher(Some(refresher), cx);
+                                });
+                            }
                             panel.view = Some(view);
                             panel.view_subscription = Some(view_subscription);
                             panel.error = None;
