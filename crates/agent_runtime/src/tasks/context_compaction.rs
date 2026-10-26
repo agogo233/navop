@@ -200,6 +200,9 @@ fn compaction_item_text(item: &HistoryItem) -> String {
             call.call_id, call.tool_name, call.arguments
         ),
         HistoryItem::Observation(obs) => format!("[工具结果]\n{}", obs.model_text(4096)),
+        HistoryItem::ToolsDeclared { names } => {
+            format!("[可用工具: {}]", names.join(", "))
+        }
     }
 }
 
@@ -221,6 +224,9 @@ fn estimated_item_chars(item: &HistoryItem) -> usize {
             call.tool_name.to_string().len() + call.arguments.to_string().len()
         }
         HistoryItem::Observation(obs) => obs.model_text(4096).len(),
+        HistoryItem::ToolsDeclared { names } => {
+            names.iter().map(String::len).sum::<usize>() + names.len()
+        }
     }
 }
 

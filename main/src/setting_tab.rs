@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::app_init::is_valid_system_hotkey;
 use crate::auth::get_auth_service;
 use crate::license::{get_license_service, is_feature_enabled, offline_license_public_key};
+use crate::settings::acp_agents_settings::AcpAgentsView;
 use crate::settings::agent_settings::agent_setting_group;
 use crate::settings::appearance::render as render_appearance_settings;
 use crate::settings::database_settings::database_setting_group;
@@ -63,8 +64,8 @@ use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
 use one_core::storage::GlobalStorageState;
 pub const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
 pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
-const SYNC_SETTINGS_PAGE_INDEX: usize = 5;
-const TEAM_KEYS_SETTINGS_PAGE_INDEX: usize = 6;
+const SYNC_SETTINGS_PAGE_INDEX: usize = 6;
+const TEAM_KEYS_SETTINGS_PAGE_INDEX: usize = 7;
 
 use gpui_component::input::InputEvent;
 pub use one_core::settings::{
@@ -559,6 +560,7 @@ fn update_master_key_storage(backend: MasterKeyStorage, cx: &mut App) {
 pub struct SettingsPanel {
     focus_handle: FocusHandle,
     llm_providers_view: Entity<LlmProvidersView>,
+    acp_agents_view: Entity<AcpAgentsView>,
     update_check_state: Entity<update::UpdateCheckState>,
     _update_check_subscription: gpui::Subscription,
     size: Size,
@@ -595,6 +597,7 @@ impl SettingsPanel {
 
     fn new_with_initial_page(initial_page_index: usize, cx: &mut Context<Self>) -> Self {
         let llm_providers_view = cx.new(|cx| LlmProvidersView::new(cx));
+        let acp_agents_view = cx.new(|cx| AcpAgentsView::new(cx));
         // 检查更新状态由 app 持有（启动时的自动检查可能早于设置页打开），这里只观察它，
         // 让「检查中」和「上次检查结果」能驱动设置页重绘。
         let update_check_state = update::update_check_state(cx);
@@ -602,6 +605,7 @@ impl SettingsPanel {
         Self {
             focus_handle: cx.focus_handle(),
             llm_providers_view,
+            acp_agents_view,
             update_check_state,
             _update_check_subscription,
             size: Size::default(),
@@ -643,6 +647,7 @@ impl SettingsPanel {
 
     fn setting_pages(&mut self, _window: &mut Window, cx: &App) -> Vec<SettingPage> {
         let llm_view = self.llm_providers_view.clone();
+        let acp_view = self.acp_agents_view.clone();
         let default_settings = AppSettings::default();
         let default_system_hotkey = AppSettings::default().current_system_hotkey().to_string();
         let (app_font_options, font_options) = self.cached_font_options(cx);
@@ -1123,6 +1128,19 @@ impl SettingsPanel {
                     agent_setting_group(&default_settings.ai_chat),
                     agent_tool_exposure_setting_group(&default_settings.tool_exposure),
                 ]),
+            // ACP 智能体设置页（插在 Agent 与 MCP 之间，改这里必须同步 SYNC_/TEAM_KEYS_SETTINGS_PAGE_INDEX）
+            SettingPage::new(t!("Settings.AcpAgents.title")).group(
+                SettingGroup::new().item(
+                    SettingItem::render(move |_options, _window, _cx| {
+                        acp_view.clone().into_any_element()
+                    })
+                    .keywords([
+                        t!("Settings.AcpAgents.title").to_string(),
+                        t!("Settings.AcpAgents.group_title").to_string(),
+                        t!("Settings.AcpAgents.description").to_string(),
+                    ]),
+                ),
+            ),
             // MCP 设置页
             SettingPage::new(t!("Settings.Mcp.title"))
                 .resettable(true)
@@ -3789,6 +3807,55 @@ const REDIS_CLI_SHORTCUTS: &[ShortcutEntry] = &[
     },
 ];
 
+/// AI 会话（agent 聊天 / 工作台）快捷键。
+///
+/// 默认值直接引用绑定层的常量（`ai_chat_view::find_shortcut`），
+/// 不在这里再写一份字面量——设置页展示的与真正生效的必须是同一份数据。
+const AI_CHAT_SHORTCUTS: &[ShortcutEntry] = &[
+    ShortcutEntry {
+        keys_macos: ai_chat_view::FIND_MACOS,
+        keys_other: ai_chat_view::FIND_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_find",
+        action_id: Some(action_id::AI_CHAT_FIND),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::FIND_NEXT_MACOS,
+        keys_other: ai_chat_view::FIND_NEXT_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_find_next",
+        action_id: Some(action_id::AI_CHAT_FIND_NEXT),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::FIND_PREVIOUS_MACOS,
+        keys_other: ai_chat_view::FIND_PREVIOUS_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_find_previous",
+        action_id: Some(action_id::AI_CHAT_FIND_PREVIOUS),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::SESSION_BACK_MACOS,
+        keys_other: ai_chat_view::SESSION_BACK_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_session_back",
+        action_id: Some(action_id::AI_CHAT_SESSION_BACK),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::SESSION_FORWARD_MACOS,
+        keys_other: ai_chat_view::SESSION_FORWARD_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_session_forward",
+        action_id: Some(action_id::AI_CHAT_SESSION_FORWARD),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::SESSION_SWITCHER_MACOS,
+        keys_other: ai_chat_view::SESSION_SWITCHER_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_session_switcher",
+        action_id: Some(action_id::AI_CHAT_SESSION_SWITCHER),
+        system_hotkey: false,
+    },
+];
+
 const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title_key: "Settings.Shortcuts.window",
@@ -3821,6 +3888,10 @@ const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title_key: "Settings.Shortcuts.redis_cli",
         entries: REDIS_CLI_SHORTCUTS,
+    },
+    ShortcutGroup {
+        title_key: "Settings.Shortcuts.ai_chat",
+        entries: AI_CHAT_SHORTCUTS,
     },
 ];
 
@@ -4385,6 +4456,64 @@ mod tests {
         assert_eq!(entry.keys_macos, &["cmd-a"]);
         assert_eq!(entry.keys_other, &["ctrl-a"]);
         assert!(!entry.system_hotkey);
+    }
+
+    /// AI 会话的三条会话键：设置页展示的默认值必须与绑定层同源。
+    ///
+    /// `AI_CHAT_SHORTCUTS` 直接引用 `ai_chat_view::SESSION_*` 常量，所以这条真正
+    /// 钉的是「macOS / 其他 两栏有没有接反」与「三条动作有没有漏进设置页」——
+    /// 接反了用户会在 macOS 上看到 `ctrl-[`，而真正生效的是 `cmd-[`。
+    #[test]
+    fn ai_chat_session_shortcuts_match_the_binding_layer() {
+        use one_core::keybindings::action_id;
+
+        for is_macos in [true, false] {
+            let (back, forward, switcher) =
+                ai_chat_view::session_shortcut_defaults_for_platform(is_macos);
+            for (action, expected) in [
+                (action_id::AI_CHAT_SESSION_BACK, back),
+                (action_id::AI_CHAT_SESSION_FORWARD, forward),
+                (action_id::AI_CHAT_SESSION_SWITCHER, switcher),
+            ] {
+                let entry = super::AI_CHAT_SHORTCUTS
+                    .iter()
+                    .find(|entry| entry.action_id == Some(action))
+                    .unwrap_or_else(|| panic!("{action} 未出现在设置页快捷键列表里"));
+                let shown = if is_macos {
+                    entry.keys_macos
+                } else {
+                    entry.keys_other
+                };
+                assert_eq!(
+                    shown, expected,
+                    "{action} 在 is_macos={is_macos} 时设置页展示值与绑定层不一致"
+                );
+            }
+        }
+    }
+
+    /// 三条会话键的 `label_key` 必须真的能在 `locales/main.yml` 里解析出文案。
+    /// 少了词条，`t!` 会把 key 原样吐回界面（用户看到 `Settings.Shortcuts.…`）。
+    #[test]
+    fn ai_chat_session_shortcut_labels_resolve() {
+        use one_core::keybindings::action_id;
+
+        for action in [
+            action_id::AI_CHAT_SESSION_BACK,
+            action_id::AI_CHAT_SESSION_FORWARD,
+            action_id::AI_CHAT_SESSION_SWITCHER,
+        ] {
+            let entry = super::AI_CHAT_SHORTCUTS
+                .iter()
+                .find(|entry| entry.action_id == Some(action))
+                .unwrap_or_else(|| panic!("{action} 未出现在设置页快捷键列表里"));
+            let text = t!(entry.label_key).to_string();
+            assert_ne!(
+                entry.label_key, text,
+                "词条 `{}` 在 locales/main.yml 里缺失",
+                entry.label_key
+            );
+        }
     }
 
     #[test]

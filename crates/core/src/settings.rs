@@ -586,9 +586,25 @@ pub enum AiChatToolExecutionMode {
     ReadOnly,
     #[default]
     Manual,
+    /// 问答模式：只回答，不向模型暴露工具（对应 `TaskKind::Ask`）。
+    Ask,
 }
 
+/// 用户在对话里最后选择的驱动后端。
+///
+/// 与 [`AiChatSettings::last_acp_agent_id`] 的区别：后者只记「上次用过的 ACP
+/// agent」，选回内置 One Agent 时无法表达；这个枚举把「内置」也当成一个明确的
+/// 选择记下来，启动时照它恢复，而不是永远回到 One Agent。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AiChatBackendSelection {
+    /// 内置 One Agent（navop 自研内核）。
+    Builtin,
+    /// 外部 ACP agent。
+    Acp { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiChatSettings {
     #[serde(default)]
     pub tool_execution_mode: AiChatToolExecutionMode,
@@ -611,6 +627,73 @@ pub struct AiChatSettings {
         deserialize_with = "deserialize_ai_request_timeout_secs"
     )]
     pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub last_acp_agent_id: Option<String>,
+    /// 上次在对话里明确选择的驱动后端（内置 One Agent 或某个 ACP agent）。
+    ///
+    /// `None` 表示旧配置里没有这条记录，启动时回落到 `last_acp_agent_id` 的
+    /// 旧行为（有值就恢复 ACP，没有就停在 One Agent）。
+    #[serde(default)]
+    pub last_backend: Option<AiChatBackendSelection>,
+    #[serde(default)]
+    pub acp_models: HashMap<String, String>,
+    /// 内置会话 uid → ACP agent id → 该 agent 上次实际在用的协议会话 id。
+    ///
+    /// 重连 / 重启后据此走 `session/load` 或 `session/resume`，而不是每回都 `session/new`：
+    /// 后者会让外接 agent 那边凭空多一个空会话，用户看到的现象是「agent 全忘了」。
+    #[serde(default)]
+    pub acp_sessions: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    pub last_workspace_root: Option<PathBuf>,
+    /// 最近使用的工作区根目录，最近在前。
+    #[serde(default)]
+    pub recent_workspace_roots: Vec<PathBuf>,
+    /// AI 工作台外壳的布局（面板落位、会话栏折叠）。
+    #[serde(default)]
+    pub workbench_layout: WorkbenchLayoutSettings,
+}
+
+/// AI 工作台外壳的布局。
+///
+/// 面板用**稳定字符串 id** 记录，这样 `one_core` 不必反向依赖 `ai_chat_view`；
+/// 悬空 id（面板已下线、或配置被手改坏）由消费方在还原时忽略，见
+/// `ai_chat_view::workbench::WorkbenchState::from_settings`。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkbenchLayoutSettings {
+    /// 会话导航栏是否折叠。默认展开，所以 `false` 是正确缺省。
+    #[serde(default)]
+    pub nav_collapsed: bool,
+    /// 中心区显示的面板 id。
+    #[serde(default)]
+    pub center: Option<String>,
+    /// 左侧单槽的面板 id。
+    #[serde(default)]
+    pub left: Option<String>,
+    /// 底部单槽的面板 id。
+    #[serde(default)]
+    pub bottom: Option<String>,
+    /// 右侧标签组的面板 id，顺序即标签顺序。
+    #[serde(default)]
+    pub right: Vec<String>,
+    /// 右侧标签组当前显示的面板 id。
+    #[serde(default)]
+    pub right_active: Option<String>,
+    /// 会话导航栏宽度（像素）。`None` 用内置默认值。
+    #[serde(default)]
+    pub nav_width: Option<f32>,
+    /// 右侧标签组宽度（像素）。`None` 用内置默认值。
+    #[serde(default)]
+    pub right_width: Option<f32>,
+    /// 右侧标签组是否被顶栏开关收起（标签保留，仅隐藏）。
+    #[serde(default)]
+    pub right_collapsed: bool,
+    /// 右侧标签组是否放大占满工作台行。
+    #[serde(default)]
+    pub right_maximized: bool,
+    /// 侧栏里被用户「移除」的工作区根目录（绝对路径）。分组由此派生，
+    /// 不记名单的话移除后下次渲染又会回来。用户显式切回该工作区时移出名单。
+    #[serde(default)]
+    pub hidden_workspaces: Vec<String>,
 }
 
 /// 自定义系统提示词的最大字符数（按 chars 计），防止拖垮上下文长度。
@@ -623,7 +706,64 @@ pub const MIN_AI_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// 模型请求空闲超时允许的最大值（秒），1 小时。
 pub const MAX_AI_REQUEST_TIMEOUT_SECS: u64 = 3600;
 
+/// 最近工作区列表上限，避免设置文件无界增长。
+pub const MAX_RECENT_WORKSPACE_ROOTS: usize = 8;
+
+/// ACP 会话记忆的外层条目上限（按内置会话 uid 计）。
+///
+/// 不按 LRU 精确淘汰：这条信息是可重建的，丢掉一条的代价只是下次多开一个 ACP 会话，
+/// 不值得为此在设置里再维护一份访问序。
+pub const MAX_REMEMBERED_ACP_SESSIONS: usize = 32;
+
 impl AiChatSettings {
+    /// 记住「这个内置会话 + 这个 ACP agent」当前指向的协议会话。
+    ///
+    /// 空值一律忽略：写入空 id 会让下次重连试着 resume 到一个不存在的会话。
+    pub fn remember_acp_session(
+        &mut self,
+        session_uid: &str,
+        agent_id: &str,
+        acp_session_id: &str,
+    ) {
+        if session_uid.is_empty() || agent_id.is_empty() || acp_session_id.is_empty() {
+            return;
+        }
+        self.acp_sessions
+            .entry(session_uid.to_string())
+            .or_default()
+            .insert(agent_id.to_string(), acp_session_id.to_string());
+        while self.acp_sessions.len() > MAX_REMEMBERED_ACP_SESSIONS {
+            let Some(victim) = self
+                .acp_sessions
+                .keys()
+                .find(|uid| uid.as_str() != session_uid)
+                .cloned()
+            else {
+                break;
+            };
+            self.acp_sessions.remove(&victim);
+        }
+    }
+
+    /// 取回「这个内置会话 + 这个 ACP agent」上次用的协议会话 id。
+    pub fn remembered_acp_session(&self, session_uid: &str, agent_id: &str) -> Option<&str> {
+        self.acp_sessions
+            .get(session_uid)?
+            .get(agent_id)
+            .map(String::as_str)
+    }
+
+    /// 记录一个工作区：去重、置顶、限长，并同步 `last_workspace_root`。
+    pub fn remember_workspace_root(&mut self, root: &std::path::Path) {
+        let root = root.to_path_buf();
+        self.recent_workspace_roots
+            .retain(|existing| existing != &root);
+        self.recent_workspace_roots.insert(0, root);
+        self.recent_workspace_roots
+            .truncate(MAX_RECENT_WORKSPACE_ROOTS);
+        self.last_workspace_root = self.recent_workspace_roots.first().cloned();
+    }
+
     /// 返回规范化后的自定义系统提示词；空白内容返回 `None`。
     ///
     /// 超长内容按 [`MAX_CUSTOM_SYSTEM_PROMPT_CHARS`] 截断，避免配置文件里
@@ -676,6 +816,13 @@ impl Default for AiChatSettings {
             max_iterations: default_agent_max_iterations(),
             custom_system_prompt: String::new(),
             request_timeout_secs: default_ai_request_timeout_secs(),
+            last_acp_agent_id: None,
+            last_backend: None,
+            acp_models: HashMap::new(),
+            acp_sessions: HashMap::new(),
+            last_workspace_root: None,
+            recent_workspace_roots: Vec::new(),
+            workbench_layout: WorkbenchLayoutSettings::default(),
         }
     }
 }
@@ -1996,19 +2143,21 @@ fn quarantine_corrupt_settings(path: &Path) -> Option<PathBuf> {
 mod tests {
     use gpui::px;
     use gpui_component::{Theme, ThemeMode};
+    use std::path::PathBuf;
 
     use super::{
-        AiChatSettings, AiChatToolExecutionMode, AppSettings, CloseButtonBehavior,
-        ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+        AiChatBackendSelection, AiChatSettings, AiChatToolExecutionMode, AppSettings,
+        CloseButtonBehavior, ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
         DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
         DEFAULT_TERMINAL_THEME, HomeConnectionLayout, LOCALE_SYSTEM, LargeTextCellEditorOpenMode,
         LocalTerminalProfileKind, LocalTerminalProfileSettings, MAX_AI_REQUEST_TIMEOUT_SECS,
-        MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState,
-        MasterKeyStorage, McpPermissionMode, McpServerMode, PersonalSyncBackendKind,
-        RemoteFileOpenMode, SqlFormatSettings, SqlIndentStyle, SqlKeywordCase, StartupDefaultPage,
-        SyncProvider, TableViewMode, default_grid_font_fallback_families,
-        default_grid_monospace_font_family, grid_monospace_font, installed_grid_monospace_font,
-        is_installed_font_family, resolve_installed_grid_monospace_font_family,
+        MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MAX_RECENT_WORKSPACE_ROOTS, MAX_REMEMBERED_ACP_SESSIONS,
+        MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState, MasterKeyStorage, McpPermissionMode,
+        McpServerMode, PersonalSyncBackendKind, RemoteFileOpenMode, SqlFormatSettings,
+        SqlIndentStyle, SqlKeywordCase, StartupDefaultPage, SyncProvider, TableViewMode,
+        default_grid_font_fallback_families, default_grid_monospace_font_family,
+        grid_monospace_font, installed_grid_monospace_font, is_installed_font_family,
+        resolve_installed_grid_monospace_font_family,
     };
 
     #[test]
@@ -3301,6 +3450,168 @@ mod tests {
         assert_eq!(
             AiChatToolExecutionMode::ReadOnly,
             restored.ai_chat.tool_execution_mode
+        );
+    }
+
+    #[test]
+    fn ai_chat_acp_workspace_selection_round_trip_is_preserved() {
+        let mut settings = AppSettings::default();
+        settings.ai_chat.last_acp_agent_id = Some("builtin.codex".to_string());
+        settings
+            .ai_chat
+            .acp_models
+            .insert("builtin.codex".to_string(), "gpt-5".to_string());
+        settings.ai_chat.last_workspace_root = Some(PathBuf::from("/tmp/project"));
+
+        let json = serde_json::to_string(&settings).expect("serialize AI ACP settings");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize AI ACP settings");
+
+        assert_eq!(
+            settings.ai_chat.last_acp_agent_id,
+            restored.ai_chat.last_acp_agent_id
+        );
+        assert_eq!(settings.ai_chat.acp_models, restored.ai_chat.acp_models);
+        assert_eq!(
+            settings.ai_chat.last_workspace_root,
+            restored.ai_chat.last_workspace_root
+        );
+    }
+
+    #[test]
+    fn ai_chat_backend_selection_round_trips_and_legacy_config_falls_back() {
+        let mut settings = AppSettings::default();
+        settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+            id: "builtin.codex".to_string(),
+        });
+
+        let json = serde_json::to_string(&settings).expect("serialize AI backend selection");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize AI backend selection");
+        assert_eq!(settings.ai_chat.last_backend, restored.ai_chat.last_backend);
+
+        settings.ai_chat.last_backend = Some(AiChatBackendSelection::Builtin);
+        let json = serde_json::to_string(&settings).expect("serialize builtin selection");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize builtin selection");
+        assert_eq!(
+            Some(AiChatBackendSelection::Builtin),
+            restored.ai_chat.last_backend
+        );
+
+        // 旧配置没有这条记录：保持 None，启动时回落到 last_acp_agent_id 的旧恢复路径。
+        let legacy: AiChatSettings =
+            serde_json::from_str("{}").expect("deserialize legacy ai_chat settings");
+        assert_eq!(None, legacy.last_backend);
+    }
+
+    #[test]
+    fn acp_session_memory_round_trips_per_session_and_agent() {
+        let mut settings = AppSettings::default();
+        settings
+            .ai_chat
+            .remember_acp_session("session-a", "agent-1", "acp-session-a1");
+        settings
+            .ai_chat
+            .remember_acp_session("session-a", "agent-2", "acp-session-a2");
+        settings
+            .ai_chat
+            .remember_acp_session("session-b", "agent-1", "acp-session-b1");
+
+        let json = serde_json::to_string(&settings).expect("serialize ACP session memory");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize ACP session memory");
+
+        assert_eq!(
+            Some("acp-session-a1"),
+            restored
+                .ai_chat
+                .remembered_acp_session("session-a", "agent-1")
+        );
+        assert_eq!(
+            Some("acp-session-a2"),
+            restored
+                .ai_chat
+                .remembered_acp_session("session-a", "agent-2")
+        );
+        assert_eq!(
+            Some("acp-session-b1"),
+            restored
+                .ai_chat
+                .remembered_acp_session("session-b", "agent-1")
+        );
+        // 没记过的组合必须是 None，而不是退回到别的 agent 的会话。
+        assert_eq!(
+            None,
+            restored
+                .ai_chat
+                .remembered_acp_session("session-b", "agent-2")
+        );
+    }
+
+    #[test]
+    fn remembering_an_acp_session_overwrites_the_previous_target() {
+        let mut settings = AiChatSettings::default();
+        settings.remember_acp_session("session-a", "agent", "old");
+        settings.remember_acp_session("session-a", "agent", "new");
+
+        assert_eq!(
+            Some("new"),
+            settings.remembered_acp_session("session-a", "agent")
+        );
+    }
+
+    #[test]
+    fn remembering_an_acp_session_ignores_blank_values() {
+        let mut settings = AiChatSettings::default();
+        settings.remember_acp_session("", "agent", "acp");
+        settings.remember_acp_session("session-a", "", "acp");
+        settings.remember_acp_session("session-a", "agent", "");
+
+        assert!(settings.acp_sessions.is_empty());
+    }
+
+    #[test]
+    fn remembered_acp_sessions_are_capped_without_dropping_the_latest() {
+        let mut settings = AiChatSettings::default();
+        for index in 0..(MAX_REMEMBERED_ACP_SESSIONS + 4) {
+            settings.remember_acp_session(&format!("session-{index}"), "agent", "acp");
+        }
+
+        assert_eq!(MAX_REMEMBERED_ACP_SESSIONS, settings.acp_sessions.len());
+        let latest = format!("session-{}", MAX_REMEMBERED_ACP_SESSIONS + 3);
+        assert_eq!(
+            Some("acp"),
+            settings.remembered_acp_session(&latest, "agent")
+        );
+    }
+
+    #[test]
+    fn remembering_a_workspace_dedupes_moves_to_front_and_caps() {
+        let mut settings = AiChatSettings::default();
+        settings.remember_workspace_root(PathBuf::from("/a").as_path());
+        settings.remember_workspace_root(PathBuf::from("/b").as_path());
+        settings.remember_workspace_root(PathBuf::from("/a").as_path());
+
+        assert_eq!(
+            vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            settings.recent_workspace_roots
+        );
+        assert_eq!(Some(PathBuf::from("/a")), settings.last_workspace_root);
+
+        for index in 0..(MAX_RECENT_WORKSPACE_ROOTS + 4) {
+            settings.remember_workspace_root(PathBuf::from(format!("/extra/{index}")).as_path());
+        }
+        assert_eq!(
+            MAX_RECENT_WORKSPACE_ROOTS,
+            settings.recent_workspace_roots.len()
+        );
+        assert_eq!(
+            Some(PathBuf::from(format!(
+                "/extra/{}",
+                MAX_RECENT_WORKSPACE_ROOTS + 3
+            ))),
+            settings.last_workspace_root
         );
     }
 

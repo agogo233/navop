@@ -184,6 +184,9 @@
   `error sending request`」——用户把代理开在系统代理里，navop 却直连）。`proxy.enabled = false`
   的语义因此是「交给系统/环境变量代理」而不是「直连」。需要强制直连时用 `user_agent_direct`。
   排查该类问题的顺序见 skill `navop-cloud-login-network-diagnose`。
+- **搜内容一律用 Grep 工具，不要用 bash `grep`**：本机 bash `grep` 会出现「明明存在却返回空」的静默漏检（2026-09-26 实测：对 `AGENTS.md` 搜 `ACP`、对 `crates/core/src/settings.rs` 搜 `acp_session` 都返回空，同一批文件用 Grep 工具立刻命中）。空结果在这种命令里与「真的没有」完全同形，会直接导致错误结论。grep 只在不关心漏检的管道过滤（如统计 clippy 输出行数）里用。
+- **zsh 不对未引用变量做词分词**：`for F in $FILES` 会把整串当一个词（实测报 `ENOENT ... 'a.rs\nb.rs\n...'`）。批量遍历文件用 `git diff --name-only | while read -r F; do ... done`，或写成 `${=FILES}`。
+- `cargo fmt` / `cargo test` 相关的格式化核验与 PATH 陷阱见「已沉淀经验」段的 skill `cargo-fmt-scope-recovery`；mbx shim 需要真 cargo 与 `cmake` 同时在该 PATH 上（`PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"`）。
 
 ### Command Verification Rules
 
@@ -662,7 +665,7 @@
 - **标题**：`cargo fmt` 不要带文件路径参数——本仓会重写整个 workspace，污染未提交改动
 - **触发信号**：想「只格式化我改的几个文件」而运行 `cargo fmt -- <paths>`（`--` 之后的路径**不是过滤器**，会被当成 rustfmt 附加参数作用于每个 workspace 成员的每个 target）；或想用 `rustfmt --config-path <repo>/rustfmt.toml /tmp/x.rs` 复现 rustfmt 行为、据此判断「某文件是否 rustfmt-clean」。
 - **根因 / 约束**：前者一次性改写了 172 个文件（其中 140+15 个当时是已提交、干净的文件）。后者**不可靠**：文件里若有 `mod x;`，rustfmt 在 `/tmp` 找不到同级模块会报错并跳过格式化，于是「rustfmt(副本) == 当前内容」的判据把这些文件误判成「含真实改动」。
-- **正确做法**：只格式化改动文件时用 `rustfmt --edition <edition> <file>`（直接调 rustfmt）或 `cargo fmt -p <crate>`。判断「某文件是否只是被格式化」要在**同一 crate 上下文**里做：`git worktree add --detach /tmp/wt HEAD` → 在 worktree 内 `rustfmt <file>` → 与工作区文件 `diff`；相等 ⇒ 该文件原本与 HEAD 只差格式化，可安全 `git checkout -- <file>` 精确回滚；不相等 ⇒ 含真实未提交改动，**不要回滚**，交还用户（RustRover Local History 里有「External change」版本可逐文件还原）。
+- **正确做法**：只格式化改动文件时用 `rustfmt --edition <edition> <file>`（直接调 rustfmt）或 `cargo fmt -p <crate>`。判断「某文件是否只是被格式化」要在**同一 crate 上下文**里做：`git worktree add --detach /tmp/wt HEAD` → 在 worktree 内 `rustfmt <file>` → 与工作区文件 `diff`；相等 ⇒ 该文件原本与 HEAD 只差格式化，可安全 `git checkout -- <file>` 精确回滚；不相等 ⇒ 含真实未提交改动，**不要回滚**，交还用户（RustRover Local History 里有「External change」版本可逐文件还原）。只想验证「我新写的代码是否 rustfmt-clean」而**不带上文件里的既有偏差**时，用 `--emit stdout` 探针（细节见 skill `cargo-fmt-scope-recovery` §1.2）：对 `git show HEAD:<file>` 与当前文件分别跑 `rustfmt --edition 2024 --emit stdout --config skip_children=true`，比较两侧 `diff -u | grep -c '^@@'`——**块数相等、且自己新增的标识符不出现在残留 diff 里，才叫 clean**；块数变多即新代码有偏差，只把落在自己改动区域内的 hunk 手工改回原文件。**该探针有一个会把结论颠倒的失败模式**：`rustfmt` 不在 PATH（非交互 shell 常见）或自身报错时输出文件为空，而 `diff -u <原文> <空文件>` 恰好也只报 1 个 hunk——与「干净（只多一行 path 头）」**完全同形**。所以必须断言探针输出非空（`[ -s out ]`），否则会得出「文件全都 clean」的假结论（本次先被坑了一次）。
 - **验证方式**：回滚后 `git diff --name-only` 只应剩下自己的改动 + 用户原有 WIP；再跑 `cargo check -p <受影响 crate>` 确认未破坏编译。
 - **适用范围**：任何 Rust 仓库的批量格式化；`rustfmt.toml` 带 `edition`/`style_edition` 时，务必用与 `cargo fmt` 相同的 `--edition` 复现行为。
 
@@ -700,6 +703,53 @@
 - **正确做法**：统一用 `crates/process-util`：`process_util::configure_background_child(&mut std_command)`（std）或 `configure_tokio_background_child(&mut tokio_command)`（tokio）。写法必须是「先 `let mut command = Command::new(..)`、配好 args/env/stdio，再 configure，最后 `spawn()` / `output()`」，不能保留链式 `.spawn()`，否则没有可变绑定可配。仅当纯逻辑小 crate 不想为 `process-util`（它硬依赖 `tokio/process`）拉进 tokio 时，按 `main/src/file_association.rs` 先例内联 `#[cfg(windows)]` 的 `creation_flags(CREATE_NO_WINDOW)` helper，并配 `#[cfg(not(windows))]` 空实现避免 unused 告警。
 - **验证方式**：四条结构 contract（`include_str!` 断言源码里存在对应的 `configure_background_child` / `creation_flags`，沿用 `workspace_explorer/src/git/tests.rs` 风格）——`cargo test -p terminal --lib wsl_distributions`、`cargo test -p html-preview`、`cargo test -p workspace_explorer --lib backend`、`cargo test -p main --bin navop mcp_skill`；再跑受影响 crate 的 `cargo check --tests` 与 `cargo clippy --all-targets`（只比对改动文件是否有新增告警）。**macOS 上 `cfg(windows)` 分支根本不参与编译，本机无法验证「不闪窗」**，最终必须 Windows 实机启动一次确认。
 - **适用范围**：`crates/terminal/src/wsl_distributions.rs`（启动期 WSL 识别，commit 57e31731b 引入的遗漏）、`crates/html-preview/src/browser.rs`（Windows 走 `cmd /C start`）、`crates/workspace_explorer/src/backend.rs`（容器后端 `docker exec`）、`main/src/settings/mcp_skill_install.rs`（`npx`/`node` 启动器），以及所有新增后台外部命令调用点；`workspace_explorer/src/git.rs`、`core/cloud_sync/personal/git_store.rs`、`extension-host/src/process.rs`、`remote_desktop/src/backends/rdp/transport.rs`、`remote_file_editor/src/external_launcher.rs`、`main/src/file_association.rs` 是已按此约定收口的正确样例。
+
+- **标题**：ACP 会话延续：复用协议会话 id 必须带降级，记忆键是（内置会话 uid × agent id）二维
+- **触发信号**：用户反馈「切了 agent / 重启应用之后，之前聊的内容 agent 不记得了」；或在 `acp/connection/setup.rs` 看到连接建立一律发 `session/new`；或想「重连时接上上次的会话」却只存了一个全局的 `last_acp_session_id`。
+- **根因 / 约束**：ACP 有两个极易混淆的 id——内置事件流的会话 id（`SessionId`，形如 `acp:<uuid>`，视图与持久化用）与协议会话地址（`AcpSessionId`，只有它能拿去 `session/load` / `session/resume`）。固定发 `session/new` 时 agent 侧一路堆空会话，用户看到的就是「全忘了」。用哪个方法由**能力协商**决定：顶层 `AgentCapabilities.load_session`（回放历史）与 `session_capabilities.resume`（接着跑不回放），两者都没有就只能新建。记忆键必须是二维的：同一个内置会话在不同 agent 上是不同的协议会话，只存「最后用过的 id」会把 agent A 的会话 id 塞给 agent B。
+- **正确做法**：`AiChatSettings.acp_sessions: HashMap<内置会话uid, HashMap<agent id, 协议会话id>>`（`remember_acp_session` / `remembered_acp_session`，带上限淘汰，且插入新键时不许把当前这个会话自己淘汰掉）；连接时从设置读出 resume 目标，按 `acp_session_open_kind()` 在 `load` / `resume` / 新建间选择；**load / resume 失败要静默降级为新建，不能把连接判死**（降级前先 `ensure_creating_session()` 对齐状态机相位，否则会打出假的「非法相位」告警）；协议 id 在会话真正就绪后才回写（`AcpConnection::protocol_session_id()`），不要在发起连接时写。
+- **降级不许静默，延续事实要流到 UI**：`tracing::warn!` 只对开发者可见，用户看到的是「明明接着聊、history 却没了」。所以在 `setup.rs` 里给每条打开路径记一份 `AcpSessionContinuity`（`ReusedWithHistory` / `ReusedWithoutHistory` / `StartedFresh` / `RestartedAfterReuseFailure`），经 `AcpConnection::session_continuity()` 流到视图，**只在「用户预期与实际不符」的两档开口**：降级重开（上下文真的不可用了）、`resume` 成功但不回放历史（接上了却看不到历史）；`StartedFresh` / `ReusedWithHistory` 不打扰用户。务必区分两个枚举的分工：`AcpSessionOpen` 表达「**可以**怎么开」（由能力协商决定，连之前算）、`AcpSessionContinuity` 表达「**实际**怎么开的」（连之后算），别合并成一个。
+- **跨后端切换要明示上下文归属**：ACP 历史归 agent、本地历史归 Runtime，两边**不迁移**。切到 ACP 时（本地转录非空才）提示「本地模型上下文不会带到 X」，切回本地时提示「与 X 的对话留在 agent 一侧」（词条 `AgentUi.context_boundary_to_acp` / `context_boundary_to_local`）。提示只能推给「屏幕上正显示的那个会话」——连接是异步的，期间用户可能已切走，否则会污染另一个会话的本地转录缓存。
+- **验证方式**：`cargo test -p ai_chat_view`（lib + `tests/acp_connection.rs` 12 个集成用例，其中 `reconnect_reuses_the_remembered_acp_session`、`a_vanished_remembered_session_falls_back_to_a_new_one`、`an_agent_without_reopen_capability_creates_a_new_session`、`an_agent_that_only_resumes_is_reported_as_no_history_replay` 用 `tests/fixtures/fake_acp_agent.rs` 真起子进程 + 方法日志钉住方法序列：复用是 `initialize/session/new/initialize/session/load`、降级是 `initialize/session/load/session/new`、无能力是 `initialize/session/new`、只支持 resume 是 `initialize/session/resume`）；`cargo test -p one-core settings` 锁住记忆的序列化、上限与二维隔离。三个测试纪律：`AcpConnection` 字段是 `pub(super)` → 端到端断言只能放 `tests/` 集成测试；记忆回写走 `AppSettings::update_and_save`，**GPUI 视图测试里不要真调它**（会写盘）；fake agent 新增模式时要同步改 `respond_prompt` 的 `match`（`Mode::SessionResumeOnly` 漏改会 E0004，且 `respond_reopen_session` 漏改会让 `session/resume` 收不到应答、表现为连接超时）。
+- **适用范围**：`crates/core/src/settings.rs`（`acp_sessions`）、`crates/ai_chat_view/src/acp/connection/{setup,runner,pending,outcome}.rs`、`crates/ai_chat_view/src/agent_view/{acp_ui,acp_sessions}.rs`，以及任何「替外部 agent 记住会话」的改造。
+
+- **标题**：GPUI 转录 LRU 缓存只允许放本地转录，且 stash 必须在切 backend 之前
+- **触发信号**：用户反馈「本地 → 切到 ACP agent → 再切回本地」后屏幕一片空白（但模型其实还记得，Runtime 里有历史）；或从 agent A 切到 agent B 后，A 的内容被当作「本地转录」回灌。
+- **根因 / 约束**：视图的 `transcript` 是屏幕、`session_transcripts` 是 LRU 缓存，两者都不是会话真相（真相在 `runtime`）。缓存若同时收 ACP 转录，「切回本地」就会还原出别的 agent 的内容。而 `stash_current_transcript()` 是按**当时**的 `backend` 决定存不存的——一旦先把 `self.backend = Backend::Acp` 赋了值，它就会把刚拿到的 ACP 内容当本地内容存走。
+- **正确做法**：`begin_acp_connect` 里**先** `stash_current_transcript()`、**再**把 `backend` 切成 `Acp`（顺序即正确性）；切回本地用 `restore_local_transcript()`（顺序：内存缓存 → Runtime 快照重建 → 清空），不要无条件 `transcript.clear()`；把「缓存只存本地转录」这条不变量写进注释钉住。
+- **空壳缓存会遮蔽 Runtime 重建**：`stash_current_transcript()` 必须返回「到底存没存」并在**转录为空时不入缓存**（`AgentTranscript::is_empty()`），`restore_local_transcript()` 与 `switch_session()` 命中缓存时也要加 `&& !transcript.is_empty()`。否则一个空的本地会话会往缓存里写一个空转录，等真正切回时「缓存命中」把 Runtime 快照重建整条跳过，屏幕永远空着——而模型其实记得。判据是「缓存非空」而不是「缓存存在」，`Option::is_some()` 在这里不够。
+- **切走时要丢弃而不是留空壳**：非当前会话切回本地走 `remove_cached_session_transcript()`（丢弃条目），不要写 `transcript.clear()`——后者会在缓存里留一个空条目，正是上一条的触发条件。
+- **验证方式**：`cargo test -p ai_chat_view --lib agent_view::`（`leaving_local_backend_stashes_the_local_transcript`、`returning_to_local_restores_the_stashed_transcript`、`returning_to_local_rebuilds_from_runtime_when_cache_is_gone`、`an_empty_session_cache_does_not_shadow_the_runtime_history`、`switching_sessions_rebuilds_when_the_cached_transcript_is_empty`、`switching_back_to_local_explains_where_the_agent_conversation_went`、`switching_to_acp_tells_the_user_where_the_local_context_goes`、`switching_to_acp_stays_quiet_when_the_local_session_is_empty`）。**这些用例必须做变异检查**：往提示条件里撒 `&& false` 应变红对应用例、「空会话保持安静」那个应仍绿；去掉两处 `is_empty()` 判定应变红空壳用例——不然「绿」不能证明保护生效。
+- **适用范围**：`crates/ai_chat_view/src/agent_view.rs`（`stash_current_transcript` / `restore_local_transcript`）、`crates/ai_chat_view/src/agent_view/acp_ui.rs`（`begin_acp_connect` / `select_local_backend_for_session`），以及任何「同一视图承载多种后端、需要来回切换」的改造。
+
+- **标题**：判断「这个会话还没聊过」要以 Runtime 历史为事实源，不能用屏幕转录
+- **触发信号**：给 AI 会话做「空白会话不增殖 / 复用没动过的会话 / 每会话独立草稿」时，判空只看 `transcript.has_conversation()` 或屏幕上的消息列表；或测试里用「空转录」造出空白会话就以为覆盖到了。
+- **根因 / 约束**：视图的 `transcript` 只是屏幕（切后端 / 切会话会被 stash / restore，见上一条经验），**真相在 `runtime` 的会话快照**。两个典型误判：①会话历史里只有系统提示 / 内部说明时，屏幕上看确实「没内容」，但 Runtime 已有一条 `HistoryItem::System`；②缓存被清后转录为空，而模型其实记得。只看屏幕会把这两种情况判成「空白」，进而复用掉一个用户其实已经用过的会话（或反过来，把一个空白会话当成有内容的而永不复用 → 空白会话增殖）。
+- **正确做法**：判据函数以 `runtime.session(&SessionId::from_string(uid)).snapshot().history` 为事实源；「空白」定义成「所有历史项都只是系统提示」，并用**白名单**表达：`HistoryItem::is_system_note()` = `matches!(self, HistoryItem::System(_))`。**必须是白名单而不是黑名单**——新增历史变体时默认「不算空白」，宁可不复用，也不要把用户内容误吞进一个被反复复用的壳里。
+- **验证方式**：除「空历史」用例外，**必须补一条「历史里只有系统提示时仍然可复用」的用例**（用 `restore_session` 造只含 `HistoryItem::System` 的快照）。本次变异（把 `is_system_note` 改成恒 `false`）暴露了盲区：`agent_runtime` 的测试变红，而 `ai_chat_view` 侧**全绿**——只覆盖「空历史」的视图测试抓不到这个 bug。补测后才变红。
+- **适用范围**：`crates/agent_runtime/src/history.rs`（`is_system_note`）、`crates/agent_runtime/src/runtime/session.rs`、`crates/ai_chat_view/src/agent_view.rs`（`runtime_history_is_blank` / `current_session_is_blank` / `reusable_blank_session`），以及任何「会话是否为空」的判断。
+
+- **标题**：会话草稿的时序不变量：capture 必须在 persist 之前；需要 `&mut Window` 的恢复动作放到 render
+- **触发信号**：给会话切换加「保留 / 恢复未发送的输入」；或发现切回来草稿没了、或两个会话的草稿串台；或想恢复输入却卡在 `InputState::set_value` 需要 `&mut Window`、而 `switch_session` 全链路只有 `&App`。
+- **根因 / 约束**：草稿要落盘就得走 `session.snapshot()`，所以 `capture_session_draft` **必须排在 `persist_current` 之前**——反了就会把「已被清空」的状态存下去。恢复侧若为了拿 window 去改 `switch_session` 的签名，会波及十几处调用点，得不偿失。
+- **正确做法**：`capture_session_draft` 先于 `persist_current`；恢复不改进切换链路签名，而是把待应用草稿存进 `pending_input_draft: Option<String>` 字段，等在 `render`（那里有 `&mut Window`）里由 `apply_pending_input_draft` 应用。**发送成功后必须 `set_draft(None)`**，否则「已经发出去的内容」会在切回来时复活。另外给输入框加一个**无副作用**的写入口（不聚焦、不动附件），不要复用「用户操作」语义的方法。
+- **验证方式**：`cargo test -p ai_chat_view --lib agent_view::`（`switching_sessions_carries_the_composer_draft_per_session`）、`cargo test -p agent_runtime`（快照 `draft` 往返）。变异：去掉 `capture` / 去掉 `set_draft(None)` 应分别变红。
+- **适用范围**：`crates/ai_chat_view/src/agent_view.rs`、`crates/ai_chat_view/src/input/agent_input.rs`（`set_composer_text`）、`crates/agent_runtime/src/runtime/session.rs`（`SessionSnapshot.draft`）。
+
+- **标题**：新增可自定义快捷键要三处同源：绑定层常量 → 设置页条目 → 词条
+- **触发信号**：给某个视图新增一个用户可改的快捷键；或设置页里显示的键位和真正按下去生效的不一致；或新增 `ShortcutEntry` 后忘了写词条，界面上直接显示 `Settings.Shortcuts.xxx`。
+- **根因 / 约束**：默认键有三个可能各写一份的地方（绑定层的 `KeyBinding::new` 字面量、设置页的 `keys_macos` / `keys_other` 字面量、`main/locales/main.yml` 词条）。三份各自漂移的后果是「设置页显示 A、实际生效 B」，且**只有用户按了才知道**。
+- **正确做法**：默认键只在绑定层定义一次（`pub const X_MACOS` / `X_OTHER`，再给一个 `*_defaults_for_platform(is_macos)` 供设置页取），设置页的 `ShortcutEntry` **直接引用该常量**、不写字面量；平台分栏必须按 `is_macos` 分别取（别把两栏接反）。配套两条守卫测试：①设置页条目在 `is_macos` 两个取值下都等于绑定层该平台的默认值；②每个 `label_key` 都能在 yml 里解析出文案（`assert_ne!(key, t!(key))`——`t!` 找不到词条时会把 key 原样吐回）。
+- **验证方式**：变异两条都要变红：把某个条目的 `keys_macos` / `keys_other` **对调**（本次实测变红并打出 `left: ["ctrl-["] right: ["cmd-["]`）、把 yml 里某个词条**改名**（本次实测变红）。命令：`cargo test -p main ai_chat_session_shortcut`。
+- **适用范围**：`crates/ai_chat_view/src/find_shortcut.rs`、`crates/ai_chat_view/src/session_shortcut.rs`、`crates/core/src/keybindings.rs`（`action_id`）、`main/src/setting_tab.rs`（`*_SHORTCUTS` + `tests`）、`main/locales/main.yml`、`main/src/navop_app.rs`（`refresh_keybindings` 调用点）。
+
+- **标题**：改「导航栈 / 最近使用序」这类纯状态机时，抽成无 GPUI 依赖的独立模块再测
+- **触发信号**：给视图加后退 / 前进、最近会话切换器（Ctrl-Tab 风格 overlay）、最近使用排序；或发现这类逻辑混在 `agent_view.rs` 里根本没法脱离 GPUI 测。
+- **根因 / 约束**：`agent_view.rs` 已近万行，塞进去的状态机既难测也难复用。而这类逻辑（栈、ring、截断、去重、失效剪枝）**完全不需要 GPUI**，放独立文件后可以纯 `#[test]` 覆盖边界。
+- **正确做法**：抽 `SessionNavigation`（`back` / `forward` 两个 `Vec<String>`；`visit` 压 back 并**清空 forward**——浏览器同款语义；`go_back` / `go_forward` 先移栈再返回；被删会话在**两个栈都要清**）与 `SessionSwitcherUi`（当前会话置顶 + recency 序 + 去重 + 上限 10；打开时高亮「上一个会话」；被删条目删除后高亮要留在邻居上）。视图层只做「把动作翻译成状态机调用」。
+- **验证方式**：`cargo test -p ai_chat_view --lib agent_view::session_navigation agent_view::session_switcher`。变异：注释掉 `forward.clear()` 或 `retain()` 应各变红——这次实测确认。
+- **注意事项**：`ctrl-tab` 在本应用是**工作台 Tab 切换的全局键**，会话切换器不能抢（用 `cmd-shift-j` / `ctrl-shift-j`），并把这条写成测试（`the_switcher_default_does_not_shadow_the_app_tab_switcher`）钉住，防止后人改回去。
+- **适用范围**：`crates/ai_chat_view/src/agent_view/session_navigation.rs`、`crates/ai_chat_view/src/agent_view/session_switcher.rs`，以及任何新增的视图级 overlay / 历史导航。新增这类文件**必须自己先跑 rustfmt 到 clean**（见上面格式化那条经验的双断言探针）。
 
 - **标题**：GUI 进程 spawn `npx` 必须先解析真实路径、再把程序目录补进子进程 PATH，否则设置页装 Skill 报 `os error 2`
 - **触发信号**：macOS 上从 Finder / Dock 启动的 Navop 点「安装 Navop Skill」失败，提示 `No such file or directory (os error 2)`；同一台机器在终端里跑同一条命令却成功。也适用于任何在 GUI 进程里 `Command::new("npx")` / `"node"` / `"pnpm"` 的后台调用。

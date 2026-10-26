@@ -6,7 +6,7 @@
 use crate::ids::{SessionId, SubAgentId, ToolCallId, TurnId};
 use crate::planner::Plan;
 use crate::runtime::PendingToolCallSummary;
-use crate::tools::{ToolName, ToolObservation};
+use crate::tools::{ToolAction, ToolName, ToolObservation};
 use serde_json::Value;
 
 /// 事件发送端(克隆给各 Session)。
@@ -34,6 +34,9 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         call_id: ToolCallId,
         tool_name: ToolName,
+        /// 调用方声明的动作类别(ACP 来自协议 `kind`,本地来自注册名)。
+        /// UI 据此选动词短语;拿不到声明时为 [`ToolAction::Other`],UI 显示工具名。
+        kind: ToolAction,
         arguments: Value,
     },
     /// 工具调用结束。
@@ -85,10 +88,14 @@ pub enum RuntimeEvent {
         delta: String,
     },
     /// 助手文本消息(完整 / 最终)。
+    ///
+    /// `reasoning` 为本轮思考过程的终值：broadcast 滞后丢了增量时，
+    /// 消费方可用它整体替换累积值自愈；`None` 表示未知/无，维持增量累积。
     AssistantMessage {
         session_id: SessionId,
         turn_id: TurnId,
         text: String,
+        reasoning: Option<String>,
     },
     /// 用户文本消息(用于外部协议恢复/回放用户消息)。
     UserMessage {

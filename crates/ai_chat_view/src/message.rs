@@ -4,6 +4,8 @@ use std::hash::{Hash, Hasher};
 
 use uuid::Uuid;
 
+use crate::message_image::MessageImage;
+
 pub const MESSAGE_RENDER_LIMIT: usize = 60;
 pub const MESSAGE_RENDER_STEP: usize = 40;
 
@@ -35,8 +37,18 @@ impl MessageExtension for NoExtension {}
 #[derive(Clone, Debug)]
 pub struct ChatMessageUIGeneric<E: MessageExtension = NoExtension> {
     pub id: String,
+    /// 该消息归属的运行时轮次（`RuntimeEvent` 一律携带）。
+    ///
+    /// 本地合成、或事件未带轮次（例如历史恢复）时为 `None`。轮次投影据此把消息
+    /// 归组，因此该字段必须由事件落值，**不得**用数组下标或渲染顺序推断。
+    pub turn_id: Option<String>,
     pub role: ChatRole,
     pub content: String,
+    /// 用户消息附带的图片（别的角色恒为空）。
+    ///
+    /// 放在正文之外而不是以 markdown data URL 塞进 `content`：转录里的图要能
+    /// 单独排版与放大，混进文本会让气泡宽度按 base64 长度算。
+    pub images: Vec<MessageImage>,
     pub reasoning_content: String,
     pub variant: MessageVariant,
     pub is_streaming: bool,
@@ -105,8 +117,10 @@ impl<E: MessageExtension + Default> ChatMessageUIGeneric<E> {
     ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            turn_id: None,
             role,
             content: content.into(),
+            images: Vec::new(),
             reasoning_content: String::new(),
             variant,
             is_streaming,
@@ -124,6 +138,12 @@ impl<E: MessageExtension> ChatMessageUIGeneric<E> {
         self
     }
 
+    /// 绑定归属轮次；`None` 表示该消息不属于任何运行时轮次。
+    pub fn with_turn_id(mut self, turn_id: Option<impl Into<String>>) -> Self {
+        self.turn_id = turn_id.map(Into::into);
+        self
+    }
+
     pub fn with_variant(mut self, variant: MessageVariant) -> Self {
         self.variant = variant;
         self
@@ -131,6 +151,12 @@ impl<E: MessageExtension> ChatMessageUIGeneric<E> {
 
     pub fn with_streaming(mut self, is_streaming: bool) -> Self {
         self.is_streaming = is_streaming;
+        self
+    }
+
+    /// 挂上图片；空集合等于没图。
+    pub fn with_images(mut self, images: Vec<MessageImage>) -> Self {
+        self.images = images;
         self
     }
 
@@ -235,5 +261,17 @@ mod tests {
 
         assert!(!msg.is_streaming);
         assert!(!msg.is_reasoning_expanded);
+    }
+
+    #[test]
+    fn messages_start_without_a_turn_and_can_be_bound_to_one() {
+        let unbound = ChatMessageUI::user("hi");
+        assert_eq!(None, unbound.turn_id);
+
+        let bound = ChatMessageUI::assistant("yo").with_turn_id(Some("turn_1"));
+        assert_eq!(Some("turn_1".to_string()), bound.turn_id);
+
+        let cleared = bound.with_turn_id(None::<String>);
+        assert_eq!(None, cleared.turn_id);
     }
 }

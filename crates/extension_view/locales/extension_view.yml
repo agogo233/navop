@@ -135,10 +135,6 @@ Extension:
     en: MCP Helper
     zh-CN: MCP 助手
     zh-HK: MCP 助手
-  kind_acp_agent:
-    en: ACP Agent
-    zh-CN: ACP 智能体
-    zh-HK: ACP 智能體
   kind_composite:
     en: Composite Extension
     zh-CN: 复合扩展

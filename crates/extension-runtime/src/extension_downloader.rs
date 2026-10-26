@@ -399,7 +399,6 @@ fn package_install_name(staging_dir: &Path, kind: ExtensionKind) -> Result<Strin
         ExtensionKind::LanguageBundle => "manifest.json",
         ExtensionKind::DatabaseDriver => "driver.json",
         ExtensionKind::RemoteDesktopProvider => "remote_desktop_provider.json",
-        ExtensionKind::AcpAgent => "acp_agent.json",
         ExtensionKind::Composite => "extension.json",
         ExtensionKind::Unsupported => unreachable!("unsupported kind cannot be installed"),
     };

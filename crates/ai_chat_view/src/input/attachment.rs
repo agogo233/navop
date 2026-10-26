@@ -44,6 +44,40 @@ impl ImageAttachment {
         }
     }
 
+    /// 测试用最小附件。
+    ///
+    /// `new` 是私有的（调用方应走剪贴板 / 路径两条真实入口）；测试只需要
+    /// 一个字节合法、能渲染的占位图片，不必把 `new` 放开成公开 API。
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self::new(
+            name,
+            Image::from_bytes(ImageFormat::Png, vec![137, 80, 78, 71]),
+        )
+    }
+
+    /// 从落库的草稿恢复一张附件（id / 名称 / MIME / base64 原样带回）。
+    ///
+    /// 认不出 MIME、base64 解不开、字节为空都返回 `None`：草稿里坏掉的一张图
+    /// 不该让整条草稿作废，跳过这一张继续。
+    pub(crate) fn from_stored(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        mime: &str,
+        data_base64: &str,
+    ) -> Option<Self> {
+        let format = ImageFormat::from_mime_type(mime)?;
+        let bytes = BASE64.decode(data_base64).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: id.into(),
+            name: name.into(),
+            image: Arc::new(Image::from_bytes(format, bytes)),
+        })
+    }
+
     /// MIME 类型(如 `image/png`)。
     pub fn mime(&self) -> &'static str {
         self.image.format.mime_type()

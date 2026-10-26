@@ -12,29 +12,50 @@ mod auth_tests;
 mod client;
 mod config;
 mod connection;
+mod elicitation;
 mod error;
 #[cfg(test)]
 mod error_tests;
 mod permission;
+mod presets;
+mod probe;
+mod probe_cache;
 mod provider;
 mod public_mcp_approval;
+mod sessions;
 mod state;
+mod subagent;
 mod translate;
 mod turn;
 #[cfg(test)]
 mod turn_tests;
 
 pub use config::{
-    AcpAgentConfig, AcpAgentEntry, AcpAuthConfig, AcpAuthMethodConfig, AcpConfigDiagnostic,
-    AcpTimeoutConfig, AcpTransport,
+    AcpAgentConfig, AcpAgentEntry, AcpAgentSource, AcpAuthConfig, AcpAuthMethodConfig,
+    AcpConfigDiagnostic, AcpTimeoutConfig, AcpTransport,
 };
-pub use connection::{AcpConnectOutcome, AcpConnection, AcpPendingConnection, AcpPromptStartError};
+pub(crate) use connection::{AcpActiveTurns, AcpInteractiveSession};
+pub use connection::{
+    AcpClientProviders, AcpConnectOutcome, AcpConnection, AcpPendingConnection, AcpPromptStartError,
+};
+pub(crate) use elicitation::{
+    AcpElicitationEnvelope, AcpElicitationMessage, acp_elicitation_channel,
+};
+pub use elicitation::{
+    AcpElicitationField, AcpElicitationFieldKind, AcpElicitationForm, AcpElicitationFuture,
+    AcpElicitationMode, AcpElicitationOption, AcpElicitationOutcome, AcpElicitationProvider,
+    AcpElicitationRequest,
+};
 pub use error::{AcpError, AcpErrorKind, AcpRecoveryAction};
 pub(crate) use permission::{AcpPermissionEnvelope, AcpPermissionMessage, acp_permission_channel};
 pub use permission::{
     AcpPermissionFuture, AcpPermissionOption, AcpPermissionOutcome, AcpPermissionProvider,
     AcpPermissionRequest,
 };
+pub use presets::{BuiltinAcpAgentPreset, builtin_acp_agent_preset, builtin_acp_agent_presets};
+pub use probe::probe_agent_blocking;
+pub use probe::{AcpAgentProbe, AcpModelInfo};
+pub use probe_cache::{AcpProbeCache, AcpProbeRecord, acp_probe_cache, probe_fingerprint};
 pub(crate) use provider::acquire_acp_permission_grant;
 pub use provider::{
     AcpPermissionGrant, build_acp_agent_configs, build_acp_agent_entries, current_acp_tool_mode,
@@ -48,5 +69,13 @@ pub use public_mcp_approval::{
     AcpPublicMcpApprovalFuture, AcpPublicMcpApprovalOutcome, AcpPublicMcpApprovalProvider,
     AcpPublicMcpApprovalRequest,
 };
-pub use state::AcpConnectionPhase;
-pub(crate) use state::AcpSessionState;
+pub(crate) use sessions::{
+    AcpSessionOpen, AcpSessionSummary, acp_session_list_supported, acp_session_open_kind,
+    acp_session_summaries,
+};
+pub use state::{AcpConnectionPhase, AcpSessionContinuity};
+pub(crate) use state::{AcpSessionState, AcpUsage};
+pub(crate) use subagent::{
+    detail_session_id_for, detail_session_uid_for, detail_turn_id_for, is_detail_session_id,
+    subagent_link_from_observation,
+};

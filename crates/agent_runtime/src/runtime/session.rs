@@ -10,10 +10,10 @@ use crate::planner::{Plan, StepStatus};
 use crate::resource::ResourceContext;
 use crate::runtime::active_turn::ActiveTurn;
 use crate::runtime::event::{RuntimeEvent, RuntimeEventSender};
-use crate::runtime::input_queue::{InputQueue, TurnInput};
+use crate::runtime::input_queue::{InputQueue, TurnInput, UserInput};
 use crate::runtime::session_state::SessionState;
 use crate::skill::SkillContext;
-use crate::tools::{ToolCall, ToolObservation};
+use crate::tools::{ToolAction, ToolCall, ToolObservation};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,19 @@ use std::sync::{Arc, Mutex};
 mod turns;
 pub(crate) use turns::PendingToolResolution;
 use turns::TurnState;
+
+/// 「这条会话由外部 agent 承载」的地址。
+///
+/// 外部 agent 自己存历史，navop 这边只记「这个会话指的是它哪一条协议会话」，
+/// 用来把会话留在侧栏列表里，并在重新打开时接回同一段对话，而不是新开一条。
+/// 会话的工作目录不在这里：它是外壳的属性，连接时由当前工作区决定。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpSessionRef {
+    /// 外部 agent 的 id（配置里的稳定标识）。
+    pub agent_id: String,
+    /// 该 agent 侧的协议会话 id（能拿去 `session/load` / `session/resume` 的地址）。
+    pub session_id: String,
+}
 
 /// 会话的可持久化快照:足以重建一个 [`Session`] 全部对话状态的最小集合。
 ///
@@ -40,6 +53,32 @@ pub struct SessionSnapshot {
     pub system_instruction: Option<String>,
     #[serde(default)]
     pub skills: SkillContext,
+    /// 会话创建时所在的工作区根目录（规范化字符串）。
+    ///
+    /// 会话归属在工作区**首次落盘时定格**，之后不随外壳切换工作区而改变；
+    /// 旧快照没有该字段，反序列化为 `None`（侧栏归入「未分组」）。
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// 用户在输入框里**尚未发送**的文字（会话草稿）。
+    ///
+    /// 切换会话时由视图捕获/恢复；随快照落盘，重启后回到对应会话仍能看到。
+    /// 空白会话不落盘（持久化层跳过空历史快照），所以空白会话的草稿只在
+    /// 本次进程内有效——这是刻意的：navop 的空白会话是瞬态的，不进列表。
+    #[serde(default)]
+    pub draft: Option<String>,
+    /// 会话当前的上下文占用估算(token 数,取最近一次模型请求的输入+输出)。
+    ///
+    /// provider 不报告计量时保持 `None`(没有测过就别装测过);切换模型后
+    /// 数字会被下一次请求自然覆盖。窗口大小不在这里——它取决于当前模型,
+    /// 由展示层按模型名解析,快照只存「用了多少」这个事实。
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    /// 会话是否由外部 agent 承载（见 [`AcpSessionRef`]）。
+    ///
+    /// `Some` 时本地 `history` 可能为空——历史在 agent 那边，本地只留这个地址；
+    /// 旧快照没有该字段，反序列化为 `None`（纯本地会话）。
+    #[serde(default)]
+    pub acp: Option<AcpSessionRef>,
 }
 
 /// 一次会话。
@@ -50,6 +89,11 @@ pub struct Session {
     skills: Mutex<SkillContext>,
     input_queue: Mutex<InputQueue>,
     turns: Mutex<TurnState>,
+    draft: Mutex<Option<String>>,
+    context_tokens: Mutex<Option<u64>>,
+    /// 会话的外部 agent 地址（纯载体：运行时不用它，只负责让它随快照往返，
+    /// 否则一次本地落盘就会把「这条会话属于哪个 agent」抹掉）。
+    acp: Mutex<Option<AcpSessionRef>>,
     events: RuntimeEventSender,
 }
 
@@ -62,6 +106,9 @@ impl Session {
             skills: Mutex::new(SkillContext::new()),
             input_queue: Mutex::new(InputQueue::new()),
             turns: Mutex::new(TurnState::default()),
+            draft: Mutex::new(None),
+            context_tokens: Mutex::new(None),
+            acp: Mutex::new(None),
             events,
         })
     }
@@ -82,6 +129,9 @@ impl Session {
             skills: Mutex::new(snapshot.skills),
             input_queue: Mutex::new(InputQueue::new()),
             turns: Mutex::new(TurnState::default()),
+            draft: Mutex::new(snapshot.draft),
+            context_tokens: Mutex::new(snapshot.context_tokens),
+            acp: Mutex::new(snapshot.acp),
             events,
         })
     }
@@ -107,6 +157,12 @@ impl Session {
             history,
             plan,
             system_instruction,
+            // 会话归属由持久化层在落盘时按「首存定格」规则补写，见
+            // ai_chat_view::persistence::save_session_with_workspace。
+            workspace_root: None,
+            draft: self.draft(),
+            context_tokens: self.context_tokens(),
+            acp: self.acp_ref(),
         }
     }
 
@@ -169,6 +225,58 @@ impl Session {
             .system_instruction = instruction;
     }
 
+    // ===== 输入草稿 =====
+
+    /// 当前未发送的输入草稿；`None` 表示没有。
+    ///
+    /// 纯空白的草稿被视为没有草稿（与「空输入框」同义），避免切走再切回
+    /// 后输入框凭空多出一段不可见的空白。
+    pub fn draft(&self) -> Option<String> {
+        self.draft
+            .lock()
+            .expect("session 锁中毒")
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+    }
+
+    /// 覆盖输入草稿。传 `None` 或纯空白即清除。
+    pub fn set_draft(&self, draft: Option<String>) {
+        *self.draft.lock().expect("session 锁中毒") = draft.filter(|text| !text.trim().is_empty());
+    }
+
+    /// 记录一次模型采样后的上下文占用(输入 + 输出 token,见
+    /// [`TokenUsage::context_tokens`])。
+    ///
+    /// 覆盖写:每次请求的 prompt 就是那之后的上下文基线,历史值无需保留。
+    /// 多次调用幂等——`Usage` 事件与 `Completed` 各记一次是正常情况。
+    pub fn record_token_usage(&self, usage: crate::model::TokenUsage) {
+        let tokens = usage.context_tokens();
+        *self.context_tokens.lock().expect("session 锁中毒") = Some(tokens);
+    }
+
+    /// 当前上下文占用估算;provider 从未报告过计量时为 `None`。
+    pub fn context_tokens(&self) -> Option<u64> {
+        *self.context_tokens.lock().expect("session 锁中毒")
+    }
+
+    /// 外部 agent 报的上下文占用直接写入（ACP 的 `session/update` UsageUpdate）。
+    ///
+    /// 与 [`Self::record_token_usage`] 分开：那个从模型采样计量取值，这个的来源
+    /// 是 agent 推送的快照，语义都是「当前上下文占用了多少」，落同一个字段。
+    pub fn set_context_tokens(&self, tokens: Option<u64>) {
+        *self.context_tokens.lock().expect("session 锁中毒") = tokens;
+    }
+
+    /// 会话当前指向的外部 agent 会话地址（没有就是本地会话）。
+    pub fn acp_ref(&self) -> Option<AcpSessionRef> {
+        self.acp.lock().expect("session 锁中毒").clone()
+    }
+
+    /// 记下 / 清掉外部 agent 会话地址。
+    pub fn set_acp_ref(&self, reference: Option<AcpSessionRef>) {
+        *self.acp.lock().expect("session 锁中毒") = reference;
+    }
+
     pub fn set_last_error(&self, error: Option<String>) {
         self.state.lock().expect("session 锁中毒").last_error = error;
     }
@@ -181,6 +289,32 @@ impl Session {
             .expect("session 锁中毒")
             .history
             .record_user(text);
+    }
+
+    /// 记录本轮工具声明快照（transcript 事实，不回灌模型）。
+    pub fn record_tools_declared(&self, names: Vec<String>) {
+        self.state
+            .lock()
+            .expect("session 锁中毒")
+            .history
+            .record_tools_declared(names);
+    }
+
+    /// 记录一条运行中到达的插话(steering)并广播 [`RuntimeEvent::UserMessage`]。
+    ///
+    /// 首次输入由 UI 先入历史，runtime 不重发事件避免气泡重复；插话走 runtime
+    /// 记录，事件也由这里发出，让其他订阅方（回放 / IPC）看到同一条用户消息。
+    pub fn record_steering_message(&self, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.record_user_input(text.clone());
+        self.emit(RuntimeEvent::UserMessage {
+            session_id: self.id.clone(),
+            turn_id: self.current_turn_id().unwrap_or_else(TurnId::new),
+            text,
+        });
     }
 
     /// 记录一条带图片的用户输入(多模态)。
@@ -208,6 +342,11 @@ impl Session {
     ) {
         let text = text.into();
         let reasoning = reasoning.into();
+        let reasoning_event = if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning.clone())
+        };
         let _ = self.with_writable_turn(turn_id, || {
             self.state
                 .lock()
@@ -218,6 +357,7 @@ impl Session {
                 session_id: self.id.clone(),
                 turn_id: turn_id.clone(),
                 text,
+                reasoning: reasoning_event,
             });
         });
     }
@@ -259,6 +399,7 @@ impl Session {
                 turn_id: turn_id.clone(),
                 call_id: call.call_id.clone(),
                 tool_name: call.tool_name.clone(),
+                kind: ToolAction::from_tool_name(call.tool_name.as_str()),
                 arguments: call.arguments.clone(),
             });
         });
@@ -385,6 +526,16 @@ impl Session {
 
     pub fn queue_input(&self, input: TurnInput) {
         self.input_queue.lock().expect("session 锁中毒").push(input);
+    }
+
+    /// 运行中插话：仅当本会话正有轮次在执行时入队，由当前轮在下一轮采样前消费。
+    /// 挂起等审批 / 空闲时返回 `false`（调用方自行决定排队或开新轮）。
+    pub fn steer(&self, input: UserInput) -> bool {
+        if self.active_turn_id().is_none() {
+            return false;
+        }
+        self.queue_input(TurnInput::User(input));
+        true
     }
 
     pub fn take_pending_inputs(&self) -> Vec<TurnInput> {
@@ -535,6 +686,107 @@ mod tests {
         let restored_plan = restored.current_plan().expect("应恢复出当前计划");
         assert_eq!(restored_plan.goal, "查询连接数");
         assert_eq!(restored_plan.steps.len(), 1);
+    }
+
+    #[test]
+    fn external_agent_reference_survives_the_local_save_path() {
+        // 外部 agent 会话由它自己存历史，本地只有地址。若 `snapshot()` 不带这个地址，
+        // 一次本地落盘（切走会话时就会发生）就会把会话变回「纯本地」，
+        // 侧栏那行也就再也接不回原来的对话。
+        let (session, _rx) = test_session();
+        assert!(session.acp_ref().is_none());
+
+        session.set_acp_ref(Some(AcpSessionRef {
+            agent_id: "agent-1".into(),
+            session_id: "acp-42".into(),
+        }));
+        let snapshot = session.snapshot();
+        assert_eq!(
+            Some("acp-42".to_string()),
+            snapshot.acp.as_ref().map(|acp| acp.session_id.clone())
+        );
+
+        let json = serde_json::to_string(&snapshot).expect("快照应可序列化为 JSON");
+        let parsed: SessionSnapshot = serde_json::from_str(&json).expect("JSON 应可反序列化回快照");
+        let (tx, _rx2) = tokio::sync::broadcast::channel(16);
+        let restored = Session::restore(parsed, tx);
+        assert_eq!(
+            restored.acp_ref().map(|acp| acp.agent_id),
+            Some("agent-1".to_string())
+        );
+
+        // 清掉之后不再随快照回来（切回本地也可以显式解绑）。
+        restored.set_acp_ref(None);
+        assert!(restored.snapshot().acp.is_none());
+    }
+
+    #[test]
+    fn draft_round_trips_through_snapshot_and_restores() {
+        let (session, _rx) = test_session();
+        // 新会话没有草稿。
+        assert_eq!(session.draft(), None);
+
+        // 草稿不 trim 内容（打字中途的前导空白可能是刻意的），只把纯空白归一为无草稿。
+        session.set_draft(Some("  帮我查一下连接数  ".into()));
+        assert_eq!(session.draft().as_deref(), Some("  帮我查一下连接数  "));
+        session.set_draft(Some("   ".into()));
+        assert_eq!(session.draft(), None);
+        session.set_draft(None);
+        assert_eq!(session.draft(), None);
+
+        session.set_draft(Some("未发送的文字".into()));
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.draft.as_deref(), Some("未发送的文字"));
+        let json = serde_json::to_string(&snapshot).expect("快照应可序列化为 JSON");
+        let parsed: SessionSnapshot = serde_json::from_str(&json).expect("JSON 应可反序列化回快照");
+        let (tx, _rx2) = tokio::sync::broadcast::channel(16);
+        let restored = Session::restore(parsed, tx);
+        assert_eq!(restored.draft().as_deref(), Some("未发送的文字"));
+    }
+
+    #[test]
+    fn legacy_snapshot_without_draft_field_deserializes_to_none() {
+        let json = r#"{"id":"sess_x","history":[]}"#;
+        let parsed: SessionSnapshot =
+            serde_json::from_str(json).expect("旧快照(无 draft 字段)应可反序列化");
+        assert_eq!(parsed.draft, None);
+    }
+
+    #[test]
+    fn context_tokens_round_trip_through_snapshot_and_restore() {
+        let (session, _rx) = test_session();
+        // 没测过就是没测过:不是 0,是 None。
+        assert_eq!(session.context_tokens(), None);
+
+        session.record_token_usage(crate::model::TokenUsage {
+            prompt_tokens: 1200,
+            completion_tokens: 300,
+            total_tokens: 1500,
+        });
+        assert_eq!(session.context_tokens(), Some(1500));
+
+        // 覆盖写:下一次请求的计量取代旧值,Usage 事件与 Completed 重复记账无副作用。
+        session.record_token_usage(crate::model::TokenUsage {
+            prompt_tokens: 2000,
+            completion_tokens: 100,
+            total_tokens: 0, // 个别 provider 只填部分字段
+        });
+        assert_eq!(session.context_tokens(), Some(2100));
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.context_tokens, Some(2100));
+        let json = serde_json::to_string(&snapshot).expect("快照应可序列化为 JSON");
+        let parsed: SessionSnapshot = serde_json::from_str(&json).expect("JSON 应可反序列化回快照");
+        let (tx, _rx2) = tokio::sync::broadcast::channel(16);
+        let restored = Session::restore(parsed, tx);
+        assert_eq!(restored.context_tokens(), Some(2100));
+    }
+
+    #[test]
+    fn legacy_snapshot_without_context_tokens_field_deserializes_to_none() {
+        let json = r#"{"id":"sess_x","history":[]}"#;
+        let parsed: SessionSnapshot = serde_json::from_str(json).expect("旧快照应可反序列化");
+        assert_eq!(parsed.context_tokens, None);
     }
 }
 
