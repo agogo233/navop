@@ -490,10 +490,14 @@ mod workspace_menu_tests {
     #[test]
     fn recent_choices_skip_the_current_root_and_missing_directories() {
         let existing = std::env::temp_dir();
+        // 不能拿固定路径（如 `/tmp`）当「另一个有效目录」：Linux 上
+        // `std::env::temp_dir()` 本身就是 `/tmp`，两者相等会被当成当前工作区过滤掉。
+        let sibling = existing.join("navop-workspace-choices-test");
+        std::fs::create_dir_all(&sibling).expect("create sibling dir");
         let roots = vec![
             existing.clone(),
             PathBuf::from("/nonexistent/navop-workspace-test"),
-            PathBuf::from("/tmp"),
+            sibling.clone(),
         ];
 
         let choices = recent_workspace_choices(&roots, &existing);
@@ -503,7 +507,9 @@ mod workspace_menu_tests {
             choices.iter().all(|root| root.is_dir()),
             "失效目录不应出现在最近列表: {choices:?}"
         );
-        assert!(choices.contains(&PathBuf::from("/tmp")));
+        assert!(choices.contains(&sibling));
+
+        let _ = std::fs::remove_dir(&sibling);
     }
 
     #[test]
