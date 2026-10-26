@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// 当前写出的配置版本。
 ///
-/// - v1：只支持对**扩展提供的** ACP agent 做覆盖（args/env/超时/鉴权方式）。
+/// - v1：只支持对**内置预设**的 ACP agent 做覆盖（args/env/超时/鉴权方式）。
 /// - v2：在 v1 基础上允许用户**自己定义** agent（写入 `command`），并记录 `active`
 ///   与 `enabled`。v1 文件按原语义继续读，保存时升到 v2。
 const CONFIG_VERSION: u32 = 2;
@@ -47,7 +47,7 @@ pub(crate) struct AcpUserAgentConfig {
     /// 展示名；缺省用 id。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// 启动命令。**存在即表示这是一条用户自定义 agent**，而不只是对扩展 agent 的覆盖。
+    /// 启动命令。**存在即表示这是一条用户自定义 agent**，而不只是对预设的覆盖。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

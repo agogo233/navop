@@ -1,17 +1,12 @@
 use ai_chat_view::{
-    AcpAgentConfig, AcpAgentEntry, AcpAgentSource, AcpAuthConfig, AcpAuthMethodConfig,
-    AcpConfigDiagnostic, AcpProbeRecord, AcpTimeoutConfig, AcpTransport, probe_fingerprint,
-    set_acp_agent_config_provider,
+    AcpAgentConfig, AcpAgentEntry, AcpAgentSource, AcpConfigDiagnostic, AcpProbeRecord,
+    AcpTransport, builtin_acp_agent_presets, probe_fingerprint, set_acp_agent_config_provider,
 };
 use anyhow::bail;
-use extension_runtime::extension::{
-    AcpAgentExtensionAgent, AcpAgentExtensionProvider, AcpAgentExtensionTransport, ExtensionKind,
-    ExtensionRegistry,
-};
 use gpui::App;
 use one_core::settings::AppSettings;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::path::Path;
 
 mod user_config;
 
@@ -28,7 +23,7 @@ pub fn init(cx: &mut App) {
 ///
 /// 聊天切换器与设置页都走这里，保证两边看到的 id、启用状态、诊断完全一致。
 pub fn current_agent_entries() -> anyhow::Result<Vec<AcpAgentEntry>> {
-    let mut entries = acp_agent_entries_from_registry()?;
+    let mut entries = builtin_agent_entries()?;
     normalize_acp_agent_entry_ids(&mut entries);
     Ok(entries)
 }
@@ -86,7 +81,7 @@ pub struct AcpUserAgentSpec {
     pub env: Vec<(String, String)>,
 }
 
-/// 新增或更新一条用户自定义 agent。
+/// 新增或更新一条用户自定义 agent（不依赖预设，自带启动命令）。
 pub fn upsert_user_agent(spec: AcpUserAgentSpec) -> anyhow::Result<()> {
     let id = spec.id.trim();
     if id.is_empty() {
@@ -111,7 +106,7 @@ pub fn upsert_user_agent(spec: AcpUserAgentSpec) -> anyhow::Result<()> {
     save_user_config(&config)
 }
 
-/// 删除一条**用户自定义**的 agent；扩展提供的 agent 走 [`reset_agent_override`]。
+/// 删除一条**用户自定义**的 agent；内置预设走 [`reset_agent_override`]。
 pub fn remove_user_agent(id: &str) -> anyhow::Result<()> {
     let mut config = load_user_config()?;
     let is_user_defined = config
@@ -125,7 +120,7 @@ pub fn remove_user_agent(id: &str) -> anyhow::Result<()> {
     save_user_config(&config)
 }
 
-/// 保存扩展提供的 agent 的参数/环境变量覆盖。
+/// 保存内置预设的参数/环境变量覆盖。
 pub fn save_agent_override(
     id: &str,
     args: Vec<String>,
@@ -144,7 +139,7 @@ pub fn save_agent_override(
     save_user_config(&config)
 }
 
-/// 清掉某条目的覆盖/启用记录，回到扩展声明的默认状态。
+/// 清掉某条目的覆盖/启用记录，回到内置预设的默认状态。
 pub fn reset_agent_override(id: &str) -> anyhow::Result<()> {
     let mut config = load_user_config()?;
     config.agents.remove(id);
@@ -156,7 +151,7 @@ pub fn set_agent_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
     let mut config = load_user_config()?;
     let entry = config.agents.entry(id.to_string()).or_default();
     if entry.command.is_none() && enabled {
-        // 扩展 agent 默认就是启用的，不需要留一条空记录。
+        // 内置预设默认就是启用的，不需要留一条空记录。
         entry.enabled = None;
     } else {
         entry.enabled = Some(enabled);
@@ -181,26 +176,99 @@ pub fn probe_and_cache(config: &AcpAgentConfig, handle: tokio::runtime::Handle) 
     AcpProbeRecord::new(probe_fingerprint(config), probe)
 }
 
-fn acp_agent_entries_from_registry() -> anyhow::Result<Vec<AcpAgentEntry>> {
+/// 内置预设 + 用户自定义，按「预设在前」的顺序拼起来。
+///
+/// 预设条目的命令在这里就解析成绝对路径：GUI 进程（Finder/Dock 启动）继承不到
+/// shell 的 PATH，`npm` / `gemini` / `opencode` 这类命令不解析就会直接
+/// `command not found`；解析成功的同时把程序所在目录补进子进程 PATH，
+/// `npm exec` 再拉起的子进程才能找到 node。
+fn builtin_agent_entries() -> anyhow::Result<Vec<AcpAgentEntry>> {
     let user_config = load_user_config()?;
     let lookup = |name: &str| std::env::var(name).ok();
-    let mut entries = ExtensionRegistry::global()
-        .map(|registry| {
-            let registry = registry
-                .read()
-                .map_err(|err| anyhow::anyhow!("extension registry lock poisoned: {err}"))?;
-            let root = registry.root_for(ExtensionKind::AcpAgent);
-            let agents = AcpAgentExtensionProvider::load_agents_from_root(&root)?;
-            Ok::<_, anyhow::Error>(acp_agent_entries_from_agents(
-                &agents,
-                &user_config,
-                &lookup,
-            ))
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let mut entries = preset_agent_entries(&user_config, &lookup);
     entries.extend(user_defined_agent_entries(&user_config, &lookup));
     Ok(dedupe_agent_entries(entries))
+}
+
+fn preset_agent_entries(
+    user_config: &AcpUserConfig,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Vec<AcpAgentEntry> {
+    preset_agent_entries_with(user_config, lookup, process_util::resolve_program)
+}
+
+fn preset_agent_entries_with(
+    user_config: &AcpUserConfig,
+    lookup: &impl Fn(&str) -> Option<String>,
+    resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Vec<AcpAgentEntry> {
+    builtin_acp_agent_presets()
+        .iter()
+        .map(|preset| {
+            let mut config = preset.config();
+            if let Err(diagnostic) = resolve_preset_command(&mut config, &resolve) {
+                return AcpAgentEntry::invalid(preset.id, preset.name, diagnostic)
+                    .with_source(AcpAgentSource::Preset);
+            }
+            let Some(override_config) = user_config.agents.get(preset.id) else {
+                return AcpAgentEntry::ready(config).with_source(AcpAgentSource::Preset);
+            };
+            let enabled = override_config.is_enabled();
+            match resolve_override(override_config, lookup) {
+                Ok(resolved) => {
+                    apply_user_override(&mut config, resolved);
+                    AcpAgentEntry::ready(config)
+                        .with_source(AcpAgentSource::Preset)
+                        .with_enabled(enabled)
+                }
+                Err(error) => AcpAgentEntry::invalid(
+                    preset.id,
+                    preset.name,
+                    AcpConfigDiagnostic::new(error.to_string()),
+                )
+                .with_source(AcpAgentSource::Preset)
+                .with_enabled(enabled),
+            }
+        })
+        .collect()
+}
+
+/// 把预设命令解析成可执行文件：绝对路径原样校验，其余按 PATH 查找。
+fn resolve_preset_command(
+    config: &mut AcpAgentConfig,
+    resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Result<(), AcpConfigDiagnostic> {
+    let AcpTransport::Stdio { command, env, .. } = &mut config.transport;
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(AcpConfigDiagnostic::new(
+            "agent 启动命令不能为空".to_string(),
+        ));
+    }
+    let path = Path::new(trimmed);
+    let resolved = if path.components().count() > 1 {
+        if path.is_file() {
+            path.to_path_buf()
+        } else {
+            return Err(AcpConfigDiagnostic::new(format!(
+                "找不到命令 `{trimmed}`：请把它改成可执行文件的绝对路径，或安装后再试"
+            )));
+        }
+    } else {
+        resolve(trimmed).ok_or_else(|| {
+            AcpConfigDiagnostic::new(format!(
+                "找不到命令 `{trimmed}`：请先安装对应 CLI（或在设置里把启动命令改成绝对路径）"
+            ))
+        })?
+    };
+    // 把程序目录补进子进程 PATH：npm/npx 需要找到同目录的 node，
+    // 否则 GUI 里拉起时会以 `env: node: No such file or directory` 失败。
+    let program_dir_path = process_util::child_path_with_program_dir(&resolved);
+    let program_dir = program_dir_path.to_string_lossy().to_string();
+    env.retain(|(name, _)| name != "PATH");
+    env.push(("PATH".to_string(), program_dir));
+    *command = resolved.to_string_lossy().to_string();
+    Ok(())
 }
 
 /// 用户自己定义的 agent（配置里带 `command` 的条目）。
@@ -211,7 +279,7 @@ fn user_defined_agent_entries(
     config
         .agents
         .iter()
-        // 没有 command 的条目只是对扩展 agent 的覆盖，不在这里生成新 agent。
+        // 没有 command 的条目只是对内置预设的覆盖，不在这里生成新 agent。
         .filter(|(_, agent)| agent.command.is_some())
         .map(|(id, agent)| {
             let enabled = agent.is_enabled();
@@ -256,102 +324,6 @@ fn dedupe_agent_entries(entries: Vec<AcpAgentEntry>) -> Vec<AcpAgentEntry> {
         .collect()
 }
 
-fn acp_agent_entries_from_agents(
-    agents: &[AcpAgentExtensionAgent],
-    user_config: &AcpUserConfig,
-    lookup: &impl Fn(&str) -> Option<String>,
-) -> Vec<AcpAgentEntry> {
-    agents
-        .iter()
-        .filter_map(|agent| {
-            let id = extension_agent_config_id(agent)?;
-            let name = non_empty_or_else(&agent.name, || "ACP Agent".to_string());
-            let mut config = match acp_agent_config_from_extension_agent(agent) {
-                Ok(config) => config,
-                Err(diagnostic) => return Some(AcpAgentEntry::invalid(id, name, diagnostic)),
-            };
-            let Some(override_config) = user_config.agents.get(config.id.as_ref()) else {
-                return Some(AcpAgentEntry::ready(config));
-            };
-            let enabled = override_config.is_enabled();
-            Some(match resolve_override(override_config, lookup) {
-                Ok(resolved) => {
-                    apply_user_override(&mut config, resolved);
-                    AcpAgentEntry::ready(config).with_enabled(enabled)
-                }
-                Err(error) => AcpAgentEntry::invalid(
-                    config.id,
-                    config.name,
-                    AcpConfigDiagnostic::new(error.to_string()),
-                )
-                .with_enabled(enabled),
-            })
-        })
-        .collect()
-}
-
-/// 把扩展声明的 agent 转成运行期配置。
-///
-/// 只接受 stdio：协议 SDK 2.x 的 `AcpAgent` 只负责拉起子进程，HTTP MCP 形态已从
-/// SDK 移除。声明 http 的扩展在这里就被判为不可用并带出诊断，而不是等到连接时才失败。
-fn acp_agent_config_from_extension_agent(
-    agent: &AcpAgentExtensionAgent,
-) -> Result<AcpAgentConfig, AcpConfigDiagnostic> {
-    let AcpAgentExtensionTransport::Stdio { command, args, env } = &agent.transport else {
-        return Err(AcpConfigDiagnostic::new(
-            "HTTP transport is no longer supported; declare a stdio command instead".to_string(),
-        ));
-    };
-    let command = non_empty_trimmed(command)
-        .ok_or_else(|| AcpConfigDiagnostic::new("stdio command must not be empty".to_string()))?;
-    let id = extension_agent_config_id(agent)
-        .ok_or_else(|| AcpConfigDiagnostic::new("agent id must not be empty".to_string()))?;
-    let name = non_empty_or_else(&agent.name, || "ACP Agent".to_string());
-    let config = AcpAgentConfig::new(
-        id,
-        name,
-        agent
-            .manifest_dir
-            .join(command)
-            .components()
-            .collect::<std::path::PathBuf>()
-            .display()
-            .to_string(),
-    )
-    .with_args(args.clone())
-    .with_env(env.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
-    Ok(config
-        .with_auth(extension_auth_config(agent))
-        .with_timeouts(extension_timeout_config(agent)))
-}
-
-fn extension_auth_config(agent: &AcpAgentExtensionAgent) -> AcpAuthConfig {
-    AcpAuthConfig {
-        requested_method: None,
-        preferred_method: agent.auth.preferred_method.clone(),
-        allow_unauthenticated_fallback: agent.auth.allow_unauthenticated_fallback,
-        methods: agent
-            .auth
-            .methods
-            .iter()
-            .map(|method| AcpAuthMethodConfig {
-                id: method.id.clone(),
-                env_any: method.env_any.clone(),
-                env_all: method.env_all.clone(),
-                interactive: method.interactive,
-            })
-            .collect(),
-    }
-}
-
-fn extension_timeout_config(agent: &AcpAgentExtensionAgent) -> AcpTimeoutConfig {
-    AcpTimeoutConfig {
-        connect: Duration::from_secs(agent.timeouts.connect_seconds),
-        authenticate: Duration::from_secs(agent.timeouts.authenticate_seconds),
-        prompt: Duration::from_secs(agent.timeouts.prompt_seconds),
-    }
-}
-
 fn apply_user_override(config: &mut AcpAgentConfig, user: AcpResolvedAgentOverride) {
     config.auth.requested_method = user.auth_method;
     if let Some(args) = user.args
@@ -378,12 +350,6 @@ fn merge_env(
             env.push((name, value));
         }
     }
-}
-
-fn extension_agent_config_id(agent: &AcpAgentExtensionAgent) -> Option<String> {
-    let extension_id = non_empty_trimmed(&agent.extension_id)?;
-    let agent_id = non_empty_trimmed(&agent.id)?;
-    Some(format!("{extension_id}.{agent_id}"))
 }
 
 fn non_empty_or_else(value: &str, fallback: impl FnOnce() -> String) -> String {

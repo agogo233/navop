@@ -72,7 +72,7 @@ struct AgentDraft {
     id: String,
     /// 新增（而不是编辑既有的）。
     is_new: bool,
-    /// 用户自定义的 agent（可改命令/名字），还是扩展提供的（只能覆盖参数）。
+    /// 用户自定义的 agent（可改命令/名字），还是内置预设（只能覆盖参数/环境变量）。
     is_user_defined: bool,
     name: Entity<InputState>,
     command: Entity<InputState>,
@@ -736,7 +736,7 @@ fn status_dot(status: &RowStatus, cx: &App) -> impl IntoElement {
         .child(div().size(px(8.)).rounded_full().bg(color))
 }
 
-/// 扩展 agent 的命令是扩展包内的相对路径，展示只读解析结果。
+/// 内置预设的命令展示的是按 PATH 解析后的绝对路径（只读展示）。
 fn extension_command_hint(rows: &[AcpAgentRow], id: &str) -> String {
     rows.iter()
         .find(|row| row.id == id)

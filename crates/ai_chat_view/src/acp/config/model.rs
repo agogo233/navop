@@ -68,9 +68,9 @@ impl AcpConfigDiagnostic {
 /// ACP agent 条目的来源。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AcpAgentSource {
-    /// 由已安装的 `acp_agent` 扩展提供。
+    /// 内置预设提供（命令、参数可被用户覆盖）。
     #[default]
-    Extension,
+    Preset,
     /// 用户在设置里自己添加的。
     User,
 }

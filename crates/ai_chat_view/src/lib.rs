@@ -93,8 +93,9 @@ pub use acp::{
     AcpPermissionOutcome, AcpPermissionProvider, AcpPermissionRequest, AcpProbeCache,
     AcpProbeRecord, AcpPromptStartError, AcpPublicMcpApprovalFuture, AcpPublicMcpApprovalOutcome,
     AcpPublicMcpApprovalProvider, AcpPublicMcpApprovalRequest, AcpRecoveryAction,
-    AcpSessionContinuity, AcpTimeoutConfig, AcpTransport, acp_probe_cache, build_acp_agent_configs,
-    build_acp_agent_entries, current_acp_tool_mode, probe_agent_blocking, probe_fingerprint,
+    AcpSessionContinuity, AcpTimeoutConfig, AcpTransport, BuiltinAcpAgentPreset, acp_probe_cache,
+    build_acp_agent_configs, build_acp_agent_entries, builtin_acp_agent_preset,
+    builtin_acp_agent_presets, current_acp_tool_mode, probe_agent_blocking, probe_fingerprint,
     set_acp_agent_config_provider, set_acp_permission_grant_provider, set_acp_tool_mode_provider,
     set_current_acp_tool_mode,
 };

@@ -17,6 +17,7 @@ mod error;
 #[cfg(test)]
 mod error_tests;
 mod permission;
+mod presets;
 mod probe;
 mod probe_cache;
 mod provider;
@@ -51,6 +52,7 @@ pub use permission::{
     AcpPermissionFuture, AcpPermissionOption, AcpPermissionOutcome, AcpPermissionProvider,
     AcpPermissionRequest,
 };
+pub use presets::{BuiltinAcpAgentPreset, builtin_acp_agent_preset, builtin_acp_agent_presets};
 pub use probe::probe_agent_blocking;
 pub use probe::{AcpAgentProbe, AcpModelInfo};
 pub use probe_cache::{AcpProbeCache, AcpProbeRecord, acp_probe_cache, probe_fingerprint};

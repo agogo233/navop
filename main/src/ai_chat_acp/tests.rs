@@ -1,16 +1,13 @@
-use super::{
-    acp_agent_config_from_extension_agent, acp_agent_entries_from_agents,
-    normalize_acp_agent_config_ids,
-};
-use ai_chat_view::{AcpAgentConfig, AcpTransport};
-use extension_runtime::extension::{
-    AcpAgentExtensionAgent, AcpAgentExtensionAuth, AcpAgentExtensionTimeouts,
-    AcpAgentExtensionTransport,
-};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use super::{normalize_acp_agent_config_ids, preset_agent_entries_with, resolve_preset_command};
+use ai_chat_view::{AcpAgentConfig, AcpTransport};
+
 use super::user_config::{parse_user_config, resolve_override};
+
+fn fake_resolver(path: &'static str) -> impl Fn(&str) -> Option<PathBuf> {
+    move |_command| Some(PathBuf::from(path))
+}
 
 #[test]
 fn normalizes_duplicate_acp_agent_config_ids() {
@@ -30,70 +27,94 @@ fn normalizes_duplicate_acp_agent_config_ids() {
 }
 
 #[test]
-fn builds_acp_agent_config_from_extension_agent() {
-    let mut env = BTreeMap::new();
-    env.insert("CODEX_HOME".to_string(), "test-home".to_string());
-    let manifest_dir = std::env::temp_dir().join("onetcli-acp").join("codex");
-    let agent = AcpAgentExtensionAgent::stdio(
-        "com.example.codex",
-        "codex",
-        "Codex",
-        manifest_dir.clone(),
-        "bin/codex-acp",
-        vec!["--stdio".to_string()],
-        env,
-    );
+fn presets_resolve_commands_and_extend_the_child_path() {
+    let user_config = parse_user_config(r#"{"version": 2, "agents": {}}"#).unwrap();
+    let entries =
+        preset_agent_entries_with(&user_config, &|_| None, fake_resolver("/opt/acp/bin/npm"));
 
-    let config = acp_agent_config_from_extension_agent(&agent).expect("extension agent config");
+    let claude = entries
+        .iter()
+        .find(|entry| entry.id.as_ref() == "claude-acp")
+        .expect("claude preset");
+    let config = claude.config.as_ref().expect("resolved config");
+    let AcpTransport::Stdio { command, env, .. } = &config.transport;
+    assert_eq!("/opt/acp/bin/npm", command);
+    let path = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.as_str())
+        .expect("PATH is injected for npm-backed presets");
+    assert!(path.starts_with("/opt/acp/bin"), "{path}");
+}
 
-    assert_eq!("com.example.codex.codex", config.id.as_ref());
-    assert_eq!("Codex", config.name.as_ref());
-    let AcpTransport::Stdio { command, args, env } = &config.transport;
-    let expected_command = manifest_dir
-        .join("bin/codex-acp")
-        .components()
-        .collect::<PathBuf>()
-        .display()
-        .to_string();
-    assert_eq!(&expected_command, command);
-    assert_eq!(&vec!["--stdio".to_string()], args);
-    assert_eq!(
-        &vec![("CODEX_HOME".to_string(), "test-home".to_string())],
-        env
+#[test]
+fn missing_preset_command_is_reported_without_hiding_other_presets() {
+    let user_config = parse_user_config(r#"{"version": 2, "agents": {}}"#).unwrap();
+    let entries = preset_agent_entries_with(&user_config, &|_| None, |command| {
+        (command != "gemini").then(|| PathBuf::from("/opt/acp/bin/npm"))
+    });
+
+    let gemini = entries
+        .iter()
+        .find(|entry| entry.id.as_ref() == "gemini-acp")
+        .expect("gemini preset");
+    assert!(gemini.config.is_none());
+    let diagnostic = gemini.diagnostic.as_ref().expect("diagnostic");
+    assert!(diagnostic.message.contains("找不到命令 `gemini`"));
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry.id.as_ref() != "gemini-acp")
+            .all(|entry| entry.config.is_some()),
+        "only the missing preset should be invalid"
     );
 }
 
-/// HTTP 传输已从协议 SDK 移除：扩展声明 http 时必须在配置阶段就带出诊断，
-/// 而不是等到用户点开 agent 才在连接时失败。
 #[test]
-fn http_transport_extension_is_reported_as_unavailable() {
-    let agent = AcpAgentExtensionAgent {
-        extension_id: "com.example.remote".to_string(),
-        id: "remote".to_string(),
-        name: "Remote".to_string(),
-        transport: AcpAgentExtensionTransport::Http {
-            url: "http://127.0.0.1:3100/".to_string(),
-        },
-        auth: AcpAgentExtensionAuth::default(),
-        timeouts: AcpAgentExtensionTimeouts::default(),
-        manifest_dir: PathBuf::from("/tmp/onetcli-acp/remote"),
-    };
+fn overrides_apply_to_presets_without_turning_them_into_user_agents() {
+    let user_config = parse_user_config(
+        r#"{
+            "version": 2,
+            "agents": {
+                "codex-acp": {
+                    "args": ["--experimental"],
+                    "env": {"LOG_LEVEL": "debug"},
+                    "enabled": false
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let entries =
+        preset_agent_entries_with(&user_config, &|_| None, fake_resolver("/opt/acp/bin/npm"));
 
-    let error = acp_agent_config_from_extension_agent(&agent).unwrap_err();
-
+    let codex = entries
+        .iter()
+        .find(|entry| entry.id.as_ref() == "codex-acp")
+        .expect("codex preset");
+    assert!(!codex.enabled);
+    let config = codex.config.as_ref().expect("resolved config");
+    let AcpTransport::Stdio { args, env, .. } = &config.transport;
+    assert_eq!(&vec!["--experimental".to_string()], args);
     assert!(
-        error.message.contains("HTTP transport"),
+        env.iter()
+            .any(|(name, value)| name == "LOG_LEVEL" && value == "debug")
+    );
+}
+
+#[test]
+fn explicit_command_paths_must_exist() {
+    let mut config = AcpAgentConfig::new("custom", "Custom", "/definitely/missing/acp");
+    let error = resolve_preset_command(&mut config, |_| None).unwrap_err();
+    assert!(
+        error.message.contains("/definitely/missing/acp"),
         "{}",
         error.message
     );
 
-    let config = parse_user_config(r#"{"version": 1, "agents": {}}"#).unwrap();
-    let entries = acp_agent_entries_from_agents(&[agent], &config, &|_| None);
-
-    assert_eq!(1, entries.len());
-    assert!(entries[0].config.is_none());
-    assert!(entries[0].diagnostic.is_some());
-    assert_eq!("com.example.remote.remote", entries[0].id.as_ref());
+    let command = std::env::current_exe().expect("test executable");
+    let mut config = AcpAgentConfig::new("custom", "Custom", command.display().to_string());
+    resolve_preset_command(&mut config, |_| None).expect("existing absolute path is accepted");
 }
 
 #[test]
@@ -102,7 +123,7 @@ fn resolves_environment_reference_without_storing_secret() {
         r#"{
             "version": 1,
             "agents": {
-                "codex.codex": {
+                "codex-acp": {
                     "env": {"OPENAI_API_KEY": "${env:OPENAI_API_KEY}"}
                 }
             }
@@ -110,7 +131,7 @@ fn resolves_environment_reference_without_storing_secret() {
     )
     .unwrap();
 
-    let resolved = resolve_override(&parsed.agents["codex.codex"], |name| {
+    let resolved = resolve_override(&parsed.agents["codex-acp"], |name| {
         (name == "OPENAI_API_KEY").then(|| "secret-value".to_string())
     })
     .unwrap();
@@ -127,7 +148,7 @@ fn rejects_plaintext_sensitive_value() {
         r#"{
             "version": 1,
             "agents": {
-                "codex.codex": {
+                "codex-acp": {
                     "env": {"OPENAI_API_KEY": "plaintext"}
                 }
             }
@@ -143,65 +164,31 @@ fn rejects_plaintext_sensitive_value() {
 }
 
 #[test]
-fn extension_auth_and_timeouts_reach_runtime_config() {
-    let mut agent = AcpAgentExtensionAgent::stdio(
-        "com.example.codex",
-        "codex",
-        "Codex",
-        PathBuf::from("/tmp/onetcli-acp/codex"),
-        "bin/codex-acp",
-        Vec::new(),
-        BTreeMap::new(),
-    );
-    agent.auth.preferred_method = Some("api-key".to_string());
-    agent
-        .auth
-        .methods
-        .push(extension_runtime::extension::AcpAgentExtensionAuthMethod {
-            id: "api-key".to_string(),
-            env_any: vec!["OPENAI_API_KEY".to_string()],
-            env_all: Vec::new(),
-            interactive: false,
-        });
-    agent.timeouts.prompt_seconds = 42;
-
-    let config = acp_agent_config_from_extension_agent(&agent).unwrap();
-
-    assert_eq!(Some("api-key"), config.auth.preferred_method.as_deref());
-    assert_eq!(42, config.timeouts.prompt.as_secs());
-}
-
-#[test]
 fn one_invalid_override_does_not_hide_other_agents() {
-    let agents = vec![extension_agent("first"), extension_agent("second")];
-    let config = parse_user_config(
+    let user_config = parse_user_config(
         r#"{
             "version": 1,
             "agents": {
-                "test.first": {
+                "claude-acp": {
                     "env": {"OPENAI_API_KEY": "${env:MISSING_KEY}"}
                 }
             }
         }"#,
     )
     .unwrap();
+    let entries =
+        preset_agent_entries_with(&user_config, &|_| None, fake_resolver("/opt/acp/bin/npm"));
 
-    let entries = acp_agent_entries_from_agents(&agents, &config, &|_| None);
-
-    assert!(entries[0].config.is_none());
-    assert!(entries[0].diagnostic.is_some());
-    assert!(entries[1].config.is_some());
-    assert!(entries[1].diagnostic.is_none());
-}
-
-fn extension_agent(id: &str) -> AcpAgentExtensionAgent {
-    AcpAgentExtensionAgent::stdio(
-        "test",
-        id,
-        format!("Test {id}"),
-        PathBuf::from("/tmp/onetcli-acp/test"),
-        "bin/test-acp",
-        Vec::new(),
-        BTreeMap::new(),
-    )
+    let claude = entries
+        .iter()
+        .find(|entry| entry.id.as_ref() == "claude-acp")
+        .expect("claude preset");
+    assert!(claude.config.is_none());
+    assert!(claude.diagnostic.is_some());
+    let codex = entries
+        .iter()
+        .find(|entry| entry.id.as_ref() == "codex-acp")
+        .expect("codex preset");
+    assert!(codex.config.is_some());
+    assert!(codex.diagnostic.is_none());
 }

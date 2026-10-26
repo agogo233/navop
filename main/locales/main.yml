@@ -3743,9 +3743,9 @@ Settings:
       zh-CN: ACP 智能体
       zh-HK: ACP 智能體
     description:
-      en: Coding agents reachable over Agent Client Protocol. Navop detects each one on demand and caches the result, so the list is ready the moment you open it.
-      zh-CN: 通过 Agent Client Protocol 接入的编码智能体。检测结果按需执行并落盘缓存，打开列表即可直接使用。
-      zh-HK: 透過 Agent Client Protocol 接入的編碼智能體。檢測結果按需執行並落盤快取，開啟清單即可直接使用。
+      en: Coding agents reachable over Agent Client Protocol. Common agents ship as built-in presets; edits are written to acp-agents.json. Navop detects each one on demand and caches the result.
+      zh-CN: 通过 Agent Client Protocol 接入的编码智能体。常用 agent 内置为预设，修改会写入 acp-agents.json；检测结果按需执行并落盘缓存。
+      zh-HK: 透過 Agent Client Protocol 接入的編碼智能體。常用 agent 內建為預設，修改會寫入 acp-agents.json；檢測結果按需執行並落盤快取。
     refresh:
       en: Refresh
       zh-CN: 刷新

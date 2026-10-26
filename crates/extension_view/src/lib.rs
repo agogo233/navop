@@ -113,27 +113,6 @@ mod tests {
     }
 
     #[test]
-    fn acp_agent_kind_matches_install_state_and_filters() {
-        let installed = vec![
-            summary(ExtensionKind::AcpAgent, "codex", "1.0.0").with_description("ACP coding agent"),
-        ];
-        let entry = marketplace_entry(ExtensionKind::AcpAgent, "codex", "1.0.0");
-
-        assert_eq!(
-            MarketplaceInstallState::Installed,
-            marketplace_install_state(&installed, &entry)
-        );
-        assert_eq!(
-            1,
-            filter_installed(&installed, "coding", Some(ExtensionKind::AcpAgent)).len()
-        );
-        assert_eq!(
-            1,
-            filter_marketplace(&[entry], "codex", Some(ExtensionKind::AcpAgent)).len()
-        );
-    }
-
-    #[test]
     fn updatable_marketplace_filter_keeps_only_newer_versions() {
         let installed = vec![summary(ExtensionKind::DatabaseDriver, "fake_pg", "1.2.0")];
         let entries = vec![
@@ -158,11 +137,11 @@ mod tests {
     fn updatable_marketplace_filter_matches_across_kinds() {
         let installed = vec![
             summary(ExtensionKind::DatabaseDriver, "fake_pg", "1.2.0"),
-            summary(ExtensionKind::AcpAgent, "codex", "2.0.0"),
+            summary(ExtensionKind::RemoteDesktopProvider, "codex", "2.0.0"),
         ];
         let entries = vec![
             marketplace_entry(ExtensionKind::DatabaseDriver, "fake_pg", "1.2.0"),
-            marketplace_entry(ExtensionKind::AcpAgent, "codex", "2.1.0"),
+            marketplace_entry(ExtensionKind::RemoteDesktopProvider, "codex", "2.1.0"),
         ];
 
         let filtered = filter_updatable_marketplace(&entries, &installed);

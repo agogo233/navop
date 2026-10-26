@@ -32,9 +32,6 @@ pub(crate) fn direct_package_kind(dir: &Path) -> Option<ExtensionKind> {
     if dir.join("remote_desktop_provider.json").exists() {
         return Some(ExtensionKind::RemoteDesktopProvider);
     }
-    if dir.join("acp_agent.json").exists() {
-        return Some(ExtensionKind::AcpAgent);
-    }
     if dir.join("manifest.json").exists() && dir.join("parser.wasm").exists() {
         return Some(ExtensionKind::Language);
     }
@@ -114,7 +111,7 @@ fn ignored_archive_metadata(name: &OsStr) -> bool {
 
 fn unrecognized_package_kind(staging_dir: &Path) -> anyhow::Error {
     anyhow!(
-        "无法识别扩展包类型,缺少 extension.json / driver.json / remote_desktop_provider.json / acp_agent.json / manifest.json+parser.wasm / language bundle manifest: {}",
+        "无法识别扩展包类型,缺少 extension.json / driver.json / remote_desktop_provider.json / manifest.json+parser.wasm / language bundle manifest: {}",
         staging_dir.display()
     )
 }

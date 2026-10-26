@@ -1,8 +1,8 @@
 use std::{fs, sync::Arc};
 
 use crate::extension::{
-    AcpAgentExtensionProvider, CompositeExtensionProvider, DatabaseDriverExtensionProvider,
-    ExtensionKind, ExtensionRegistry, ExtensionSummary, LanguageExtensionProvider,
+    CompositeExtensionProvider, DatabaseDriverExtensionProvider, ExtensionKind, ExtensionRegistry,
+    ExtensionSummary, LanguageExtensionProvider,
 };
 use crate::extension_downloader::{
     MarketplaceManifest, detect_package_kind, install_from_staging_generic,
@@ -177,10 +177,6 @@ fn detect_package_kind_identifies_language_database_composite() {
     fs::create_dir_all(&composite_dir).unwrap();
     fs::write(composite_dir.join("extension.json"), "{}").unwrap();
 
-    let acp_agent_dir = tmp.path().join("acp_agent");
-    fs::create_dir_all(&acp_agent_dir).unwrap();
-    fs::write(acp_agent_dir.join("acp_agent.json"), "{}").unwrap();
-
     assert_eq!(
         ExtensionKind::Language,
         detect_package_kind(&language_dir).unwrap()
@@ -192,10 +188,6 @@ fn detect_package_kind_identifies_language_database_composite() {
     assert_eq!(
         ExtensionKind::Composite,
         detect_package_kind(&composite_dir).unwrap()
-    );
-    assert_eq!(
-        ExtensionKind::AcpAgent,
-        detect_package_kind(&acp_agent_dir).unwrap()
     );
 }
 
@@ -280,35 +272,6 @@ fn install_from_staging_generic_installs_database_driver() {
     );
     assert!(root.join("database_drivers/fake_pg/driver.json").exists());
     assert!(root.join("database_drivers/fake_pg/driver-bin").exists());
-}
-
-#[test]
-fn install_from_staging_generic_installs_acp_agent() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path().join("extensions");
-    let staging = tmp.path().join("staging");
-    fs::create_dir_all(staging.join("bin")).unwrap();
-    fs::write(staging.join("bin/codex-acp"), b"#!/bin/sh\n").unwrap();
-    make_executable(&staging.join("bin/codex-acp"));
-    write_acp_agent_manifest(&staging);
-
-    let mut registry = ExtensionRegistry::new(root.clone());
-    registry.register_provider(Arc::new(AcpAgentExtensionProvider));
-
-    let summary = install_from_staging_generic(&staging, &registry, None).unwrap();
-
-    assert_eq!(
-        ExtensionSummary::new(
-            ExtensionKind::AcpAgent,
-            "codex",
-            "1.2.3",
-            root.join("acp_agents").join("codex")
-        )
-        .with_description("Codex ACP agent"),
-        summary
-    );
-    assert!(root.join("acp_agents/codex/acp_agent.json").exists());
-    assert!(root.join("acp_agents/codex/bin/codex-acp").exists());
 }
 
 #[test]
@@ -549,29 +512,6 @@ fn write_driver_manifest(dir: &std::path::Path, id: &str, name: &str) {
                 }}
             }}"#
         ),
-    )
-    .unwrap();
-}
-
-fn write_acp_agent_manifest(dir: &std::path::Path) {
-    fs::write(
-        dir.join("acp_agent.json"),
-        r#"{
-            "id": "codex",
-            "name": "Codex",
-            "description": "Codex ACP agent",
-            "version": "1.2.3",
-            "agents": [{
-                "id": "codex",
-                "name": "Codex",
-                "transport": {
-                    "type": "stdio",
-                    "command": "bin/codex-acp",
-                    "args": ["--stdio"],
-                    "env": { "CODEX_HOME": "test-home" }
-                }
-            }]
-        }"#,
     )
     .unwrap();
 }

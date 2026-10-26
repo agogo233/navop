@@ -415,7 +415,6 @@ fn to_view_kind(kind: host_extension::ExtensionKind) -> extension_view::Extensio
         host_extension::ExtensionKind::RemoteDesktopProvider => {
             extension_view::ExtensionKind::RemoteDesktopProvider
         }
-        host_extension::ExtensionKind::AcpAgent => extension_view::ExtensionKind::AcpAgent,
         host_extension::ExtensionKind::Composite => extension_view::ExtensionKind::Composite,
         host_extension::ExtensionKind::Unsupported => {
             unreachable!("unsupported kind is filtered before view conversion")
@@ -435,7 +434,6 @@ fn to_host_kind(kind: extension_view::ExtensionKind) -> host_extension::Extensio
         extension_view::ExtensionKind::RemoteDesktopProvider => {
             host_extension::ExtensionKind::RemoteDesktopProvider
         }
-        extension_view::ExtensionKind::AcpAgent => host_extension::ExtensionKind::AcpAgent,
         extension_view::ExtensionKind::Composite => host_extension::ExtensionKind::Composite,
     }
 }
@@ -457,7 +455,6 @@ mod tests {
         for kind in [
             extension_view::ExtensionKind::DatabaseDriver,
             extension_view::ExtensionKind::RemoteDesktopProvider,
-            extension_view::ExtensionKind::AcpAgent,
             extension_view::ExtensionKind::Composite,
         ] {
             assert!(

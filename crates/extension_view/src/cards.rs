@@ -25,7 +25,6 @@ pub(crate) fn kind_icon(kind: ExtensionKind) -> IconName {
         ExtensionKind::LanguageBundle => IconName::Apps,
         ExtensionKind::DatabaseDriver => IconName::Database,
         ExtensionKind::RemoteDesktopProvider => IconName::RdpLine,
-        ExtensionKind::AcpAgent => IconName::Ai,
         ExtensionKind::Composite => IconName::ExtensionsColor,
     }
 }
@@ -37,7 +36,6 @@ pub(crate) fn kind_color(kind: ExtensionKind) -> ColorName {
         ExtensionKind::LanguageBundle => ColorName::Cyan,
         ExtensionKind::DatabaseDriver => ColorName::Emerald,
         ExtensionKind::RemoteDesktopProvider => ColorName::Violet,
-        ExtensionKind::AcpAgent => ColorName::Orange,
         ExtensionKind::Composite => ColorName::Pink,
     }
 }
@@ -50,7 +48,6 @@ pub(crate) fn kind_label(kind: ExtensionKind) -> String {
         ExtensionKind::RemoteDesktopProvider => {
             t!("Extension.kind_remote_desktop_provider").to_string()
         }
-        ExtensionKind::AcpAgent => t!("Extension.kind_acp_agent").to_string(),
         ExtensionKind::Composite => t!("Extension.kind_composite").to_string(),
     }
 }
@@ -61,7 +58,6 @@ pub(crate) fn extension_kind_id(kind: ExtensionKind) -> &'static str {
         ExtensionKind::LanguageBundle => "language-bundle",
         ExtensionKind::DatabaseDriver => "database-driver",
         ExtensionKind::RemoteDesktopProvider => "remote-desktop-provider",
-        ExtensionKind::AcpAgent => "acp-agent",
         ExtensionKind::Composite => "composite",
     }
 }
