@@ -543,18 +543,6 @@ fn write_language_bundle_staging(staging: &std::path::Path) {
     fs::write(staging.join("javascript/parser.wasm"), [0u8; 4]).unwrap();
 }
 
-#[cfg(unix)]
-fn make_executable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &std::path::Path) {}
-
 fn write_composite_manifest(dir: &std::path::Path, id: &str, permission: &str) {
     fs::write(
         dir.join("extension.json"),

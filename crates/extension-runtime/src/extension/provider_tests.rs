@@ -355,18 +355,6 @@ fn builtin_registry_registers_all_extension_providers() {
     );
 }
 
-#[cfg(unix)]
-fn make_executable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &std::path::Path) {}
-
 fn remote_desktop_provider_json(id: &str, name: &str, protocol: &str, command: &str) -> String {
     format!(
         r#"{{
