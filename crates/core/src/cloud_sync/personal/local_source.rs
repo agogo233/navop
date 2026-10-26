@@ -234,11 +234,24 @@ impl PersonalSyncLocalRepositorySource {
                     )
                     .map_err(repository_error)
             }
-            None => self
-                .connections
-                .insert(&mut conn)
-                .map(|_| ())
-                .map_err(repository_error),
+            None => {
+                let id = self
+                    .connections
+                    .insert(&mut conn)
+                    .map_err(repository_error)?;
+                // `insert` 会把 `updated_at` 改写成写库时刻，看起来像一次本地修改；
+                // 下载落地应当保持远端内容与同步基线一致，否则下一轮会把这条刚下载
+                // 下来的连接判成「本地改过」，把它的分组（很可能还是空的）推回云端。
+                let synced_at = record.updated_at / 1000;
+                self.connections
+                    .update_sync_status_with_updated_at(
+                        id,
+                        Some(record.id.clone()),
+                        Some(synced_at),
+                        synced_at,
+                    )
+                    .map_err(repository_error)
+            }
         }
     }
 

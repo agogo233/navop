@@ -934,9 +934,12 @@ impl SyncEngine {
                 drop(service);
                 updated.id = resolved.conflict.local.id;
                 updated.cloud_id = Some(resolved.conflict.cloud.id.clone());
-                updated.workspace_id = self.local_workspace_id_for_connection(
-                    resolved.conflict.cloud.team_id.as_deref(),
+                let connection_name = updated.name.clone();
+                updated.workspace_id = self.resolve_download_workspace_id(
+                    &resolved.conflict.cloud,
                     workspace_cloud_id.as_deref(),
+                    resolved.conflict.local.workspace_id,
+                    &connection_name,
                 )?;
                 updated.last_synced_at = Some(Self::current_timestamp());
 
@@ -983,9 +986,12 @@ impl SyncEngine {
                 drop(service);
                 updated.id = resolved.conflict.local.id;
                 updated.cloud_id = Some(resolved.conflict.cloud.id.clone());
-                updated.workspace_id = self.local_workspace_id_for_connection(
-                    resolved.conflict.cloud.team_id.as_deref(),
+                let connection_name = updated.name.clone();
+                updated.workspace_id = self.resolve_download_workspace_id(
+                    &resolved.conflict.cloud,
                     workspace_cloud_id.as_deref(),
+                    resolved.conflict.local.workspace_id,
+                    &connection_name,
                 )?;
                 updated.last_synced_at = Some(Self::current_timestamp());
 

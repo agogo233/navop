@@ -13,6 +13,7 @@ use llm_connector::ChatRequest;
 use crate::cloud_sync::client::{
     AuthResponse, CloudApiClient, CloudApiError, OAuthResponse, UserInfo,
 };
+use crate::cloud_sync::connection_sync::WorkspaceUploadLink;
 use crate::cloud_sync::models::{
     CloudSyncData, CloudUserConfig, SyncResult, Team, TeamMember, TeamMemberWithEmail, TeamRole,
     WorkspaceParentLink, data_type,
@@ -23,8 +24,9 @@ use crate::storage::connection::SqliteConnection;
 use crate::storage::migration::run_migrations;
 use crate::storage::traits::Repository;
 use crate::storage::{
-    ConnectionRepository, CredentialRepository, PendingCloudDeletionRepository, StorageManager,
-    TeamKeyCacheRepository, TeamMembershipCacheRepository, Workspace, WorkspaceRepository,
+    ConnectionRepository, ConnectionType, CredentialRepository, PendingCloudDeletionRepository,
+    StorageManager, StoredConnection, TeamKeyCacheRepository, TeamMembershipCacheRepository,
+    Workspace, WorkspaceRepository,
 };
 
 const TEST_MASTER_KEY: &str = "workspace-hierarchy-engine-test-master-key";
@@ -274,6 +276,7 @@ struct Device {
     _temp: tempfile::TempDir,
     engine: SyncEngine,
     workspaces: WorkspaceRepository,
+    connections: ConnectionRepository,
     service: Arc<RwLock<CloudSyncService>>,
 }
 
@@ -289,7 +292,8 @@ impl Device {
         let storage = StorageManager::new_with_connection(connection.clone());
         let workspaces = WorkspaceRepository::new(connection.clone());
         storage.register(workspaces.clone());
-        storage.register(ConnectionRepository::new(connection.clone()));
+        let connections = ConnectionRepository::new(connection.clone());
+        storage.register(connections.clone());
         storage.register(CredentialRepository::new(connection.clone()));
         storage.register(PendingCloudDeletionRepository::new(connection.clone()));
         storage.register(TeamKeyCacheRepository::new(connection.clone()));
@@ -310,6 +314,7 @@ impl Device {
             _temp: temp,
             engine,
             workspaces,
+            connections,
             service,
         }
     }
@@ -590,5 +595,161 @@ async fn engine_upload_follows_ancestor_order_not_sidebar_order() {
     assert_eq!(
         WorkspaceParentLink::Cloud(device.cloud_id(root)),
         device.decrypt_link(&store.record(&device.cloud_id(child)))
+    );
+}
+
+impl Device {
+    fn insert_connection(&self, name: &str, workspace_id: Option<i64>) -> i64 {
+        let mut connection = StoredConnection {
+            ai_access_level: Default::default(),
+            id: None,
+            credential_revision: None,
+            name: name.to_string(),
+            connection_type: ConnectionType::Database,
+            params: "{}".to_string(),
+            workspace_id,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+            preferred_open_mode: None,
+        };
+        self.connections
+            .insert(&mut connection)
+            .expect("connection insert")
+    }
+
+    fn connection(&self, local_id: i64) -> StoredConnection {
+        self.connections
+            .get(local_id)
+            .expect("connection query")
+            .expect("connection exists")
+    }
+
+    fn decrypt_connection_link(&self, record: &CloudSyncData) -> Option<String> {
+        self.service
+            .read()
+            .expect("service lock")
+            .decrypt_sync_data_connection_with_workspace_cloud_id(record)
+            .expect("decrypt connection payload")
+            .1
+    }
+}
+
+#[tokio::test]
+async fn engine_upload_defers_connection_until_its_group_reaches_cloud() {
+    let store = FakeCloudStore::new();
+    let device = Device::new(store.clone());
+    let group = device.insert_workspace("G", None);
+    let connection = device.insert_connection("C1", Some(group));
+
+    // 分组还没有云端 ID：此刻上传只能带「无分组」，会永久污染云端记录
+    let local = device.connection(connection);
+    assert!(matches!(
+        device
+            .engine
+            .workspace_upload_link_for_connection(&local)
+            .expect("解析上传分组"),
+        WorkspaceUploadLink::Pending(name) if name == "G"
+    ));
+
+    device.sync().await;
+
+    let synced = device.connection(connection);
+    let cloud_id = synced.cloud_id.clone().expect("连接应已上传");
+    let group_cloud_id = device.cloud_id(group);
+    assert_eq!(
+        Some(group_cloud_id.clone()),
+        device.decrypt_connection_link(&store.record(&cloud_id)),
+        "连接上传时就必须带上所属分组的云端引用"
+    );
+    assert!(matches!(
+        device
+            .engine
+            .workspace_upload_link_for_connection(&synced)
+            .expect("解析上传分组"),
+        WorkspaceUploadLink::Group(id) if id == group_cloud_id
+    ));
+}
+
+#[tokio::test]
+async fn engine_keeps_local_group_when_cloud_connection_has_no_group_link() {
+    let store = FakeCloudStore::new();
+    let device = Device::new(store.clone());
+    let group = device.insert_workspace("G", None);
+    let connection = device.insert_connection("C1", Some(group));
+    device.sync().await;
+
+    let local = device.connection(connection);
+    let cloud_id = local.cloud_id.clone().expect("连接应已上传");
+    assert_eq!(
+        Some(device.cloud_id(group)),
+        device.decrypt_connection_link(&store.record(&cloud_id))
+    );
+
+    // 模拟旧版本客户端（或分组尚未上传时的历史记录）：云端连接记录没有分组引用，
+    // 且更新时间更晚，于是本轮会走「以云端为准」的下载分支。
+    let mut detached = local.clone();
+    detached.workspace_id = None;
+    let payload = {
+        let service = device.service.read().expect("service lock");
+        service
+            .prepare_sync_data_upload_with_workspace_cloud_id(&detached, None, &[], None)
+            .expect("旧载荷")
+    };
+    let mut record = store.record(&cloud_id);
+    record.version += 1;
+    record.updated_at = (local.updated_at.unwrap_or(0) + 3_600) * 1000;
+    record.encrypted_data = payload.encrypted_data;
+    store.upsert(&record);
+
+    device.sync().await;
+
+    // 云端没有分组引用时不能把本地分组清掉，这正是用户反馈的「连接跑出文件夹」
+    assert_eq!(
+        Some(group),
+        device.connection(connection).workspace_id,
+        "云端记录缺少分组引用不等于「用户把它移到了根目录」"
+    );
+}
+
+#[tokio::test]
+async fn engine_aligns_connection_group_when_local_link_drifted() {
+    let store = FakeCloudStore::new();
+    let device = Device::new(store.clone());
+    let group = device.insert_workspace("G", None);
+    let connection = device.insert_connection("C1", Some(group));
+    device.sync().await;
+
+    let cloud_id = device
+        .connection(connection)
+        .cloud_id
+        .clone()
+        .expect("已上传");
+    // 归属漂移但本轮没有本地改动：收尾阶段必须按云端引用收敛回来
+    device
+        .connections
+        .update_workspace_id(connection, None)
+        .expect("detach");
+    assert_eq!(None, device.connection(connection).workspace_id);
+
+    device.sync().await;
+
+    assert_eq!(
+        Some(group),
+        device.connection(connection).workspace_id,
+        "未改动过的连接应按云端引用对齐分组"
+    );
+    assert_eq!(
+        Some(device.cloud_id(group)),
+        device.decrypt_connection_link(&store.record(&cloud_id)),
+        "对齐不能改动云端记录"
     );
 }

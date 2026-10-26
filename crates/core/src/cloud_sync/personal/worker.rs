@@ -251,9 +251,15 @@ where
             .planner
             .plan(&local_items, &active_remote_records, &paused);
 
-        self.apply_plan(&plan, &local_items, &active_remote_records)
+        let written_records = self
+            .apply_plan(&plan, &local_items, &active_remote_records)
             .await?;
-        self.local.finalize_pass(&active_remote_records).await?;
+        // 收尾对齐必须基于「本轮写完之后」的记录：`active_remote_records` 是 pass 开始前的
+        // 读取结果，本轮刚上传 / 刚更新到云端的记录在里面还是旧内容（旧的 `workspace_cloud_id`）。
+        // 用旧快照去收敛连接所属分组，会把刚移动到新分组、刚同步上去的连接按旧引用改回原分组，
+        // 表现就是「新建连接 / 调整分组之后，连接又回到之前那个文件夹」。
+        let finalize_records = merge_written_records(active_remote_records, written_records);
+        self.local.finalize_pass(&finalize_records).await?;
         let deletion_conflicts = local_delete_conflicts + tombstone_conflicts;
         if deletion_conflicts > 0 {
             return Err(SyncStoreError::Conflict(format!(
@@ -390,27 +396,38 @@ where
         plan: &PersonalSyncPlan,
         local_items: &[PersonalSyncItemSnapshot],
         remote_records: &[CloudSyncData],
-    ) -> Result<(), SyncStoreError> {
-        self.apply_uploads(plan).await?;
-        self.apply_cloud_updates(plan).await?;
+    ) -> Result<Vec<CloudSyncData>, SyncStoreError> {
+        // 返回本轮真正写入云端存储的记录，供收尾阶段使用（而不是 pass 开始前的旧快照）。
+        let mut written_records = self.apply_uploads(plan).await?;
+        written_records.extend(self.apply_cloud_updates(plan).await?);
         self.apply_local_updates(plan).await?;
         self.apply_downloads(plan).await?;
         self.apply_synced_marks(plan, local_items, remote_records)
             .await?;
         self.apply_conflicts(plan, local_items, remote_records)
-            .await
+            .await?;
+        Ok(written_records)
     }
 
-    async fn apply_uploads(&self, plan: &PersonalSyncPlan) -> Result<(), SyncStoreError> {
+    async fn apply_uploads(
+        &self,
+        plan: &PersonalSyncPlan,
+    ) -> Result<Vec<CloudSyncData>, SyncStoreError> {
+        let mut written = Vec::with_capacity(plan.to_upload.len());
         for item in &plan.to_upload {
             let record = self.local.export_item(item).await?;
             let stored = self.store.upsert_record(&record, None).await?;
             self.mark_synced(item, &stored).await?;
+            written.push(stored);
         }
-        Ok(())
+        Ok(written)
     }
 
-    async fn apply_cloud_updates(&self, plan: &PersonalSyncPlan) -> Result<(), SyncStoreError> {
+    async fn apply_cloud_updates(
+        &self,
+        plan: &PersonalSyncPlan,
+    ) -> Result<Vec<CloudSyncData>, SyncStoreError> {
+        let mut written = Vec::with_capacity(plan.to_update_cloud.len());
         for (item, remote) in &plan.to_update_cloud {
             let record = self.local.export_item(item).await?;
             let stored = self
@@ -418,8 +435,9 @@ where
                 .upsert_record(&record, Some(remote.version))
                 .await?;
             self.mark_synced(item, &stored).await?;
+            written.push(stored);
         }
-        Ok(())
+        Ok(written)
     }
 
     async fn apply_local_updates(&self, plan: &PersonalSyncPlan) -> Result<(), SyncStoreError> {
@@ -495,6 +513,26 @@ where
     }
 }
 
+/// 把本轮写入云端存储的记录覆盖到 pass 开始前的快照上，得到收尾阶段应该使用的记录集。
+///
+/// 覆盖按 `(data_type, id)` 匹配；本轮新建的记录直接追加。这样收尾阶段的层级 / 分组收敛
+/// 看到的就是本轮写完之后云端真正的内容，而不是上传前那份旧内容。
+fn merge_written_records(
+    mut records: Vec<CloudSyncData>,
+    written_records: Vec<CloudSyncData>,
+) -> Vec<CloudSyncData> {
+    for written in written_records {
+        match records
+            .iter_mut()
+            .find(|record| record.data_type == written.data_type && record.id == written.id)
+        {
+            Some(existing) => *existing = written,
+            None => records.push(written),
+        }
+    }
+    records
+}
+
 fn find_local_by_cloud_key<'a>(
     items: &'a [PersonalSyncItemSnapshot],
     key: &PersonalSyncCloudKey,
@@ -556,4 +594,46 @@ fn local_deleted_keys(
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_sync::data_type;
+
+    fn record(id: &str, updated_at: i64) -> CloudSyncData {
+        CloudSyncData {
+            id: id.to_string(),
+            owner_id: "user-1".to_string(),
+            team_id: None,
+            data_type: data_type::CONNECTION.to_string(),
+            encrypted_data: format!("payload-{updated_at}"),
+            key_version: 1,
+            checksum: String::new(),
+            version: 1,
+            updated_at,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn finalize_snapshot_uses_records_written_in_this_pass() {
+        let stale = vec![record("a", 1_000), record("b", 1_000)];
+        let written = vec![record("b", 2_000), record("c", 2_000)];
+
+        let merged = merge_written_records(stale, written);
+
+        // 同一份记录以本轮写入的版本为准：否则收尾阶段会拿旧的分组引用把本地改回去
+        let by_id = |id: &str| {
+            merged
+                .iter()
+                .find(|record| record.id == id)
+                .unwrap_or_else(|| panic!("{id} 应该出现在收尾快照里"))
+                .updated_at
+        };
+        assert_eq!(1_000, by_id("a"));
+        assert_eq!(2_000, by_id("b"));
+        assert_eq!(2_000, by_id("c"));
+        assert_eq!(3, merged.len(), "同 id 记录不应重复");
+    }
 }
