@@ -21,6 +21,8 @@ use crate::selects::{ForwardingKindSelectItem, SshConnectionSelectItem, Workspac
 #[derive(Clone)]
 pub struct PortForwardingFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub ssh_connections: Vec<StoredConnection>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
@@ -93,6 +95,12 @@ impl PortForwardingFormWindow {
             );
             SelectState::new(items, Some(IndexPath::default()), window, cx)
         });
+        // 新建连接向导带着目标分组打开时预选该分组（编辑连接由 load_editing_connection 回填）。
+        if !is_editing && let Some(workspace_id) = config.initial_workspace_id {
+            workspace_select.update(cx, |select, cx| {
+                select.set_selected_value(&Some(workspace_id), window, cx);
+            });
+        }
         let team_select = create_team_select(&config.teams, None, window, cx);
 
         let mut form = Self {

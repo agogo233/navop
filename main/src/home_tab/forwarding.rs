@@ -25,6 +25,7 @@ impl HomePage {
             .collect();
 
         let config = PortForwardingFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection,
             ssh_connections,
             workspaces: self.workspaces.clone(),
@@ -132,6 +133,7 @@ impl HomePage {
         });
 
         let config = RemoteDesktopFormWindowConfig {
+            initial_workspace_id: None,
             protocol,
             editing_connection: editing_conn,
             workspaces: self.workspaces.clone(),

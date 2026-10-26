@@ -1365,7 +1365,7 @@ fn init_action_handlers(cx: &mut App) {
                     window.close_all_dialogs(cx);
                 }
                 home_page.update(cx, |hp, cx| {
-                    hp.show_new_connection_dialog(window, cx);
+                    hp.show_new_connection_dialog(None, window, cx);
                 });
             });
         });

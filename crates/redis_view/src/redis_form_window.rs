@@ -50,6 +50,8 @@ use crate::{GlobalRedisState, RedisManager};
 pub struct RedisFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub initial_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub on_saved: Option<RedisFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
@@ -391,7 +393,12 @@ impl RedisFormWindow {
                 .map(WorkspaceSelectItem::from_workspace),
         );
 
-        let selected_workspace_id = connection_to_load.as_ref().and_then(|c| c.workspace_id);
+        // 编辑 / 复制连接回填原分组；纯新建时用新建向导传入的目标分组预选（用户仍可改）。
+        let selected_workspace_id = if connection_to_load.is_some() {
+            connection_to_load.as_ref().and_then(|c| c.workspace_id)
+        } else {
+            config.initial_workspace_id
+        };
 
         let workspace_select = cx.new(|cx| {
             let mut state = SelectState::new(workspace_items, None, window, cx);
@@ -1195,6 +1202,7 @@ mod tests {
     fn initial_connection_prefills_without_edit_mode() {
         let connection = redis_connection("imported redis");
         let config = RedisFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(connection),
             on_saved: None,
@@ -1215,6 +1223,7 @@ mod tests {
     #[test]
     fn editing_connection_takes_precedence_over_initial_connection() {
         let config = RedisFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: Some(redis_connection("existing redis")),
             initial_connection: Some(redis_connection("imported redis")),
             on_saved: None,
@@ -1240,6 +1249,7 @@ mod tests {
             cx.set_global(AppSettings::default());
             cx.open_window(Default::default(), |window, cx| {
                 let config = RedisFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(redis_connection("empty username")),
                     on_saved: None,
@@ -1276,6 +1286,7 @@ mod tests {
             cx.set_global(AppSettings::default());
             cx.open_window(Default::default(), |window, cx| {
                 let config = RedisFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(redis_connection("ai access redis")),
                     on_saved: None,

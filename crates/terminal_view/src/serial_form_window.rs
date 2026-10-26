@@ -35,6 +35,8 @@ use baud_rate::{custom_baud_rate_text, is_valid_baud_rate_text, resolve_baud_rat
 #[derive(Clone)]
 pub struct SerialFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
 }
@@ -351,7 +353,12 @@ impl SerialFormWindow {
         let team_select = create_team_select(&config.teams, None, window, cx);
 
         let mut sync_enabled = true;
-        let mut workspace_id: Option<i64> = None;
+        // 新建连接向导指定了目标分组时预选该分组（编辑连接走下面的回填逻辑）。
+        let mut workspace_id: Option<i64> = if is_editing {
+            None
+        } else {
+            config.initial_workspace_id
+        };
         let mut team_id: Option<String> = None;
 
         // 编辑模式：加载已有数据
@@ -965,6 +972,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SerialFormWindow::new(
                 super::SerialFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: Some(custom_baud_rate_connection()),
                     workspaces: Vec::new(),
                     teams: Vec::new(),
@@ -998,6 +1006,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SerialFormWindow::new(
                 super::SerialFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     workspaces: Vec::new(),
                     teams: Vec::new(),
@@ -1034,6 +1043,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SerialFormWindow::new(
                 super::SerialFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: Some(custom_baud_rate_connection()),
                     workspaces: Vec::new(),
                     teams: Vec::new(),

@@ -76,6 +76,7 @@ impl HomePage {
             return;
         };
         let config = universal_plugins::ExtensionConnectionFormConfig {
+            initial_workspace_id: None,
             contribution,
             editing_connection: Some(connection.clone()),
             workspaces: self.workspaces.clone(),
@@ -182,6 +183,7 @@ impl HomePage {
             .collect();
 
         let config = ConnectionFormWindowConfig {
+            initial_workspace_id: None,
             db_type: db_type.clone(),
             external_driver_id: None,
             external_driver_registry: self.external_driver_registry.clone(),
@@ -236,6 +238,7 @@ impl HomePage {
         }
 
         let config = SshFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(connection),
             on_saved: Some(Arc::new(|saved, _action, window, cx| {
@@ -270,6 +273,7 @@ impl HomePage {
         });
 
         let config = SshFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: editing_conn,
             initial_connection: None,
             on_saved: None,
@@ -310,6 +314,7 @@ impl HomePage {
         });
 
         let config = RedisFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: editing_conn,
             initial_connection: None,
             on_saved: None,
@@ -353,6 +358,7 @@ impl HomePage {
         });
 
         let config = FtpFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: editing_conn,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -391,6 +397,7 @@ impl HomePage {
         });
 
         let config = MongoFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: editing_conn,
             initial_connection: None,
             on_saved: None,
@@ -429,6 +436,7 @@ impl HomePage {
         });
 
         let config = SerialFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: editing_conn,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -467,6 +475,7 @@ impl HomePage {
         });
 
         let config = TelnetFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: editing_conn,
             workspaces: self.workspaces.clone(),
             teams: get_cached_team_options(cx),

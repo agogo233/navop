@@ -411,7 +411,7 @@ impl HomePage {
                     })
                     .on_click(cx.listener(move |home, _, window, cx| {
                         if initial {
-                            home.show_new_connection_dialog(window, cx);
+                            home.show_new_connection_dialog(None, window, cx);
                         } else {
                             home.selected_filter = ConnectionFilter::All;
                             home.clear_workspace_filter(cx);
