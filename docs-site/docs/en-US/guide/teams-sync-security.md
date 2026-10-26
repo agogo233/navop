@@ -1,6 +1,6 @@
 # Teams, sync, and encryption security
 
-Navop supports personal sync and team-shared connection configuration. The website handles OTP sign-in, teams, and membership; the desktop application performs local encryption, decryption, and actual connection use. Cloud storage contains locally produced ciphertext, not directly readable credentials.
+Navop supports personal sync and team-shared connection configuration. The website only handles accounts and OTP sign-in; teams, members, and team keys are managed on the desktop **Team** page. The desktop application performs local encryption, decryption, and actual connection use, and cloud storage contains locally produced ciphertext, not directly readable credentials.
 
 ## Sign in and assign roles
 

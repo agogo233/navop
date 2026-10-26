@@ -29,6 +29,8 @@ pub enum SyncError {
     StorageError(String),
     /// 未登录
     NotLoggedIn,
+    /// 团队管理操作被服务端拒绝（文案已本地化，可直接展示）
+    TeamAdmin(String),
 }
 
 impl SyncError {
@@ -63,6 +65,7 @@ impl std::fmt::Display for SyncError {
             SyncError::DataFormatError(e) => write!(f, "数据格式错误: {}", e),
             SyncError::StorageError(e) => write!(f, "存储错误: {}", e),
             SyncError::NotLoggedIn => write!(f, "请先登录云端账户"),
+            SyncError::TeamAdmin(message) => f.write_str(message),
         }
     }
 }

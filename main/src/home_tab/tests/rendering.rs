@@ -194,7 +194,7 @@ fn connection_render_uses_cached_team_permissions() {
 }
 
 #[test]
-fn team_key_entry_uses_team_management_feature_gate() {
+fn team_entry_uses_team_feature_gate() {
     assert!(
         include_str!("../account_menu.rs")
             .contains("is_feature_enabled(Feature::TeamManagement, cx)")
@@ -208,7 +208,7 @@ fn account_menu_groups_sync_keys_and_authentication() {
         "Encryption.personal_key",
         "Home.unlock_state_unlocked",
         "Home.unlock_state_locked",
-        "Encryption.team_key",
+        "TeamManagement.title",
         "Auth.logout",
         "Auth.login",
     ] {
@@ -501,17 +501,20 @@ fn both_settings_entries_use_the_existing_tab_opener() {
 }
 
 #[test]
-fn team_key_settings_tab_has_feature_guard() {
+fn team_tab_has_feature_guard() {
     let source = include_str!("../../home/home_tabs.rs");
     let entry = source
-        .split("pub(crate) fn add_team_key_settings_tab(")
+        .split("pub(crate) fn add_team_tab(")
         .nth(1)
-        .expect("team key settings entry exists")
+        .expect("team tab entry exists")
         .split("pub(crate) fn add_extensions_tab(")
         .next()
-        .expect("team key settings entry has an end marker");
+        .expect("team tab entry has an end marker");
 
+    // 团队入口仍受 TeamManagement 特性开关控制，且必须落到原生 tab 而不是浏览器。
     assert!(entry.contains("is_feature_enabled(Feature::TeamManagement, cx)"));
+    assert!(entry.contains("TabItem::new(\"team\", \"home\", team_tab)"));
+    assert!(!entry.contains("open_url"));
 }
 
 #[test]

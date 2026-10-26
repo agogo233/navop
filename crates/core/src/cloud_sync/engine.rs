@@ -14,9 +14,12 @@ use super::sync_type::SyncTypeHandler;
 use super::workspace_sync::WorkspaceSyncType;
 use crate::cloud_sync::CloudAccountScope;
 use crate::cloud_sync::client::{CloudApiClient, CloudApiError};
-use crate::cloud_sync::models::{ConflictResolution, SyncResult, Team, TeamMember, TeamRole};
+use crate::cloud_sync::models::{
+    ConflictResolution, SyncResult, Team, TeamMember, TeamMemberWithEmail, TeamRole,
+};
 use crate::cloud_sync::queue::OperationQueue;
 use crate::cloud_sync::service::{CloudSyncService, SyncError};
+use crate::cloud_sync::team_admin::team_admin_error_message;
 use crate::cloud_sync::team_key_envelope::TeamKeyKdfParams;
 use crate::cloud_sync::team_key_manager::{TeamKeyError, TeamKeyLoadStatus, TeamKeyManager};
 use crate::crypto;
@@ -34,6 +37,14 @@ pub type SyncFuture<'a> = Pin<Box<dyn Future<Output = Result<SyncResult, SyncErr
 const TEAM_MEMBER_FETCH_CONCURRENCY: usize = 4;
 
 type TeamRoleLookup = (Team, Result<Option<TeamRole>, CloudApiError>);
+
+/// 团队管理接口错误 → `SyncError`
+///
+/// 服务端原文先在 `team_admin` 里映射成中文，这里用 `TeamAdmin` 承载，
+/// 展示时不会再被加上「网络错误:」这类前缀。
+fn team_admin_sync_error(error: CloudApiError) -> SyncError {
+    SyncError::TeamAdmin(team_admin_error_message(&error))
+}
 
 fn sync_execution_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -726,6 +737,108 @@ impl SyncEngine {
         Ok(())
     }
 
+    // ========================================================================
+    // 团队管理（写操作）
+    // ========================================================================
+
+    /// 创建团队并把当前用户设为 owner，返回新团队 ID。
+    pub async fn create_team(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<String, SyncError> {
+        let team_id = self
+            .cloud_client
+            .create_team_with_owner(name, description)
+            .await
+            .map_err(team_admin_sync_error)?;
+        self.refresh_team_cache_best_effort("创建团队").await;
+        Ok(team_id)
+    }
+
+    /// 更新团队资料（名称 / 描述）。
+    pub async fn update_team_profile(
+        &self,
+        team_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<(), SyncError> {
+        let team = self
+            .cloud_client
+            .update_team_profile(team_id, name, description)
+            .await
+            .map_err(team_admin_sync_error)?;
+        // 服务端已经回传完整团队记录，直接更新缓存，省掉一次列表请求
+        self.update_cached_team(team)?;
+        Ok(())
+    }
+
+    /// 按邮箱把已注册用户加入团队。
+    pub async fn add_team_member(
+        &self,
+        team_id: &str,
+        email: &str,
+        role: TeamRole,
+    ) -> Result<(), SyncError> {
+        self.cloud_client
+            .add_team_member_by_email(team_id, email, role)
+            .await
+            .map_err(team_admin_sync_error)?;
+        self.refresh_team_cache_best_effort("添加团队成员").await;
+        Ok(())
+    }
+
+    /// 获取带邮箱的团队成员列表。
+    pub async fn list_team_members_with_email(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<TeamMemberWithEmail>, SyncError> {
+        self.cloud_client
+            .list_team_members_with_email(team_id)
+            .await
+            .map_err(team_admin_sync_error)
+    }
+
+    /// 修改成员角色。
+    pub async fn set_team_member_role(
+        &self,
+        team_id: &str,
+        member_id: &str,
+        role: TeamRole,
+    ) -> Result<(), SyncError> {
+        self.cloud_client
+            .set_team_member_role(team_id, member_id, role)
+            .await
+            .map_err(team_admin_sync_error)?;
+        self.refresh_team_cache_best_effort("修改成员角色").await;
+        Ok(())
+    }
+
+    /// 管理员移除成员（owner 与 admin 都不可被直接移除；RPC 不支持成员自助退出）。
+    pub async fn remove_team_member(
+        &self,
+        team_id: &str,
+        member_id: &str,
+    ) -> Result<(), SyncError> {
+        self.cloud_client
+            .remove_team_member(team_id, member_id)
+            .await
+            .map_err(team_admin_sync_error)?;
+        self.refresh_team_cache_best_effort("移除团队成员").await;
+        Ok(())
+    }
+
+    /// 刷新本地团队缓存，失败只记日志，不影响已经成功的写操作。
+    async fn refresh_team_cache_best_effort(&self, action: &str) {
+        if let Err(error) = self.refresh_team_key_cache().await {
+            tracing::warn!(
+                "[团队管理] {}后刷新团队缓存失败（不影响主操作）: {}",
+                action,
+                error
+            );
+        }
+    }
+
     /// 使用指定的策略映射应用冲突解决方案
     ///
     /// 允许为每个冲突单独指定解决策略，而不是使用全局策略
@@ -975,7 +1088,9 @@ mod tests {
     use crate::cloud_sync::client::{
         AuthResponse, CloudApiClient, CloudApiError, OAuthResponse, UserInfo,
     };
-    use crate::cloud_sync::models::{CloudSyncData, CloudUserConfig, Team, TeamMember, TeamRole};
+    use crate::cloud_sync::models::{
+        CloudSyncData, CloudUserConfig, Team, TeamMember, TeamMemberWithEmail, TeamRole,
+    };
     use crate::cloud_sync::{CloudAccountScope, CloudSyncService, SyncEngine, TeamKeyLoadStatus};
     use crate::storage::connection::SqliteConnection;
     use crate::storage::migration::run_migrations;
@@ -1205,6 +1320,56 @@ mod tests {
         async fn initialize_team_key(&self, team: &Team) -> Result<Team, CloudApiError> {
             *self.initialized_team.lock().expect("init lock") = Some(team.clone());
             Ok(team.clone())
+        }
+
+        async fn create_team_with_owner(
+            &self,
+            _name: &str,
+            _description: Option<&str>,
+        ) -> Result<String, CloudApiError> {
+            Err(CloudApiError::Unknown("not used".to_string()))
+        }
+
+        async fn update_team_profile(
+            &self,
+            _team_id: &str,
+            _name: &str,
+            _description: Option<&str>,
+        ) -> Result<Team, CloudApiError> {
+            Err(CloudApiError::Unknown("not used".to_string()))
+        }
+
+        async fn add_team_member_by_email(
+            &self,
+            _team_id: &str,
+            _email: &str,
+            _role: TeamRole,
+        ) -> Result<String, CloudApiError> {
+            Err(CloudApiError::Unknown("not used".to_string()))
+        }
+
+        async fn list_team_members_with_email(
+            &self,
+            _team_id: &str,
+        ) -> Result<Vec<TeamMemberWithEmail>, CloudApiError> {
+            Err(CloudApiError::Unknown("not used".to_string()))
+        }
+
+        async fn set_team_member_role(
+            &self,
+            _team_id: &str,
+            _member_id: &str,
+            _role: TeamRole,
+        ) -> Result<(), CloudApiError> {
+            Err(CloudApiError::Unknown("not used".to_string()))
+        }
+
+        async fn remove_team_member(
+            &self,
+            _team_id: &str,
+            _member_id: &str,
+        ) -> Result<(), CloudApiError> {
+            Err(CloudApiError::Unknown("not used".to_string()))
         }
 
         async fn chat(

@@ -14,7 +14,8 @@ use crate::cloud_sync::client::{
     AuthResponse, CloudApiClient, CloudApiError, OAuthResponse, UserInfo,
 };
 use crate::cloud_sync::models::{
-    CloudSyncData, CloudUserConfig, SyncResult, Team, TeamMember, WorkspaceParentLink, data_type,
+    CloudSyncData, CloudUserConfig, SyncResult, Team, TeamMember, TeamMemberWithEmail, TeamRole,
+    WorkspaceParentLink, data_type,
 };
 use crate::cloud_sync::{CloudSyncService, SyncEngine};
 use crate::llm::ChatStream;
@@ -189,6 +190,56 @@ impl CloudApiClient for FakeCloudClient {
 
     async fn list_current_user_team_members(&self) -> Result<Vec<TeamMember>, CloudApiError> {
         Ok(Vec::new())
+    }
+
+    async fn create_team_with_owner(
+        &self,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> Result<String, CloudApiError> {
+        Err(not_used())
+    }
+
+    async fn update_team_profile(
+        &self,
+        _team_id: &str,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> Result<Team, CloudApiError> {
+        Err(not_used())
+    }
+
+    async fn add_team_member_by_email(
+        &self,
+        _team_id: &str,
+        _email: &str,
+        _role: TeamRole,
+    ) -> Result<String, CloudApiError> {
+        Err(not_used())
+    }
+
+    async fn list_team_members_with_email(
+        &self,
+        _team_id: &str,
+    ) -> Result<Vec<TeamMemberWithEmail>, CloudApiError> {
+        Err(not_used())
+    }
+
+    async fn set_team_member_role(
+        &self,
+        _team_id: &str,
+        _member_id: &str,
+        _role: TeamRole,
+    ) -> Result<(), CloudApiError> {
+        Err(not_used())
+    }
+
+    async fn remove_team_member(
+        &self,
+        _team_id: &str,
+        _member_id: &str,
+    ) -> Result<(), CloudApiError> {
+        Err(not_used())
     }
 
     async fn initialize_team_key(&self, _team: &Team) -> Result<Team, CloudApiError> {

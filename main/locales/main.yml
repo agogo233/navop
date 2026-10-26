@@ -1150,6 +1150,179 @@ TeamManagement:
     en: Team
     zh-CN: 团队
     zh-HK: 團隊
+  status_summary:
+    en: "%{teams} teams · %{missing} missing keys"
+    zh-CN: "%{teams} 个团队 · %{missing} 个缺密钥"
+    zh-HK: "%{teams} 個團隊 · %{missing} 個缺密鑰"
+  no_teams:
+    en: No teams yet
+    zh-CN: 还没有团队
+    zh-HK: 尚未有團隊
+  no_teams_hint:
+    en: Sign in to the cloud account and join a team to see it here.
+    zh-CN: 登录云端账户并加入团队后，会显示在这里。
+    zh-HK: 登入雲端帳戶並加入團隊後，會顯示在這裡。
+  members:
+    en: Members
+    zh-CN: 成员
+    zh-HK: 成員
+  members_count:
+    en: "%{count} members"
+    zh-CN: 共 %{count} 人
+    zh-HK: 共 %{count} 人
+  members_loading:
+    en: Loading members...
+    zh-CN: 正在加载成员...
+    zh-HK: 正在載入成員...
+  members_load_failed:
+    en: "Failed to load members: %{error}"
+    zh-CN: 成员加载失败：%{error}
+    zh-HK: 成員載入失敗：%{error}
+  members_empty:
+    en: No members yet
+    zh-CN: 暂无成员
+    zh-HK: 暫無成員
+  member_you:
+    en: you
+    zh-CN: 我
+    zh-HK: 我
+  member_joined:
+    en: Joined
+    zh-CN: 加入于
+    zh-HK: 加入於
+  description_empty:
+    en: No description
+    zh-CN: 未填写描述
+    zh-HK: 未填寫描述
+  owner:
+    en: Owner
+    zh-CN: 拥有者
+    zh-HK: 擁有者
+  created_at:
+    en: Created
+    zh-CN: 创建时间
+    zh-HK: 建立時間
+  read_only_hint:
+    en: "What you can edit depends on your role: owners manage everything, admins manage members."
+    zh-CN: 可编辑范围取决于你的角色：所有者可以管理全部，管理员可以管理成员。
+    zh-HK: 可編輯範圍取決於你的角色：擁有者可以管理全部，管理員可以管理成員。
+  role_owner:
+    en: Owner
+    zh-CN: 拥有者
+    zh-HK: 擁有者
+  role_admin:
+    en: Admin
+    zh-CN: 管理员
+    zh-HK: 管理員
+  role_member:
+    en: Member
+    zh-CN: 成员
+    zh-HK: 成員
+
+  name_too_long:
+    en: Team name cannot exceed %{max} characters
+    zh-CN: 团队名称不能超过 %{max} 个字符
+    zh-HK: 團隊名稱不能超過 %{max} 個字元
+  description_too_long:
+    en: Description cannot exceed %{max} characters
+    zh-CN: 团队描述不能超过 %{max} 个字符
+    zh-HK: 團隊描述不能超過 %{max} 個字元
+  create_team:
+    en: New team
+    zh-CN: 新建团队
+    zh-HK: 建立團隊
+  create_team_title:
+    en: Create team
+    zh-CN: 新建团队
+    zh-HK: 建立團隊
+  team_name_placeholder:
+    en: Team name
+    zh-CN: 团队名称
+    zh-HK: 團隊名稱
+  team_description_placeholder:
+    en: Description (optional)
+    zh-CN: 团队描述（可选）
+    zh-HK: 團隊描述（可選）
+  team_description_hint:
+    en: A short description helps members recognize this team.
+    zh-CN: 一句描述能帮成员认出这个团队。
+    zh-HK: 一句描述能幫成員認出這個團隊。
+  name_required:
+    en: Team name is required
+    zh-CN: 团队名称不能为空
+    zh-HK: 團隊名稱不能為空
+  team_created:
+    en: Team created
+    zh-CN: 团队已创建
+    zh-HK: 團隊已建立
+  edit_profile:
+    en: Edit profile
+    zh-CN: 编辑资料
+    zh-HK: 編輯資料
+  edit_profile_title:
+    en: Edit team profile
+    zh-CN: 编辑团队资料
+    zh-HK: 編輯團隊資料
+  profile_saved:
+    en: Team profile updated
+    zh-CN: 团队资料已更新
+    zh-HK: 團隊資料已更新
+  add_member:
+    en: Add member
+    zh-CN: 邀请成员
+    zh-HK: 邀請成員
+  add_member_title:
+    en: Add team member
+    zh-CN: 邀请团队成员
+    zh-HK: 邀請團隊成員
+  member_email_placeholder:
+    en: Email of a registered user
+    zh-CN: 已注册用户的邮箱
+    zh-HK: 已註冊用戶的電子郵件
+  member_role_pick:
+    en: Role
+    zh-CN: 角色
+    zh-HK: 角色
+  email_required:
+    en: Email is required
+    zh-CN: 邮箱不能为空
+    zh-HK: 電子郵件不能為空
+  email_invalid:
+    en: Enter a valid email address
+    zh-CN: 请输入有效的邮箱地址
+    zh-HK: 請輸入有效的電子郵件地址
+  change_role:
+    en: Role
+    zh-CN: 改角色
+    zh-HK: 改角色
+  change_role_title:
+    en: Change role
+    zh-CN: 修改成员角色
+    zh-HK: 修改成員角色
+  role_changed:
+    en: Role updated
+    zh-CN: 成员角色已更新
+    zh-HK: 成員角色已更新
+  remove_member:
+    en: Remove
+    zh-CN: 移除
+    zh-HK: 移除
+  remove_member_title:
+    en: Remove member
+    zh-CN: 移除成员
+    zh-HK: 移除成員
+  remove_member_confirm:
+    en: "Remove %{email} from this team? They will lose access to team connections."
+    zh-CN: 确定把 %{email} 移出团队吗？对方将失去团队连接的访问权限。
+    zh-HK: 確定把 %{email} 移出團隊嗎？對方將失去團隊連線的存取權限。
+  member_added:
+    en: Member added
+    zh-CN: 成员已加入
+    zh-HK: 成員已加入
+  member_removed:
+    en: Member removed
+    zh-CN: 成员已移除
+    zh-HK: 成員已移除
 
 # 团队同步
 TeamSync:

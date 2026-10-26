@@ -1253,11 +1253,11 @@ impl HomePage {
         });
     }
 
-    pub(crate) fn add_team_key_settings_tab(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 打开原生「团队」tab（团队资料 / 成员 / 团队密钥）。
+    ///
+    /// 过去这里跳浏览器 dashboard，URL 里还带着 access_token / refresh_token；
+    /// 现在全部走桌面端云端 API，网站 dashboard 可以下线。
+    pub(crate) fn add_team_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !is_feature_enabled(Feature::TeamManagement, cx) {
             return;
         }
@@ -1266,10 +1266,11 @@ impl HomePage {
         window.defer(cx, move |window, cx| {
             tab_container.update(cx, |tc, cx| {
                 tc.activate_or_add_tab_lazy(
-                    "settings-team-keys",
-                    |win, cx| {
-                        let settings = cx.new(|cx| SettingsPanel::new_team_keys(win, cx));
-                        TabItem::new("settings-team-keys", "home", settings)
+                    "team",
+                    |window, cx| {
+                        let team_tab = cx.new(|cx| crate::team_tab::TeamTab::new(window, cx));
+                        team_tab.update(cx, |team_tab, cx| team_tab.ensure_loaded(window, cx));
+                        TabItem::new("team", "home", team_tab)
                     },
                     window,
                     cx,
