@@ -21,7 +21,9 @@ use crate::manifest_helpers::{
     ssh_number_field, ssh_password_field, tab, yes_no_options,
 };
 use crate::mssql::connection::MssqlDbConnection;
-use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
+use crate::plugin::{
+    DatabasePlugin, DatabaseUserOperationRequest, PaginatedQuery, SqlCompletionInfo,
+};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
@@ -35,6 +37,80 @@ use crate::types::*;
 /// 二者都要能识别为真，否则索引唯一性这类标志会被误判为假。
 fn mssql_text_is_true(text: &str) -> bool {
     text == "1" || text.eq_ignore_ascii_case("true")
+}
+
+/// SQL Server 从兼容级别 110（SQL Server 2012）开始支持 `OFFSET … FETCH NEXT`。
+///
+/// 从旧版本还原的库即使挂在 2012+ 实例上，兼容级别仍可能停在 100；此时任何
+/// OFFSET/FETCH 分页都会报 “'OFFSET' 附近有语法错误”和“FETCH 语句中选项 NEXT
+/// 的用法无效”，表预览因此整页空白（issue #471）。
+const MSSQL_OFFSET_FETCH_MIN_COMPATIBILITY_LEVEL: i64 = 110;
+
+/// 回退分页在结果集里追加的行号列，展示前由 [`PaginatedQuery`] 去掉。
+const MSSQL_PAGINATION_ROW_NUMBER_COLUMN: &str = "__navop_pagination_rownum__";
+
+fn mssql_offset_fetch_supported(compatibility_level: i64) -> bool {
+    compatibility_level >= MSSQL_OFFSET_FETCH_MIN_COMPATIBILITY_LEVEL
+}
+
+fn mssql_compatibility_level_sql(database: &str) -> String {
+    let database = database.trim().replace('\'', "''");
+    if database.is_empty() {
+        "SELECT compatibility_level FROM sys.databases WHERE database_id = DB_ID()".to_string()
+    } else {
+        format!("SELECT compatibility_level FROM sys.databases WHERE name = N'{database}'")
+    }
+}
+
+/// 探测连接的目标数据库能否使用 OFFSET/FETCH。
+///
+/// 探测本身失败（权限、非 SQL Server 驱动等）时返回 `true`，保持修复前的行为，
+/// 避免把与兼容级别无关的方言差异误判成旧库。
+pub(crate) async fn mssql_supports_offset_fetch(
+    connection: &dyn DbConnection,
+    database: &str,
+) -> Result<bool> {
+    let sql = mssql_compatibility_level_sql(database);
+    let query_result = match connection.query(&sql).await {
+        Ok(SqlResult::Query(query_result)) => query_result,
+        _ => return Ok(true),
+    };
+    let Some(compatibility_level) = crate::metadata_read::metadata_integer(&query_result, 0, 0)?
+    else {
+        return Ok(true);
+    };
+    Ok(mssql_offset_fetch_supported(compatibility_level))
+}
+
+/// 取 `ORDER BY` 子句里的排序表达式；没有排序时用 SQL Server 的任意顺序写法。
+fn mssql_pagination_order_by(order_clause: &str) -> &str {
+    let order_clause = order_clause.trim();
+    order_clause
+        .strip_prefix("ORDER BY")
+        .or_else(|| order_clause.strip_prefix("order by"))
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .unwrap_or("(SELECT NULL)")
+}
+
+/// 兼容级别 < 110 时的分页：用 `ROW_NUMBER()` 包装派生表，兼容 SQL Server 2005+。
+///
+/// 派生表里不允许出现 `ORDER BY`，所以 `base_sql` 必须不含排序子句，排序表达式
+/// 由 `order_clause` 单独传入并放进 `ROW_NUMBER() OVER (...)`。
+pub(crate) fn mssql_legacy_paginated_query(
+    base_sql: &str,
+    limit: usize,
+    offset: usize,
+    order_clause: &str,
+) -> PaginatedQuery {
+    let order_by = mssql_pagination_order_by(order_clause);
+    let rownum = MSSQL_PAGINATION_ROW_NUMBER_COLUMN;
+    let first_row = offset.saturating_add(1);
+    let last_row = offset.saturating_add(limit);
+    PaginatedQuery::new(format!(
+        "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY {order_by}) AS [{rownum}] FROM ({base_sql}) AS [navop_pagination_source]) AS [navop_pagination_page] WHERE [{rownum}] BETWEEN {first_row} AND {last_row} ORDER BY [{rownum}]"
+    ))
+    .with_hidden_result_column(rownum)
 }
 
 /// MSSQL data types (name, description)
@@ -3057,6 +3133,29 @@ ORDER BY name;"#
         }
     }
 
+    async fn supports_offset_fetch_pagination(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+    ) -> Result<bool> {
+        mssql_supports_offset_fetch(connection, database).await
+    }
+
+    fn build_legacy_paginated_query(
+        &self,
+        base_sql: &str,
+        limit: usize,
+        offset: usize,
+        order_clause: &str,
+    ) -> Option<PaginatedQuery> {
+        Some(mssql_legacy_paginated_query(
+            base_sql,
+            limit,
+            offset,
+            order_clause,
+        ))
+    }
+
     fn format_table_reference(&self, database: &str, schema: Option<&str>, table: &str) -> String {
         match schema {
             Some(s) => format!(
@@ -3880,6 +3979,232 @@ mod tests {
         assert_eq!(
             plugin.format_pagination(500, 0, ""),
             " ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY"
+        );
+    }
+
+    /// 只回答兼容级别探测的假连接，用于分页能力分流测试。
+    struct PaginationProbeConnection {
+        config: DbConnectionConfig,
+        compatibility_level: Option<&'static str>,
+    }
+
+    impl PaginationProbeConnection {
+        fn new(compatibility_level: Option<&'static str>) -> Self {
+            Self {
+                config: DbConnectionConfig {
+                    id: "mssql-pagination-probe".to_string(),
+                    name: "SQL Server pagination probe".to_string(),
+                    database_type: DatabaseType::MSSQL,
+                    host: "localhost".to_string(),
+                    port: 1433,
+                    username: "sa".to_string(),
+                    password: String::new(),
+                    credential_reference: None,
+                    database: Some("legacy_compat".to_string()),
+                    service_name: None,
+                    sid: None,
+                    workspace_id: None,
+                    proxy: None,
+                    extra_params: Default::default(),
+                },
+                compatibility_level,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DbConnection for PaginationProbeConnection {
+        fn config(&self) -> &DbConnectionConfig {
+            &self.config
+        }
+
+        fn set_config_database(&mut self, database: Option<String>) {
+            self.config.database = database;
+        }
+
+        async fn connect(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _plugin: &dyn DatabasePlugin,
+            _script: &str,
+            _options: ExecOptions,
+        ) -> Result<Vec<SqlResult>, DbError> {
+            Err(DbError::query(
+                "execute should not be used by pagination tests",
+            ))
+        }
+
+        async fn query(&self, query: &str) -> Result<SqlResult, DbError> {
+            let Some(compatibility_level) = self.compatibility_level else {
+                return Err(DbError::query("compatibility probe denied"));
+            };
+            assert!(
+                query.contains("compatibility_level"),
+                "unexpected probe query: {query}"
+            );
+            Ok(SqlResult::Query(QueryResult {
+                sql: query.to_string(),
+                columns: vec!["compatibility_level".to_string()],
+                column_meta: vec![],
+                rows: vec![vec![Some(compatibility_level.to_string())]],
+                binary_cells: vec![],
+                elapsed_ms: 0,
+                ..Default::default()
+            }))
+        }
+
+        async fn current_database(&self) -> Result<Option<String>, DbError> {
+            Ok(self.config.database.clone())
+        }
+
+        async fn switch_database(&self, _database: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn execute_streaming(
+            &self,
+            _plugin: &dyn DatabasePlugin,
+            _source: SqlSource,
+            _options: ExecOptions,
+            _sender: mpsc::Sender<crate::connection::StreamingProgress>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn offset_fetch_requires_compatibility_level_110() {
+        assert_eq!(false, mssql_offset_fetch_supported(100));
+        assert_eq!(false, mssql_offset_fetch_supported(109));
+        assert_eq!(true, mssql_offset_fetch_supported(110));
+        assert_eq!(true, mssql_offset_fetch_supported(160));
+    }
+
+    #[test]
+    fn compatibility_probe_sql_escapes_database_name() {
+        assert_eq!(
+            "SELECT compatibility_level FROM sys.databases WHERE name = N'O''Brien'",
+            mssql_compatibility_level_sql("O'Brien")
+        );
+        assert_eq!(
+            "SELECT compatibility_level FROM sys.databases WHERE database_id = DB_ID()",
+            mssql_compatibility_level_sql("  ")
+        );
+    }
+
+    #[test]
+    fn legacy_pagination_wraps_row_number_without_offset_fetch() {
+        let query = mssql_legacy_paginated_query(
+            "SELECT * FROM [sales].[dbo].[orders] WHERE [status] = 'open'",
+            25,
+            50,
+            " ORDER BY [id] DESC",
+        );
+
+        let expected = concat!(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY [id] DESC) AS ",
+            "[__navop_pagination_rownum__] FROM (SELECT * FROM [sales].[dbo].[orders] ",
+            "WHERE [status] = 'open') AS [navop_pagination_source]) AS ",
+            "[navop_pagination_page] WHERE [__navop_pagination_rownum__] BETWEEN 51 AND 75 ",
+            "ORDER BY [__navop_pagination_rownum__]",
+        );
+        assert_eq!(expected, query.sql);
+        assert_eq!(false, query.sql.contains("OFFSET"));
+        assert_eq!(false, query.sql.contains("FETCH NEXT"));
+    }
+
+    #[test]
+    fn legacy_pagination_without_order_uses_arbitrary_order() {
+        let query = mssql_legacy_paginated_query("SELECT * FROM [orders]", 10, 0, "");
+
+        assert_eq!(
+            true,
+            query
+                .sql
+                .contains("ROW_NUMBER() OVER (ORDER BY (SELECT NULL))")
+        );
+        assert_eq!(
+            true,
+            query
+                .sql
+                .contains("WHERE [__navop_pagination_rownum__] BETWEEN 1 AND 10")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_compatibility_level_uses_row_number_pagination() {
+        let plugin = create_plugin();
+        let connection = PaginationProbeConnection::new(Some("100"));
+
+        assert_eq!(
+            false,
+            plugin
+                .supports_offset_fetch_pagination(&connection, "legacy_compat")
+                .await
+                .expect("compatibility probe should succeed")
+        );
+
+        let query = plugin
+            .paginated_query_for_connection(
+                &connection,
+                "legacy_compat",
+                "SELECT * FROM [sales].[dbo].[orders]",
+                25,
+                0,
+                " ORDER BY [id]",
+            )
+            .await
+            .expect("legacy pagination should be available");
+
+        assert_eq!(
+            true,
+            query.sql.contains("ROW_NUMBER() OVER (ORDER BY [id])")
+        );
+        assert_eq!(true, query.sql.contains("BETWEEN 1 AND 25"));
+        assert_eq!(false, query.sql.contains("FETCH NEXT"));
+    }
+
+    #[tokio::test]
+    async fn modern_compatibility_level_keeps_offset_fetch() {
+        let plugin = create_plugin();
+        let connection = PaginationProbeConnection::new(Some("150"));
+
+        let query = plugin
+            .paginated_query_for_connection(
+                &connection,
+                "legacy_compat",
+                "SELECT * FROM [sales].[dbo].[orders]",
+                25,
+                50,
+                " ORDER BY [id]",
+            )
+            .await
+            .expect("offset fetch pagination should be available");
+
+        assert_eq!(
+            "SELECT * FROM [sales].[dbo].[orders] ORDER BY [id] OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY",
+            query.sql
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_probe_failure_keeps_offset_fetch() {
+        let plugin = create_plugin();
+        let connection = PaginationProbeConnection::new(None);
+
+        assert_eq!(
+            true,
+            plugin
+                .supports_offset_fetch_pagination(&connection, "legacy_compat")
+                .await
+                .expect("probe failure must not fail table data loading")
         );
     }
 

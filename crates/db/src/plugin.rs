@@ -2096,6 +2096,66 @@ pub trait DatabasePlugin: Send + Sync {
         ))
     }
 
+    /// 该连接能否用 `OFFSET … FETCH NEXT` 分页。
+    ///
+    /// 只有 T-SQL 方言需要覆盖：SQL Server 的 OFFSET/FETCH 可用性取决于目标数据库的
+    /// 兼容级别，级别低于 110 时整条分页 SQL 语法无效（issue #471）。其余数据库保持
+    /// 默认值。
+    async fn supports_offset_fetch_pagination(
+        &self,
+        _connection: &dyn DbConnection,
+        _database: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// 连接不支持 OFFSET/FETCH 时使用的分页实现，`None` 表示该插件没有回退方案。
+    fn build_legacy_paginated_query(
+        &self,
+        _base_sql: &str,
+        _limit: usize,
+        _offset: usize,
+        _order_clause: &str,
+    ) -> Option<PaginatedQuery> {
+        None
+    }
+
+    /// 结合连接能力构建分页查询，表预览、导出与数据比较共用。
+    ///
+    /// `base_sql` 必须**不含** `ORDER BY`：支持 OFFSET/FETCH 时由本方法追加
+    /// `order_clause`；走回退实现时基础查询要作为派生表使用，派生表里不允许出现
+    /// `ORDER BY`。
+    async fn paginated_query_for_connection(
+        &self,
+        connection: &dyn DbConnection,
+        database: &str,
+        base_sql: &str,
+        limit: usize,
+        offset: usize,
+        order_clause: &str,
+    ) -> Result<PaginatedQuery> {
+        if self
+            .supports_offset_fetch_pagination(connection, database)
+            .await?
+        {
+            return Ok(self.build_paginated_query(
+                &format!("{base_sql}{order_clause}"),
+                limit,
+                offset,
+                order_clause,
+            ));
+        }
+
+        self.build_legacy_paginated_query(base_sql, limit, offset, order_clause)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{:?} does not implement legacy pagination, and the connection cannot \
+                     use OFFSET … FETCH NEXT",
+                    self.name()
+                )
+            })
+    }
+
     /// Format table reference for queries. Override for databases with different syntax.
     /// - MySQL: `database`.`table`
     /// - PostgreSQL: "schema"."table" (uses schema, ignores database since connection is db-specific)
@@ -2223,21 +2283,25 @@ pub trait DatabasePlugin: Send + Sync {
         let base_sql = if rowid_projection {
             let rowid_col = self.rowid_column_name();
             format!(
-                "SELECT {} AS {}, t.* FROM {} t{}{}",
+                "SELECT {} AS {}, t.* FROM {} t{}",
                 rowid_col,
                 self.rowid_column_alias(),
                 table_ref,
-                where_clause,
-                order_clause
+                where_clause
             )
         } else {
-            format!(
-                "SELECT * FROM {}{}{}",
-                table_ref, where_clause, order_clause
-            )
+            format!("SELECT * FROM {}{}", table_ref, where_clause)
         };
-        let paginated_query =
-            self.build_paginated_query(&base_sql, request.page_size, offset, &order_clause);
+        let paginated_query = self
+            .paginated_query_for_connection(
+                connection,
+                &request.database,
+                &base_sql,
+                request.page_size,
+                offset,
+                &order_clause,
+            )
+            .await?;
         let sql_result = connection.query(&paginated_query.sql).await?;
         let duration = start_time.elapsed().as_millis();
 
@@ -2845,9 +2909,13 @@ pub trait DatabasePlugin: Send + Sync {
             sql.push_str(" WHERE ");
             sql.push_str(where_clause);
         }
-        let query = limit
-            .map(|limit| self.build_paginated_query(&sql, limit, 0, ""))
-            .unwrap_or_else(|| PaginatedQuery::new(sql));
+        let query = match limit {
+            Some(limit) => {
+                self.paginated_query_for_connection(connection, database, &sql, limit, 0, "")
+                    .await?
+            }
+            None => PaginatedQuery::new(sql),
+        };
         let result = connection
             .query(&query.sql)
             .await
