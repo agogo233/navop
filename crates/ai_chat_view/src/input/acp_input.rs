@@ -2048,6 +2048,7 @@ impl Render for AcpAgentInput {
             // 聚焦时这里的描边转 accent，卡片外框保持安静。
             .child(composer_editor_frame(
                 &theme,
+                self.edge_to_edge,
                 input_focused,
                 Editor::new(&self.input_state)
                     .w_full()

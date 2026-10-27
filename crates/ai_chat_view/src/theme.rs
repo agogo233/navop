@@ -52,8 +52,9 @@ pub struct AgentChatTheme {
     pub raised: Hsla,
     /// 内嵌区表面：输入框、代码槽、inset 容器这类「比卡片更沉一层」的底。
     ///
-    /// 同样属于调色板：终端侧边栏里它就取终端自己的 `muted`，而不是应用主题的
-    /// 输入框底色 —— 后者在浅色主题下是白的，正是「深色面板里一块白」的来源。
+    /// 同样属于调色板：终端侧边栏里它就取终端自己的 `muted`。直接用组件的
+    /// `input_background()` 会出事——它在浅色主题下等于背景色（白），落到深色
+    /// 面板上就是一块白；`ThemeColor::input` 又只是描边色，铺底会变成一块重灰。
     pub inset: Hsla,
 
     // ── 语义槽：面板内的层次与状态色。全部取自宿主主题，不另立调色板，
@@ -267,9 +268,13 @@ fn base_from_app_theme(theme: &Theme) -> AgentChatThemeBase {
         link: theme.link,
         text_selection: theme.selection,
         surface_radius: theme.radius,
-        // 应用主题自己的浮层与输入框底色：`from_app` 出来的主题必须与宿主一致。
+        // 应用主题自己的浮层与内嵌表面：`from_app` 出来的主题必须与宿主一致。
+        //
+        // `inset` 取 `muted` 而不是 `ThemeColor::input`：后者是输入框的**描边**色
+        // （浅色主题下 neutral-200），拿来铺底会把编辑区刷成一块比卡片更重的灰。
+        // 真正的「内嵌一层」在应用主题里就是 `muted`。
         raised: theme.popover,
-        inset: theme.input,
+        inset: theme.muted,
     }
 }
 
@@ -359,7 +364,7 @@ mod tests {
     /// 那会让用量圆环、骨架屏、图表在终端侧边栏里直接隐形。
     ///
     /// 另外卡「表面层必须跟面板底色走」：终端侧边栏配的是深色终端配色，若
-    /// `raised` / `inset` 仍取应用主题（浅色）的 popover / input，浮层与输入框
+    /// `raised` / `inset` 仍取应用主题（浅色）的 popover / muted，浮层与输入框
     /// 就会在深色面板上白成一片 —— 这正是 composer 编辑区白框的来源。
     #[test]
     fn custom_base_colors_keep_application_semantic_slots() {
@@ -376,7 +381,7 @@ mod tests {
         assert_eq!(color(0x2a3a4a), theme.raised);
         assert_eq!(color(0x0a1a2a), theme.inset);
         assert_ne!(application_theme.colors.popover, theme.raised);
-        assert_ne!(application_theme.colors.input, theme.inset);
+        assert_ne!(application_theme.colors.muted, theme.inset);
 
         let colors = &application_theme.colors;
         assert_eq!(colors.danger, theme.danger);
@@ -421,7 +426,7 @@ mod tests {
             assert_eq!(app_theme.colors.skeleton, theme.skeleton);
             // 应用主题自己的表面层要和宿主一致：面板在应用主题下不该有第二种层次。
             assert_eq!(app_theme.colors.popover, theme.raised);
-            assert_eq!(app_theme.colors.input, theme.inset);
+            assert_eq!(app_theme.colors.muted, theme.inset);
             assert!(theme.text_ghost.a > 0.0);
         });
     }

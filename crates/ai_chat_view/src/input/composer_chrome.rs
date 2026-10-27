@@ -119,11 +119,17 @@ pub(crate) fn composer_card(theme: &AgentChatTheme, edge_to_edge: bool) -> Div {
 
 /// 编辑区：内框 + 编辑器本体。
 ///
-/// 内框底色用 `theme.inset`（面板调色板里的「内嵌一层」），不是全局
-/// `input_background()`：后者在浅色应用主题下是白的，会把深色侧栏里的输入框
-/// 点成一块白，只有描边跟面板走是没有用的。
+/// 底色随卡片的形态变，不是两种风格：
+/// - 有卡片框时（应用内的工作台），编辑区就是卡片本身的一块空地，再铺一层底
+///   会变成「白卡片里套灰卡片」，所以不填色，只留描边；
+/// - `edge_to_edge` 时（侧栏里没有卡片框），内框是唯一的分界线，用 `theme.inset`
+///   打底 —— 它是面板调色板里的「内嵌一层」，深色面板取深色、浅色面板取浅灰。
+///
+/// 两处都不用全局 `input_background()`：它在浅色应用主题下等于背景色（白），
+/// 落进深色侧栏就是一块白。
 pub(crate) fn composer_editor_frame(
     theme: &AgentChatTheme,
+    edge_to_edge: bool,
     focused: bool,
     editor: impl IntoElement,
 ) -> Div {
@@ -141,9 +147,19 @@ pub(crate) fn composer_editor_frame(
                 .rounded(theme.surface_radius)
                 .border_1()
                 .border_color(if focused { theme.accent } else { theme.border })
-                .bg(theme.inset)
+                .bg(composer_editor_fill(theme, edge_to_edge))
                 .child(editor),
         )
+}
+
+/// 编辑区内框的底色：卡片有框时不填色（跟卡片一个底色），`edge_to_edge` 时
+/// 用面板的 `inset` 表面。见 [`composer_editor_frame`] 的说明。
+pub(crate) fn composer_editor_fill(theme: &AgentChatTheme, edge_to_edge: bool) -> Hsla {
+    if edge_to_edge {
+        theme.inset
+    } else {
+        theme.background
+    }
 }
 
 /// 参数行：`[能力 chip] … [模型][模式][附件][发送]`。
@@ -403,4 +419,27 @@ fn is_full_width_char(ch: char) -> bool {
             | 0xFFE0..=0xFFE6
             | 0x20000..=0x3FFFD
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// 编辑区底色只有两条规则：卡片有框时不填色，`edge_to_edge` 时用面板的
+    /// `inset`。这张截图级反馈（「卡片里套了一块灰」）就靠这条卡住。
+    #[gpui::test]
+    fn editor_fill_follows_card_form(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let theme = AgentChatTheme::from_app(cx);
+
+            assert_eq!(theme.background, composer_editor_fill(&theme, false));
+            assert_eq!(theme.inset, composer_editor_fill(&theme, true));
+            assert_ne!(
+                theme.background, theme.inset,
+                "`inset` 与卡片底色必须能区分，否则侧栏里的内框就消失了"
+            );
+        });
+    }
 }
