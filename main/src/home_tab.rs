@@ -30,7 +30,6 @@ use one_core::cloud_sync::{
     CloudAccountScope, CloudApiClient, CloudSyncService, SyncConflict, SyncEngine, SyncError,
     TeamOption, UserInfo, get_cached_team_display_options_for_scope, get_cached_team_options,
 };
-use one_core::config::{team_management_url_template, website_base_url};
 use one_core::connection_notifier::{ConnectionDataEvent, emit_connection_event, get_notifier};
 use one_core::crypto;
 use one_core::gpui_tokio::Tokio;
@@ -74,7 +73,6 @@ use crate::local_terminal_profiles::{
 };
 use crate::new_connection::NewConnectionWindow;
 use crate::setting_tab::GlobalCurrentUser;
-use crate::team_management::{build_team_management_url, resolve_team_management_url};
 use remote_desktop_view::remote_desktop_form::{
     RemoteDesktopFormWindow, RemoteDesktopFormWindowConfig,
 };

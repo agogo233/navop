@@ -5,8 +5,8 @@
 //! [`AgentTranscript::apply`],再渲染 `messages`。
 
 use agent_runtime::{
-    HistoryItem, PendingToolCallSummary, Plan, PlanStatus, ResourceContext, RuntimeEvent,
-    StepStatus, ToolObservation,
+    FileChange, HistoryItem, PendingToolCallSummary, Plan, PlanStatus, ResourceContext,
+    RuntimeEvent, StepStatus, ToolAction, ToolObservation,
     ids::{ToolCallId, TurnId},
 };
 use rust_i18n::t;
@@ -15,13 +15,15 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::acp::{AcpPermissionOption, AcpPermissionRequest, AcpPublicMcpApprovalRequest};
 use crate::agent_cards::{
-    ACP_PERMISSION_CARD, AcpPermissionCardData, AcpPermissionOptionData, PlanCardData,
-    PlanStepData, SUBAGENT_CARD, SubAgentCardData, TOOL_CARD, TOOL_CONFIRM_CARD, ToolCardData,
-    ToolConfirmCardData, ToolConfirmItemData,
+    ACP_PERMISSION_CARD, AcpPermissionCardData, AcpPermissionOptionData, COMPACTION_CARD,
+    CompactionCardData, PLAN_CARD, PlanCardData, PlanStepData, SUBAGENT_CARD, SubAgentCardData,
+    TOOL_CARD, TOOL_CONFIRM_CARD, ToolCardData, ToolConfirmCardData, ToolConfirmItemData,
 };
+use crate::agent_diff::FileChangeSummary;
 use crate::agent_tool_input::build_tool_input_display;
 use crate::code_block::extract_fenced_code_blocks;
-use crate::{ChatMessageUI, MessageVariant, parse_chart_json_block};
+use crate::message_image::MessageImage;
+use crate::{ChatMessageUI, ChatRole, MessageVariant, parse_chart_json_block};
 
 mod acp;
 
@@ -38,6 +40,8 @@ const MAX_CACHED_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CARD_FIELD_BYTES: usize = 64 * 1024;
 const MAX_CARD_ITEM_FIELD_BYTES: usize = 8 * 1024;
 const MAX_CARD_COLLECTION_ITEMS: usize = 64;
+/// 一张工具卡片最多带几个文件的改动。超出部分不进卡片(计数也不再累计)。
+const MAX_CARD_FILE_CHANGES: usize = 8;
 const TRANSCRIPT_TRUNCATION_MARKER: &str = "[...earlier content truncated...]\n";
 const DELEGATE_TASK_TOOL: &str = "delegate_task";
 
@@ -73,6 +77,17 @@ enum TerminalEventKey {
 pub struct AgentTranscript {
     /// 渲染用的消息列表。
     pub messages: Vec<ChatMessageUI>,
+    /// 当前轮次；`apply` 入口从事件统一提取，其后所有新消息据此打标。
+    ///
+    /// 不做「按下标推断」：轮次归属必须来自 `RuntimeEvent::*::turn_id`，否则
+    /// 迟到的旧轮次事件会被算进当前轮。
+    current_turn: Option<String>,
+    /// 因预算被淘汰的消息条数；>0 时 UI 应显式提示历史被裁断。
+    dropped_messages: usize,
+    /// 内容修订号：任何可能改变**可搜索文本**的写入都会 +1。
+    ///
+    /// 会话内搜索不必每帧全量重算，只在这个号变化时刷新。
+    revision: u64,
     /// 当前流式助手消息 id(若正在流式)。
     streaming_id: Option<String>,
     /// 当前轻量状态消息 id(若存在未完成状态)。
@@ -81,6 +96,8 @@ pub struct AgentTranscript {
     acp_status_id: Option<String>,
     /// 本轮最新计划(渲染到输入框上方的 Tasks 面板,不进消息流)。
     latest_plan: Option<PlanCardData>,
+    /// 本轮计划在消息流里那一行的 id；计划更新时只改这一条。
+    plan_message_id: Option<String>,
     /// 当前会话最近的子代理(渲染到输入框上方的子代理面板,不进消息流)。
     active_subagents: Vec<SubAgentCardData>,
     /// 当前资源池 id -> label 快照,用于工具结果卡片展示目标资源。
@@ -89,6 +106,12 @@ pub struct AgentTranscript {
     tool_inputs: HashMap<String, serde_json::Value>,
     /// 原始工具入参插入顺序,用于淘汰长期未完成的陈旧调用。
     tool_input_order: VecDeque<String>,
+    /// Public MCP 审批请求 id 集合。
+    ///
+    /// Public MCP 审批与本地工具确认共用 `agent.confirm` 卡片，只靠卡片本身分不出授权域。
+    /// 这里记下身份，供 [`AgentTranscript::pending_decisions`] 标注正确的来源，
+    /// **不参与任何解析路径**——三个授权域各自走各自的入口，绝不合并。
+    public_mcp_ids: HashSet<String>,
     /// 已归约的审批/终态事件,防止重复事件写入转录或触发持久化。
     terminal_events: HashSet<TerminalEventKey>,
     /// 已归约事件插入顺序,只保留有限的近期去重窗口。
@@ -146,15 +169,50 @@ impl AgentTranscript {
     /// 清空(切换 / 新建会话)。
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.dropped_messages = 0;
+        self.touch();
+        self.current_turn = None;
         self.streaming_id = None;
         self.active_status_id = None;
         self.acp_status_id = None;
         self.latest_plan = None;
+        self.plan_message_id = None;
         self.active_subagents.clear();
         self.tool_inputs.clear();
         self.tool_input_order.clear();
+        self.public_mcp_ids.clear();
         self.terminal_events.clear();
         self.terminal_event_order.clear();
+    }
+
+    /// 屏幕上是否还没有任何内容。
+    ///
+    /// 两个用途都关于「切后端会不会让用户觉得东西被吃掉」：空转录切去 ACP 不必提示
+    /// 「本地这段不会带过去」；空转录也不该进会话缓存——缓存里留个空壳会遮蔽
+    /// Runtime 快照重建（见 `AgentChatView::restore_local_transcript`），
+    /// 让「切回本地」看起来像历史丢了。
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// 屏幕上是否已经有「真正的对话」——用户或助手说过话。
+    ///
+    /// 与 [`Self::is_empty`] 的差别：只有系统提示（「正在创建 ACP 会话」之类）时
+    /// 这仍然是 `false`。「新建会话」要不要复用上一张白纸就看这条，
+    /// 见 `AgentChatView::current_session_is_blank`。
+    pub fn has_conversation(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| matches!(message.role, ChatRole::User | ChatRole::Assistant))
+    }
+
+    /// 当前未决的决策清单：时间线卡片与输入区决策栏**共用**这一份。
+    ///
+    /// 顺序即出现顺序；同一身份只出现一次（卡片就地替换时不会重复）。
+    pub fn pending_decisions(&self) -> Vec<crate::PendingDecision> {
+        crate::pending_decision::pending_decisions(&self.messages, |call_id| {
+            self.public_mcp_ids.contains(call_id)
+        })
     }
 
     /// 当前轮的最新计划(供输入框上方的 Tasks 面板渲染;不进消息流)。
@@ -220,8 +278,7 @@ impl AgentTranscript {
             selected_option_name: String::new(),
         };
         bound_acp_permission_data(&mut data, self.card_field_limit());
-        self.messages
-            .push(ChatMessageUI::card(ACP_PERMISSION_CARD, data.to_json()));
+        self.push_message(ChatMessageUI::card(ACP_PERMISSION_CARD, data.to_json()));
         self.enforce_budget();
     }
 
@@ -264,7 +321,9 @@ impl AgentTranscript {
         self.clear();
         for item in items {
             match item {
-                HistoryItem::User { text, images } => self.push_user(text, images.len()),
+                HistoryItem::User { text, images } => {
+                    self.push_user(text, crate::message_image::images_from_inputs(images))
+                }
                 HistoryItem::Assistant(text) => {
                     self.messages.push(ChatMessageUI::assistant(text.clone()));
                 }
@@ -278,19 +337,15 @@ impl AgentTranscript {
                 HistoryItem::ContextSummary {
                     text,
                     original_items,
-                } => self.push_system(
-                    t!(
-                        "AgentUi.context_summary",
-                        count = original_items,
-                        text = text
-                    )
-                    .to_string(),
-                ),
+                } => self.push_compaction(text, *original_items),
                 HistoryItem::ToolCall(call) => {
                     if !self.push_delegate_task_from_history(call) {
+                        // 历史条目里没有协议声明的动作类别,只能按第一方工具名
+                        // 表回推;推不出来就退化成显示工具名(渲染层已经这么做了)。
                         self.push_tool_call(
                             call.call_id.as_str(),
                             call.tool_name.as_str(),
+                            ToolAction::from_tool_name(call.tool_name.as_str()),
                             &call.arguments,
                         );
                     }
@@ -301,6 +356,8 @@ impl AgentTranscript {
                         self.finish_tool_call(obs.call_id.as_str(), obs.success);
                     }
                 }
+                // 工具声明是 transcript 事实记录，不产生 UI 气泡。
+                HistoryItem::ToolsDeclared { .. } => {}
             }
             // 历史恢复也逐项收敛,避免先完整装载大历史再统一淘汰的峰值。
             self.enforce_budget();
@@ -313,33 +370,65 @@ impl AgentTranscript {
 
     /// 追加一条系统提示。
     pub fn push_system(&mut self, text: impl Into<String>) {
-        self.messages.push(ChatMessageUI::system(text));
+        self.push_message(ChatMessageUI::system(text));
+        self.enforce_budget();
+    }
+
+    /// 追加一条对话压缩记录。
+    ///
+    /// 只写一行「对话已压缩 N 条历史」—— 摘要是给模型续写用的，不是给人读的；
+    /// 过去把它整段铺在转录里，翻历史时满屏都是它。正文留在展开里。
+    pub fn push_compaction(&mut self, text: &str, original_items: usize) {
+        let data = CompactionCardData {
+            items: original_items,
+            text: text.to_string(),
+        };
+        self.push_message(ChatMessageUI::card(COMPACTION_CARD, data.to_json()));
         self.enforce_budget();
     }
 
     /// 追加用户消息(提交时由视图调用;`image_count` 用于提示附带图片)。
-    pub fn push_user(&mut self, text: &str, image_count: usize) {
-        let content = if image_count > 0 {
-            t!(
-                "AgentUi.message_with_images",
-                text = text,
-                count = image_count
-            )
-            .to_string()
-        } else {
-            text.to_string()
-        };
-        self.messages.push(ChatMessageUI::user(content));
+    /// 追加一条用户消息。
+    ///
+    /// `images` 是**已经解成可渲染图片**的附件——附件持的是 `Arc<Image>`，这里
+    /// 不再做编解码，免得每帧 render 路径上重复解 base64。图片画在图槽里，
+    /// 不再往正文里补「[附带 N 张图片]」的说明：缩略图本身已经说明了这件事。
+    pub fn push_user(&mut self, text: &str, images: Vec<MessageImage>) {
+        self.push_message(ChatMessageUI::user(text).with_images(images));
         self.enforce_budget();
+    }
+
+    /// 追加一条来自运行时事件 / ACP 回放的用户消息。
+    ///
+    /// ACP agent 会把带图片的 prompt 原样重放回来，图片在那条 update 里是
+    /// `![](data:image/…;base64,…)` 的 markdown。不抠出来就会以纯文本形式把
+    /// 一大段 base64 铺进气泡——恢复历史时看到的就是那串东西。
+    fn push_user_from_text(&mut self, text: &str) {
+        let (text, images) = crate::message_image::split_data_url_images(text);
+        self.push_user(&text, images);
     }
 
     /// 应用一个运行时事件,更新消息列表。
     pub fn apply(&mut self, event: &RuntimeEvent) -> bool {
+        // 轮次归属：先更新当前轮，再归约，保证本轮所有消息都带上正确的 `turn_id`。
+        if let Some(turn_id) = event_turn_id(event) {
+            let turn_id = turn_id.as_str().to_string();
+            if self.current_turn.as_deref() != Some(turn_id.as_str()) {
+                // 新的一轮：计划行也归新一轮。旧那一行留在它发生的那一轮里 ——
+                // 往回翻历史时，应该看到「当时打算怎么做」，而不是最后的结果。
+                self.plan_message_id = None;
+            }
+            self.current_turn = Some(turn_id);
+        }
         if let Some(key) = terminal_event_key(event)
             && !self.record_terminal_event(key)
         {
             return false;
         }
+        // 内容修订号在这里统一推进：`apply` 是运行时驱动变更的**唯一**入口
+        // （含流式增量），把 `touch` 放在各分支里迟早会漏一个。
+        // 幂等事件已在上面提前返回，不会白白计数。
+        self.touch();
         match event {
             RuntimeEvent::TurnStarted { .. }
             | RuntimeEvent::AssistantMessageDelta { .. }
@@ -372,8 +461,10 @@ impl AgentTranscript {
             }
             RuntimeEvent::AssistantMessageDelta { delta, .. } => self.append_delta(delta),
             RuntimeEvent::ReasoningDelta { delta, .. } => self.append_reasoning_delta(delta),
-            RuntimeEvent::AssistantMessage { text, .. } => self.finalize_assistant(text),
-            RuntimeEvent::UserMessage { text, .. } => self.push_user(text, 0),
+            RuntimeEvent::AssistantMessage {
+                text, reasoning, ..
+            } => self.finalize_assistant(text, reasoning.as_deref()),
+            RuntimeEvent::UserMessage { text, .. } => self.push_user_from_text(text),
             RuntimeEvent::Status { title, is_done, .. } => self.upsert_status(title, *is_done),
             _ => unreachable!("non-message event routed to apply_message_event"),
         }
@@ -408,9 +499,10 @@ impl AgentTranscript {
             RuntimeEvent::ToolCallStarted {
                 call_id,
                 tool_name,
+                kind,
                 arguments,
                 ..
-            } => self.push_tool_call(call_id.as_str(), tool_name.as_str(), arguments),
+            } => self.push_tool_call(call_id.as_str(), tool_name.as_str(), *kind, arguments),
             RuntimeEvent::ObservationAdded { observation, .. } => {
                 self.apply_observation(observation)
             }
@@ -460,8 +552,7 @@ impl AgentTranscript {
             status: "pending".into(),
         };
         bound_tool_confirm_data(&mut data, self.card_field_limit());
-        self.messages
-            .push(ChatMessageUI::card(TOOL_CONFIRM_CARD, data.to_json()));
+        self.push_message(ChatMessageUI::card(TOOL_CONFIRM_CARD, data.to_json()));
         self.enforce_budget();
     }
 
@@ -469,6 +560,7 @@ impl AgentTranscript {
         if self.has_pending_tool_confirm(&request.request_id) {
             return;
         }
+        self.public_mcp_ids.insert(request.request_id.clone());
         self.finish_active_status();
         self.close_streaming_segment();
         let arguments = request
@@ -490,8 +582,7 @@ impl AgentTranscript {
             status: "pending".into(),
         };
         bound_tool_confirm_data(&mut data, self.card_field_limit());
-        self.messages
-            .push(ChatMessageUI::card(TOOL_CONFIRM_CARD, data.to_json()));
+        self.push_message(ChatMessageUI::card(TOOL_CONFIRM_CARD, data.to_json()));
         self.enforce_budget();
     }
 
@@ -500,13 +591,13 @@ impl AgentTranscript {
         match event {
             RuntimeEvent::TurnFailed { reason, .. } => {
                 self.streaming_id = None;
-                self.messages.push(ChatMessageUI::system(
+                self.push_message(ChatMessageUI::system(
                     t!("AgentUi.task_failed_warning", error = reason).to_string(),
                 ));
             }
             RuntimeEvent::TurnCancelled { .. } => {
                 self.close_streaming_segment();
-                self.messages.push(ChatMessageUI::system(
+                self.push_message(ChatMessageUI::system(
                     t!("AgentUi.task_cancelled").to_string(),
                 ));
             }
@@ -529,7 +620,7 @@ impl AgentTranscript {
         append_bounded(&mut content, delta, self.budget.max_field_bytes);
         let msg = ChatMessageUI::streaming_assistant().with_content(content);
         self.streaming_id = Some(msg.id.clone());
-        self.messages.push(msg);
+        self.push_message(msg);
     }
 
     fn append_reasoning_delta(&mut self, delta: &str) {
@@ -551,23 +642,36 @@ impl AgentTranscript {
             self.budget.max_field_bytes,
         );
         self.streaming_id = Some(msg.id.clone());
-        self.messages.push(msg);
+        self.push_message(msg);
     }
 
-    fn finalize_assistant(&mut self, text: &str) {
+    /// 落最终文本。`reasoning_final` 为思考终值：
+    /// - `Some`：整体替换累积值（broadcast 滞后丢增量时的自愈路径）；
+    /// - `None`：沿用已累积的增量（旧语义，例如 ACP 回放）。
+    fn finalize_assistant(&mut self, text: &str, reasoning_final: Option<&str>) {
         self.finish_active_status();
         if let Some(id) = self.streaming_id.take() {
             if let Some(index) = self.messages.iter().position(|m| m.id == id) {
-                let reasoning = self.messages[index].reasoning_content.clone();
+                let reasoning = reasoning_final
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.messages[index].reasoning_content.clone());
                 let mut messages = assistant_messages_from_content(text);
                 if let Some(first) = messages.first_mut() {
                     first.reasoning_content = reasoning;
                 }
+                let messages = self.stamp_turn(messages);
                 self.messages.splice(index..=index, messages);
                 return;
             }
         }
-        self.messages.extend(assistant_messages_from_content(text));
+        let mut messages = assistant_messages_from_content(text);
+        if let Some(reasoning) = reasoning_final
+            && let Some(first) = messages.first_mut()
+        {
+            first.reasoning_content = reasoning.to_owned();
+        }
+        let messages = self.stamp_turn(messages);
+        self.messages.extend(messages);
     }
 
     fn close_streaming_segment(&mut self) {
@@ -580,6 +684,7 @@ impl AgentTranscript {
             if let Some(first) = messages.first_mut() {
                 first.reasoning_content = reasoning;
             }
+            let messages = self.stamp_turn(messages);
             self.messages.splice(index..=index, messages);
         }
     }
@@ -602,7 +707,7 @@ impl AgentTranscript {
         if !is_done {
             self.active_status_id = Some(msg.id.clone());
         }
-        self.messages.push(msg);
+        self.push_message(msg);
     }
 
     fn finish_active_status(&mut self) {
@@ -614,12 +719,39 @@ impl AgentTranscript {
     // ===== 计划卡片 =====
 
     fn upsert_plan(&mut self, plan: &Plan) {
-        self.latest_plan = Some(plan_to_card(plan));
+        let card = plan_to_card(plan);
+        self.latest_plan = Some(card.clone());
+        self.sync_plan_row(&card);
+    }
+
+    /// 把计划同步到消息流里那一行。
+    ///
+    /// 计划会被反复更新，行只有一条：找到就改内容，找不到（新一轮、被预算
+    /// 淘汰、历史重建）就补一条。不改位置 —— 计划应该留在它发生的那一刻，
+    /// 而不是被后续的工具调用推到末尾。
+    fn sync_plan_row(&mut self, plan: &PlanCardData) {
+        let content = plan.to_json();
+        if let Some(id) = self.plan_message_id.as_deref()
+            && let Some(message) = self.messages.iter_mut().find(|message| message.id == id)
+        {
+            message.content = content;
+            self.touch();
+            return;
+        }
+        let message = ChatMessageUI::card(PLAN_CARD, content);
+        self.plan_message_id = Some(message.id.clone());
+        self.push_message(message);
     }
 
     // ===== 工具卡片 =====
 
-    fn push_tool_call(&mut self, call_id: &str, tool_name: &str, arguments: &serde_json::Value) {
+    fn push_tool_call(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        kind: ToolAction,
+        arguments: &serde_json::Value,
+    ) {
         self.finish_active_status();
         self.close_streaming_segment();
         self.cache_tool_input(call_id, arguments);
@@ -627,6 +759,7 @@ impl AgentTranscript {
         let mut data = ToolCardData {
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
+            action: kind,
             target_id: None,
             target_label: None,
             input_summary: input.summary,
@@ -635,10 +768,11 @@ impl AgentTranscript {
             success: None,
             summary: String::new(),
             data_text: String::new(),
+            file_changes: Vec::new(),
+            duration_ms: None,
         };
         bound_tool_card_data(&mut data, self.card_field_limit());
-        self.messages
-            .push(ChatMessageUI::card(TOOL_CARD, data.to_json()));
+        self.push_message(ChatMessageUI::card(TOOL_CARD, data.to_json()));
     }
 
     fn apply_observation(&mut self, obs: &ToolObservation) {
@@ -646,7 +780,15 @@ impl AgentTranscript {
         let summary = obs.summary.clone();
         let data_text = truncate_chars(&obs.data.to_text(), max_data_chars_for_tool(obs));
         let success = obs.success;
-        let target_id = obs.resource_id.as_ref().map(|id| id.as_str().to_string());
+        let file_changes = file_change_summaries(&obs.file_changes);
+        let duration_ms = Some(obs.duration_ms()).filter(|ms| *ms > 0);
+        // 目标优先级:改动过的文件 → agent 声明这次调用指向什么 → 资源。
+        // 三者都是「产出方声明」,不是从工具名反推。
+        let target_id = file_changes
+            .first()
+            .map(|change| change.path.clone())
+            .or_else(|| obs.target.clone())
+            .or_else(|| obs.resource_id.as_ref().map(|id| id.as_str().to_string()));
         let target_label = target_id.as_ref().map(|id| {
             self.resource_labels
                 .get(id)
@@ -659,24 +801,41 @@ impl AgentTranscript {
             data.target_label = target_label;
             data.summary = summary;
             data.data_text = data_text;
+            data.file_changes = file_changes;
+            data.duration_ms = duration_ms;
             data.success = Some(success);
+            // 调用开始时 agent 可能还没给出入参(ACP 的 `tool_call` 只有占位),真实
+            // 入参随终态一起到。这里覆盖,而不是只在为空时补 —— 行标题按「这一行说了
+            // 什么」取,占位留着就会一直显示成 `bash {"cwd": …}`。
+            if let Some(arguments) = obs.arguments.as_ref() {
+                let input = build_tool_input_display(&data.tool_name, arguments);
+                data.input_summary = input.summary;
+                data.input_json = input.json;
+            }
             self.replace_tool_card(&call_id, data);
         } else {
             // 防御:没有对应的开始事件,直接建一张完成态卡片。
+            let input = obs
+                .arguments
+                .as_ref()
+                .map(|arguments| build_tool_input_display(obs.tool_name.as_str(), arguments))
+                .unwrap_or_default();
             let data = ToolCardData {
                 call_id,
                 tool_name: obs.tool_name.to_string(),
+                action: ToolAction::from_tool_name(obs.tool_name.as_str()),
                 target_id,
                 target_label,
-                input_summary: String::new(),
-                input_json: String::new(),
+                input_summary: input.summary,
+                input_json: input.json,
                 running: false,
                 success: Some(success),
                 summary,
                 data_text,
+                file_changes,
+                duration_ms,
             };
-            self.messages
-                .push(ChatMessageUI::card(TOOL_CARD, data.to_json()));
+            self.push_message(ChatMessageUI::card(TOOL_CARD, data.to_json()));
         }
     }
 
@@ -843,8 +1002,7 @@ impl AgentTranscript {
         };
         bound_subagent_data(&mut data, self.card_field_limit());
         self.upsert_active_subagent(data.clone());
-        self.messages
-            .push(ChatMessageUI::card(SUBAGENT_CARD, data.to_json()));
+        self.push_message(ChatMessageUI::card(SUBAGENT_CARD, data.to_json()));
     }
 
     fn update_subagent(&mut self, subagent_id: &str, summary: &str) {
@@ -920,6 +1078,9 @@ impl AgentTranscript {
     }
 
     fn enforce_budget(&mut self) {
+        // 预算是**所有写入路径的汇合点**（`apply`、各 `push_*`、卡片就地替换都经过它），
+        // 因此修订号在这里递增，就不必在每个写入点各记一次、也不会漏。
+        self.touch();
         if self.budget_deferred {
             return;
         }
@@ -997,8 +1158,61 @@ impl AgentTranscript {
         true
     }
 
+    /// 累计被预算淘汰的消息条数。
+    pub fn dropped_messages(&self) -> usize {
+        self.dropped_messages
+    }
+
+    /// 内容修订号。写入路径每变更一次 +1；会话内搜索据此决定是否重算命中。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// 标记内容已变更。
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// 当前轮次（无运行时轮次时为 `None`）。
+    pub fn current_turn_id(&self) -> Option<&str> {
+        self.current_turn.as_deref()
+    }
+
+    /// 屏幕上第一条用户消息的内容（去空白后为空的不算）。
+    ///
+    /// 用在「会话归外部 agent 管、本地没有快照历史」的地方：侧栏那行总得有个名字，
+    /// 而此刻能代表这段对话的只有用户说的第一句话。
+    pub fn first_user_text(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .find(|message| message.role == ChatRole::User && !message.content.trim().is_empty())
+            .map(|message| message.content.as_str())
+    }
+
+    /// 给消息打上当前轮次并推入列表。
+    ///
+    /// 所有新消息都走这里：**唯一**的轮次落值点，避免某个分支漏打标。
+    /// 对外公开是为了让「直接往 `messages` 里塞」这件事没有存在的必要
+    /// —— 那样会绕过修订号，会话内搜索就永远不知道内容变了。
+    pub fn push_message(&mut self, msg: ChatMessageUI) {
+        self.messages
+            .push(msg.with_turn_id(self.current_turn.clone()));
+        self.touch();
+    }
+
+    /// 批量打标（`splice` / `extend` 路径用）。
+    fn stamp_turn(&self, messages: Vec<ChatMessageUI>) -> Vec<ChatMessageUI> {
+        let turn = self.current_turn.clone();
+        messages
+            .into_iter()
+            .map(|msg| msg.with_turn_id(turn.clone()))
+            .collect()
+    }
+
     fn remove_message(&mut self, index: usize) {
+        self.dropped_messages += 1;
         let removed = self.messages.remove(index);
+        self.touch();
         if self.streaming_id.as_deref() == Some(removed.id.as_str()) {
             self.streaming_id = None;
         }
@@ -1012,6 +1226,12 @@ impl AgentTranscript {
             && let Some(data) = ToolCardData::from_json(&removed.content)
         {
             self.remove_tool_input(&data.call_id);
+        }
+        if removed.variant.card_kind() == Some(TOOL_CONFIRM_CARD)
+            && let Some(data) = ToolConfirmCardData::from_json(&removed.content)
+        {
+            // 卡片被预算淘汰后，授权域标注也必须一起消失，避免身份集合无界增长。
+            self.public_mcp_ids.remove(&data.call_id);
         }
     }
 }
@@ -1074,7 +1294,31 @@ fn truncate_card_fields(message: &mut ChatMessageUI, max_bytes: usize) {
                 message.content = data.to_json();
             }
         }
+        PLAN_CARD => {
+            if let Some(mut data) = PlanCardData::from_json(&message.content) {
+                bound_plan_data(&mut data, max_bytes);
+                message.content = data.to_json();
+            }
+        }
+        COMPACTION_CARD => {
+            if let Some(mut data) = CompactionCardData::from_json(&message.content) {
+                truncate_to_recent(&mut data.text, max_bytes);
+                message.content = data.to_json();
+            }
+        }
         _ => {}
+    }
+}
+
+/// 计划行的体积上限：目标与每一步都可能有长描述，逐字段收敛。
+fn bound_plan_data(data: &mut PlanCardData, max_bytes: usize) {
+    truncate_to_recent(&mut data.goal, max_bytes);
+    data.steps.truncate(MAX_CARD_COLLECTION_ITEMS);
+    let step_max_bytes = max_bytes.min(MAX_CARD_ITEM_FIELD_BYTES);
+    for step in &mut data.steps {
+        truncate_to_recent(&mut step.title, step_max_bytes);
+        truncate_to_recent(&mut step.description, step_max_bytes);
+        truncate_to_recent(&mut step.risk, step_max_bytes);
     }
 }
 
@@ -1090,6 +1334,30 @@ fn bound_tool_card_data(data: &mut ToolCardData, max_bytes: usize) {
     truncate_to_recent(&mut data.input_json, max_bytes);
     truncate_to_recent(&mut data.summary, max_bytes);
     truncate_to_recent(&mut data.data_text, max_bytes);
+    // 文件改动里的路径同样要设上限:路径由外部 agent 提供,不能假设它短。
+    data.file_changes.truncate(MAX_CARD_FILE_CHANGES);
+    let path_max_bytes = max_bytes.min(MAX_CARD_ITEM_FIELD_BYTES);
+    for change in &mut data.file_changes {
+        truncate_to_recent(&mut change.path, path_max_bytes);
+    }
+}
+
+/// 观测里的文件改动 → 卡片摘要。
+///
+/// 改动前后的**完整文本在这里被丢掉**:卡片只需要「路径 + 增删计数 + 十几行
+/// diff」。留着全文的话,一次大文件编辑就能把单条消息的 JSON 撑到几百 KB。
+fn file_change_summaries(changes: &[FileChange]) -> Vec<FileChangeSummary> {
+    changes
+        .iter()
+        .take(MAX_CARD_FILE_CHANGES)
+        .map(|change| {
+            FileChangeSummary::from_texts(
+                change.path.clone(),
+                change.old_text.as_deref(),
+                &change.new_text,
+            )
+        })
+        .collect()
 }
 
 fn bound_tool_confirm_data(data: &mut ToolConfirmCardData, max_bytes: usize) {
@@ -1215,6 +1483,33 @@ fn utf8_suffix(text: &str, max_bytes: usize) -> &str {
         start += 1;
     }
     &text[start..]
+}
+
+/// 取出事件归属的轮次。
+///
+/// **穷举** `RuntimeEvent` 全部变体（当前 18 个一律带 `turn_id`）：这样以后新增变体
+/// 时编译器会强制在这里表态，不会静默漏掉一个轮次来源。
+fn event_turn_id(event: &RuntimeEvent) -> Option<&TurnId> {
+    match event {
+        RuntimeEvent::TurnStarted { turn_id, .. }
+        | RuntimeEvent::PlanUpdated { turn_id, .. }
+        | RuntimeEvent::ToolCallStarted { turn_id, .. }
+        | RuntimeEvent::ToolCallFinished { turn_id, .. }
+        | RuntimeEvent::SubAgentStarted { turn_id, .. }
+        | RuntimeEvent::SubAgentUpdated { turn_id, .. }
+        | RuntimeEvent::SubAgentFinished { turn_id, .. }
+        | RuntimeEvent::ObservationAdded { turn_id, .. }
+        | RuntimeEvent::AssistantMessageDelta { turn_id, .. }
+        | RuntimeEvent::ReasoningDelta { turn_id, .. }
+        | RuntimeEvent::AssistantMessage { turn_id, .. }
+        | RuntimeEvent::UserMessage { turn_id, .. }
+        | RuntimeEvent::Status { turn_id, .. }
+        | RuntimeEvent::NeedUserInput { turn_id, .. }
+        | RuntimeEvent::ToolApprovalResolved { turn_id, .. }
+        | RuntimeEvent::TurnCompleted { turn_id, .. }
+        | RuntimeEvent::TurnCancelled { turn_id, .. }
+        | RuntimeEvent::TurnFailed { turn_id, .. } => Some(turn_id),
+    }
 }
 
 fn terminal_event_key(event: &RuntimeEvent) -> Option<TerminalEventKey> {
@@ -1354,8 +1649,8 @@ mod tests {
     use agent_runtime::ids::{SubAgentId, ToolCallId, TurnId};
     use agent_runtime::tools::{ObservationData, ToolCall, ToolName};
     use agent_runtime::{
-        PendingToolCallSummary, PlanSource, PlanStep, ResourceContext, ResourceId, ResourceKind,
-        ResourceRef, SessionId,
+        InputImage, PendingToolCallSummary, PlanSource, PlanStep, ResourceContext, ResourceId,
+        ResourceKind, ResourceRef, SessionId,
     };
 
     fn sid() -> SessionId {
@@ -1363,6 +1658,223 @@ mod tests {
     }
     fn tid() -> TurnId {
         TurnId::from_string("t1")
+    }
+
+    /// 第 `n` 个轮次（用于跨轮归属测试）。
+    fn turn(n: usize) -> TurnId {
+        TurnId::from_string(format!("t{n}"))
+    }
+
+    /// 从事件流归约出的消息轮次标签。
+    fn turn_labels(tr: &AgentTranscript) -> Vec<Option<&str>> {
+        tr.messages
+            .iter()
+            .map(|message| message.turn_id.as_deref())
+            .collect()
+    }
+
+    /// ACP 回放带图片的 prompt 时，图片是 markdown data URL；要变成图片槽，
+    /// 而不是把整段 base64 铺进气泡。
+    #[test]
+    fn replayed_image_chunks_become_images_instead_of_base64_text() {
+        let mut tr = AgentTranscript::new();
+        tr.apply(&RuntimeEvent::UserMessage {
+            session_id: sid(),
+            turn_id: tid(),
+            text: "看这张图\n\n![](data:image/png;base64,QUJD)\n\n然后改一下".into(),
+        });
+
+        let message = tr.messages.last().expect("用户消息应该落进转录");
+        assert_eq!(1, message.images.len());
+        assert_eq!("看这张图\n\n然后改一下", message.content);
+        assert!(
+            !message.content.contains("base64"),
+            "base64 不该留在正文里: {}",
+            message.content
+        );
+    }
+
+    /// 本地快照恢复：历史里的图片是 base64 输入，要回到图片槽。
+    #[test]
+    fn restored_history_keeps_user_images() {
+        let mut tr = AgentTranscript::new();
+        tr.load_history(
+            &[HistoryItem::User {
+                text: "看下这个".into(),
+                images: vec![InputImage::new("image/png", "QUJD")],
+            }],
+            None,
+        );
+
+        let message = tr.messages.last().expect("历史用户消息应该还原");
+        assert_eq!(1, message.images.len());
+        assert_eq!("看下这个", message.content);
+    }
+
+    /// 解不出来的历史图片只跳过图，不丢整条消息。
+    #[test]
+    fn restored_history_survives_an_undecodable_image() {
+        let mut tr = AgentTranscript::new();
+        tr.load_history(
+            &[HistoryItem::User {
+                text: "这句还在".into(),
+                images: vec![InputImage::new("application/pdf", "QUJD")],
+            }],
+            None,
+        );
+
+        let message = tr.messages.last().expect("消息本身不该丢");
+        assert!(message.images.is_empty());
+        assert_eq!("这句还在", message.content);
+    }
+
+    #[test]
+    fn messages_carry_the_turn_id_of_the_event_that_produced_them() {
+        let mut tr = AgentTranscript::new();
+
+        tr.apply(&RuntimeEvent::TurnStarted {
+            session_id: sid(),
+            turn_id: turn(1),
+        });
+        tr.apply(&RuntimeEvent::UserMessage {
+            session_id: sid(),
+            turn_id: turn(1),
+            text: "第一轮".into(),
+        });
+        tr.apply(&RuntimeEvent::ToolCallStarted {
+            session_id: sid(),
+            turn_id: turn(1),
+            call_id: ToolCallId::from_string("c1"),
+            tool_name: ToolName::new("fs.read"),
+            kind: ToolAction::Read,
+            arguments: serde_json::json!({ "path": "a.rs" }),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessageDelta {
+            session_id: sid(),
+            turn_id: turn(1),
+            delta: "答案一".into(),
+        });
+        tr.apply(&RuntimeEvent::TurnCompleted {
+            session_id: sid(),
+            turn_id: turn(1),
+            answer: Some("答案一".into()),
+        });
+
+        tr.apply(&RuntimeEvent::TurnStarted {
+            session_id: sid(),
+            turn_id: turn(2),
+        });
+        tr.apply(&RuntimeEvent::UserMessage {
+            session_id: sid(),
+            turn_id: turn(2),
+            text: "第二轮".into(),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessageDelta {
+            session_id: sid(),
+            turn_id: turn(2),
+            delta: "答案二".into(),
+        });
+
+        assert_eq!(
+            vec![
+                Some("t1"), // user
+                Some("t1"), // tool card
+                Some("t1"), // assistant
+                Some("t2"), // user
+                Some("t2"), // assistant
+            ],
+            turn_labels(&tr)
+        );
+        assert_eq!(Some("t2"), tr.current_turn_id());
+    }
+
+    #[test]
+    fn streaming_message_keeps_its_turn_after_splice_and_finalize() {
+        let mut tr = AgentTranscript::new();
+        let text = r#"下面是图表:
+
+```chart-json
+{"chart_type":"bar","data":[{"x":"Jan","y":1}]}
+```
+
+结论如上。"#;
+
+        tr.apply(&RuntimeEvent::TurnStarted {
+            session_id: sid(),
+            turn_id: turn(7),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessageDelta {
+            session_id: sid(),
+            turn_id: turn(7),
+            delta: "流式".into(),
+        });
+        // 结算会把流式消息替换成按图表块切分的多条消息，轮次必须跟着走。
+        tr.apply(&RuntimeEvent::AssistantMessage {
+            session_id: sid(),
+            turn_id: turn(7),
+            text: text.to_string(),
+            reasoning: None,
+        });
+
+        assert_eq!(3, tr.messages.len(), "chart block should split messages");
+        assert!(turn_labels(&tr).iter().all(|label| *label == Some("t7")));
+    }
+
+    #[test]
+    fn tool_cards_and_confirmations_inherit_the_current_turn() {
+        let mut tr = AgentTranscript::new();
+
+        tr.apply(&RuntimeEvent::TurnStarted {
+            session_id: sid(),
+            turn_id: turn(3),
+        });
+        tr.apply(&RuntimeEvent::ToolCallStarted {
+            session_id: sid(),
+            turn_id: turn(3),
+            call_id: ToolCallId::from_string("c1"),
+            tool_name: ToolName::new("ssh.exec"),
+            kind: ToolAction::Execute,
+            arguments: serde_json::json!({ "command": "df -h" }),
+        });
+        tr.apply(&RuntimeEvent::NeedUserInput {
+            session_id: sid(),
+            turn_id: turn(3),
+            pending_tool_call_id: Some(ToolCallId::from_string("c1")),
+            question: "允许执行?".into(),
+            tool_name: Some(ToolName::new("ssh.exec")),
+            arguments: Some(serde_json::json!({ "command": "df -h" })),
+            pending_tool_calls: Vec::new(),
+        });
+
+        // load_history / 本地合成路径清空当前轮，历史消息不带轮次。
+        assert!(turn_labels(&tr).iter().all(|label| *label == Some("t3")));
+
+        tr.clear();
+        assert_eq!(None, tr.current_turn_id());
+        tr.push_system("本地提示");
+        assert_eq!(vec![None], turn_labels(&tr));
+    }
+
+    #[test]
+    fn history_replay_leaves_turn_ids_empty() {
+        let mut tr = AgentTranscript::new();
+        tr.apply(&RuntimeEvent::TurnStarted {
+            session_id: sid(),
+            turn_id: turn(9),
+        });
+
+        tr.load_history(
+            &[
+                HistoryItem::User {
+                    text: "旧问题".into(),
+                    images: Vec::new(),
+                },
+                HistoryItem::Assistant("旧回答".into()),
+            ],
+            None,
+        );
+
+        assert_eq!(vec![None, None], turn_labels(&tr));
     }
 
     #[test]
@@ -1451,6 +1963,7 @@ mod tests {
             turn_id: tid(),
             call_id: call_id.clone(),
             tool_name: ToolName::new("terminal_exec"),
+            kind: ToolAction::Execute,
             arguments: serde_json::json!({"command": "sleep 10"}),
         });
         tr.apply(&RuntimeEvent::NeedUserInput {
@@ -1612,6 +2125,7 @@ mod tests {
                 turn_id: tid(),
                 call_id: ToolCallId::from_string(format!("call_{index}")),
                 tool_name: ToolName::new("terminal_exec"),
+                kind: ToolAction::Execute,
                 arguments: serde_json::json!({"command": format!("sleep {index}")}),
             });
         }
@@ -1633,6 +2147,7 @@ mod tests {
                 turn_id: tid(),
                 call_id: call_id.clone(),
                 tool_name: ToolName::new("echo"),
+                kind: ToolAction::Other,
                 arguments: serde_json::json!({"text": call_id.as_str()}),
             });
         }
@@ -1770,7 +2285,12 @@ mod tests {
             "command": "x".repeat(MAX_CACHED_TOOL_INPUT_BYTES + 1)
         });
 
-        tr.push_tool_call("oversized", "terminal_exec", &arguments);
+        tr.push_tool_call(
+            "oversized",
+            "terminal_exec",
+            ToolAction::Execute,
+            &arguments,
+        );
 
         assert!(tr.tool_call_arguments("oversized").is_none());
         let card = tr.find_tool_card("oversized").expect("tool card");
@@ -1830,11 +2350,57 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: "你好".into(),
+            reasoning: None,
         });
         // 增量与最终合并为一条消息。
         assert_eq!(tr.messages.len(), 1);
         assert_eq!(tr.messages[0].content, "你好");
         assert!(!tr.messages[0].is_streaming);
+    }
+
+    /// broadcast 滞后丢了增量时，终值必须整体替换累积值（自愈），
+    /// 否则用户看到的是一段中间被剜掉的思考。
+    #[test]
+    fn reasoning_final_value_overwrites_stale_accumulated_deltas() {
+        let mut tr = AgentTranscript::new();
+        // 只有部分增量送达（前面的 ReasoningDelta 被 Lagged 掉了）。
+        tr.apply(&RuntimeEvent::ReasoningDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "…后半段".to_string(),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessage {
+            session_id: sid(),
+            turn_id: tid(),
+            text: "答案".to_string(),
+            reasoning: Some("先分析，再…后半段".to_string()),
+        });
+
+        assert_eq!(1, tr.messages.len());
+        assert_eq!("答案", tr.messages[0].content);
+        assert_eq!(
+            "先分析，再…后半段", tr.messages[0].reasoning_content,
+            "终值应整体替换残缺累积"
+        );
+    }
+
+    /// `None` 维持旧语义：沿用增量累积（ACP 回放等没有终值的路径）。
+    #[test]
+    fn reasoning_none_keeps_accumulated_deltas() {
+        let mut tr = AgentTranscript::new();
+        tr.apply(&RuntimeEvent::ReasoningDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "先分析".to_string(),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessage {
+            session_id: sid(),
+            turn_id: tid(),
+            text: "答案".to_string(),
+            reasoning: None,
+        });
+
+        assert_eq!("先分析", tr.messages[0].reasoning_content);
     }
 
     #[test]
@@ -1878,6 +2444,7 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: "最终答案".to_string(),
+            reasoning: None,
         });
 
         assert_eq!(1, tr.messages.len());
@@ -2068,6 +2635,7 @@ mod tests {
             turn_id: tid(),
             call_id: call.clone(),
             tool_name: ToolName::new("echo"),
+            kind: ToolAction::Other,
             arguments: serde_json::json!({"text": "hi"}),
         });
         tr.apply(&RuntimeEvent::ToolCallFinished {
@@ -2103,6 +2671,7 @@ mod tests {
             turn_id: tid(),
             call_id: call.clone(),
             tool_name: ToolName::new("echo"),
+            kind: ToolAction::Other,
             arguments: serde_json::json!({"text": "hi"}),
         });
         assert_eq!(tr.messages.len(), 1);
@@ -2144,6 +2713,7 @@ mod tests {
             turn_id: tid(),
             call_id: call.clone(),
             tool_name: ToolName::new("terminal_exec"),
+            kind: ToolAction::Execute,
             arguments: serde_json::json!({"command": "systemctl list-units"}),
         });
         let output = "x".repeat(MAX_DATA_CHARS + 100);
@@ -2176,6 +2746,7 @@ mod tests {
             turn_id: tid(),
             call_id: call.clone(),
             tool_name: ToolName::new("echo"),
+            kind: ToolAction::Other,
             arguments: serde_json::json!({"text": "hi"}),
         });
         let obs = ToolObservation::success(
@@ -2209,6 +2780,7 @@ mod tests {
             turn_id: tid(),
             call_id: call.clone(),
             tool_name: ToolName::new("ssh.exec"),
+            kind: ToolAction::Execute,
             arguments: serde_json::json!({"command": "df -h"}),
         });
         let obs = ToolObservation::success(
@@ -2407,6 +2979,7 @@ mod tests {
             turn_id: tid(),
             call_id: call_id.clone(),
             tool_name: ToolName::new("db_query"),
+            kind: ToolAction::Other,
             arguments: serde_json::json!({"sql": "select count(*) from users"}),
         });
         tr.apply(&RuntimeEvent::NeedUserInput {
@@ -2512,6 +3085,7 @@ mod tests {
             turn_id: tid(),
             call_id: call,
             tool_name: ToolName::new("Read"),
+            kind: ToolAction::Read,
             arguments: serde_json::json!({"path": "/tmp/a.txt"}),
         });
         tr.apply(&RuntimeEvent::AssistantMessageDelta {
@@ -2557,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_goes_to_latest_plan_not_messages() {
+    fn plan_takes_one_row_and_keeps_the_latest_state() {
         let mut tr = AgentTranscript::new();
         let mut plan = Plan::new("排查慢查询", PlanSource::Llm)
             .with_steps(vec![PlanStep::new("查看连接数", "SHOW PROCESSLIST")]);
@@ -2567,12 +3141,90 @@ mod tests {
             turn_id: tid(),
             plan,
         });
-        // 计划不进消息流。
-        assert!(tr.messages.is_empty());
-        // 计划存入 latest_plan,可读出目标与步骤。
+        // 计划在消息流里占**一行**——不是每条步骤铺开。
+        assert_eq!(tr.messages.len(), 1);
+        assert_eq!(tr.messages[0].variant.card_kind(), Some(PLAN_CARD));
+        // 同时仍供输入框上方的面板读取最新状态。
         let data = tr.latest_plan().expect("latest_plan 应已填充");
         assert_eq!(data.goal, "排查慢查询");
         assert_eq!(data.steps.len(), 1);
+
+        // 计划会被反复更新:只有改内容,不追加新行。
+        let mut updated = Plan::new("排查慢查询", PlanSource::Llm).with_steps(vec![
+            PlanStep::new("查看连接数", "SHOW PROCESSLIST"),
+            PlanStep::new("看执行计划", "EXPLAIN"),
+        ]);
+        updated.set_status(PlanStatus::Running);
+        tr.apply(&RuntimeEvent::PlanUpdated {
+            session_id: sid(),
+            turn_id: tid(),
+            plan: updated,
+        });
+        assert_eq!(tr.messages.len(), 1);
+        let row = PlanCardData::from_json(&tr.messages[0].content).unwrap();
+        assert_eq!(2, row.steps.len());
+    }
+
+    #[test]
+    fn every_turn_keeps_its_own_plan_row() {
+        let mut tr = AgentTranscript::new();
+        tr.apply(&RuntimeEvent::PlanUpdated {
+            session_id: sid(),
+            turn_id: turn(1),
+            plan: Plan::new("第一轮", PlanSource::Llm).with_steps(vec![PlanStep::new("a", "")]),
+        });
+        tr.apply(&RuntimeEvent::PlanUpdated {
+            session_id: sid(),
+            turn_id: turn(2),
+            plan: Plan::new("第二轮", PlanSource::Llm).with_steps(vec![PlanStep::new("b", "")]),
+        });
+
+        // 往回翻历史时应该看到「当时打算怎么做」,而不是最后的结果。
+        assert_eq!(tr.messages.len(), 2);
+        assert_eq!(
+            PlanCardData::from_json(&tr.messages[0].content)
+                .unwrap()
+                .goal,
+            "第一轮"
+        );
+        assert_eq!(
+            PlanCardData::from_json(&tr.messages[1].content)
+                .unwrap()
+                .goal,
+            "第二轮"
+        );
+        assert!(turn_labels(&tr).iter().all(|label| label.is_some()));
+    }
+
+    #[test]
+    fn restored_history_shows_compaction_as_one_row() {
+        let mut tr = AgentTranscript::new();
+        tr.load_history(
+            &[
+                HistoryItem::User {
+                    text: "旧问题".into(),
+                    images: Vec::new(),
+                },
+                HistoryItem::ContextSummary {
+                    text: "之前聊了很久很久很久……".into(),
+                    original_items: 42,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(2, tr.messages.len());
+        assert_eq!(tr.messages[1].variant.card_kind(), Some(COMPACTION_CARD));
+        let data = CompactionCardData::from_json(&tr.messages[1].content).unwrap();
+        assert_eq!(42, data.items);
+        assert_eq!("之前聊了很久很久很久……", data.text);
+    }
+
+    #[test]
+    fn compaction_card_data_tolerates_missing_fields() {
+        let data = CompactionCardData::from_json("{}").expect("空对象也应当能解析");
+        assert_eq!(0, data.items);
+        assert!(data.text.is_empty());
     }
 
     #[test]
@@ -2648,6 +3300,7 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: text.to_string(),
+            reasoning: None,
         });
 
         assert_eq!(3, tr.messages.len());
@@ -2666,6 +3319,7 @@ mod tests {
             session_id: sid(),
             turn_id: tid(),
             text: text.to_string(),
+            reasoning: None,
         });
 
         assert_eq!(1, tr.messages.len());

@@ -64,6 +64,9 @@ impl HomePage {
             .unwrap_or_else(|| t!("Auth.login").to_string());
         let syncing = self.syncing;
         let unlocked = crypto::has_master_key();
+        let show_team = is_feature_enabled(Feature::TeamManagement, cx);
+        let (team_count, missing_key_count) =
+            crate::team_tab::team_key_summary(&get_cached_team_options(cx));
         v_flex()
             .id("home-navigation-status")
             .w_full()
@@ -115,6 +118,22 @@ impl HomePage {
                         |home, window, cx| home.handle_sync_click(window, cx),
                         cx,
                     ))
+                    .when(show_team, |this| {
+                        this.child(status_row(
+                            "home-navigation-team",
+                            IconName::TeamLine,
+                            t!("TeamManagement.title").to_string(),
+                            t!(
+                                "TeamManagement.status_summary",
+                                teams = team_count,
+                                missing = missing_key_count
+                            )
+                            .to_string(),
+                            view.clone(),
+                            |home, window, cx| home.add_team_tab(window, cx),
+                            cx,
+                        ))
+                    })
                     .child(status_row(
                         "home-navigation-change-master-key",
                         IconName::Edit,

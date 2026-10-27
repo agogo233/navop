@@ -335,6 +335,9 @@ fn empty_repository() -> PathBuf {
     let root = unique_test_path();
     std::fs::create_dir_all(&root).unwrap();
     run_test_git(&root, &["init", "-q"]);
+    // 固定初始分支名：`git init` 建哪个默认分支取决于本机 `init.defaultBranch`，
+    // 不固定的话断言上游 ref 名的测试会随环境漂移（本机是 `main`，CI 上未必）。
+    run_test_git(&root, &["symbolic-ref", "HEAD", "refs/heads/master"]);
     run_test_git(&root, &["config", "core.autocrlf", "false"]);
     run_test_git(&root, &["config", "user.name", "Workspace Explorer Test"]);
     run_test_git(
@@ -367,4 +370,551 @@ fn run_test_git(root: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn worktrees_are_created_listed_and_removed_with_their_branch() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    let worktree_root = unique_test_path();
+
+    let created = create_worktree_in(&worktree_root, &repository, &root, None).unwrap();
+    assert!(created.branch.starts_with("navop/"));
+    assert!(created.worktree_root.is_dir());
+    assert_eq!(created.worktree_root, created.path, "repo 根即项目根");
+
+    let listed = list_worktrees(&repository).unwrap();
+    assert!(listed.iter().any(|entry| entry.is_main), "主工作区应被标记");
+    let linked = listed
+        .iter()
+        .find(|entry| entry.path == created.worktree_root)
+        .expect("新建 worktree 应出现在列表里");
+    assert!(linked.managed);
+    assert!(!linked.is_main);
+
+    remove_worktree(&repository, &created.worktree_root).unwrap();
+
+    let after = list_worktrees(&repository).unwrap();
+    assert!(
+        after
+            .iter()
+            .all(|entry| entry.path != created.worktree_root),
+        "删除后不应再出现在列表里"
+    );
+    let branches = run_git_stdout(&root, &["branch", "--list", &created.branch]);
+    assert!(branches.trim().is_empty(), "受管分支应一并删除");
+
+    std::fs::remove_dir_all(&worktree_root).ok();
+}
+
+/// 从 linked worktree 里发现仓库时，主工作区仍须被认成主工作区。
+///
+/// `rev-parse --show-toplevel` 在 worktree 内部返回的是那个 worktree 自己；
+/// 早先直接把它当「主工作区」，于是两个条目的 `is_main` 整体判反 ——
+/// worktree 成了「主工作区」（切回去原地空转），真正的主工作区成了可删除的 worktree。
+/// 应用切根之后正是这个状态，所以从 worktree 内部重新发现是这条测试的关键。
+#[test]
+fn discovering_from_a_linked_worktree_keeps_the_main_worktree_marked_as_main() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    let worktree_root = unique_test_path();
+
+    let created = create_worktree_in(&worktree_root, &repository, &root, None).unwrap();
+
+    let from_worktree = discover_repository(&created.worktree_root)
+        .unwrap()
+        .expect("worktree 内部也是仓库");
+    assert_ne!(
+        canonical_or_self(&root),
+        canonical_or_self(&from_worktree.root),
+        "前置：worktree 内部发现出的根不该等于主工作区根"
+    );
+
+    let listed = list_worktrees(&from_worktree).unwrap();
+    let mains: Vec<_> = listed.iter().filter(|entry| entry.is_main).collect();
+    assert_eq!(1, mains.len(), "有且只有一个主工作区：{listed:#?}");
+    assert_eq!(
+        canonical_or_self(&root),
+        mains[0].path,
+        "主工作区必须是原始仓库根，而不是 worktree"
+    );
+    let linked = listed
+        .iter()
+        .find(|entry| entry.path == created.worktree_root)
+        .expect("新建 worktree 应出现在列表里");
+    assert!(!linked.is_main, "worktree 不能被当成主工作区");
+
+    // 顺带钉住「站在 worktree 里删它自己」：`is_main` 修对之前，这个条目被判成主
+    // 工作区，菜单里根本不出现删除入口，所以这条路径一直没人走过。删除过程中
+    // `git worktree remove` 会把 cwd（= 这个 worktree）删掉，后续删分支必须换 cwd。
+    let branch = linked.branch.clone().expect("worktree 有分支");
+    remove_worktree(&from_worktree, &created.worktree_root).unwrap();
+    let branches = run_git_stdout(&root, &["branch", "--list", &branch]);
+    assert!(branches.trim().is_empty(), "受管分支应一并删除");
+
+    std::fs::remove_dir_all(&worktree_root).ok();
+}
+
+#[test]
+fn removing_the_main_worktree_is_refused() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    let error = remove_worktree(&repository, &repository.root).unwrap_err();
+
+    assert!(error.to_string().contains("main worktree"), "{error}");
+}
+
+#[test]
+fn worktree_parser_marks_managed_and_main_entries() {
+    let output = "\
+worktree /repo
+HEAD abc
+branch refs/heads/main
+
+worktree /wt/one
+HEAD def
+branch refs/heads/navop/one
+
+worktree /wt/detached
+HEAD 0123
+detached
+";
+    let entries = parse_worktrees(output, Path::new("/repo"));
+
+    assert_eq!(3, entries.len());
+    assert!(entries[0].is_main);
+    assert!(!entries[0].managed);
+    assert_eq!(Some("navop/one".to_string()), entries[1].branch);
+    assert!(entries[1].managed);
+    assert_eq!(None, entries[2].branch);
+    assert!(!entries[2].managed);
+}
+
+fn run_git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn worktree_snapshot_captures_dirty_and_untracked_files_without_touching_index() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"changed\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("untracked.txt"), "new\n").unwrap();
+
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+    let diff = diff_snapshots(&repository, "HEAD", &snapshot).unwrap();
+    let status = run_git_stdout(&root, &["status", "--porcelain"]);
+
+    assert!(diff.contains("main.rs"));
+    assert!(diff.contains("untracked.txt"));
+    assert!(status.contains(" M main.rs"));
+    assert!(status.contains("?? untracked.txt"));
+}
+
+#[test]
+fn commit_all_commits_dirty_and_untracked_and_leaves_a_clean_tree() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() { println!(\"v2\"); }\n").unwrap();
+    std::fs::write(root.join("added.txt"), "new file\n").unwrap();
+
+    commit_all(&repository, "navop: commit all test").unwrap();
+
+    let log = run_git_stdout(&root, &["log", "-1", "--format=%s"]);
+    assert_eq!("navop: commit all test", log.trim());
+    let committed = run_git_stdout(&root, &["show", "--stat", "--format=", "HEAD"]);
+    assert!(committed.contains("main.rs"), "{committed}");
+    assert!(committed.contains("added.txt"), "{committed}");
+    let status = run_git_stdout(&root, &["status", "--porcelain"]);
+    assert!(status.trim().is_empty(), "提交后工作区应干净: {status}");
+}
+
+#[test]
+fn commit_all_rejects_blank_messages() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    let error = commit_all(&repository, "   ").unwrap_err();
+
+    assert!(error.to_string().contains("empty"), "{error}");
+}
+
+#[test]
+fn checkpoints_survive_restart_via_anchored_refs() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(root.join("turn1.txt"), "one\n").unwrap();
+
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+    anchor_checkpoint(&repository, &snapshot).unwrap();
+
+    // "重启"：只从仓库 ref 恢复，不再依赖内存值。
+    let restored = anchored_checkpoint(&repository)
+        .unwrap()
+        .expect("checkpoint should survive via ref");
+    assert_eq!(snapshot, restored);
+
+    // ref 不占分支名空间。
+    let branches = run_git_stdout(&root, &["branch", "--list"]);
+    assert!(
+        !branches.contains("navop/checkpoints"),
+        "checkpoint ref 不应出现在分支列表: {branches}"
+    );
+}
+
+#[test]
+fn anchored_checkpoint_is_none_before_first_capture() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    assert_eq!(None, anchored_checkpoint(&repository).unwrap());
+}
+
+#[test]
+fn push_current_branch_publishes_to_default_remote_and_sets_upstream() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    // 本地 bare 仓库当远端，测试不触网。
+    let remote_path = unique_test_path();
+    std::fs::create_dir_all(&remote_path).unwrap();
+    run_test_git(&remote_path, &["init", "-q", "--bare"]);
+    // 远端也要固定初始分支：bare 仓库的 HEAD 同样随 `init.defaultBranch` 漂移，
+    // 它指向哪个分支决定了远端的 HEAD 能不能被 `rev-parse` 解出来。
+    run_test_git(&remote_path, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    run_test_git(
+        &root,
+        &["remote", "add", "origin", remote_path.to_str().unwrap()],
+    );
+    run_test_git(&root, &["commit", "-q", "--allow-empty", "-m", "to push"]);
+
+    push_current_branch(&repository).unwrap();
+
+    let upstream = run_git_stdout(
+        &root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    );
+    assert_eq!("origin/master", upstream.trim(), "首次 push 应建立上游跟踪");
+    let remote_head = run_git_stdout(&remote_path, &["rev-parse", "HEAD"]);
+    let local_head = run_git_stdout(&root, &["rev-parse", "HEAD"]);
+    assert_eq!(local_head.trim(), remote_head.trim());
+
+    std::fs::remove_dir_all(&remote_path).ok();
+}
+
+#[test]
+fn push_current_branch_refuses_without_current_branch() {
+    let root = initialized_repository();
+    run_test_git(&root, &["checkout", "-q", "--detach"]);
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    let error = push_current_branch(&repository).unwrap_err();
+
+    assert!(error.to_string().contains("detached"), "{error}");
+}
+
+#[test]
+fn commit_context_lists_changes_untracked_and_bounds_size() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n// changed\n").unwrap();
+    std::fs::write(root.join("brand_new.rs"), "pub fn new() {}\n").unwrap();
+
+    let context = commit_context(&repository, 4 * 1024).unwrap();
+
+    assert!(context.contains("main.rs"), "{context}");
+    assert!(context.contains("New files:"), "{context}");
+    assert!(context.contains("brand_new.rs"), "{context}");
+    assert!(context.contains("Diff"), "{context}");
+
+    let tiny = commit_context(&repository, 120).unwrap();
+    assert!(tiny.contains("truncated"), "小上限必须截断: {tiny}");
+    assert!(tiny.len() <= 140);
+}
+
+#[test]
+fn truncate_on_char_boundary_never_splits_a_multibyte_character() {
+    let text = "开始中文内容结尾";
+    for budget in 0..=text.len() + 2 {
+        let truncated = truncate_on_char_boundary(text, budget);
+        assert!(truncated.len() <= budget, "{budget}: {truncated}");
+        assert!(text.starts_with(truncated), "{budget}: {truncated}");
+    }
+
+    // 每个汉字 3 字节：7、8 落在「中」内部，必须回退到 6。
+    assert_eq!("", truncate_on_char_boundary(text, 0));
+    assert_eq!("开始", truncate_on_char_boundary(text, 6));
+    assert_eq!("开始", truncate_on_char_boundary(text, 7));
+    assert_eq!("开始", truncate_on_char_boundary(text, 8));
+    assert_eq!("开始中", truncate_on_char_boundary(text, 9));
+    assert_eq!(text, truncate_on_char_boundary(text, text.len() + 2));
+}
+
+#[test]
+fn commit_context_truncation_stops_on_a_character_boundary() {
+    // 实测崩溃回归：中文 diff 的预算落在字符内部时，`&full[..n]` 直接 panic，
+    // 后台线程里无法 unwind 会 abort 整个进程（`failed to initiate panic`）。
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    // 必须写进已跟踪文件：`git diff HEAD` 不含未跟踪文件，写新文件的话 diff 里没有中文。
+    let mut body = String::new();
+    for index in 0..80 {
+        body.push_str(&format!(
+            "第 {index} 行：中文正文用来把 diff 撑到预算之外。\n"
+        ));
+    }
+    std::fs::write(root.join("main.rs"), &body).unwrap();
+
+    let full = git_stdout(&root, &["diff", "HEAD", "--unified=3"]).unwrap();
+    // diff 之前那段前缀（numstat/untracked/标题）与预算无关，长度恒定。
+    let prefix_len = commit_context(&repository, usize::MAX).unwrap().len() - full.len();
+    let offset = (0..full.len())
+        .find(|&offset| !full.is_char_boundary(offset))
+        .expect("中文 diff 里应当存在非字符边界");
+    let budget = prefix_len + offset;
+
+    // 先确认这一档确实是「旧写法会 panic」的那一档，否则这条测试是空转的。
+    assert!(
+        !full.is_char_boundary(budget - prefix_len),
+        "预算 {budget} 没有落在字符内部，回归失去意义"
+    );
+
+    let context = commit_context(&repository, budget).unwrap();
+
+    assert!(context.contains("truncated"), "{context}");
+    assert!(
+        context.len() <= budget + "\n... (truncated)".len(),
+        "截断标记之外的体量不该超预算: {}",
+        context.len()
+    );
+    assert!(context.ends_with("... (truncated)"), "{context}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn restore_checkpoint_rewrites_tracked_files_and_removes_untracked_ones() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"turn 1\"); }\n",
+    )
+    .unwrap();
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+
+    // 往后再走一轮：改 tracked、加 untracked。
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"turn 2\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("added.txt"), "added in turn 2\n").unwrap();
+
+    restore_checkpoint(&repository, &snapshot).unwrap();
+
+    let restored = std::fs::read_to_string(root.join("main.rs")).unwrap();
+    assert!(restored.contains("turn 1"), "{restored}");
+    assert!(
+        !root.join("added.txt").exists(),
+        "快照之后新增的 untracked 必须被清掉"
+    );
+}
+
+#[test]
+fn restore_checkpoint_leaves_ignored_files_alone() {
+    let root = initialized_repository();
+    std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    run_test_git(&root, &["add", ".gitignore"]);
+    run_test_git(&root, &["commit", "-q", "-m", "ignore build"]);
+    let repository = discover_repository(&root).unwrap().unwrap();
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+
+    std::fs::create_dir_all(root.join("build")).unwrap();
+    std::fs::write(root.join("build/out.bin"), "artifact\n").unwrap();
+
+    restore_checkpoint(&repository, &snapshot).unwrap();
+
+    assert!(
+        root.join("build/out.bin").exists(),
+        "`clean -fd` 不带 `-x`，.gitignore 命中的文件不能被删"
+    );
+}
+
+#[test]
+fn restore_checkpoint_backup_undoes_the_restore() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"turn 1\"); }\n",
+    )
+    .unwrap();
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"turn 2\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("added.txt"), "added in turn 2\n").unwrap();
+
+    let restore = restore_checkpoint(&repository, &snapshot).unwrap();
+    let undo = restore_checkpoint(&repository, &restore.backup).unwrap();
+
+    assert_eq!(undo.target, restore.backup);
+    let undone = std::fs::read_to_string(root.join("main.rs")).unwrap();
+    assert!(undone.contains("turn 2"), "{undone}");
+    assert!(
+        root.join("added.txt").exists(),
+        "撤销恢复应把当时的新文件带回来"
+    );
+}
+
+#[test]
+fn restore_checkpoint_reports_unavailable_snapshot() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    let error =
+        restore_checkpoint(&repository, "0123456789abcdef0123456789abcdef01234567").unwrap_err();
+
+    assert!(error.to_string().contains("unavailable"), "{error}");
+}
+
+#[test]
+fn resolve_commit_accepts_a_commit_and_rejects_a_tree() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    let head = resolve_commit(&repository, "HEAD").unwrap();
+    assert_eq!(40, head.len());
+
+    let tree = run_git_stdout(&root, &["rev-parse", "HEAD^{tree}"]);
+    assert!(
+        resolve_commit(&repository, tree.trim()).is_err(),
+        "树对象不是 commit，必须被拒绝"
+    );
+}
+
+#[test]
+fn turn_checkpoints_are_anchored_listed_and_deleted() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n// turn 1\n").unwrap();
+    let first = capture_worktree_snapshot(&repository).unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n// turn 2\n").unwrap();
+    let second = capture_worktree_snapshot(&repository).unwrap();
+
+    anchor_turn_checkpoint(&repository, "turn_aaaa", &first).unwrap();
+    anchor_turn_checkpoint(&repository, "turn_bbbb", &second).unwrap();
+
+    let checkpoints = turn_checkpoints(&repository).unwrap();
+    assert_eq!(2, checkpoints.len());
+    assert_eq!(Some(&first), checkpoints.get("turn_aaaa"));
+    assert_eq!(Some(&second), checkpoints.get("turn_bbbb"));
+
+    delete_turn_checkpoints(&repository, &["turn_aaaa".to_string()]).unwrap();
+
+    let remaining = turn_checkpoints(&repository).unwrap();
+    assert_eq!(1, remaining.len());
+    assert!(remaining.contains_key("turn_bbbb"));
+}
+
+#[test]
+fn restore_backup_slot_holds_the_latest_pre_restore_state() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"turn 1\"); }\n",
+    )
+    .unwrap();
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+    anchor_checkpoint(&repository, &snapshot).unwrap();
+    assert_eq!(None, restore_backup(&repository).unwrap());
+
+    std::fs::write(
+        root.join("main.rs"),
+        "fn main() { println!(\"turn 2\"); }\n",
+    )
+    .unwrap();
+    let restore = restore_checkpoint(&repository, &snapshot).unwrap();
+
+    assert_eq!(
+        Some(restore.backup.clone()),
+        restore_backup(&repository).unwrap(),
+        "最近一次恢复前的现场要落进撤销槽位"
+    );
+    assert_eq!(
+        Some(snapshot),
+        anchored_checkpoint(&repository).unwrap(),
+        "恢复动作不能改写基线 ref"
+    );
+}
+
+#[test]
+fn turn_checkpoints_are_isolated_from_the_baseline_ref() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+    anchor_checkpoint(&repository, &snapshot).unwrap();
+
+    assert!(
+        turn_checkpoints(&repository).unwrap().is_empty(),
+        "基线 ref 不能被当成某一轮"
+    );
+    assert_eq!(Some(snapshot), anchored_checkpoint(&repository).unwrap());
+}
+
+#[test]
+fn turn_checkpoints_and_backups_coexist_with_the_baseline_ref() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+    let snapshot = capture_worktree_snapshot(&repository).unwrap();
+
+    // git 不允许同一路径既是 ref 又是目录：基线、逐轮、撤销槽位三者必须能同时存在。
+    // 逐轮 ref 曾经挂在基线 ref 之下，这条就是那个坑的回归守卫。
+    anchor_checkpoint(&repository, &snapshot).unwrap();
+    anchor_turn_checkpoint(&repository, "turn_cafe", &snapshot).unwrap();
+    anchor_restore_backup(&repository, &snapshot).unwrap();
+
+    assert_eq!(
+        Some(snapshot.clone()),
+        anchored_checkpoint(&repository).unwrap()
+    );
+    assert_eq!(
+        Some(snapshot.clone()),
+        turn_checkpoints(&repository)
+            .unwrap()
+            .get("turn_cafe")
+            .cloned()
+    );
+    assert_eq!(Some(snapshot), restore_backup(&repository).unwrap());
+}
+
+#[test]
+fn turn_checkpoint_ref_rejects_unsafe_turn_ids() {
+    let root = initialized_repository();
+    let repository = discover_repository(&root).unwrap().unwrap();
+
+    for turn_id in ["", "../escape", "turn/1", "turn 1", "turn~1"] {
+        assert!(
+            turn_checkpoint_ref_name(&repository, turn_id).is_err(),
+            "`{turn_id}` 应被拒绝"
+        );
+    }
+    assert!(turn_checkpoint_ref_name(&repository, "turn_1a2b3c").is_ok());
 }

@@ -44,7 +44,7 @@ mod setting_tab;
 mod settings;
 mod sync_conflict_dialog;
 mod system_tray;
-mod team_management;
+mod team_tab;
 mod toolbox_tab;
 mod update;
 mod window_visibility;

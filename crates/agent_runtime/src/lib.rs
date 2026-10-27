@@ -40,7 +40,7 @@ pub use resource::{
 pub use resource_scope::{AgentResourceScope, DefaultTarget, DefaultTargetReason, ResourceCatalog};
 pub use risk::RiskLevel;
 pub use runtime::{
-    DEFAULT_AGENT_MAX_ITERATIONS, MAX_AGENT_MAX_ITERATIONS, MIN_AGENT_MAX_ITERATIONS,
+    DEFAULT_AGENT_MAX_ITERATIONS, MAX_AGENT_MAX_ITERATIONS, MIN_AGENT_MAX_ITERATIONS, AcpSessionRef,
     PendingToolCallSummary, Runtime, RuntimeCommand, RuntimeEvent, RuntimeEventReceiver,
     RuntimeServices, Session, SessionSnapshot, TaskKind, TaskOutcome, ToolExecutionMode,
     TurnContext, UserInput,
@@ -52,6 +52,6 @@ pub use skill::{
 };
 pub use tasks::AgentTask;
 pub use tools::{
-    ObservationData, Tool, ToolCall, ToolDispatchContext, ToolName, ToolObservation, ToolRegistry,
-    ToolRouter, ToolSpec,
+    FileChange, ObservationData, Tool, ToolAction, ToolCall, ToolDispatchContext, ToolName,
+    ToolObservation, ToolRegistry, ToolRouter, ToolSpec,
 };

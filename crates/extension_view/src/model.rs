@@ -8,7 +8,6 @@ pub enum ExtensionKind {
     LanguageBundle,
     DatabaseDriver,
     RemoteDesktopProvider,
-    AcpAgent,
     Composite,
 }
 

@@ -137,6 +137,81 @@ impl HomePage {
         .detach();
     }
 
+    /// 把分组挂到另一个分组下面；`parent_id` 为 `None` 表示移到顶层。
+    ///
+    /// 之前没有任何入口能改分组的父级：`handle_save_workspace` 在编辑态用
+    /// `parent_id.or(ws.parent_id)`，把 `None` 当成「没传」而不是「移到顶层」，
+    /// 结果子分组一旦建出来就再也回不到根级，也无法在分组之间搬家。
+    pub(crate) fn move_workspace_to_parent(
+        &mut self,
+        workspace_id: i64,
+        parent_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        if !workspace_move_is_allowed(&self.workspaces, workspace_id, parent_id) {
+            tracing::warn!(
+                "[分组] 拒绝移动分组 {} 到 {:?}：目标不存在或会形成环",
+                workspace_id,
+                parent_id
+            );
+            return;
+        }
+        let Some(mut workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == Some(workspace_id))
+            .cloned()
+        else {
+            return;
+        };
+        if workspace.parent_id == parent_id {
+            return;
+        }
+        workspace.parent_id = parent_id;
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let save_task = cx.background_spawn(async move {
+            let repo = storage
+                .get::<WorkspaceRepository>()
+                .ok_or_else(|| anyhow::anyhow!("WorkspaceRepository not found"))?;
+            // `Repository::update` 会同时刷新 `updated_at`，让这次搬家成为一条
+            // 待上传的本地修改；用 `update_parent_id`（同步专用、刻意不刷时间）
+            // 会让云同步永远看不到这次移动。
+            repo.update(&mut workspace)?;
+            Ok::<_, anyhow::Error>(workspace)
+        });
+        cx.spawn(async move |this, cx| match save_task.await {
+            Ok(workspace) => {
+                _ = this.update(cx, |this, cx| {
+                    if let Some(pos) = this
+                        .workspaces
+                        .iter()
+                        .position(|item| item.id == workspace.id)
+                    {
+                        this.workspaces[pos] = workspace;
+                    }
+                    // 换了父级之后同级顺序会变，复用与数据库一致的排序规则。
+                    sort_workspaces(&mut this.workspaces);
+                    emit_connection_event(
+                        ConnectionDataEvent::WorkspaceUpdated { workspace_id },
+                        cx,
+                    );
+                    if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
+                        tracing::info!("本地工作区移动成功，自动触发云同步");
+                        this.trigger_sync(cx);
+                    }
+                    cx.notify();
+                });
+            }
+            Err(error) => tracing::error!("移动分组失败: {error}"),
+        })
+        .detach();
+    }
+
+    /// 该分组自身加上它的全部后代，供「移动到」菜单剔除必然成环的目标。
+    pub(crate) fn workspace_subtree_ids(&self, workspace_id: i64) -> HashSet<i64> {
+        workspace_subtree_ids(&self.workspaces, workspace_id)
+    }
+
     pub(crate) fn delete_workspace(
         &mut self,
         workspace_id: i64,
@@ -297,4 +372,136 @@ pub(super) fn promote_workspace_children_in_memory(
     }
     workspaces.retain(|workspace| workspace.id != Some(workspace_id));
     parent_id
+}
+
+/// 分组层级过深（或 `parent_id` 脏数据成环）时的兜底上限。
+pub(super) const MAX_WORKSPACE_DEPTH: usize = 32;
+
+/// 分组能否挂到 `parent_id` 之下（`None` 表示顶层）。
+///
+/// 拒绝三种情况：目标分组不存在、目标是分组自己、目标是自己的后代（会成环）。
+pub(super) fn workspace_move_is_allowed(
+    workspaces: &[Workspace],
+    workspace_id: i64,
+    parent_id: Option<i64>,
+) -> bool {
+    if !workspaces
+        .iter()
+        .any(|workspace| workspace.id == Some(workspace_id))
+    {
+        return false;
+    }
+    let Some(parent_id) = parent_id else {
+        return true;
+    };
+    if parent_id == workspace_id
+        || !workspaces
+            .iter()
+            .any(|workspace| workspace.id == Some(parent_id))
+    {
+        return false;
+    }
+    let mut cursor = Some(parent_id);
+    let mut hops = 0;
+    while let Some(current) = cursor {
+        if current == workspace_id {
+            return false;
+        }
+        hops += 1;
+        if hops > MAX_WORKSPACE_DEPTH {
+            return false;
+        }
+        cursor = workspaces
+            .iter()
+            .find(|workspace| workspace.id == Some(current))
+            .and_then(|workspace| workspace.parent_id);
+    }
+    true
+}
+
+/// `root_id` 本身加上它的全部后代，供「移动到」菜单剔掉自己这颗子树。
+pub(super) fn workspace_subtree_ids(workspaces: &[Workspace], root_id: i64) -> HashSet<i64> {
+    let mut ids: HashSet<i64> = HashSet::from([root_id]);
+    loop {
+        let mut added = false;
+        for workspace in workspaces {
+            let Some(id) = workspace.id else {
+                continue;
+            };
+            if !ids.contains(&id)
+                && workspace
+                    .parent_id
+                    .is_some_and(|parent_id| ids.contains(&parent_id))
+            {
+                ids.insert(id);
+                added = true;
+            }
+        }
+        if !added {
+            return ids;
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_move_tests {
+    use super::*;
+
+    fn workspace(id: i64, parent_id: Option<i64>, name: &str) -> Workspace {
+        let mut workspace = Workspace::new(name.to_string());
+        workspace.id = Some(id);
+        workspace.parent_id = parent_id;
+        workspace
+    }
+
+    fn tree() -> Vec<Workspace> {
+        vec![
+            workspace(1, None, "Root"),
+            workspace(2, Some(1), "Child"),
+            workspace(3, Some(2), "Grandchild"),
+            workspace(4, None, "Another root"),
+        ]
+    }
+
+    #[test]
+    fn a_group_can_move_back_to_the_top_level() {
+        // 编辑对话框的 `parent_id.or(ws.parent_id)` 把 None 当成「没传」，
+        // 所以「移回顶层」必须走独立入口，这条用例守住这个能力。
+        assert!(workspace_move_is_allowed(&tree(), 2, None));
+        assert!(workspace_move_is_allowed(&tree(), 3, Some(4)));
+    }
+
+    #[test]
+    fn a_group_cannot_move_into_itself_or_its_descendants() {
+        assert!(!workspace_move_is_allowed(&tree(), 2, Some(2)));
+        assert!(!workspace_move_is_allowed(&tree(), 1, Some(3)));
+        assert!(!workspace_move_is_allowed(&tree(), 2, Some(3)));
+    }
+
+    #[test]
+    fn unknown_groups_are_rejected() {
+        assert!(!workspace_move_is_allowed(&tree(), 99, None));
+        assert!(!workspace_move_is_allowed(&tree(), 2, Some(99)));
+    }
+
+    #[test]
+    fn cyclic_dirty_data_is_rejected_instead_of_looping_forever() {
+        let cyclic = vec![
+            workspace(1, Some(2), "A"),
+            workspace(2, Some(1), "B"),
+            workspace(3, None, "C"),
+        ];
+        assert!(!workspace_move_is_allowed(&cyclic, 3, Some(1)));
+    }
+
+    #[test]
+    fn subtree_ids_cover_the_group_and_all_of_its_descendants() {
+        assert_eq!(
+            HashSet::from([2, 3]),
+            workspace_subtree_ids(&tree(), 2),
+            "移动目标菜单要剔掉自己这颗子树"
+        );
+        assert_eq!(HashSet::from([1, 2, 3]), workspace_subtree_ids(&tree(), 1));
+        assert_eq!(HashSet::from([4]), workspace_subtree_ids(&tree(), 4));
+    }
 }

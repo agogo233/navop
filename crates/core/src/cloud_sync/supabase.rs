@@ -631,6 +631,53 @@ impl SupabaseClient {
         }
     }
 
+    /// 发送带 401 自动重试的 POST 请求，返回原始响应文本
+    ///
+    /// RPC 的返回值可能是标量、表或空（`returns void`），失败时又要按服务端
+    /// 原文映射提示文案，所以这里不提前反序列化。
+    async fn post_raw_with_retry<B: serde::Serialize>(
+        &self,
+        url: &str,
+        extra_headers: Vec<(&'static str, String)>,
+        body: &B,
+    ) -> Result<(StatusCode, String), CloudApiError> {
+        // 主动检查 token 是否即将过期
+        if self.is_token_expiring_soon() {
+            info!("[supabase] proactive token refresh before POST {}", url);
+            self.ensure_token_valid().await?;
+        }
+
+        let mut headers = self.auth_headers()?;
+        headers.extend(extra_headers.clone());
+        let (status, response_body) = self.post_raw(url, headers, body).await?;
+
+        if status == StatusCode::UNAUTHORIZED {
+            warn!("[supabase] 401 received, refreshing token: POST {}", url);
+            self.ensure_token_valid().await?;
+            let mut retry_headers = self.auth_headers()?;
+            retry_headers.extend(extra_headers);
+            self.post_raw(url, retry_headers, body).await
+        } else {
+            Ok((status, response_body))
+        }
+    }
+
+    /// 发送 POST 请求并返回原始响应文本
+    async fn post_raw<B: serde::Serialize>(
+        &self,
+        url: &str,
+        headers: Vec<(&'static str, String)>,
+        body: &B,
+    ) -> Result<(StatusCode, String), CloudApiError> {
+        let body_bytes =
+            serde_json::to_vec(body).map_err(|e| CloudApiError::ParseError(e.to_string()))?;
+
+        let request = self.build_request(Method::POST, url, headers, Some(body_bytes))?;
+        let (status, response_bytes) = self.send_request(request).await?;
+
+        Ok((status, String::from_utf8_lossy(&response_bytes).to_string()))
+    }
+
     /// 发送流式 POST 请求（带 401 自动重试）
     async fn post_stream_with_retry<B: serde::Serialize>(
         &self,
@@ -1168,6 +1215,145 @@ impl From<&TeamMember> for TeamMemberRow {
             joined_at: None,
         }
     }
+}
+
+/// `list_team_members_with_email` 返回的一行
+///
+/// 该 RPC 只返回成员本身，不带 team_id，团队 ID 由调用方补齐。
+#[derive(Debug, Deserialize)]
+struct TeamMemberWithEmailRow {
+    id: String,
+    user_id: String,
+    email: Option<String>,
+    #[serde(default = "default_member_role")]
+    role: String,
+    #[serde(default)]
+    joined_at: Option<String>,
+}
+
+impl TeamMemberWithEmailRow {
+    fn into_member(self, team_id: &str) -> TeamMemberWithEmail {
+        TeamMemberWithEmail {
+            id: self.id,
+            team_id: team_id.to_string(),
+            user_id: self.user_id,
+            email: self.email.unwrap_or_default(),
+            role: parse_team_role(&self.role),
+            joined_at: parse_timestamp_millis(self.joined_at.as_deref()),
+        }
+    }
+}
+
+/// `create_team_with_owner` 的 RPC 入参
+#[derive(Debug, Serialize)]
+struct CreateTeamWithOwnerPayload<'a> {
+    p_name: &'a str,
+    p_description: Option<&'a str>,
+}
+
+/// `add_team_member_by_email` 的 RPC 入参
+#[derive(Debug, Serialize)]
+struct AddTeamMemberByEmailPayload<'a> {
+    p_team_id: &'a str,
+    p_email: &'a str,
+    p_role: &'a str,
+}
+
+/// `list_team_members_with_email` 的 RPC 入参
+#[derive(Debug, Serialize)]
+struct ListTeamMembersWithEmailPayload<'a> {
+    p_team_id: &'a str,
+}
+
+/// `update_team_member_role` 的 RPC 入参
+#[derive(Debug, Serialize)]
+struct UpdateTeamMemberRolePayload<'a> {
+    p_member_id: &'a str,
+    p_role: &'a str,
+}
+
+/// `remove_team_member` 的 RPC 入参
+#[derive(Debug, Serialize)]
+struct RemoveTeamMemberPayload<'a> {
+    p_member_id: &'a str,
+}
+
+/// 团队资料更新入参
+///
+/// `description` 显式序列化为 null，表示「清空描述」，与
+/// `SyncDataUpdatePayload` 处理 team 归属的语义一致。
+#[derive(Debug, Serialize)]
+struct TeamProfileUpdatePayload<'a> {
+    name: &'a str,
+    description: Option<&'a str>,
+}
+
+/// 把服务端角色标识解析成 `TeamRole`，未知值按 member 处理
+fn parse_team_role(role: &str) -> TeamRole {
+    match role {
+        "owner" => TeamRole::Owner,
+        "admin" => TeamRole::Admin,
+        _ => TeamRole::Member,
+    }
+}
+
+/// 把 PostgREST 返回的 RFC3339 时间解析成毫秒时间戳
+fn parse_timestamp_millis(value: Option<&str>) -> i64 {
+    value
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// 从 RPC 返回的 JSON 里取出 uuid 标量
+///
+/// PostgREST 对返回单个标量的函数直接返回裸值（如 `"uuid"`）；部分版本
+/// 会包成 `[{"create_team_with_owner": "uuid"}]` 或对象，这里都兼容。
+fn parse_rpc_uuid(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::String(id) if !id.trim().is_empty() => Some(id.clone()),
+        serde_json::Value::Array(items) => items.iter().find_map(|item| parse_rpc_uuid(item, key)),
+        serde_json::Value::Object(map) => {
+            if let Some(id) = map
+                .get(key)
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.trim().is_empty())
+            {
+                return Some(id.to_string());
+            }
+            map.values().find_map(|value| parse_rpc_uuid(value, key))
+        }
+        _ => None,
+    }
+}
+
+/// 从 PostgREST 错误响应里提取可读信息
+///
+/// RPC 抛 `RAISE EXCEPTION` 时返回
+/// `{"code":"P0001","message":"...","details":null,"hint":null}`，
+/// 这里优先取 `message`，让上层能按服务端原文做中文映射。
+fn rpc_error_message(body: &str) -> String {
+    let body = body.trim();
+
+    if body.is_empty() {
+        return "服务端未返回错误详情".to_string();
+    }
+
+    let parsed_message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|message| message.as_str())
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+        });
+    if let Some(message) = parsed_message {
+        return message;
+    }
+
+    SupabaseClient::truncate_error_body(body)
 }
 
 #[async_trait]
@@ -1902,6 +2088,211 @@ impl CloudApiClient for SupabaseClient {
     }
 
     // ========================================================================
+    // 团队管理（写操作）
+    // ========================================================================
+
+    async fn create_team_with_owner(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<String, CloudApiError> {
+        let url = format!(
+            "{}/rest/v1/rpc/create_team_with_owner",
+            self.config.project_url
+        );
+        let payload = CreateTeamWithOwnerPayload {
+            p_name: name,
+            p_description: description,
+        };
+
+        let (status, body) = self.post_raw_with_retry(&url, vec![], &payload).await?;
+
+        if !status.is_success() {
+            let message = rpc_error_message(&body);
+            warn!(
+                status = status.as_u16(),
+                url = %url,
+                error = %message,
+                "创建团队失败"
+            );
+            return Err(CloudApiError::ServerError(message));
+        }
+
+        let value = serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| CloudApiError::ParseError(format!("创建团队响应不是合法 JSON: {e}")))?;
+        parse_rpc_uuid(&value, "create_team_with_owner")
+            .ok_or_else(|| CloudApiError::ParseError("创建团队响应缺少团队 ID".to_string()))
+    }
+
+    async fn update_team_profile(
+        &self,
+        team_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Team, CloudApiError> {
+        let url = format!("{}?id=eq.{}", self.rest_url("teams"), team_id);
+        let payload = TeamProfileUpdatePayload { name, description };
+        let extra_headers = vec![("Prefer", "return=representation".to_string())];
+
+        let (status, result) = self
+            .patch_json_with_retry::<Vec<TeamRow>, _>(&url, extra_headers, &payload)
+            .await?;
+
+        if status.is_success() {
+            let rows = result.map_err(CloudApiError::ParseError)?;
+            // RLS 只放行 owner：越权时是一行都没改到的空数组，不能当成功
+            return rows.into_iter().next().map(Team::from).ok_or_else(|| {
+                CloudApiError::Conflict("你不是团队所有者，无法修改团队资料".to_string())
+            });
+        }
+
+        if status == StatusCode::CONFLICT || status.as_u16() == 409 {
+            return Err(CloudApiError::Conflict(
+                "团队资料已被其他成员修改，请刷新后重试".to_string(),
+            ));
+        }
+
+        let error_body = Self::format_error_summary(&result);
+        warn!(
+            status = status.as_u16(),
+            url = %url,
+            error_body = %error_body,
+            "更新团队资料失败"
+        );
+        Err(CloudApiError::ServerError(format!(
+            "更新团队资料失败: {}",
+            error_body
+        )))
+    }
+
+    async fn add_team_member_by_email(
+        &self,
+        team_id: &str,
+        email: &str,
+        role: TeamRole,
+    ) -> Result<String, CloudApiError> {
+        let url = format!(
+            "{}/rest/v1/rpc/add_team_member_by_email",
+            self.config.project_url
+        );
+        let payload = AddTeamMemberByEmailPayload {
+            p_team_id: team_id,
+            p_email: email,
+            p_role: role.as_str(),
+        };
+
+        let (status, body) = self.post_raw_with_retry(&url, vec![], &payload).await?;
+
+        if !status.is_success() {
+            let message = rpc_error_message(&body);
+            warn!(
+                status = status.as_u16(),
+                url = %url,
+                error = %message,
+                "添加团队成员失败"
+            );
+            return Err(CloudApiError::ServerError(message));
+        }
+
+        let value = serde_json::from_str::<serde_json::Value>(&body).map_err(|e| {
+            CloudApiError::ParseError(format!("添加团队成员响应不是合法 JSON: {e}"))
+        })?;
+        parse_rpc_uuid(&value, "add_team_member_by_email")
+            .ok_or_else(|| CloudApiError::ParseError("添加团队成员响应缺少成员 ID".to_string()))
+    }
+
+    async fn list_team_members_with_email(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<TeamMemberWithEmail>, CloudApiError> {
+        let url = format!(
+            "{}/rest/v1/rpc/list_team_members_with_email",
+            self.config.project_url
+        );
+        let payload = ListTeamMembersWithEmailPayload { p_team_id: team_id };
+
+        let (status, body) = self.post_raw_with_retry(&url, vec![], &payload).await?;
+
+        if !status.is_success() {
+            let message = rpc_error_message(&body);
+            warn!(
+                status = status.as_u16(),
+                url = %url,
+                error = %message,
+                "获取团队成员列表失败"
+            );
+            return Err(CloudApiError::ServerError(message));
+        }
+
+        let rows: Vec<TeamMemberWithEmailRow> = serde_json::from_str(&body)
+            .map_err(|e| CloudApiError::ParseError(format!("团队成员列表解析失败: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_member(team_id))
+            .collect())
+    }
+
+    async fn set_team_member_role(
+        &self,
+        team_id: &str,
+        member_id: &str,
+        role: TeamRole,
+    ) -> Result<(), CloudApiError> {
+        let url = format!(
+            "{}/rest/v1/rpc/update_team_member_role",
+            self.config.project_url
+        );
+        let payload = UpdateTeamMemberRolePayload {
+            p_member_id: member_id,
+            p_role: role.as_str(),
+        };
+
+        let (status, body) = self.post_raw_with_retry(&url, vec![], &payload).await?;
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let message = rpc_error_message(&body);
+        warn!(
+            status = status.as_u16(),
+            team_id = team_id,
+            member_id = member_id,
+            role = role.as_str(),
+            error = %message,
+            "修改团队成员角色失败"
+        );
+        Err(CloudApiError::ServerError(message))
+    }
+
+    async fn remove_team_member(
+        &self,
+        team_id: &str,
+        member_id: &str,
+    ) -> Result<(), CloudApiError> {
+        let url = format!("{}/rest/v1/rpc/remove_team_member", self.config.project_url);
+        let payload = RemoveTeamMemberPayload {
+            p_member_id: member_id,
+        };
+
+        let (status, body) = self.post_raw_with_retry(&url, vec![], &payload).await?;
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let message = rpc_error_message(&body);
+        warn!(
+            status = status.as_u16(),
+            team_id = team_id,
+            member_id = member_id,
+            error = %message,
+            "移除团队成员失败"
+        );
+        Err(CloudApiError::ServerError(message))
+    }
+
+    // ========================================================================
     // AI 聊天
     // ========================================================================
 
@@ -2238,6 +2629,292 @@ mod tests {
         assert!(matches!(error, CloudApiError::ParseError(_)));
     }
 
+    #[test]
+    fn team_rpc_payloads_use_backend_parameter_names() {
+        let create = serde_json::to_value(CreateTeamWithOwnerPayload {
+            p_name: "Platform",
+            p_description: None,
+        })
+        .expect("create payload serializes");
+        assert_eq!(
+            serde_json::json!({"p_name": "Platform", "p_description": null}),
+            create
+        );
+
+        let create_with_description = serde_json::to_value(CreateTeamWithOwnerPayload {
+            p_name: "Platform",
+            p_description: Some("平台组"),
+        })
+        .expect("create payload serializes");
+        assert_eq!(
+            serde_json::json!({"p_name": "Platform", "p_description": "平台组"}),
+            create_with_description
+        );
+
+        let add = serde_json::to_value(AddTeamMemberByEmailPayload {
+            p_team_id: "team-1",
+            p_email: "member@example.com",
+            p_role: TeamRole::Admin.as_str(),
+        })
+        .expect("add payload serializes");
+        assert_eq!(
+            serde_json::json!({"p_team_id": "team-1", "p_email": "member@example.com", "p_role": "admin"}),
+            add
+        );
+
+        let list = serde_json::to_value(ListTeamMembersWithEmailPayload {
+            p_team_id: "team-1",
+        })
+        .expect("list payload serializes");
+        assert_eq!(serde_json::json!({"p_team_id": "team-1"}), list);
+
+        // 改角色 / 移除成员只传成员 ID，团队 ID 不参与服务端校验
+        let role = serde_json::to_value(UpdateTeamMemberRolePayload {
+            p_member_id: "member-1",
+            p_role: TeamRole::Owner.as_str(),
+        })
+        .expect("role payload serializes");
+        assert_eq!(
+            serde_json::json!({"p_member_id": "member-1", "p_role": "owner"}),
+            role
+        );
+
+        let removed = serde_json::to_value(RemoveTeamMemberPayload {
+            p_member_id: "member-1",
+        })
+        .expect("remove payload serializes");
+        assert_eq!(serde_json::json!({"p_member_id": "member-1"}), removed);
+
+        let profile = serde_json::to_value(TeamProfileUpdatePayload {
+            name: "Renamed",
+            description: None,
+        })
+        .expect("profile payload serializes");
+        assert_eq!(
+            serde_json::json!({"name": "Renamed", "description": null}),
+            profile
+        );
+    }
+
+    #[test]
+    fn rpc_error_message_prefers_postgrest_message() {
+        let body = r#"{"code":"P0001","message":"Member not found","details":null,"hint":null}"#;
+        assert_eq!("Member not found", rpc_error_message(body));
+
+        assert_eq!("服务端未返回错误详情", rpc_error_message(""));
+        assert_eq!("plain body", rpc_error_message("plain body"));
+    }
+
+    #[tokio::test]
+    async fn create_team_with_owner_returns_rpc_uuid() {
+        let (client, http) = team_client(200, r#""0b7a5e88-1c1f-4d0a-9d20-1234567890ab""#);
+
+        let team_id = client
+            .create_team_with_owner("Platform", Some("平台组"))
+            .await
+            .expect("create succeeds");
+
+        assert_eq!("0b7a5e88-1c1f-4d0a-9d20-1234567890ab", team_id);
+        assert!(
+            http.last_url()
+                .ends_with("/rest/v1/rpc/create_team_with_owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_team_with_owner_accepts_wrapped_rpc_uuid() {
+        let (client, _http) = team_client(
+            200,
+            r#"[{"create_team_with_owner":"0b7a5e88-1c1f-4d0a-9d20-1234567890ab"}]"#,
+        );
+
+        let team_id = client
+            .create_team_with_owner("Platform", None)
+            .await
+            .expect("wrapped response parses");
+
+        assert_eq!("0b7a5e88-1c1f-4d0a-9d20-1234567890ab", team_id);
+    }
+
+    #[tokio::test]
+    async fn create_team_with_owner_surfaces_rpc_message() {
+        let (client, _http) = team_client(
+            400,
+            r#"{"code":"P0001","message":"Team name is required","details":null,"hint":null}"#,
+        );
+
+        let error = client
+            .create_team_with_owner("", None)
+            .await
+            .expect_err("rpc rejection must fail");
+
+        match error {
+            CloudApiError::ServerError(message) => assert_eq!("Team name is required", message),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_team_member_by_email_returns_member_id() {
+        let (client, http) = team_client(200, r#""member-9""#);
+
+        let member_id = client
+            .add_team_member_by_email("team-1", "member@example.com", TeamRole::Member)
+            .await
+            .expect("add succeeds");
+
+        assert_eq!("member-9", member_id);
+        assert!(
+            http.last_url()
+                .ends_with("/rest/v1/rpc/add_team_member_by_email")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_team_members_with_email_maps_rows() {
+        let (client, http) = team_client(
+            200,
+            r#"[{"id":"member-1","user_id":"user-1","email":"owner@example.com","role":"owner","joined_at":"2026-07-01T00:00:00Z"},{"id":"member-2","user_id":"user-2","email":null,"role":"admin","joined_at":null}]"#,
+        );
+
+        let members = client
+            .list_team_members_with_email("team-1")
+            .await
+            .expect("list succeeds");
+
+        assert_eq!(2, members.len());
+        assert_eq!("member-1", members[0].id);
+        assert_eq!("team-1", members[0].team_id);
+        assert_eq!("user-1", members[0].user_id);
+        assert_eq!("owner@example.com", members[0].email);
+        assert_eq!(TeamRole::Owner, members[0].role);
+        assert!(members[0].joined_at > 0);
+
+        // email 为空时给空串，joined_at 缺失时给 0，UI 无需再处理 Option
+        assert_eq!("", members[1].email);
+        assert_eq!(TeamRole::Admin, members[1].role);
+        assert_eq!(0, members[1].joined_at);
+        assert!(
+            http.last_url()
+                .ends_with("/rest/v1/rpc/list_team_members_with_email")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_team_member_role_accepts_empty_void_response() {
+        let (client, http) = team_client(204, "");
+
+        client
+            .set_team_member_role("team-1", "member-1", TeamRole::Admin)
+            .await
+            .expect("void rpc succeeds");
+
+        assert!(
+            http.last_url()
+                .ends_with("/rest/v1/rpc/update_team_member_role")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_team_member_role_surfaces_rpc_message() {
+        let (client, _http) = team_client(
+            400,
+            r#"{"code":"P0001","message":"Only owners can assign owners","details":null,"hint":null}"#,
+        );
+
+        let error = client
+            .set_team_member_role("team-1", "member-1", TeamRole::Owner)
+            .await
+            .expect_err("rpc rejection must fail");
+
+        match error {
+            CloudApiError::ServerError(message) => {
+                assert_eq!("Only owners can assign owners", message);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_team_member_accepts_empty_void_response() {
+        let (client, http) = team_client(200, "");
+
+        client
+            .remove_team_member("team-1", "member-1")
+            .await
+            .expect("void rpc succeeds");
+
+        assert!(http.last_url().ends_with("/rest/v1/rpc/remove_team_member"));
+    }
+
+    #[tokio::test]
+    async fn remove_team_member_surfaces_rpc_message() {
+        let (client, _http) = team_client(
+            400,
+            r#"{"code":"P0001","message":"Owners cannot be removed from the website console","details":null,"hint":null}"#,
+        );
+
+        let error = client
+            .remove_team_member("team-1", "owner-member")
+            .await
+            .expect_err("owner removal must fail");
+
+        match error {
+            CloudApiError::ServerError(message) => {
+                assert_eq!("Owners cannot be removed from the website console", message)
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_team_profile_returns_updated_team() {
+        let (client, http) = team_client(
+            200,
+            r#"[{"id":"team-1","name":"Renamed","owner_id":"user-1","description":"新说明","key_version":3,"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}]"#,
+        );
+
+        let team = client
+            .update_team_profile("team-1", "Renamed", Some("新说明"))
+            .await
+            .expect("profile update succeeds");
+
+        assert_eq!("team-1", team.id);
+        assert_eq!("Renamed", team.name);
+        assert_eq!(Some("新说明".to_string()), team.description);
+        assert_eq!(3, team.key_version);
+        assert_eq!(
+            Some("return=representation".to_string()),
+            http.last_prefer()
+        );
+        assert!(http.last_url().contains("/rest/v1/teams?id=eq.team-1"));
+    }
+
+    #[tokio::test]
+    async fn update_team_profile_empty_patch_response_is_conflict() {
+        // RLS 只放行 owner，越权时返回空数组而不是错误
+        let (client, _http) = team_client(200, "[]");
+
+        let error = client
+            .update_team_profile("team-1", "Renamed", None)
+            .await
+            .expect_err("non-owner must not be reported as success");
+
+        assert!(matches!(error, CloudApiError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn update_team_profile_patch_conflict_is_reported() {
+        let (client, _http) = team_client(409, r#"{"code":"23505"}"#);
+
+        let error = client
+            .update_team_profile("team-1", "Renamed", None)
+            .await
+            .expect_err("patch conflict must fail");
+
+        assert!(matches!(error, CloudApiError::Conflict(_)));
+    }
+
     struct RecordingHttpClient {
         status: u16,
         body: &'static str,
@@ -2304,6 +2981,17 @@ mod tests {
 
     fn delete_client(body: &'static str) -> (SupabaseClient, Arc<RecordingHttpClient>) {
         let http = Arc::new(RecordingHttpClient::respond_json(200, body));
+        let client = SupabaseClient::new(test_config(), http.clone());
+        client.set_auth(
+            "access".to_string(),
+            "refresh".to_string(),
+            "user-1".to_string(),
+        );
+        (client, http)
+    }
+
+    fn team_client(status: u16, body: &'static str) -> (SupabaseClient, Arc<RecordingHttpClient>) {
+        let http = Arc::new(RecordingHttpClient::respond_json(status, body));
         let client = SupabaseClient::new(test_config(), http.clone());
         client.set_auth(
             "access".to_string(),

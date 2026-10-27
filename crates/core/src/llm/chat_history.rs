@@ -19,6 +19,47 @@ pub struct AgentSession {
     pub updated_at: i64,
 }
 
+/// 侧栏会话列表需要的一行，**不含** `snapshot_json` 本体。
+///
+/// 列表只用得到快照里的两个顶层字段（工作区归属、外部 agent 来源）。把整列
+/// `snapshot_json` 读上来、再在调用侧反序列化，代价与快照体积成正比（实测本机
+/// 未归档 356 行合计 76.8MB、单条最大 19.2MB；debug 下光反序列化就要 1.6s），
+/// 而列表刷新跑在 UI 线程上且触发频繁（切会话 / 每轮结束 / 连接就绪都会跑）。
+/// 因此这两个字段下推到 SQL 层用 `json_extract` 提取：快照本体不再进入进程内存。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionSummaryRow {
+    pub id: i64,
+    pub uid: String,
+    pub title: String,
+    pub archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// 快照里的 `workspace_root`。缺失 / 空串 / 快照不是合法 JSON 时为 `None`。
+    pub workspace_root: Option<String>,
+    /// 快照里的 `acp.agent_id`（这段会话由外部 agent 承载）。判定同上。
+    pub acp_agent_id: Option<String>,
+}
+
+/// 正文命中的一条会话。
+///
+/// 只带「够在列表里认出这一条」的三样东西：会话 uid、标题、命中处上下文。
+/// 不带消息序号 / 偏移——调用方拿到的是同一段查询词，跳过去以后由页面自己的
+/// 搜索去定位高亮，比在这里维护一套「第几条消息第几个字」的坐标更不容易走样。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionBodyMatch {
+    pub uid: String,
+    pub title: String,
+    /// 命中处上下文：单行、空白已折叠、两端按需带省略号。
+    pub snippet: String,
+}
+
+/// 片段每个方向取多少个字符。
+const BODY_SNIPPET_RADIUS: usize = 48;
+
+/// `LIKE` 一次最多扫多少行。命中率低时（大量假阳性）不能只按 limit 取行，
+/// 否则返回条数会莫名其妙地少；多扫几倍再截断，代价仍然有界。
+const BODY_SEARCH_SCAN_FACTOR: usize = 8;
+
 impl FromSqliteRow for AgentSession {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let archived: i32 = row.get("archived")?;
@@ -411,6 +452,114 @@ impl AgentSessionRepository {
         })
     }
 
+    /// 列出摘要行（侧栏用），**不读** `snapshot_json` 本体。
+    ///
+    /// 过滤与排序与 [`Self::list_by_archived`] 完全一致，只是把来自快照的两个字段
+    /// 下推到 SQL 层提取。调用侧因此不必把几十 MB 的快照 JSON 搬进内存、更不必逐行
+    /// 反序列化。
+    ///
+    /// `json_valid` 守卫是必需的，不是防御性冗余：本表历史数据里存在
+    /// `snapshot_json` 为空串或非合法 JSON 的行（早期 chat 会话），裸
+    /// `json_extract` 遇到它们会直接报 `malformed JSON`，**整条查询失败**，
+    /// 侧栏会话列表会整体变空。
+    pub fn list_summary_rows_by_archived(
+        &self,
+        archived: bool,
+    ) -> Result<Vec<AgentSessionSummaryRow>> {
+        let archived = if archived { 1i32 } else { 0i32 };
+        self.conn.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT
+                   id,
+                   COALESCE(uid, CAST(id AS TEXT)) AS uid,
+                   name AS title,
+                   archived,
+                   created_at,
+                   updated_at,
+                   CASE WHEN json_valid(snapshot_json)
+                        THEN json_extract(snapshot_json, '$.workspace_root') END AS workspace_root,
+                   CASE WHEN json_valid(snapshot_json)
+                        THEN json_extract(snapshot_json, '$.acp.agent_id') END AS acp_agent_id
+                 FROM chat_sessions
+                 WHERE archived = ?1
+                 ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![archived], |row| {
+                let archived: i32 = row.get("archived")?;
+                Ok(AgentSessionSummaryRow {
+                    id: row.get("id")?,
+                    uid: row.get("uid")?,
+                    title: row.get("title")?,
+                    archived: archived != 0,
+                    created_at: row.get("created_at")?,
+                    updated_at: row.get("updated_at")?,
+                    workspace_root: row.get("workspace_root")?,
+                    acp_agent_id: row.get("acp_agent_id")?,
+                })
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+    }
+
+    /// 按正文子串搜会话（大小写不敏感，最近更新的在前）。
+    ///
+    /// 正文只活在 `snapshot_json` 里，没有可查询的独立列，所以先用 `LIKE` 让
+    /// SQLite 粗筛行——这违反了「快照本体不进内存」那条约定的边角：只有筛出来的
+    /// 行才把快照读上来。然后在 Rust 侧把 JSON 拆开、**按消息逐条**找命中：
+    /// `LIKE` 定位不到片段边界，JSON 转义还会造成假阳性（`\n` 之类），逐条找
+    /// 既拿到干净的上下文，也顺手丢掉这些假阳性。
+    ///
+    /// 只看消息文本（用户 / 助手 / 系统 / 摘要），不看工具调用与观测：那两类的
+    /// JSON 又大又杂，参数里随便一个路径就能命中，噪音远大于用处。
+    pub fn search_snapshots(
+        &self,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentSessionBodyMatch>> {
+        let needle = needle.trim();
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", escape_like_pattern(needle));
+        let scan_limit = (limit.saturating_mul(BODY_SEARCH_SCAN_FACTOR)) as i64;
+        self.conn.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(uid, CAST(id AS TEXT)) AS uid, name AS title, snapshot_json
+                 FROM chat_sessions
+                 WHERE snapshot_json LIKE ?1 ESCAPE '\\'
+                 ORDER BY updated_at DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![pattern, scan_limit], |row| {
+                Ok((
+                    row.get::<_, String>("uid")?,
+                    row.get::<_, String>("title")?,
+                    row.get::<_, String>("snapshot_json")?,
+                ))
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                let (uid, title, snapshot_json) = row?;
+                let Some(snippet) = snapshot_body_snippet(&snapshot_json, needle) else {
+                    continue;
+                };
+                results.push(AgentSessionBodyMatch {
+                    uid,
+                    title,
+                    snippet,
+                });
+                if results.len() >= limit {
+                    break;
+                }
+            }
+            Ok(results)
+        })
+    }
+
     pub fn delete_by_uid(&self, uid: &str) -> Result<()> {
         let uid = uid.to_string();
         self.conn.with_connection(|conn| {
@@ -727,3 +876,91 @@ impl MessageRepository {
         })
     }
 }
+
+/// 转义 `LIKE` 模式里的通配符：用户打进来的 `%` / `_` / `\` 是字面量。
+fn escape_like_pattern(needle: &str) -> String {
+    let mut escaped = String::with_capacity(needle.len());
+    for ch in needle.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// 在快照的历史里找第一条含 `needle` 的消息，返回命中处的上下文片段。
+fn snapshot_body_snippet(snapshot_json: &str, needle: &str) -> Option<String> {
+    message_texts_from_snapshot(snapshot_json)
+        .into_iter()
+        .find_map(|text| snippet_around(&text, needle))
+}
+
+/// 快照里的消息文本（用户 / 助手 / 助手+reasoning / 系统 / 摘要）。
+fn message_texts_from_snapshot(snapshot_json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(snapshot_json) else {
+        return Vec::new();
+    };
+    let Some(history) = value.get("history").and_then(|history| history.as_array()) else {
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    for item in history {
+        match item {
+            // `HistoryItem::Assistant` / `System` 这类单值变体序列化成裸字符串。
+            serde_json::Value::String(text) => texts.push(text.clone()),
+            serde_json::Value::Object(map) => {
+                let text = ["User", "AssistantWithReasoning", "ContextSummary"]
+                    .iter()
+                    .find_map(|key| map.get(*key))
+                    .and_then(|inner| inner.get("text"))
+                    .and_then(|text| text.as_str());
+                if let Some(text) = text {
+                    texts.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    texts
+}
+
+/// 命中处前后各取 [`BODY_SNIPPET_RADIUS`] 个字符，压成一行。
+fn snippet_around(text: &str, needle: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let byte_index = lower.find(&needle.to_lowercase())?;
+    // 大小写折叠在个别字符上会改变字节数，先把下标落到字符边界以内再按字符切片。
+    let byte_index = floor_char_boundary(text, byte_index.min(text.len()));
+    let match_start = text[..byte_index].chars().count();
+    let match_len = needle.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let start = match_start.saturating_sub(BODY_SNIPPET_RADIUS);
+    let end = (match_start + match_len + BODY_SNIPPET_RADIUS).min(chars.len());
+    // 片段是列表右侧的一行说明文字：换行与连续空白折叠成单个空格，否则会被
+    // 截断成一团乱码。
+    let mut snippet = chars[start..end]
+        .iter()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if start > 0 {
+        snippet.insert_str(0, "…");
+    }
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
+/// 向前找到最近的字符边界：按字节下标切片时不能切在 UTF-8 中间。
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+#[cfg(test)]
+#[path = "body_search_tests.rs"]
+mod body_search_tests;

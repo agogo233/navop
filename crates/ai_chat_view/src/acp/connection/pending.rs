@@ -1,16 +1,15 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{AuthMethodId, SessionId as AcpSessionId};
+use agent_client_protocol::schema::v1::{AuthMethodId, SessionId as AcpSessionId};
 use agent_client_protocol::{Agent, ConnectionTo};
-use agent_runtime::{RuntimeEvent, SessionId};
+use agent_runtime::{RuntimeEvent, SessionId, TurnId};
 use rust_i18n::t;
 use tokio::sync::broadcast;
 
 use crate::acp::config::AcpAgentConfig;
 use crate::acp::state::AcpSessionState;
-use crate::acp::turn::AcpTurnTracker;
-use crate::acp::{AcpError, AcpErrorKind};
+use crate::acp::{AcpActiveTurns, AcpError, AcpErrorKind, AcpInteractiveSession};
 
 use super::AcpConnection;
 use super::lifecycle::AcpConnectionLifecycle;
@@ -22,10 +21,18 @@ pub struct AcpPendingConnection {
     pub(super) session_id: SessionId,
     pub(super) events_tx: broadcast::Sender<RuntimeEvent>,
     pub(super) state: Arc<Mutex<AcpSessionState>>,
-    pub(super) active_turn: Arc<Mutex<Option<AcpTurnTracker>>>,
+    pub(super) active_turn: AcpActiveTurns,
+    /// 交互会话指针；登录完成后要带进 [`AcpConnection`]。
+    pub(super) interactive_session: AcpInteractiveSession,
+    /// 历史回放窗口；登录完成后要带进 [`AcpConnection`]，否则通知层认不出回放。
+    pub(super) history_replay: Arc<Mutex<Option<TurnId>>>,
+    /// 子代理详情会话注册表；登录完成后同样要带过去。
+    pub(super) detail_sessions: super::AcpDetailSessions,
     pub(super) workspace_root: PathBuf,
     pub(super) config: AcpAgentConfig,
     pub(super) methods: Vec<AuthMethodId>,
+    /// 登录完成后要复用的那个 ACP 会话（可能没有）。
+    pub(super) resume: Option<AcpSessionId>,
     pub(super) lifecycle: AcpConnectionLifecycle,
 }
 
@@ -50,12 +57,17 @@ impl AcpPendingConnection {
             &self.state,
             self.workspace_root.clone(),
             method,
+            self.resume.clone(),
         )
         .await?;
         Ok(self.into_ready(acp_session_id))
     }
 
     fn into_ready(self, acp_session_id: AcpSessionId) -> AcpConnection {
+        // 交互指针跟着登录后开出来的会话走。
+        if let Ok(mut interactive) = self.interactive_session.lock() {
+            *interactive = acp_session_id.0.to_string();
+        }
         AcpConnection {
             handle: self.handle,
             conn: self.conn,
@@ -64,6 +76,9 @@ impl AcpPendingConnection {
             events_tx: self.events_tx,
             state: self.state,
             active_turn: self.active_turn,
+            interactive_session: self.interactive_session,
+            history_replay: self.history_replay,
+            detail_sessions: self.detail_sessions,
             prompt_timeout: self.config.timeouts.prompt,
             agent_id: self.config.id.to_string(),
             agent_name: self.config.name.to_string(),

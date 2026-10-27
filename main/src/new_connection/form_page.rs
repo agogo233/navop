@@ -26,11 +26,13 @@ pub(crate) enum NewConnectionFormResult {
 }
 
 pub(crate) trait NewConnectionFormPage {
+    /// `initial_workspace_id` 是从某个分组右键进入向导时的目标分组，各表单据此预选分组。
     fn build_form_view(
         self,
         parent: Entity<HomePage>,
         parent_window: AnyWindowHandle,
         external_driver_registry: &IpcDriverRegistry,
+        initial_workspace_id: Option<i64>,
         window: &mut Window,
         cx: &mut Context<NewConnectionWindow>,
     ) -> NewConnectionFormResult;
@@ -42,24 +44,45 @@ impl NewConnectionFormPage for NewConnectionKind {
         parent: Entity<HomePage>,
         parent_window: AnyWindowHandle,
         external_driver_registry: &IpcDriverRegistry,
+        initial_workspace_id: Option<i64>,
         window: &mut Window,
         cx: &mut Context<NewConnectionWindow>,
     ) -> NewConnectionFormResult {
         match self {
-            Self::Ssh => build_ssh_form(parent, window, cx),
-            Self::Rdp => build_remote_desktop_form(parent, RemoteDesktopProtocol::Rdp, window, cx),
-            Self::Vnc => build_remote_desktop_form(parent, RemoteDesktopProtocol::Vnc, window, cx),
-            Self::Redis => build_redis_form(parent, window, cx),
-            Self::MongoDB => build_mongo_form(parent, window, cx),
-            Self::Serial => build_serial_form(parent, window, cx),
-            Self::Telnet => build_telnet_form(parent, window, cx),
-            Self::Ftp => build_ftp_form(parent, window, cx),
-            Self::PortForwarding => build_port_forwarding_form(parent, window, cx),
+            Self::Ssh => build_ssh_form(parent, initial_workspace_id, window, cx),
+            Self::Rdp => build_remote_desktop_form(
+                parent,
+                RemoteDesktopProtocol::Rdp,
+                initial_workspace_id,
+                window,
+                cx,
+            ),
+            Self::Vnc => build_remote_desktop_form(
+                parent,
+                RemoteDesktopProtocol::Vnc,
+                initial_workspace_id,
+                window,
+                cx,
+            ),
+            Self::Redis => build_redis_form(parent, initial_workspace_id, window, cx),
+            Self::MongoDB => build_mongo_form(parent, initial_workspace_id, window, cx),
+            Self::Serial => build_serial_form(parent, initial_workspace_id, window, cx),
+            Self::Telnet => build_telnet_form(parent, initial_workspace_id, window, cx),
+            Self::Ftp => build_ftp_form(parent, initial_workspace_id, window, cx),
+            Self::PortForwarding => {
+                build_port_forwarding_form(parent, initial_workspace_id, window, cx)
+            }
             Self::MoreConnections => open_extensions_tab(parent, parent_window, cx),
             Self::InstallCategoryExtensions(_) => open_extensions_tab(parent, parent_window, cx),
-            Self::Database(db_type) => {
-                build_database_form(parent, db_type, None, external_driver_registry, window, cx)
-            }
+            Self::Database(db_type) => build_database_form(
+                parent,
+                db_type,
+                None,
+                external_driver_registry,
+                initial_workspace_id,
+                window,
+                cx,
+            ),
             Self::ExternalDatabase { driver_id, .. } => {
                 let db_type = DatabaseType::external(driver_id.clone());
                 build_database_form(
@@ -67,11 +90,14 @@ impl NewConnectionFormPage for NewConnectionKind {
                     db_type,
                     Some(driver_id),
                     external_driver_registry,
+                    initial_workspace_id,
                     window,
                     cx,
                 )
             }
-            Self::Extension(contribution) => build_extension_form(parent, contribution, window, cx),
+            Self::Extension(contribution) => {
+                build_extension_form(parent, contribution, initial_workspace_id, window, cx)
+            }
         }
     }
 }
@@ -79,6 +105,7 @@ impl NewConnectionFormPage for NewConnectionKind {
 fn build_extension_form(
     parent: Entity<HomePage>,
     contribution: extension_runtime::RegisteredResourceConnectionContribution,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -100,6 +127,7 @@ fn build_extension_form(
         Some(ExtensionConnectionFormConfig {
             contribution,
             editing_connection,
+            initial_workspace_id,
             workspaces: home.workspaces.clone(),
             teams,
         })
@@ -114,6 +142,7 @@ fn build_extension_form(
 
 fn build_port_forwarding_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -137,6 +166,7 @@ fn build_port_forwarding_form(
         home.editing_connection_id = None;
         Some(PortForwardingFormWindowConfig {
             editing_connection,
+            initial_workspace_id,
             ssh_connections,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -154,6 +184,7 @@ fn build_port_forwarding_form(
 fn build_remote_desktop_form(
     parent: Entity<HomePage>,
     protocol: RemoteDesktopProtocol,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -172,6 +203,7 @@ fn build_remote_desktop_form(
         Some(RemoteDesktopFormWindowConfig {
             protocol,
             editing_connection,
+            initial_workspace_id,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
         })
@@ -203,6 +235,7 @@ fn build_database_form(
     db_type: DatabaseType,
     external_driver_id: Option<String>,
     external_driver_registry: &IpcDriverRegistry,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -239,6 +272,7 @@ fn build_database_form(
             external_driver_registry: external_driver_registry.clone(),
             editing_connection,
             initial_connection: None,
+            initial_workspace_id,
             on_saved: None,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -256,6 +290,7 @@ fn build_database_form(
 
 fn build_ssh_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -274,6 +309,7 @@ fn build_ssh_form(
         Some(SshFormWindowConfig {
             editing_connection,
             initial_connection: None,
+            initial_workspace_id,
             on_saved: None,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -287,6 +323,7 @@ fn build_ssh_form(
 
 fn build_redis_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -311,6 +348,7 @@ fn build_redis_form(
         Some(RedisFormWindowConfig {
             editing_connection,
             initial_connection: None,
+            initial_workspace_id,
             on_saved: None,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -325,6 +363,7 @@ fn build_redis_form(
 
 fn build_mongo_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -344,6 +383,7 @@ fn build_mongo_form(
         Some(MongoFormWindowConfig {
             editing_connection,
             initial_connection: None,
+            initial_workspace_id,
             on_saved: None,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
@@ -358,6 +398,7 @@ fn build_mongo_form(
 
 fn build_serial_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -375,6 +416,7 @@ fn build_serial_form(
         home.editing_connection_id = None;
         Some(SerialFormWindowConfig {
             editing_connection,
+            initial_workspace_id,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
         })
@@ -390,6 +432,7 @@ fn build_serial_form(
 
 fn build_telnet_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -407,6 +450,7 @@ fn build_telnet_form(
         home.editing_connection_id = None;
         Some(TelnetFormWindowConfig {
             editing_connection,
+            initial_workspace_id,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
         })
@@ -422,6 +466,7 @@ fn build_telnet_form(
 
 fn build_ftp_form(
     parent: Entity<HomePage>,
+    initial_workspace_id: Option<i64>,
     window: &mut Window,
     cx: &mut Context<NewConnectionWindow>,
 ) -> NewConnectionFormResult {
@@ -439,6 +484,7 @@ fn build_ftp_form(
         home.editing_connection_id = None;
         Some(FtpFormWindowConfig {
             editing_connection,
+            initial_workspace_id,
             workspaces: home.workspaces.clone(),
             teams: get_cached_team_options(cx),
         })

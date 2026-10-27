@@ -78,6 +78,8 @@ pub type SshFormSavedCallback = Arc<
 pub struct SshFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub initial_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub on_saved: Option<SshFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
@@ -992,7 +994,12 @@ impl SshFormWindow {
         let mut save_password = true;
         let mut keyboard_interactive = true;
         let mut jump_auth_method = AuthMethodSelection::Password;
-        let mut workspace_id: Option<i64> = None;
+        // 新建连接向导指定了目标分组时预选该分组（编辑 / 复制连接走下面的回填逻辑）。
+        let mut workspace_id: Option<i64> = if is_editing || config.initial_connection.is_some() {
+            None
+        } else {
+            config.initial_workspace_id
+        };
         let mut enable_jump_server = false;
         let mut enable_proxy = false;
         let mut proxy_type = ProxyTypeSelection::default();
@@ -4160,6 +4167,7 @@ mod tests {
         let initial_connection =
             StoredConnection::new_ssh("imported".to_string(), sample_params(), None);
         let config = super::SshFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(initial_connection),
             on_saved: None,
@@ -4176,6 +4184,7 @@ mod tests {
         let initial_connection =
             StoredConnection::new_ssh("imported".to_string(), sample_params(), None);
         let config = super::SshFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(initial_connection),
             on_saved: Some(Arc::new(|_, _, _, _| {})),
@@ -4200,6 +4209,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4235,6 +4245,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4281,6 +4292,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4319,6 +4331,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4352,6 +4365,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(default_connection),
                     on_saved: None,
@@ -4373,6 +4387,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(dual_pane_connection),
                     on_saved: None,
@@ -4409,6 +4424,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4468,6 +4484,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4495,6 +4512,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             let form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4529,6 +4547,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4564,6 +4583,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4607,6 +4627,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4644,6 +4665,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4713,6 +4735,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -4750,6 +4773,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4794,6 +4818,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4823,6 +4848,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             let mut form = super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4852,6 +4878,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: None,
                     on_saved: None,
@@ -4894,6 +4921,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(initial_connection),
                     on_saved: None,
@@ -5203,6 +5231,7 @@ mod tests {
         let (form, cx) = cx.add_window_view(|window, cx| {
             super::SshFormWindow::new(
                 super::SshFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: Some(initial_connection.clone()),
                     initial_connection: None,
                     on_saved: None,

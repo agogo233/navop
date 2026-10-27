@@ -1458,6 +1458,16 @@ pub struct TerminalTextSnapshot {
     pub history_size: usize,
     pub screen_lines: usize,
     pub columns: usize,
+    /// 全屏程序（vim、less 等）占据屏幕时，text 是它的界面而不是 shell 历史。
+    pub alt_screen: bool,
+    /// 用户往回滚的行数；非 0 表示正在看历史。
+    pub display_offset: usize,
+    /// 光标在 text 里的行号（0 起）。
+    pub cursor_row: usize,
+    /// 光标列号（0 起）。
+    pub cursor_column: usize,
+    /// 用户当前选中的文本；没有选区时为 None。
+    pub selection: Option<String>,
 }
 
 impl TerminalScrollProxy {
@@ -1626,6 +1636,12 @@ fn recent_text_from_term(
             .collect::<Vec<_>>()
     };
 
+    let cursor_row = if take == 0 {
+        0
+    } else {
+        (cursor_line - start_line).max(0) as usize
+    };
+
     TerminalTextSnapshot {
         text: lines.join("\n"),
         requested_lines: max_lines,
@@ -1634,6 +1650,11 @@ fn recent_text_from_term(
         history_size,
         screen_lines,
         columns,
+        alt_screen: term.mode().contains(TermMode::ALT_SCREEN),
+        display_offset: grid.display_offset(),
+        cursor_row,
+        cursor_column: grid.cursor.point.column.0,
+        selection: crate::selection_text_from_term(&term),
     }
 }
 
@@ -7366,6 +7387,62 @@ mod tests {
         assert_eq!(2, snapshot.returned_lines);
         assert!(snapshot.available_lines >= 4);
         assert!(snapshot.history_size >= 1);
+    }
+
+    #[test]
+    fn recent_text_tracks_alt_screen_mode() {
+        let (event_tx, _event_rx) = unbounded_channel();
+        let (term, _event_proxy, _colors, _performance_metrics) =
+            Terminal::create_term(20, 8, 10_000, event_tx);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+
+        processor.advance(&mut *term.lock(), b"\x1b[?1049h-- INSERT --");
+        assert!(
+            recent_text_from_term(&term, 3).alt_screen,
+            "进入备用屏幕后应报告全屏程序占用"
+        );
+
+        processor.advance(&mut *term.lock(), b"\x1b[?1049l");
+        assert!(
+            !recent_text_from_term(&term, 3).alt_screen,
+            "退出备用屏幕后应恢复普通模式"
+        );
+    }
+
+    #[test]
+    fn recent_text_reports_selection_and_display_offset() {
+        let (event_tx, _event_rx) = unbounded_channel();
+        let (term, _event_proxy, _colors, _performance_metrics) =
+            Terminal::create_term(20, 8, 10_000, event_tx);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        let payload = b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven";
+        processor.advance(&mut *term.lock(), payload);
+
+        {
+            let mut term = term.lock();
+            let line = -(term.history_size() as i32);
+            {
+                use alacritty_terminal::index::{Column, Line, Point, Side};
+                use alacritty_terminal::selection::{Selection, SelectionType};
+
+                let mut selection = Selection::new(
+                    SelectionType::Simple,
+                    Point::new(Line(line), Column(0)),
+                    Side::Left,
+                );
+                selection.update(Point::new(Line(line), Column(2)), Side::Right);
+                term.selection = Some(selection);
+            }
+            term.scroll_display(alacritty_terminal::grid::Scroll::Top);
+            assert!(term.history_size() > 0, "内容应按行数溢出屏幕历史");
+        }
+
+        let snapshot = recent_text_from_term(&term, 5);
+        assert_eq!(Some("one".to_string()), snapshot.selection);
+        assert!(
+            snapshot.display_offset > 0,
+            "用户向上滚动后应报告非零 display_offset"
+        );
     }
 
     #[test]

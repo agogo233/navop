@@ -48,6 +48,8 @@ pub struct ConnectionFormWindowConfig {
     pub external_driver_registry: db::ipc::IpcDriverRegistry,
     pub editing_connection: Option<StoredConnection>,
     pub initial_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub on_saved: Option<ConnectionFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
@@ -168,6 +170,12 @@ impl ConnectionFormWindow {
         } else if let Some(conn) = config.initial_connection.as_ref() {
             form.update(cx, |f, cx| {
                 f.load_initial_connection(conn, window, cx);
+            });
+        } else if let Some(workspace_id) = config.initial_workspace_id {
+            // 新建连接向导带着目标分组打开时预选该分组（必须在 set_workspaces 之后，
+            // 因为 set_items 会重置选中项），用户仍可在下拉里改。
+            form.update(cx, |f, cx| {
+                f.select_workspace(workspace_id, window, cx);
             });
         }
 
@@ -427,6 +435,7 @@ mod tests {
     fn database_form_prefill_does_not_enter_edit_mode() {
         let initial_connection = stored_connection_with_extra_driver_param();
         let config = ConnectionFormWindowConfig {
+            initial_workspace_id: None,
             db_type: DatabaseType::MySQL,
             external_driver_id: None,
             external_driver_registry: db::ipc::IpcDriverRegistry::empty(),
@@ -446,6 +455,7 @@ mod tests {
     fn database_form_prefill_can_enable_save_and_continue() {
         let initial_connection = stored_connection_with_extra_driver_param();
         let config = ConnectionFormWindowConfig {
+            initial_workspace_id: None,
             db_type: DatabaseType::MySQL,
             external_driver_id: None,
             external_driver_registry: db::ipc::IpcDriverRegistry::empty(),

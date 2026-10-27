@@ -5,17 +5,23 @@ mod frame;
 mod header;
 mod load;
 mod render;
+mod review;
 
 use crate::WorkspaceEditor;
 use crate::backend::{WorkspaceBackend, local_backend};
 use crate::editor::{GitDiffRequest, WorkspaceEditorEvent};
-use crate::git::{GitChange, GitRepository, load_changes};
+use crate::git::{
+    GitChange, GitRepository, WorktreeEntry, anchor_checkpoint, anchor_turn_checkpoint,
+    capture_worktree_snapshot, create_worktree, delete_turn_checkpoints, diff_snapshots,
+    load_changes, restore_checkpoint,
+};
 use crate::model::ExplorerEntry;
 use crate::theme::WorkspaceTheme;
 use gpui::{
     AppContext as _, AsyncApp, Context, Entity, FocusHandle, PathPromptOptions, ScrollHandle,
     Subscription, WeakEntity, Window,
 };
+use gpui_component::{WindowExt as _, input::InputState, notification::Notification};
 use ignore::gitignore::Gitignore;
 use rust_i18n::t;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +31,10 @@ use std::sync::Arc;
 use self::load::{WorkspaceSnapshot, load_workspace};
 use branches::BranchManager;
 use clipboard::FileClipboard;
-use file_actions::{ExplorerConfirmation, FileActionEditor};
+use file_actions::{
+    ExplorerConfirmation, ExplorerConfirmationOperation, FileActionEditor, FileActionEditorMode,
+};
+use review::{patch_section_for_path, same_path};
 
 pub(crate) use clipboard::keybindings;
 pub use frame::{ExplorerFramePlacement, WorkspaceExplorerEvent};
@@ -43,6 +52,21 @@ pub struct WorkspaceExplorer {
     repository: Option<GitRepository>,
     branch_manager: Option<Entity<BranchManager>>,
     changes: Vec<GitChange>,
+    /// 仓库已注册的 worktree，来自 `git worktree list`。
+    worktrees: Vec<WorktreeEntry>,
+    last_checkpoint: Option<String>,
+    /// 逐轮审阅快照，按捕获先后排列（跨会话）。
+    ///
+    /// 与 `turn_checkpoints` **分开存**：那份是「能回到这一轮」的依据，锚定失败
+    /// 就不入列；这份只要 diff 算出来了就留 —— 审阅入口不该因为 ref 没锚上就
+    /// 点不开。两者一起在「回到某一轮」时截断。
+    turn_reviews: Vec<WorktreeReviewSnapshot>,
+    /// 每个会话已捕获的逐轮快照，按轮次先后排列（key = session id）。
+    turn_checkpoints: HashMap<String, Vec<TurnCheckpoint>>,
+    /// 提交信息生成中（按钮防重复触发）。
+    commit_message_generating: bool,
+    /// 宿主注入的最近工作区根目录，最近在前。
+    recent_roots: Vec<PathBuf>,
     changes_expanded: bool,
     files_expanded: bool,
     loading: bool,
@@ -66,6 +90,25 @@ pub struct WorkspaceExplorer {
     file_operation_running: bool,
     file_action_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeReviewSnapshot {
+    pub session_id: String,
+    pub turn_id: String,
+    pub diff: String,
+    pub success: bool,
+}
+
+/// 一轮结束时的快照。按会话累积成链，是「回到某一轮」的依据。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnCheckpoint {
+    pub session_id: String,
+    pub turn_id: String,
+    /// 该轮结束时的整棵工作区快照（悬空 commit，已锚成 ref）。
+    pub commit: String,
+    /// 该轮是否正常结束；失败的轮次同样可以回滚（它一样改变了磁盘）。
+    pub success: bool,
 }
 
 pub struct WorkspaceExplorerConfig {
@@ -105,6 +148,12 @@ impl WorkspaceExplorer {
             repository: None,
             branch_manager: None,
             changes: Vec::new(),
+            worktrees: Vec::new(),
+            last_checkpoint: None,
+            turn_reviews: Vec::new(),
+            turn_checkpoints: HashMap::new(),
+            commit_message_generating: false,
+            recent_roots: Vec::new(),
             changes_expanded: true,
             files_expanded: true,
             loading: false,
@@ -135,6 +184,475 @@ impl WorkspaceExplorer {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 当前已加载的 Git 变更列表。
+    pub fn changes(&self) -> &[GitChange] {
+        &self.changes
+    }
+
+    /// 当前工作区根对应的 Git 仓库；非 Git 目录时为 `None`。
+    pub fn repository(&self) -> Option<&GitRepository> {
+        self.repository.as_ref()
+    }
+
+    /// 重新加载 Git 变更（外部容器在切换工作台后调用）。
+    pub fn refresh_git_changes(&mut self, cx: &mut Context<Self>) {
+        self.refresh_git(cx);
+    }
+
+    /// 仓库已注册的 worktree；非 Git 目录时为空。
+    pub fn worktrees(&self) -> &[WorktreeEntry] {
+        &self.worktrees
+    }
+
+    /// 宿主注入的最近工作区列表（最近在前）。不落盘，持久化由宿主负责。
+    pub fn set_recent_roots(&mut self, roots: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.recent_roots = roots;
+        cx.notify();
+    }
+
+    pub fn recent_roots(&self) -> &[PathBuf] {
+        &self.recent_roots
+    }
+
+    /// 在 turn 结束时捕获工作区快照，并与上一轮结束快照比较。
+    ///
+    /// 捕获使用临时 index，不会修改用户暂存区。首轮没有基线时只保存快照，
+    /// 后续轮次即可得到上一轮到当前轮的 diff。
+    pub fn capture_turn_finished(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        success: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let before = self.last_checkpoint.clone();
+        let turn_to_anchor = turn_id.clone();
+        let task = cx.background_spawn(async move {
+            let after = capture_worktree_snapshot(&repository)?;
+            // 锚定成持久 ref：防 gc，重启后 Explorer 能恢复基线。
+            anchor_checkpoint(&repository, &after)?;
+            // 同一份快照另挂到该轮的 ref 下，供「回到这一轮」取用。锚定失败（例如 turn id
+            // 不合规）不该拖垮基线记录，所以单独吞掉错误，只让这一轮不进可回滚列表。
+            let anchored_turn =
+                anchor_turn_checkpoint(&repository, &turn_to_anchor, &after).is_ok();
+            let diff = before
+                .as_deref()
+                .map(|before| diff_snapshots(&repository, before, &after))
+                .transpose()?
+                .unwrap_or_default();
+            anyhow::Ok((after, diff, anchored_turn))
+        });
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = entity.update(cx, |this, cx| {
+                if let Ok((after, diff, anchored_turn)) = result {
+                    this.last_checkpoint = Some(after.clone());
+                    if anchored_turn {
+                        this.turn_checkpoints
+                            .entry(session_id.clone())
+                            .or_default()
+                            .push(TurnCheckpoint {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                commit: after,
+                                success,
+                            });
+                        this.emit_restorable_turns(&session_id, cx);
+                    }
+                    this.turn_reviews.push(WorktreeReviewSnapshot {
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        diff: diff.clone(),
+                        success,
+                    });
+                    // 两件事分开通知：① 那些轮的「查看改动」入口变了；② 刚刚这一轮
+                    // 的 diff 要摆到审阅面板（打开它需要窗口，Explorer 手里没有）。
+                    this.emit_reviews_changed(&session_id, cx);
+                    if !diff.trim().is_empty() {
+                        cx.emit(WorkspaceExplorerEvent::TurnReviewCaptured {
+                            session_id,
+                            turn_id,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 某个会话里已捕获快照、可以回滚到的轮次（按轮次先后）。
+    pub fn turn_checkpoints(&self, session_id: &str) -> &[TurnCheckpoint] {
+        self.turn_checkpoints
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// 把某个会话当前可回滚的轮次**全量**通知宿主。
+    ///
+    /// 宿主（Agent 面板）据此决定轮次页脚要不要显示「回到这一轮」——它拿不到 git ref，
+    /// 所以不通知就等于入口不出现。
+    fn emit_restorable_turns(&self, session_id: &str, cx: &mut Context<Self>) {
+        let turn_ids = self
+            .turn_checkpoints(session_id)
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect();
+        cx.emit(WorkspaceExplorerEvent::RestorableTurnsChanged {
+            session_id: session_id.to_string(),
+            turn_ids,
+        });
+    }
+
+    /// 某个会话里留下了整轮审阅 diff 的轮次（按轮次先后）。
+    ///
+    /// 只算**有实质 diff** 的轮次：首轮没有基线（快照算出来是空的）、或这一轮
+    /// 压根没改文件时，轮次页脚就不该出现「查看改动」——点开只有一份空 diff，
+    /// 那和没有入口一样，还多欠用户一次失望。
+    pub fn reviewed_turn_ids(&self, session_id: &str) -> Vec<String> {
+        reviewed_turn_ids_of(&self.turn_reviews, session_id)
+    }
+
+    /// 把某个会话当前有审阅 diff 的轮次**全量**通知宿主。
+    ///
+    /// 与 [`Self::emit_restorable_turns`] 同一套约定：入口只在宿主手里有依据时出现。
+    fn emit_reviews_changed(&self, session_id: &str, cx: &mut Context<Self>) {
+        cx.emit(WorkspaceExplorerEvent::ReviewsChanged {
+            session_id: session_id.to_string(),
+            turn_ids: self.reviewed_turn_ids(session_id),
+        });
+    }
+
+    /// 把某一轮的整轮 diff 摆到审阅面板。
+    ///
+    /// 只认**用户点的那一轮**：那一轮没有快照（非 Git 目录、捕获失败、首轮没基线）
+    /// 或 diff 为空时返回 `false`，**不**退到最近一轮——页脚上写的是「本轮改动」，
+    /// 拿别的轮次冒充就是答非所问。宿主据此决定要不要把面板带到前台。
+    ///
+    /// 打开文档需要窗口，所以调用方只能是宿主（见
+    /// [`WorkspaceExplorerEvent::TurnReviewCaptured`] 与聊天面板的「查看改动」）。
+    pub fn open_turn_review(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(review) = openable_review(&self.turn_reviews, session_id, turn_id) else {
+            return false;
+        };
+        let display_name = t!(
+            "WorkspaceExplorer.editor.review_turn_tab",
+            turn = review.turn_id.as_str()
+        )
+        .to_string();
+        let diff = review.diff.clone();
+        self.editor.update(cx, |editor, cx| {
+            editor.open_snapshot_diff(display_name, diff, window, cx);
+        });
+        cx.emit(WorkspaceExplorerEvent::DocumentRequested);
+        cx.notify();
+        true
+    }
+
+    /// 把工作区恢复到某一轮结束时的状态。
+    ///
+    /// 恢复到第 N 轮后，第 N 轮之后的快照不再指向这条时间线，一并丢弃；但**先恢复、
+    /// 成功了才丢**——恢复失败时保留记录，用户可以重试或换一轮。
+    pub fn restore_turn(&mut self, session_id: String, turn_id: String, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let Some(commit) = self
+            .turn_checkpoints
+            .get(&session_id)
+            .and_then(|turns| turns.iter().find(|turn| turn.turn_id == turn_id))
+            .map(|turn| turn.commit.clone())
+        else {
+            return;
+        };
+        let task = cx.background_spawn(async move { restore_checkpoint(&repository, &commit) });
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = entity.update(cx, |this, cx| {
+                match result {
+                    Ok(restore) => {
+                        // 恢复后的现场就是目标快照，基线随之对齐。
+                        this.last_checkpoint = Some(restore.target);
+                        this.drop_reviews_after(&session_id, &turn_id);
+                        this.emit_reviews_changed(&session_id, cx);
+                        this.git_error = None;
+                        let dropped = this.truncate_turns_after(&session_id, &turn_id);
+                        if !dropped.is_empty() {
+                            if let Some(repository) = this.repository.clone() {
+                                cx.background_spawn(async move {
+                                    let _ = delete_turn_checkpoints(&repository, &dropped);
+                                })
+                                .detach();
+                            }
+                        }
+                        this.refresh_git(cx);
+                        // 截断后宿主手里的列表就过期了，重发一份全量。
+                        this.emit_restorable_turns(&session_id, cx);
+                    }
+                    Err(error) => {
+                        this.git_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 丢掉第 `turn_id` 轮之后的快照记录，返回被丢掉的 turn id（调用方据此删 ref）。
+    fn truncate_turns_after(&mut self, session_id: &str, turn_id: &str) -> Vec<String> {
+        truncate_checkpoints_after(&mut self.turn_checkpoints, session_id, turn_id)
+    }
+
+    /// 丢掉第 `turn_id` 轮之后的审阅快照。
+    ///
+    /// 与检查点同步截断：回到第 N 轮之后，第 N 轮之后的 diff 不再对应磁盘上的
+    /// 任何状态，留着只会让审阅入口裁出一份从未存在过的改动。第 N 轮自己留着
+    /// ——它正是这次恢复出来的那份改动。
+    fn drop_reviews_after(&mut self, session_id: &str, turn_id: &str) {
+        drop_reviews_after(&mut self.turn_reviews, session_id, turn_id);
+    }
+
+    /// 弹出提交信息输入框，提交当前全部变更。
+    pub fn prompt_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repository.is_none() || self.file_operation_running {
+            return;
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("WorkspaceExplorer.commit.placeholder").to_string())
+        });
+        self.file_action_editor = Some(FileActionEditor {
+            mode: FileActionEditorMode::CommitAll,
+            input: input.clone(),
+        });
+        self.file_confirmation = None;
+        input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// 请求宿主生成提交信息；Explorer 只发事件，LLM 调用由宿主完成。
+    pub fn request_commit_message(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.file_action_editor.as_ref() else {
+            return;
+        };
+        if !matches!(editor.mode, FileActionEditorMode::CommitAll) || self.commit_message_generating
+        {
+            return;
+        }
+        self.commit_message_generating = true;
+        cx.emit(WorkspaceExplorerEvent::CommitMessageRequested);
+        cx.notify();
+    }
+
+    /// 宿主生成完成后回填输入框（覆盖已有草稿，用户仍可编辑再提交）。
+    pub fn set_commit_message(
+        &mut self,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_message_generating = false;
+        if let Some(editor) = self.file_action_editor.as_ref() {
+            if matches!(editor.mode, FileActionEditorMode::CommitAll) {
+                editor
+                    .input
+                    .update(cx, |input, cx| input.set_value(message, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 生成失败时仅复位按钮状态，不打断用户手写。
+    pub fn commit_message_generation_failed(&mut self, cx: &mut Context<Self>) {
+        self.commit_message_generating = false;
+        cx.notify();
+    }
+
+    /// 推送当前分支；无上游时按默认 remote 建立跟踪。
+    pub fn push_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        if self.file_operation_running {
+            return;
+        }
+        self.file_operation_running = true;
+        let task = cx.background_spawn(async move { crate::git::push_current_branch(&repository) });
+        let entity = cx.entity().downgrade();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let Some(entity) = entity.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |this, cx| {
+                    this.file_operation_running = false;
+                    match result {
+                        Ok(()) => {
+                            window.push_notification(
+                                Notification::success(
+                                    t!("WorkspaceExplorer.push.pushed").to_string(),
+                                )
+                                .autohide(true),
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            this.error = Some(message.clone());
+                            window.push_notification(
+                                Notification::error(message).autohide(false),
+                                cx,
+                            );
+                        }
+                    }
+                    this.refresh_after_branch_operation(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn commit_all(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        if self.file_operation_running {
+            return;
+        }
+        self.file_operation_running = true;
+        let task =
+            cx.background_spawn(async move { crate::git::commit_all(&repository, &message) });
+        let entity = cx.entity().downgrade();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let Some(entity) = entity.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |this, cx| {
+                    this.file_operation_running = false;
+                    match result {
+                        Ok(()) => {
+                            window.push_notification(
+                                Notification::success(
+                                    t!("WorkspaceExplorer.commit.committed").to_string(),
+                                )
+                                .autohide(true),
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            this.error = Some(message.clone());
+                            window.push_notification(
+                                Notification::error(message).autohide(false),
+                                cx,
+                            );
+                        }
+                    }
+                    this.refresh_after_branch_operation(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn create_worktree(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let project_root = self.root.clone();
+        let task =
+            cx.background_spawn(async move { create_worktree(&repository, &project_root, None) });
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = entity.update(cx, |this, cx| match result {
+                Ok(created) => this.apply_root_change(created.path, cx),
+                Err(error) => {
+                    this.error = Some(error.to_string());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 切换到某个已注册 worktree 的工作目录。
+    pub fn switch_worktree(&mut self, worktree_root: PathBuf, cx: &mut Context<Self>) {
+        // 主工作区的 `path` 即根；链接 worktree 的 `path` 就是其目录。
+        if worktree_root == self.root {
+            cx.notify();
+            return;
+        }
+        self.apply_root_change(worktree_root, cx);
+    }
+
+    /// 切换到最近列表里的任意工作区根目录。
+    pub fn switch_workspace(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if root == self.root {
+            cx.notify();
+            return;
+        }
+        self.apply_root_change(root, cx);
+    }
+
+    /// 删除 worktree 前的确认（会丢弃该工作区未提交的改动）。
+    pub(super) fn confirm_remove_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.file_confirmation = Some(ExplorerConfirmation {
+            operation: ExplorerConfirmationOperation::RemoveWorktree(path),
+            message: t!("WorkspaceExplorer.worktree.remove_confirm", name = name).to_string(),
+        });
+        cx.notify();
+    }
+
+    /// 删除一个受管理的 worktree，并刷新列表。
+    pub fn remove_worktree(&mut self, worktree_root: PathBuf, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let entity = cx.entity().downgrade();
+        let task =
+            cx.background_spawn(
+                async move { crate::git::remove_worktree(&repository, &worktree_root) },
+            );
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = entity.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.error = None,
+                    Err(error) => this.error = Some(error.to_string()),
+                }
+                this.refresh_workspace(cx);
+            });
+        })
+        .detach();
     }
 
     pub fn follows_terminal_cwd(&self) -> bool {
@@ -198,8 +716,29 @@ impl WorkspaceExplorer {
 
     fn apply_root_change(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.root = root;
+        // 旧根下锚定的快照 ref 与新根无关，随记录一起作废；逐会话发一条空列表，
+        // 免得宿主视图里留着点了没反应的「回到这一轮」入口。
+        // 审阅与回滚两份记录一起清掉了：两者都要把「哪些轮还有入口」的全量列表
+        // 重发一遍，否则页脚上会留着指向已经不存在快照的按钮。会话 id 取两份的并集。
+        let mut dropped_sessions: Vec<String> = self.turn_checkpoints.keys().cloned().collect();
+        for review in &self.turn_reviews {
+            if !dropped_sessions.contains(&review.session_id) {
+                dropped_sessions.push(review.session_id.clone());
+            }
+        }
         self.reset_workspace_state();
+        for session_id in dropped_sessions {
+            cx.emit(WorkspaceExplorerEvent::RestorableTurnsChanged {
+                session_id: session_id.clone(),
+                turn_ids: Vec::new(),
+            });
+            cx.emit(WorkspaceExplorerEvent::ReviewsChanged {
+                session_id,
+                turn_ids: Vec::new(),
+            });
+        }
         self.refresh(cx);
+        cx.emit(WorkspaceExplorerEvent::RootChanged(self.root.clone()));
     }
 
     fn reset_workspace_state(&mut self) {
@@ -212,6 +751,10 @@ impl WorkspaceExplorer {
         self.repository = None;
         self.branch_manager = None;
         self.changes.clear();
+        self.worktrees.clear();
+        self.last_checkpoint = None;
+        self.turn_reviews.clear();
+        self.turn_checkpoints.clear();
         self.ignore_matcher = None;
         self.git_loading = false;
         self.git_refresh_pending = false;
@@ -270,7 +813,17 @@ impl WorkspaceExplorer {
                 }
                 this.loading = false;
                 match result {
-                    Ok(snapshot) => this.apply_snapshot(snapshot),
+                    Ok(snapshot) => {
+                        let previous = this.repository.as_ref().map(|repo| repo.root.clone());
+                        this.apply_snapshot(snapshot);
+                        let current = this.repository.as_ref().map(|repo| repo.root.clone());
+                        // 仓库是异步发现的：装机那一帧 `repository()` 还是 None，
+                        // 宿主若只看一次就会把「不是 Git 仓库」永久缓存下来。
+                        // 这里在句柄真正变化时补一条事件，宿主据此重读分支 / worktree。
+                        if previous != current {
+                            cx.emit(WorkspaceExplorerEvent::RepositoryChanged);
+                        }
+                    }
                     Err(error) => this.error = Some(error.to_string()),
                 }
                 cx.notify();
@@ -292,6 +845,11 @@ impl WorkspaceExplorer {
         self.selected_path = None;
         self.repository = snapshot.repository;
         self.changes = snapshot.changes;
+        self.worktrees = snapshot.worktrees;
+        // 重启恢复：内存没有更新的基线时，采用仓库锚定的 checkpoint。
+        if self.last_checkpoint.is_none() {
+            self.last_checkpoint = snapshot.anchored_checkpoint;
+        }
         if self
             .selected_change_path
             .as_ref()
@@ -398,22 +956,111 @@ impl WorkspaceExplorer {
         cx.notify();
     }
 
-    fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// 打开（或聚焦已打开的）某个文件编辑器标签页。
+    pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_path = Some(path.clone());
         self.editor
             .update(cx, |editor, cx| editor.open_file(path, window, cx));
+        cx.emit(WorkspaceExplorerEvent::DocumentRequested);
         cx.notify();
     }
 
-    fn open_change(&mut self, change: GitChange, window: &mut Window, cx: &mut Context<Self>) {
+    /// 打开（或聚焦已打开的）某条 Git 变更的 diff 标签页。
+    pub fn open_change(&mut self, change: GitChange, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.repository.clone() else {
             return;
         };
         self.selected_change_path = Some(change.path.clone());
         self.editor.update(cx, |editor, cx| {
-            editor.open_git_change(GitDiffRequest { repository, change }, window, cx);
+            editor.open_diff(GitDiffRequest { repository, change }, window, cx);
         });
+        cx.emit(WorkspaceExplorerEvent::DocumentRequested);
         cx.notify();
+    }
+
+    /// 打开某个「改动文件」的审阅视图。
+    ///
+    /// `turn_id` 是用户点的那一处属于哪一轮（轮次页脚、工具卡都会给）。给了就裁
+    /// **那一轮**的快照 —— 同一个文件在不同轮次改出来的不是同一份 diff；给不出来
+    /// （历史恢复的轮次没有 turn id）才退到最近一轮，聊胜于无。
+    ///
+    /// 三个来源按可信度排序：
+    ///
+    /// 1. 该轮审阅快照里该文件那一段——Review 面板展示的就是这份 diff；
+    /// 2. 本轮还没结束、或该轮没留下快照（未纳入版本控制、快照捕获失败）时，
+    ///    退到 Git 变更里同名文件相对 HEAD 的 diff；
+    /// 3. 两条都落空（路径对不上、非 Git 目录）才退回打开文件本身。
+    ///
+    /// 第 3 档不是顺手加的：审阅入口必须点了有事发生，但也**不能**用空 diff 冒充
+    /// 「这个文件没改」——那恰恰是这个入口之前的样子（点了只打开源文件，看不出
+    /// 哪里变了，再点一次连源文件都已经在前台，于是「点了没反应」）。
+    pub fn open_review_file(
+        &mut self,
+        session_id: &str,
+        path: String,
+        turn_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let requested = PathBuf::from(path.as_str());
+        if let Some(patch) = self.review_patch_for(session_id, &requested, turn_id) {
+            self.editor.update(cx, |editor, cx| {
+                editor.open_review_diff(requested, patch, window, cx);
+            });
+            cx.emit(WorkspaceExplorerEvent::DocumentRequested);
+            cx.notify();
+            return;
+        }
+        if let Some(change) = self.change_for_path(&path) {
+            self.open_change(change, window, cx);
+            return;
+        }
+        self.open_file(PathBuf::from(path), window, cx);
+    }
+
+    /// 某一轮快照 patch 里该文件那一段。
+    ///
+    /// 用哪一份快照由 [`review_for_open`] 决定：优先用户点的那一轮，该轮没有快照
+    /// 或调用方给不出轮次时退到最近一轮。
+    fn review_patch_for(
+        &self,
+        session_id: &str,
+        path: &Path,
+        turn_id: Option<&str>,
+    ) -> Option<String> {
+        let review = review_for_open(&self.turn_reviews, session_id, turn_id)?;
+        let section = self
+            .relative_candidates(path)
+            .into_iter()
+            .find_map(|relative| patch_section_for_path(&review.diff, &relative))?;
+        Some(section.to_owned())
+    }
+
+    /// Git 变更列表里与该路径对应的那条；仓库不存在或路径不在变更里时为 `None`。
+    ///
+    /// 仓库不存在要返回 `None` 而不是「随便挑一条」：`open_change` 在没有仓库时
+    /// 会静默返回，那正好又造出一个「点了没反应」。
+    fn change_for_path(&self, path: &str) -> Option<GitChange> {
+        self.repository.as_ref()?;
+        let candidates = self.relative_candidates(Path::new(path));
+        self.changes
+            .iter()
+            .find(|change| {
+                let change_path = change.path.to_string_lossy();
+                candidates
+                    .iter()
+                    .any(|wanted| same_path(&change_path, wanted))
+            })
+            .cloned()
+    }
+
+    /// 请求路径相对「工作区根」「仓库根」的两种候选写法（按此优先级）。
+    fn relative_candidates(&self, path: &Path) -> Vec<String> {
+        let mut roots = vec![self.root.as_path()];
+        if let Some(repository) = self.repository.as_ref() {
+            roots.push(repository.root.as_path());
+        }
+        review::relative_candidates(path, &roots)
     }
 }
 
@@ -438,6 +1085,104 @@ fn should_sync_terminal_root(
     in_repository: bool,
 ) -> bool {
     follow_terminal_cwd && should_update_root(current, requested, in_repository)
+}
+
+/// 审阅入口该裁哪一份快照。
+///
+/// 用户点了哪一轮就取哪一轮 —— 同一个文件在第 2 轮和第 5 轮改出来的不是同一份
+/// diff，拿最近一轮冒充会答错。只有**给不出轮次**（历史恢复的轮次没有 turn id），
+/// 或那一轮压根没留下快照（非 Git 目录、捕获失败）时，才退到最近一轮：
+/// 聊胜于无，而且这两条路上本来也没有更准的答案。
+fn review_for_open<'a>(
+    reviews: &'a [WorktreeReviewSnapshot],
+    session_id: &str,
+    turn_id: Option<&str>,
+) -> Option<&'a WorktreeReviewSnapshot> {
+    turn_id
+        .and_then(|turn_id| review_for_turn(reviews, session_id, turn_id))
+        .or_else(|| reviews.last())
+}
+
+/// 指定会话某一轮的审阅快照。
+///
+/// 一轮的 diff 得从**该轮**的快照里裁：同一个文件在第 2 轮和第 5 轮改出来的不是
+/// 同一份 diff；拿最近一轮冒充会答错，而那正是「点历史轮的文件看不到那一刻改动」
+/// 的根子。
+fn review_for_turn<'a>(
+    reviews: &'a [WorktreeReviewSnapshot],
+    session_id: &str,
+    turn_id: &str,
+) -> Option<&'a WorktreeReviewSnapshot> {
+    reviews
+        .iter()
+        .rev()
+        .find(|review| review.session_id == session_id && review.turn_id == turn_id)
+}
+
+/// 某一轮能不能摆出「查看改动」：既要真的属于这一轮，也要有非空 diff。
+///
+/// 两个条件分属两层：`review_for_turn` 保证「不拿别的轮冒充」，这里再筛掉
+/// **空 diff**——首轮没有基线、或这一轮压根没改文件时快照算出来是空的，
+/// 入口摆出来点开只有一片空白，不如不摆。抽成自由函数是为了能不开窗口就测掉。
+fn openable_review<'a>(
+    reviews: &'a [WorktreeReviewSnapshot],
+    session_id: &str,
+    turn_id: &str,
+) -> Option<&'a WorktreeReviewSnapshot> {
+    review_for_turn(reviews, session_id, turn_id).filter(|review| !review.diff.trim().is_empty())
+}
+
+/// 某个会话里可以摆出「查看改动」入口的轮次（按捕获先后）。
+///
+/// 审阅入口与回滚入口依据不同：回滚要有锚得住的 git ref，审阅只要 diff 真算出来
+/// （见 [`openable_review`]）。两者共用一份过滤的话，某一轮锚定失败就会连带把
+/// 「查看改动」一起吞掉。
+fn reviewed_turn_ids_of(reviews: &[WorktreeReviewSnapshot], session_id: &str) -> Vec<String> {
+    reviews
+        .iter()
+        .filter(|review| review.session_id == session_id)
+        .filter(|review| !review.diff.trim().is_empty())
+        .map(|review| review.turn_id.clone())
+        .collect()
+}
+
+/// 丢掉第 `turn_id` 轮**之后**的审阅快照，第 `turn_id` 轮自己留着。
+///
+/// 与 [`truncate_checkpoints_after`] 同步：回到第 N 轮之后，第 N 轮之后的 diff
+/// 不再对应磁盘上的任何状态，留着只会让审阅入口裁出一份从未存在过的改动。
+/// 别的会话的快照与这条时间线无关，原地保留。
+fn drop_reviews_after(reviews: &mut Vec<WorktreeReviewSnapshot>, session_id: &str, turn_id: &str) {
+    let Some(index) = reviews
+        .iter()
+        .position(|review| review.session_id == session_id && review.turn_id == turn_id)
+    else {
+        return;
+    };
+    let stale = reviews.split_off(index + 1);
+    reviews.extend(
+        stale
+            .into_iter()
+            .filter(|review| review.session_id != session_id),
+    );
+}
+
+fn truncate_checkpoints_after(
+    checkpoints: &mut HashMap<String, Vec<TurnCheckpoint>>,
+    session_id: &str,
+    turn_id: &str,
+) -> Vec<String> {
+    let Some(turns) = checkpoints.get_mut(session_id) else {
+        return Vec::new();
+    };
+    let Some(index) = turns.iter().position(|turn| turn.turn_id == turn_id) else {
+        return Vec::new();
+    };
+    // 保留到该轮（含）为止；被截掉的那些不再属于这条时间线。
+    turns
+        .split_off(index + 1)
+        .into_iter()
+        .map(|turn| turn.turn_id)
+        .collect()
 }
 
 #[cfg(test)]

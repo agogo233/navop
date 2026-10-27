@@ -151,6 +151,17 @@ async fn run_agent_loop(ctx: AgentLoopContext, cancellation: CancellationToken) 
         if cancellation.is_cancelled() {
             return TaskOutcome::Cancelled;
         }
+        // steering：运行中到达的用户输入在下一轮采样前注入历史，模型尽早看到。
+        // 含图片的插话不注入（同轮多批图片会叠加 token / 请求体），留给轮次结束后重开。
+        for input in ctx.session.take_pending_inputs() {
+            let images = input.images();
+            if images.is_empty() {
+                ctx.session
+                    .record_steering_message(input.as_text().to_string());
+            } else {
+                ctx.session.queue_input(input);
+            }
+        }
         match compact_session_context_if_needed(
             &ctx.session,
             &ctx.turn_id,
@@ -171,6 +182,14 @@ async fn run_agent_loop(ctx: AgentLoopContext, cancellation: CancellationToken) 
 
         let tool_specs =
             specs_for_task(ctx.task_kind, ctx.tool_mode, &ctx.services, &ctx.resources);
+        // 工具声明进 transcript：重放/审计可还原「当时模型看到了哪些工具」。
+        // 相同快照不重复记；模型侧定义仍由 request.tools 携带。
+        ctx.session.record_tools_declared(
+            tool_specs
+                .iter()
+                .map(|spec| spec.name.as_str().to_string())
+                .collect(),
+        );
         let tools = match tool_specs
             .iter()
             .map(|spec| spec.to_llm_tool())
@@ -540,15 +559,26 @@ async fn sample(
             }
             // 工具调用以 Completed 聚合结果为准,避免重复计数。
             ModelStreamEvent::ToolCall(_) => {}
-            ModelStreamEvent::Completed(resp) => completed = Some(resp),
+            // 计量随到随记(流式 provider 在最终 chunk 报告,通常先于
+            // Completed),UI 不必等轮次结束就能看到占用更新。
+            ModelStreamEvent::Usage(usage) => session.record_token_usage(usage),
+            ModelStreamEvent::Completed(resp) => {
+                if let Some(usage) = resp.usage {
+                    session.record_token_usage(usage);
+                }
+                completed = Some(resp);
+            }
         }
     }
 
-    let tool_calls = completed.map(|r| r.tool_calls).unwrap_or_default();
+    let (tool_calls, usage) = completed
+        .map(|r| (r.tool_calls, r.usage))
+        .unwrap_or_default();
     Ok(Some(AgentSample {
         response: ModelResponse {
             text: (!text.is_empty()).then_some(text),
             tool_calls,
+            usage,
         },
         reasoning,
     }))

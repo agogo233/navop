@@ -7,12 +7,11 @@ use crate::{ExtensionKind, ExtensionManagerMode, ExtensionSummary, MarketplaceEn
 const MANIFEST_JSON_SUFFIX: &str = ".json";
 const INSTALL_PROGRESS_VALUE: f32 = 28.0;
 /// 浏览态分区顺序，与过滤 chips 一致。
-pub(crate) const EXTENSION_KINDS: [ExtensionKind; 6] = [
+pub(crate) const EXTENSION_KINDS: [ExtensionKind; 5] = [
     ExtensionKind::Language,
     ExtensionKind::LanguageBundle,
     ExtensionKind::DatabaseDriver,
     ExtensionKind::RemoteDesktopProvider,
-    ExtensionKind::AcpAgent,
     ExtensionKind::Composite,
 ];
 

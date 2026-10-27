@@ -1,6 +1,7 @@
-use agent_client_protocol::schema::{
-    AgentCapabilities, AvailableCommand, LoadSessionResponse, NewSessionResponse,
-    ResumeSessionResponse, SessionConfigOption, SessionMode, SessionModeId, SessionUpdate,
+use agent_client_protocol::schema::v1::{
+    AgentCapabilities, AvailableCommand, Implementation, LoadSessionResponse, NewSessionResponse,
+    ResumeSessionResponse, SessionConfigKind, SessionConfigOption, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionMode, SessionModeId, SessionUpdate,
 };
 use agent_runtime::TurnId;
 
@@ -28,10 +29,33 @@ pub enum AcpConnectionPhase {
     Closed,
 }
 
+/// 一次连接里 ACP 会话**实际**是怎么打开的。
+///
+/// 与 [`super::AcpSessionOpen`] 分工不同：那个是由 agent 能力推出的「**可以**怎么开」，
+/// 由 `acp_session_open_kind()` 从能力协商得出；这个记录「**实际**怎么开的」，是视图判断
+/// 「要不要告诉用户上一轮上下文没接上」的唯一依据。
+///
+/// 复用失败只写日志是不够的：用户以为对话还在，继续追问才发现 agent 什么都不记得——
+/// 这正是「会话记不住」的观感来源，必须让 UI 有机会说出来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpSessionContinuity {
+    /// 接上了记住的会话，并让 agent 回放了历史（`session/load`）。
+    ReusedWithHistory,
+    /// 接上了记住的会话，但没有回放历史（`session/resume`）：agent 记得，屏幕上看不到。
+    ReusedWithoutHistory,
+    /// 没有可复用的记忆，或 agent 不具备复用能力：开了一条新会话。
+    ///
+    /// 这种情况不必提示——此前从没延续成功过，用户没有「上下文还在」的错误预期。
+    StartedFresh,
+    /// 有记忆但复用失败，退而新建：**上一轮的上下文已经断了**。
+    RestartedAfterReuseFailure,
+}
+
 /// ACP 会话状态快照。用于保存协议层元数据,不直接承担渲染职责。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AcpSessionState {
     phase: AcpConnectionPhase,
+    agent_info: Option<Implementation>,
     agent_capabilities: AgentCapabilities,
     available_commands: Vec<AvailableCommand>,
     current_mode_id: Option<SessionModeId>,
@@ -40,13 +64,15 @@ pub(crate) struct AcpSessionState {
     title: Option<String>,
     updated_at: Option<String>,
     usage: Option<AcpUsage>,
+    /// 这次连接实际怎么打开会话的；连接还没走到开会话时为 `None`。
+    session_continuity: Option<AcpSessionContinuity>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AcpUsage {
     pub used: u64,
     pub size: u64,
-    pub cost: Option<agent_client_protocol::schema::Cost>,
+    pub cost: Option<agent_client_protocol::schema::v1::Cost>,
 }
 
 impl AcpSessionState {
@@ -67,6 +93,10 @@ impl AcpSessionState {
         &self.agent_capabilities
     }
 
+    pub(crate) fn agent_info(&self) -> Option<&Implementation> {
+        self.agent_info.as_ref()
+    }
+
     pub(crate) fn available_commands(&self) -> &[AvailableCommand] {
         &self.available_commands
     }
@@ -83,6 +113,89 @@ impl AcpSessionState {
         &self.config_options
     }
 
+    pub(crate) fn current_model_config(&self) -> Option<&SessionConfigOption> {
+        self.config_options.iter().find(|option| {
+            matches!(
+                option.category,
+                Some(agent_client_protocol::schema::v1::SessionConfigOptionCategory::Model)
+            ) || option.id.0.eq_ignore_ascii_case("model")
+                || option.name.to_ascii_lowercase().contains("model")
+        })
+    }
+
+    /// agent 把会话模式放在 `category=mode` 的配置项里（新式：opencode 等）。
+    ///
+    /// 传统走 `SessionModeState.available_modes`；这里只在没有 `modes` 时才用。
+    /// 判定刻意排除 `model`：`"model".contains("mode")` 为真，不能用裸子串匹配。
+    pub(crate) fn current_mode_config(&self) -> Option<&SessionConfigOption> {
+        self.config_options.iter().find(|option| {
+            matches!(
+                option.category,
+                Some(agent_client_protocol::schema::v1::SessionConfigOptionCategory::Mode)
+            ) || option.id.0.eq_ignore_ascii_case("mode")
+                || (option.name.to_ascii_lowercase().contains("mode")
+                    && !option.name.to_ascii_lowercase().contains("model"))
+        })
+    }
+
+    /// agent 广告的模型候选 `(value_id, label)`,按 agent 给出的顺序。
+    ///
+    /// 只读 `model` 类配置的 select 值;没有该配置或不是 select 时返回空,
+    /// 不伪造候选。分组与平面列表都展开成同一顺序。
+    pub(crate) fn model_options(&self) -> Vec<(String, String)> {
+        let Some(option) = self.current_model_config() else {
+            return Vec::new();
+        };
+        select_values(option)
+            .into_iter()
+            .map(|value| (value.value.to_string(), value.name.clone()))
+            .collect()
+    }
+
+    /// agent 广告的会话模式候选 `(value_id, label, description)`,用于执行模式下拉。
+    pub(crate) fn mode_options(&self) -> Vec<(String, String, Option<String>)> {
+        let Some(option) = self.current_mode_config() else {
+            return Vec::new();
+        };
+        select_values(option)
+            .into_iter()
+            .map(|value| {
+                (
+                    value.value.to_string(),
+                    value.name.clone(),
+                    value.description.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// 当前会话模式的展示文案。
+    ///
+    /// 优先传统 `modes`；没有时取 `category=mode` 配置项的当前值。
+    pub(crate) fn current_mode_label(&self) -> Option<String> {
+        if let Some(current) = self.current_mode_id() {
+            return Some(
+                self.available_modes()
+                    .iter()
+                    .find(|mode| mode.id == *current)
+                    .map(|mode| mode.name.clone())
+                    .unwrap_or_else(|| current.0.to_string()),
+            );
+        }
+        let option = self.current_mode_config()?;
+        let SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        let current = select.current_value.to_string();
+        Some(
+            select_values(option)
+                .into_iter()
+                .find(|value| value.value.to_string() == current)
+                .map(|value| value.name.clone())
+                .unwrap_or(current),
+        )
+    }
+
     pub(crate) fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
@@ -95,8 +208,21 @@ impl AcpSessionState {
         self.usage.as_ref()
     }
 
+    /// 这次连接实际怎么打开会话的（复用 / 没记忆新建 / 复用失败降级）。
+    pub(crate) fn session_continuity(&self) -> Option<AcpSessionContinuity> {
+        self.session_continuity
+    }
+
+    pub(crate) fn set_session_continuity(&mut self, continuity: AcpSessionContinuity) {
+        self.session_continuity = Some(continuity);
+    }
+
     pub(crate) fn set_agent_capabilities(&mut self, capabilities: AgentCapabilities) {
         self.agent_capabilities = capabilities;
+    }
+
+    pub(crate) fn set_agent_info(&mut self, info: Option<Implementation>) {
+        self.agent_info = info;
     }
 
     pub(crate) fn set_current_mode(&mut self, mode_id: SessionModeId) {
@@ -147,7 +273,7 @@ impl AcpSessionState {
 
     fn apply_modes_and_config(
         &mut self,
-        modes: Option<&agent_client_protocol::schema::SessionModeState>,
+        modes: Option<&agent_client_protocol::schema::v1::SessionModeState>,
         config_options: Option<&Vec<SessionConfigOption>>,
     ) {
         if let Some(modes) = modes {
@@ -157,6 +283,21 @@ impl AcpSessionState {
         if let Some(config_options) = config_options {
             self.config_options = config_options.clone();
         }
+    }
+}
+
+/// select 型配置项的候选值，分组展开成同一顺序；非 select 返回空。
+fn select_values(option: &SessionConfigOption) -> Vec<&SessionConfigSelectOption> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(values) => values.iter().collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -193,15 +334,16 @@ fn phase_transition_allowed(current: &AcpConnectionPhase, next: &AcpConnectionPh
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock,
-        CurrentModeUpdate, NewSessionResponse, SessionConfigOption, SessionConfigSelectOption,
-        SessionInfoUpdate, SessionMode, SessionModeState, SessionUpdate, TextContent, UsageUpdate,
+        CurrentModeUpdate, NewSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, SessionInfoUpdate, SessionMode, SessionModeState, SessionUpdate,
+        TextContent, UsageUpdate,
     };
 
     use agent_runtime::TurnId;
 
-    use super::{AcpConnectionPhase, AcpSessionState};
+    use super::{AcpConnectionPhase, AcpSessionContinuity, AcpSessionState};
     use crate::acp::{AcpError, AcpErrorKind};
 
     #[test]
@@ -233,6 +375,55 @@ mod tests {
     }
 
     #[test]
+    fn mode_config_option_surfaces_as_execution_modes() {
+        let mut state = AcpSessionState::default();
+        let model_config = SessionConfigOption::select(
+            "model",
+            "Model",
+            "fast",
+            vec![SessionConfigSelectOption::new("fast", "Fast")],
+        );
+        let mode_config = SessionConfigOption::select(
+            "mode",
+            "Session Mode",
+            "build",
+            vec![
+                SessionConfigSelectOption::new("build", "build").description("The default agent."),
+                SessionConfigSelectOption::new("plan", "plan"),
+                SessionConfigSelectOption::new("scout", "scout"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode);
+
+        state.apply_new_session_response(
+            &NewSessionResponse::new("s1").config_options(vec![model_config, mode_config]),
+        );
+
+        // mode 配置不能被当成 model，反之亦然。
+        assert_eq!(
+            Some("mode"),
+            state
+                .current_mode_config()
+                .map(|option| option.id.0.as_ref())
+        );
+        assert_eq!(
+            Some("model"),
+            state
+                .current_model_config()
+                .map(|option| option.id.0.as_ref())
+        );
+        assert_eq!(
+            vec!["build", "plan", "scout"],
+            state
+                .mode_options()
+                .into_iter()
+                .map(|(value, _, _)| value)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(Some("build".to_string()), state.current_mode_label());
+    }
+
+    #[test]
     fn session_updates_replace_commands_modes_config_and_usage() {
         let mut state = AcpSessionState::default();
 
@@ -252,9 +443,9 @@ mod tests {
         ));
         state.apply_session_update(&SessionUpdate::UsageUpdate(UsageUpdate::new(42, 100)));
         state.apply_session_update(&SessionUpdate::AgentMessageChunk(
-            agent_client_protocol::schema::ContentChunk::new(ContentBlock::Text(TextContent::new(
-                "ignored by state",
-            ))),
+            agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                TextContent::new("ignored by state"),
+            )),
         ));
 
         assert_eq!(1, state.available_commands().len());
@@ -330,6 +521,24 @@ mod tests {
 
         assert!(error.contains("Closed -> Failed"));
         assert_eq!(AcpConnectionPhase::Closed, state.phase);
+    }
+
+    #[test]
+    fn session_continuity_is_absent_until_a_session_is_opened() {
+        let mut state = AcpSessionState::default();
+
+        assert_eq!(
+            None,
+            state.session_continuity(),
+            "还没走到开会话时不能凭能力协商猜一个结论"
+        );
+
+        state.set_session_continuity(AcpSessionContinuity::RestartedAfterReuseFailure);
+
+        assert_eq!(
+            Some(AcpSessionContinuity::RestartedAfterReuseFailure),
+            state.session_continuity()
+        );
     }
 
     fn test_error() -> AcpError {

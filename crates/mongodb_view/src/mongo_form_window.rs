@@ -49,6 +49,8 @@ use crate::GlobalMongoState;
 pub struct MongoFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub initial_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub on_saved: Option<MongoFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
@@ -370,12 +372,18 @@ impl MongoFormWindow {
             items
         };
 
-        let workspace_select = cx.new(|cx| {
-            let mut state = SelectState::new(workspace_items, None, window, cx);
-            if let Some(selected) = connection_to_load
+        // 编辑 / 复制连接回填原分组；纯新建时用新建向导传入的目标分组预选（用户仍可改）。
+        let selected_workspace_id = if connection_to_load.is_some() {
+            connection_to_load
                 .as_ref()
                 .and_then(|connection| connection.workspace_id)
-            {
+        } else {
+            config.initial_workspace_id
+        };
+
+        let workspace_select = cx.new(|cx| {
+            let mut state = SelectState::new(workspace_items, None, window, cx);
+            if let Some(selected) = selected_workspace_id {
                 state.set_selected_value(&Some(selected), window, cx);
             }
             state
@@ -1120,6 +1128,7 @@ mod tests {
     #[test]
     fn initial_connection_prefills_without_edit_mode() {
         let config = MongoFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(mongo_connection("imported mongo")),
             on_saved: None,
@@ -1140,6 +1149,7 @@ mod tests {
     #[test]
     fn editing_connection_takes_precedence_over_initial_connection() {
         let config = MongoFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: Some(mongo_connection("existing mongo")),
             initial_connection: Some(mongo_connection("imported mongo")),
             on_saved: None,

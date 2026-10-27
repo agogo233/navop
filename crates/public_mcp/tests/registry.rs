@@ -107,6 +107,11 @@ impl TerminalReadSessionHandle for FakeTerminal {
             screen_lines: 24,
             columns: 80,
             truncated: false,
+            alt_screen: false,
+            display_offset: 0,
+            cursor_row: 1,
+            cursor_column: 0,
+            selection: None,
         })
     }
 }

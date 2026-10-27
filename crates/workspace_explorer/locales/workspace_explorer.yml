@@ -161,23 +161,15 @@ WorkspaceExplorer:
       zh-CN: 更改已放弃
       zh-HK: 變更已放棄
   editor:
+    review_turn_tab:
+      en: "Turn changes (%{turn})"
+      zh-CN: "本轮改动（%{turn}）"
+      zh-HK: "本輪改動（%{turn}）"
     diff_tab:
       en: "%{name} (diff)"
       zh-CN: "%{name}（差异）"
       zh-HK: "%{name}（差異）"
   diff:
-    change_count:
-      en: "%{count} changes"
-      zh-CN: "%{count} 处变更"
-      zh-HK: "%{count} 處變更"
-    before:
-      en: HEAD
-      zh-CN: HEAD 版本
-      zh-HK: HEAD 版本
-    after:
-      en: Working tree
-      zh-CN: 当前文件
-      zh-HK: 目前檔案
     empty:
       en: No changes compared to HEAD
       zh-CN: 与 HEAD 相比没有差异
@@ -352,7 +344,79 @@ WorkspaceExplorer:
       en: Unable to open document
       zh-CN: 无法打开文档
       zh-HK: 無法打開文件
+  workspace:
+    tooltip:
+      en: Workspace
+      zh-CN: 工作区
+      zh-HK: 工作區
+    choose:
+      en: Choose workspace folder…
+      zh-CN: 选择工作区目录…
+      zh-HK: 選擇工作區目錄…
+    recent:
+      en: Recent workspaces
+      zh-CN: 最近工作区
+      zh-HK: 最近工作區
+  commit:
+    menu:
+      en: Commit all changes…
+      zh-CN: 提交全部变更…
+      zh-HK: 提交全部變更…
+    placeholder:
+      en: Commit message
+      zh-CN: 提交信息
+      zh-HK: 提交訊息
+    committed:
+      en: Changes committed
+      zh-CN: 已提交
+      zh-HK: 已提交
+    generate:
+      en: AI message
+      zh-CN: AI 生成
+      zh-HK: AI 生成
+    generating:
+      en: Generating…
+      zh-CN: 生成中…
+      zh-HK: 生成中…
+    generate_failed:
+      en: "Could not generate a commit message: %{error}"
+      zh-CN: "生成提交信息失败：%{error}"
+      zh-HK: "產生提交訊息失敗：%{error}"
+  push:
+    menu:
+      en: Push current branch
+      zh-CN: 推送当前分支
+      zh-HK: 推送目前分支
+    pushed:
+      en: Branch pushed
+      zh-CN: 已推送
+      zh-HK: 已推送
+  worktree:
+    create:
+      en: Create isolated worktree
+      zh-CN: 创建隔离工作区
+      zh-HK: 建立隔離工作區
+    empty:
+      en: No worktrees yet
+      zh-CN: 还没有隔离工作区
+      zh-HK: 還沒有隔離工作區
+    section:
+      en: "Worktrees (%{count})"
+      zh-CN: "隔离工作区（%{count}）"
+      zh-HK: "隔離工作區（%{count}）"
+    remove:
+      en: "Remove %{name}"
+      zh-CN: "删除 %{name}"
+      zh-HK: "刪除 %{name}"
+    remove_confirm:
+      en: "Remove worktree %{name} and its branch? Uncommitted changes in it are lost."
+      zh-CN: "删除隔离工作区 %{name} 及其分支？其中未提交的改动会丢失。"
+      zh-HK: "刪除隔離工作區 %{name} 及其分支？其中未提交的變更會遺失。"
   tooltip:
+    create_worktree:
+      en: Create isolated worktree
+      zh-CN: 创建隔离工作区
+      zh-HK: 建立隔離工作區
     close_tab:
       en: Close tab
       zh-CN: 关闭标签页

@@ -488,7 +488,11 @@ mod tests {
         let pinned = opener.find("activate_pinned_tab_by_id").unwrap();
         let regular = opener.find("activate_or_add_tab_lazy").unwrap();
         assert!(pinned < regular);
-        assert!(opener.contains("with_tab_closeable(true)"));
+        // 「AI 工作台标签可关闭」这件事是在 `build_ai_workbench_shell` 里设置的
+        // （opener 只是 `TabItem::new(..)` 引用它），所以断言要分开落两处：
+        // 这里确认 opener 确实走那个构造函数，具体标志位去它自己的文件里查。
+        assert!(opener.contains("build_ai_workbench_shell"));
+        assert!(include_str!("ai_workbench.rs").contains(".with_tab_closeable(true)"));
     }
 
     #[test]
@@ -1249,11 +1253,11 @@ impl HomePage {
         });
     }
 
-    pub(crate) fn add_team_key_settings_tab(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 打开原生「团队」tab（团队资料 / 成员 / 团队密钥）。
+    ///
+    /// 过去这里跳浏览器 dashboard，URL 里还带着 access_token / refresh_token；
+    /// 现在全部走桌面端云端 API，网站 dashboard 可以下线。
+    pub(crate) fn add_team_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !is_feature_enabled(Feature::TeamManagement, cx) {
             return;
         }
@@ -1262,10 +1266,11 @@ impl HomePage {
         window.defer(cx, move |window, cx| {
             tab_container.update(cx, |tc, cx| {
                 tc.activate_or_add_tab_lazy(
-                    "settings-team-keys",
-                    |win, cx| {
-                        let settings = cx.new(|cx| SettingsPanel::new_team_keys(win, cx));
-                        TabItem::new("settings-team-keys", "home", settings)
+                    "team",
+                    |window, cx| {
+                        let team_tab = cx.new(|cx| crate::team_tab::TeamTab::new(window, cx));
+                        team_tab.update(cx, |team_tab, cx| team_tab.ensure_loaded(window, cx));
+                        TabItem::new("team", "home", team_tab)
                     },
                     window,
                     cx,
@@ -1404,20 +1409,15 @@ impl HomePage {
             ai_chat_view::build_workbench_resource_state(&self.connections, &ai_access_levels);
         window.defer(cx, move |window, cx| {
             tab_container.update(cx, |tabs, cx| {
-                if tabs.activate_pinned_tab_by_id("ai-workbench", window, cx) { return; }
+                if tabs.activate_pinned_tab_by_id("ai-workbench", window, cx) {
+                    return;
+                }
                 tabs.activate_or_add_tab_lazy(
                     "ai-workbench",
                     |window, cx| {
-                        let workbench = cx.new(|cx| {
-                            ai_chat_view::DefaultAgentChatPanel::new_workbench_with_scope_and_catalog(
-                                scope,
-                                catalog,
-                                mentions,
-                                window,
-                                cx,
-                            )
-                            .with_tab_closeable(true)
-                        });
+                        let workbench = crate::home::ai_workbench::build_ai_workbench_shell(
+                            scope, catalog, mentions, window, cx,
+                        );
                         TabItem::new("ai-workbench", "home", workbench)
                     },
                     window,

@@ -251,35 +251,36 @@ fn fullscreen_window_connection_item(
 }
 
 /// 「移动到分组」菜单最多展开的层级数；`parent_id` 脏数据成环时用于兜底。
-const MOVE_TARGET_MAX_DEPTH: usize = 32;
+pub(super) const MOVE_TARGET_MAX_DEPTH: usize = 32;
 
 /// 分组数量超过该值时，在子菜单顶部提示层级关系，避免长列表难以扫读。
-const MOVE_TARGET_HINT_THRESHOLD: usize = 20;
+pub(super) const MOVE_TARGET_HINT_THRESHOLD: usize = 20;
 
 /// 构造菜单条目时需要本地化的固定文案，注入后纯逻辑不依赖 i18n 运行时。
 #[derive(Clone, Copy)]
-struct MoveTargetLabels<'a> {
-    unassigned: &'a str,
-    root_group: &'a str,
+pub(super) struct MoveTargetLabels<'a> {
+    /// 第一项（`workspace_id` 为 `None`）的文案：连接是「未分组」，分组是「顶层」。
+    pub(super) unassigned: &'a str,
+    pub(super) root_group: &'a str,
 }
 
-/// 一个「移动到分组」目标；`workspace_id` 为 `None` 表示「未分组」。
+/// 一个移动目标；`workspace_id` 为 `None` 表示「不放进任何分组」。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MoveTargetNode {
-    label: String,
-    workspace_id: Option<i64>,
-    children: Vec<MoveTargetNode>,
+pub(super) struct MoveTargetNode {
+    pub(super) label: String,
+    pub(super) workspace_id: Option<i64>,
+    pub(super) children: Vec<MoveTargetNode>,
 }
 
-/// 纯逻辑产出的菜单数据：`entries` 的第一项固定是「未分组」。
+/// 纯逻辑产出的菜单数据：`entries` 的第一项固定是「未分组 / 顶层」。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct MoveTargetMenu {
-    entries: Vec<MoveTargetNode>,
-    group_count: usize,
+pub(super) struct MoveTargetMenu {
+    pub(super) entries: Vec<MoveTargetNode>,
+    pub(super) group_count: usize,
 }
 
 impl MoveTargetMenu {
-    fn needs_hint(&self) -> bool {
+    pub(super) fn needs_hint(&self) -> bool {
         self.group_count > MOVE_TARGET_HINT_THRESHOLD
     }
 }
@@ -406,6 +407,18 @@ fn append_move_target_nodes(
 
 /// 纯逻辑：把扁平分组列表按 `parent_id` 组成层级条目，供菜单层直接消费。
 fn move_target_menu(workspaces: &[Workspace], labels: MoveTargetLabels<'_>) -> MoveTargetMenu {
+    move_target_menu_excluding(workspaces, labels, &HashSet::new())
+}
+
+/// 同上，但把 `excluded` 里的分组（以及它们的子树）整体剔掉。
+///
+/// 分组自身的「移动到」菜单要排除自己那颗子树，否则菜单里会出现「移到自己下面」
+/// 这种必然成环的目标。
+pub(super) fn move_target_menu_excluding(
+    workspaces: &[Workspace],
+    labels: MoveTargetLabels<'_>,
+    excluded: &HashSet<i64>,
+) -> MoveTargetMenu {
     let mut by_id: HashMap<i64, &Workspace> = HashMap::new();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
     let mut children: HashMap<Option<i64>, Vec<&Workspace>> = HashMap::new();
@@ -414,6 +427,9 @@ fn move_target_menu(workspaces: &[Workspace], labels: MoveTargetLabels<'_>) -> M
         let Some(id) = workspace.id else {
             continue;
         };
+        if excluded.contains(&id) {
+            continue;
+        }
         by_id.insert(id, workspace);
         *name_counts.entry(workspace.name.as_str()).or_default() += 1;
     }
@@ -421,6 +437,9 @@ fn move_target_menu(workspaces: &[Workspace], labels: MoveTargetLabels<'_>) -> M
         let Some(id) = workspace.id else {
             continue;
         };
+        if excluded.contains(&id) {
+            continue;
+        }
         // 父级指向自己或已不存在的分组时按根分组处理，脏数据也能出现在菜单里。
         let parent_id = workspace
             .parent_id

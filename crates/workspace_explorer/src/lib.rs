@@ -7,22 +7,28 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 mod backend;
-mod diff;
 mod editor;
 mod explorer;
 mod file_system;
-mod git;
+pub mod git;
 mod model;
 mod theme;
 
 pub use backend::{
     ContainerBackend, LocalBackend, WorkspaceBackend, container_backend, local_backend,
 };
-pub use editor::{WorkspaceEditor, WorkspaceEditorEvent};
+pub use editor::{GitDiffRequest, WorkspaceEditor, WorkspaceEditorEvent};
 pub use explorer::{
     ExplorerFramePlacement, WorkspaceExplorer, WorkspaceExplorerConfig, WorkspaceExplorerEvent,
+    WorktreeReviewSnapshot,
 };
-pub use git::{GitChange, GitChangeKind, GitRepository};
+pub use git::{
+    CreatedWorktree, GitBranch, GitBranchKind, GitChange, GitChangeKind, GitRepository,
+    WorktreeEntry, anchor_checkpoint, anchored_checkpoint, capture_worktree_snapshot, commit_all,
+    commit_context, create_worktree, create_worktree_in, diff_snapshots, discard_change,
+    discover_repository, list_worktrees, load_branches, load_changes, load_diff,
+    push_current_branch, remove_worktree, stage_change, unstage_change,
+};
 pub use theme::WorkspaceTheme;
 
 /// Registers workspace explorer keyboard shortcuts.

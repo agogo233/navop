@@ -42,7 +42,7 @@ fn build_ready(
     shared: ConnectShared,
     spawned: SpawnedConnection,
     conn: ConnectionTo<Agent>,
-    acp_session_id: agent_client_protocol::schema::SessionId,
+    acp_session_id: agent_client_protocol::schema::v1::SessionId,
 ) -> AcpConnection {
     let lifecycle = build_lifecycle(&shared, spawned);
     AcpConnection {
@@ -53,6 +53,9 @@ fn build_ready(
         events_tx: shared.events_tx,
         state: shared.state,
         active_turn: shared.active_turn,
+        interactive_session: shared.interactive_session,
+        history_replay: shared.history_replay,
+        detail_sessions: shared.detail_sessions,
         prompt_timeout: shared.config.timeouts.prompt,
         agent_id: shared.config.id.to_string(),
         agent_name: shared.config.name.to_string(),
@@ -64,7 +67,7 @@ fn build_pending(
     shared: ConnectShared,
     spawned: SpawnedConnection,
     conn: ConnectionTo<Agent>,
-    methods: Vec<agent_client_protocol::schema::AuthMethodId>,
+    methods: Vec<agent_client_protocol::schema::v1::AuthMethodId>,
 ) -> AcpPendingConnection {
     let lifecycle = build_lifecycle(&shared, spawned);
     AcpPendingConnection {
@@ -74,9 +77,13 @@ fn build_pending(
         events_tx: shared.events_tx,
         state: shared.state,
         active_turn: shared.active_turn,
+        interactive_session: shared.interactive_session,
+        history_replay: shared.history_replay,
+        detail_sessions: shared.detail_sessions,
         workspace_root: shared.workspace_root,
         config: shared.config,
         methods,
+        resume: shared.resume,
         lifecycle,
     }
 }

@@ -111,8 +111,11 @@ mod tests {
         let workbench = HostModule::new("navop.workbench")
             .function("current", null)
             .function("dispatch", null);
-        // `current` 返回 `Null`:页面全部写成 `context.current()?.connection?...`,
-        // 缺上下文时自己兜底。
+        // 嵌入式工作台页会 `import * as context from "navop.context"` 取当前连接
+        // （契约见 `navop-extensions` 的 `middleware-standard.md`）。这里的台子没有
+        // 真实会话，`current` 返回 `Null` 即可 —— 页面都写成
+        // `context.current()?.connection?...` 自己兜底，落成 `undefined` 会被下面的
+        // PLACEHOLDER_TEXT 抓出来。宿主真正的实现在 `shell_plugin_host/context.rs`。
         let context = HostModule::new("navop.context").function("current", null);
         let dev = HostModule::new("navop.dev")
             .function("list", empty)

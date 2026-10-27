@@ -963,6 +963,7 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     one_ui::init(cx, table_keybindings);
     db_view::search_shortcut::init(cx);
     db_view::sql_editor_view::init(cx);
+    // ai_chat_view 的会话搜索快捷键随 `ai_chat_view::init(cx)` 一起注册（见该 crate 的 lib.rs）。
     crate::auth::init(cx);
     crate::license::init(cx);
     {
@@ -1019,6 +1020,9 @@ pub fn refresh_keybindings(cx: &mut App) {
     cx.bind_keys(refreshable_keybindings(cx));
     crate::home_tab::refresh_keybindings(cx);
     db_view::search_shortcut::refresh_keybindings(cx);
+    // AI 工作台的快捷键是 app 级（无 context 冲突），留在原位即可。
+    ai_chat_view::find_shortcut::refresh_keybindings(cx);
+    ai_chat_view::session_shortcut::refresh_keybindings(cx);
     terminal_view::refresh_keybindings(cx);
     redis_view::refresh_keybindings(cx);
     remote_desktop_view::refresh_keybindings(cx);
@@ -1361,7 +1365,7 @@ fn init_action_handlers(cx: &mut App) {
                     window.close_all_dialogs(cx);
                 }
                 home_page.update(cx, |hp, cx| {
-                    hp.show_new_connection_dialog(window, cx);
+                    hp.show_new_connection_dialog(None, window, cx);
                 });
             });
         });

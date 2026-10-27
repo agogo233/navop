@@ -1,13 +1,17 @@
 pub mod chat_history;
+pub mod composer_draft;
 pub mod connector;
 pub mod manager;
 pub mod notifier;
 pub mod storage;
 pub mod types;
+pub mod usage_history;
 
+pub use composer_draft::{ComposerDraft, ComposerDraftRepository};
 pub use connector::{ChatStream, LlmConnector, LlmProvider, default_api_base};
 pub use manager::{GlobalProviderState, ProviderManager};
 pub use types::{ProviderConfig, ProviderType};
+pub use usage_history::{AgentUsageRepository, AgentUsageSample};
 
 pub use llm_connector::types::{ChatRequest, Message, MessageBlock, Role, StreamingResponse};
 

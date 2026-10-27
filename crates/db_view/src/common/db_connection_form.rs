@@ -1666,6 +1666,19 @@ impl DbConnectionForm {
         cx.notify();
     }
 
+    /// 预选目标分组（新建连接向导从某个分组右键进入时使用），用户仍可在下拉里改。
+    pub fn select_workspace(
+        &mut self,
+        workspace_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_select.update(cx, |select, cx| {
+            select.set_selected_value(&Some(workspace_id), window, cx);
+        });
+        cx.notify();
+    }
+
     pub fn set_teams(
         &mut self,
         teams: Vec<TeamOption>,

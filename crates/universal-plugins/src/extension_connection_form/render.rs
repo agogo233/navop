@@ -324,6 +324,7 @@ mod tests {
         let (_form, cx) = cx.add_window_view(|window, cx| {
             ExtensionConnectionForm::new(
                 ExtensionConnectionFormConfig {
+                    initial_workspace_id: None,
                     contribution: two_tab_contribution(),
                     editing_connection: None,
                     workspaces: Vec::new(),

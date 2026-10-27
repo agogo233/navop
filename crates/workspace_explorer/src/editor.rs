@@ -4,18 +4,17 @@ mod render;
 mod save;
 mod tabs;
 
-use crate::diff::SideBySideDiff;
 use crate::file_system::LoadedFile;
 use crate::git::{GitChange, GitRepository};
 use crate::theme::WorkspaceTheme;
 use crate::{WorkspaceBackend, local_backend};
 use gpui::{App, Context, Entity, EventEmitter, KeyBinding, Subscription, actions};
+use gpui_component::diff::DiffState;
 use gpui_component::input::EditorState;
 use notes::NotesView;
 use one_ui::StatusPresentation;
 use remote_file_editor::EditorMode;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
 actions!(workspace_editor, [SaveDocument]);
@@ -40,7 +39,14 @@ pub enum WorkspaceEditorEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum DocumentKey {
     File(PathBuf),
-    Diff { repository: PathBuf, path: PathBuf },
+    Diff {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    /// 稳定单例 key：同一会话的 last-turn review 复用同一标签页刷新。
+    SnapshotDiff,
+    /// 单个文件的审阅 diff（本轮快照里裁出来的那一段）；按文件分页。
+    ReviewFile(PathBuf),
 }
 
 impl DocumentKey {
@@ -51,6 +57,10 @@ impl DocumentKey {
                 .join(".git")
                 .join("workspace-explorer-diff")
                 .join(path),
+            Self::SnapshotDiff => PathBuf::from("navop://last-turn-review"),
+            // 不能写成 `"navop://review".join(path)`：`join` 遇到绝对路径会整段
+            // 替换，于是和 `Self::File` 撞成同一个身份、审阅页会把文件页顶掉。
+            Self::ReviewFile(path) => PathBuf::from(format!("navop://review{}", path.display())),
         }
     }
 
@@ -60,6 +70,8 @@ impl DocumentKey {
             Self::Diff { repository, path } => {
                 format!("{} · {}", repository.display(), path.display())
             }
+            Self::SnapshotDiff => "last-turn".to_string(),
+            Self::ReviewFile(path) => path.display().to_string(),
         }
     }
 }
@@ -70,11 +82,30 @@ pub(super) enum LoadRequest {
         repository: GitRepository,
         change: GitChange,
     },
+    /// 已就绪的 patch 原文（整轮 checkpoint diff、单文件审阅切片……），无需再查 git。
+    SnapshotDiff {
+        text: String,
+    },
 }
 
-pub(crate) struct GitDiffRequest {
-    pub(crate) repository: GitRepository,
-    pub(crate) change: GitChange,
+impl LoadRequest {
+    /// 是否为差异文档（只读快照）。
+    ///
+    /// 复用同名标签页时，文件与差异要分开对待：差异页每次打开都换成新的 patch，
+    /// 文件页只能聚焦（重载会吞掉用户的未保存改动）。
+    pub(super) fn is_diff(&self) -> bool {
+        matches!(self, Self::Diff { .. } | Self::SnapshotDiff { .. })
+    }
+}
+
+/// 请求编辑器展示某条 Git 变更的 diff。
+///
+/// 供工作台审阅面板等外部容器构造；`repository` 与 `change` 均来自
+/// [`crate::git`] 的公开查询函数。
+#[derive(Clone, Debug)]
+pub struct GitDiffRequest {
+    pub repository: GitRepository,
+    pub change: GitChange,
 }
 
 pub(super) struct PendingDocument {
@@ -86,7 +117,6 @@ pub(super) struct PendingDocument {
 pub(super) struct LoadedDocument {
     text: String,
     language: String,
-    diff_language: Option<String>,
     file_size: usize,
     policy: DocumentPolicy,
     read_only: bool,
@@ -113,28 +143,32 @@ impl LoadedDocument {
         Self {
             text: file.text,
             language: file.language,
-            diff_language: None,
             file_size: file.file_size,
             policy,
             read_only: false,
         }
     }
 
-    pub(super) fn from_diff(diff: String, language: String) -> Self {
+    pub(super) fn from_diff(diff: String) -> Self {
         Self {
             file_size: diff.len(),
             text: diff,
-            language: "diff".to_string(),
-            diff_language: Some(language),
+            language: String::new(),
             policy: DocumentPolicy::Diff,
             read_only: true,
         }
     }
-}
 
-pub(super) struct DiffEditors {
-    left: Entity<EditorState>,
-    right: Entity<EditorState>,
+    /// 整轮快照 diff：多文件 patch,与单文件 diff 走同一条组件渲染路径。
+    pub(super) fn from_snapshot_diff(diff: String) -> Self {
+        Self {
+            file_size: diff.len(),
+            text: diff,
+            language: String::new(),
+            policy: DocumentPolicy::Diff,
+            read_only: true,
+        }
+    }
 }
 
 pub(super) struct EditorTab {
@@ -144,10 +178,10 @@ pub(super) struct EditorTab {
     editor: Option<Entity<EditorState>>,
     markdown: Option<Entity<NotesView>>,
     subscriptions: Vec<Subscription>,
-    diff: Option<Rc<SideBySideDiff>>,
-    diff_editors: Option<DiffEditors>,
+    /// Diff 组件状态:从 patch 原文解析,负责全部 diff 渲染(Split/Unified)。
+    diff_state: Option<Entity<DiffState>>,
+    /// `true` 为 Split 双栏,`false` 为 Unified 单栏。
     diff_side_by_side: bool,
-    diff_change_cursor: Option<usize>,
     saved_text: String,
     file_size: usize,
     policy: DocumentPolicy,
@@ -163,6 +197,10 @@ pub(super) struct EditorTab {
 
 impl EditorTab {
     pub(super) fn new(id: u64, document: PendingDocument) -> Self {
+        // 差异页默认换行：审阅面板是可调宽的侧栏（工作台右侧默认 400px），
+        // 长行不换行时只能横向拖动或把面板放大才看得全。普通代码文件保持
+        // 不换行（对齐比折行重要），需要时用工具栏的「换行」开关切换。
+        let soft_wrap = document.load_request.is_diff();
         Self {
             id,
             key: document.key,
@@ -170,16 +208,17 @@ impl EditorTab {
             editor: None,
             markdown: None,
             subscriptions: Vec::new(),
-            diff: None,
-            diff_editors: None,
-            diff_side_by_side: true,
-            diff_change_cursor: None,
+            diff_state: None,
+            // 默认单栏(Unified)。审阅面板是可调宽的侧栏,窄下来时 Split 的右栏
+            // 会被父级 `overflow_hidden` 整块裁掉——宁可先给一栏看得全的,
+            // 要并排再点工具栏切换(那里本来就有开关)。
+            diff_side_by_side: false,
             saved_text: String::new(),
             file_size: 0,
             policy: DocumentPolicy::Code,
             loading: true,
             saving: false,
-            soft_wrap: false,
+            soft_wrap,
             read_only: false,
             status_message: rust_i18n::t!("WorkspaceExplorer.status.loading").to_string(),
             status_presentation: StatusPresentation::Progress,

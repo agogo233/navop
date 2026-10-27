@@ -271,27 +271,6 @@ impl HomePage {
         key_input.update(cx, |input, cx| input.focus(window, cx));
     }
 
-    pub(super) fn team_management_url(&self) -> Result<String, String> {
-        let Some((access_token, refresh_token, _, _)) = load_auth_data() else {
-            return Err(t!("Home.cloud_need_login").to_string());
-        };
-
-        let template = team_management_url_template();
-        let template = template.trim();
-        let url = build_team_management_url(template, &access_token, &refresh_token);
-        Ok(resolve_team_management_url(
-            &url,
-            website_base_url().as_deref(),
-        ))
-    }
-
-    pub(crate) fn open_team_management(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.team_management_url() {
-            Ok(url) => cx.open_url(&url),
-            Err(message) => window.push_notification(message, cx),
-        }
-    }
-
     /// 修改主密钥。成功后刷新连接列表并触发全量同步，
     /// 让其他设备尽快看到"云端密钥已被更换"。
     pub(crate) fn show_change_master_key_dialog(
@@ -349,7 +328,11 @@ mod tests {
         let dialog = source
             .split("pub(super) fn show_encryption_key_dialog(")
             .nth(1)
-            .and_then(|source| source.split("pub(super) fn team_management_url").next())
+            .and_then(|source| {
+                source
+                    .split("pub(crate) fn show_change_master_key_dialog(")
+                    .next()
+            })
             .expect("show_encryption_key_dialog source");
 
         assert!(dialog.contains("let startup_lock ="));
@@ -366,7 +349,11 @@ mod tests {
         let dialog = source
             .split("pub(super) fn show_encryption_key_dialog(")
             .nth(1)
-            .and_then(|source| source.split("pub(super) fn team_management_url").next())
+            .and_then(|source| {
+                source
+                    .split("pub(crate) fn show_change_master_key_dialog(")
+                    .next()
+            })
             .expect("show_encryption_key_dialog source");
 
         assert!(dialog.contains("crypto::set_master_key_for_session"));
@@ -392,7 +379,11 @@ mod tests {
         let dialog = source
             .split("pub(super) fn show_encryption_key_dialog(")
             .nth(1)
-            .and_then(|source| source.split("pub(super) fn team_management_url").next())
+            .and_then(|source| {
+                source
+                    .split("pub(crate) fn show_change_master_key_dialog(")
+                    .next()
+            })
             .expect("show_encryption_key_dialog source");
 
         assert!(dialog.contains("master_key_error_message(&error)"));
@@ -407,7 +398,11 @@ mod tests {
         let dialog = source
             .split("pub(super) fn show_encryption_key_dialog(")
             .nth(1)
-            .and_then(|source| source.split("pub(super) fn team_management_url").next())
+            .and_then(|source| {
+                source
+                    .split("pub(crate) fn show_change_master_key_dialog(")
+                    .next()
+            })
             .expect("show_encryption_key_dialog source");
 
         assert!(!dialog.contains("self.show_change_master_key_dialog(window, cx)"));

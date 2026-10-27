@@ -28,9 +28,9 @@ use crate::{
     theme::{TerminalColors, TerminalTheme},
 };
 use ai_chat_view::{
-    AgentChatTheme, CodeBlockAction, DefaultAgentChatPanel, DefaultAgentChatPanelEvent,
-    LanguageMatcher, MentionItem, build_mentions_from_connections, build_resource_catalog,
-    build_sidebar_resource_state,
+    AgentChatTheme, AgentChatThemeBase, CodeBlockAction, DefaultAgentChatPanel,
+    DefaultAgentChatPanelEvent, LanguageMatcher, MentionItem, build_mentions_from_connections,
+    build_resource_catalog, build_sidebar_resource_state,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -39,7 +39,7 @@ use gpui::{
     Window, div,
 };
 use gpui_component::{
-    ActiveTheme, Icon, Selectable, Sizable, Size,
+    ActiveTheme, Icon, Selectable, Sizable, Size, Theme,
     button::{ButtonCustomVariant, ButtonVariants},
     h_flex, v_flex,
 };
@@ -79,6 +79,10 @@ pub(crate) fn workspace_theme_from_terminal_colors(
         border: colors.border,
         accent: colors.accent,
         accent_foreground: colors.accent_foreground,
+        // 终端配色没有「选区 / 光标」这两个概念，取应用主题的专用色兜底。
+        // 关键是不能用 accent：它贴着终端背景，拿来当选区等于不可见。
+        selection: application_theme.selection,
+        caret: application_theme.caret,
         danger: application_theme.danger,
         warning: application_theme.warning,
         success: application_theme.success,
@@ -138,40 +142,53 @@ fn terminal_ai_system_instruction(connection_kind: TerminalConnectionKind) -> St
     )
 }
 
+/// 终端侧边栏的对话主题：基础色（含浮层 / 内嵌两个表面层）用终端自有配色，
+/// 语义槽（状态色 / 用量档位 / 图表色）仍取应用主题——终端可以有一套自己的底色，
+/// 但「危险」到哪都该是那个红。
+///
+/// 表面层必须跟着终端配色走：终端是深色而应用主题是浅色时，浮层与输入框
+/// 若取应用主题就会在深色侧边栏里白成一片。
 fn agent_theme_from_terminal_theme(
     theme: &TerminalTheme,
-    surface_radius: Pixels,
+    application_theme: &Theme,
 ) -> AgentChatTheme {
     let colors = theme.colors();
-    AgentChatTheme {
-        is_dark: theme.is_dark(),
-        background: colors.background,
-        foreground: colors.foreground,
-        muted: colors.muted,
-        muted_foreground: colors.muted_foreground,
-        border: colors.border,
-        panel: colors.muted,
-        panel_hover: colors.muted.opacity(0.72),
-        accent: colors.accent,
-        accent_foreground: colors.accent_foreground,
-        code_background: colors.muted,
-        code_foreground: colors.foreground,
-        table_header: colors.muted,
-        table_row: colors.background,
-        table_row_alt: colors.muted.opacity(0.35),
-        quote_border: colors.border,
-        link: colors.accent,
-        // gpui-component 的 TextView 选区高亮绘制在文字字形上层（inline.rs
-        // Inline::paint），不透明色会完全盖住选中文本；应用主题的选区色在
-        // 组件内被钳制到 alpha<=0.3，而终端主题的选区色是不透明的，这里
-        // 统一压到同样的半透明水平（暗色 0.3 / 亮色 0.4，保证高亮可见）。
-        text_selection: if theme.is_dark() {
-            theme.selection.alpha(0.3)
-        } else {
-            theme.selection.alpha(0.4)
+    AgentChatTheme::from_base_colors(
+        AgentChatThemeBase {
+            is_dark: theme.is_dark(),
+            background: colors.background,
+            foreground: colors.foreground,
+            muted: colors.muted,
+            muted_foreground: colors.muted_foreground,
+            border: colors.border,
+            panel: colors.muted,
+            panel_hover: colors.muted.opacity(0.72),
+            accent: colors.accent,
+            accent_foreground: colors.accent_foreground,
+            code_background: colors.muted,
+            code_foreground: colors.foreground,
+            table_header: colors.muted,
+            table_row: colors.background,
+            table_row_alt: colors.muted.opacity(0.35),
+            quote_border: colors.border,
+            link: colors.accent,
+            // gpui-component 的 TextView 选区高亮绘制在文字字形上层（inline.rs
+            // Inline::paint），不透明色会完全盖住选中文本；应用主题的选区色在
+            // 组件内被钳制到 alpha<=0.3，而终端主题的选区色是不透明的，这里
+            // 统一压到同样的半透明水平（暗色 0.3 / 亮色 0.4，保证高亮可见）。
+            text_selection: if theme.is_dark() {
+                theme.selection.alpha(0.3)
+            } else {
+                theme.selection.alpha(0.4)
+            },
+            surface_radius: application_theme.radius,
+            // 终端配色里没有独立的浮层 / 输入框色：`muted` 就是这套调色板里
+            // 「比底色亮一级」的那个表面，浮层与 inset 容器都用它。
+            raised: colors.muted,
+            inset: colors.muted,
         },
-        surface_radius,
-    }
+        application_theme,
+    )
 }
 
 fn build_terminal_ai_context(
@@ -223,6 +240,55 @@ fn build_live_terminal_ai_context(
         ai_access_levels,
     ));
     (scope, catalog, mentions)
+}
+
+/// 构造「每轮发送前重建资源上下文」的回调：把终端此刻的现场写进资源池。
+///
+/// 资源池只在侧边栏创建时构建一次，之后终端的当前目录、是否运行全屏程序、
+/// 选中内容都会变；这个回调让每次发送都在主线程上重新读取一份最新状态，
+/// 模型本轮就能看到终端现状，不必先调用一次读取工具。
+pub(crate) fn live_terminal_resource_refresher(
+    terminal: Entity<crate::Terminal>,
+    current_terminal: agent_runtime::ResourceRef,
+    current_connection: Option<String>,
+) -> ai_chat_view::ResourceContextRefresher {
+    let terminal = terminal.downgrade();
+    Arc::new(move |cx: &App| {
+        // 终端已释放时不再刷新，避免读取已释放实体。
+        let terminal = terminal.upgrade()?;
+        let connections = load_terminal_ai_connections(cx);
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
+        let live_scopes = {
+            let terminal_ref = terminal.read(cx);
+            crate::ai_live_context::live_resource_scopes(terminal_ref)
+        };
+        let catalog = build_resource_catalog(&connections, &ai_access_levels);
+        crate::ai_live_context::build_live_resource_context(
+            crate::ai_live_context::LiveContextInputs {
+                terminal: &current_terminal,
+                live_scopes,
+                catalog,
+                current_connection: current_connection.as_deref(),
+            },
+        )
+    })
+}
+
+/// 构造「终端选中内容随消息发送」的回调。
+///
+/// 与资源刷新回调分开：刷新回调决定模型「看到什么现场」，这个回调决定用户
+/// 明确选中的正文「送进这一轮消息」。选区为空时不附加，消息与用户输入
+/// 逐字一致，不会平白多出空块。
+pub(crate) fn live_terminal_context_attachment_provider(
+    terminal: Entity<crate::Terminal>,
+    source_label: String,
+) -> ai_chat_view::ContextAttachmentProvider {
+    let terminal = terminal.downgrade();
+    Arc::new(move |cx: &App| {
+        let terminal = terminal.upgrade()?;
+        let terminal_ref = terminal.read(cx);
+        crate::ai_live_context::selection_attachment(terminal_ref, &source_label)
+    })
 }
 
 fn terminal_ai_connection_catalog(
@@ -417,6 +483,8 @@ fn terminal_sidebar_available_panels(
     if has_file_explorer {
         panels.push(SidebarPanel::FileExplorer);
     }
+    // 原始终端侧栏保留 AI 面板；只有 AI 工作台里的终端（WorkspacePane，无内建侧栏）
+    // 不出现它。
     panels.extend([SidebarPanel::Settings, SidebarPanel::AiChat]);
     if broadcast_supported {
         panels.push(SidebarPanel::BroadcastInput);
@@ -712,6 +780,8 @@ pub struct TerminalSidebar {
     history_command_panel: Option<Entity<HistoryCommandPanel>>,
     /// AI 聊天面板
     ai_chat_panel: Entity<DefaultAgentChatPanel>,
+    /// 连接模式下 AI 的默认连接资源 id（本地终端为 `None`）
+    ai_connection_resource: Option<String>,
     /// SSH 广播输入面板
     broadcast_input_panel: Option<Entity<BroadcastInputPanel>>,
     /// 文件管理器面板（仅 SSH 终端时创建）
@@ -821,6 +891,36 @@ impl TerminalSidebar {
             return;
         }
         cx.emit(TerminalSidebarEvent::SaveAsConnection);
+    }
+
+    /// AI 面板里的默认连接资源 id（本地终端为 `None`）。
+    pub(crate) fn ai_connection_resource(&self) -> Option<String> {
+        self.ai_connection_resource.clone()
+    }
+
+    /// 注入「每轮发送前重建资源上下文」的回调。
+    ///
+    /// 让 AI 面板每轮都能看到终端实时状态（当前目录、是否运行全屏程序、
+    /// 选中内容），而不是使用面板创建时的快照。
+    pub(crate) fn set_ai_resource_context_refresher(
+        &mut self,
+        refresher: ai_chat_view::ResourceContextRefresher,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_chat_panel.update(cx, |panel, cx| {
+            panel.set_resource_context_refresher(Some(refresher), cx);
+        });
+    }
+
+    /// 接入「选中正文随消息发送」，AI 面板建好之前也能设置。
+    pub(crate) fn set_ai_context_attachment_provider(
+        &mut self,
+        provider: ai_chat_view::ContextAttachmentProvider,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_chat_panel.update(cx, |panel, cx| {
+            panel.set_context_attachment_provider(Some(provider), cx);
+        });
     }
 
     /// 文件管理器 / 服务器监控面板是否都已可用（或本来就不适用）。
@@ -981,11 +1081,18 @@ impl TerminalSidebar {
                 HistoryCommandPanel::new(scope, history_user.clone(), colors.clone(), window, cx)
             })
         });
+        // 连接模式下 AI 的默认目标是连接；记下它的资源 id，刷新器据此把
+        // 正在使用的这台终端挂到连接旁边（见 `live_terminal_resource_refresher`）。
+        let mut ai_connection_resource: Option<String> = None;
         let ai_chat_panel = if let Some(connection) = stored_connection.as_ref() {
             let connections = load_terminal_ai_connections(cx);
             let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
             let (scope, catalog, mentions) =
                 build_terminal_ai_context(connection, &connections, &ai_access_levels);
+            ai_connection_resource = scope
+                .default_target
+                .as_ref()
+                .map(|target| target.resource_id.as_str().to_string());
             cx.new(|cx| {
                 DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(
                     scope, catalog, mentions, window, cx,
@@ -1053,7 +1160,7 @@ impl TerminalSidebar {
 
         // 注册 bash/sh 代码块操作，并注入终端专属提示词
         let sidebar_entity = cx.entity();
-        let ai_theme = agent_theme_from_terminal_theme(initial_theme, cx.theme().radius);
+        let ai_theme = agent_theme_from_terminal_theme(initial_theme, cx.theme());
         ai_chat_panel.update(cx, |panel, cx| {
             panel.set_theme(Some(ai_theme), cx);
             panel.set_sidebar_header_visible(true, cx);
@@ -1209,6 +1316,15 @@ impl TerminalSidebar {
                 DefaultAgentChatPanelEvent::MoveTo(placement) => {
                     this.move_tool(SidebarPanel::AiChat, *placement, cx);
                 }
+                // 终端侧栏不承载 AI 工作台，轮次边界、「回到这一轮」、「在 Review 中打开」
+                // 与子代理详情面板都由工作台外壳处理。
+                DefaultAgentChatPanelEvent::TurnStarted { .. }
+                | DefaultAgentChatPanelEvent::TurnFinished { .. }
+                | DefaultAgentChatPanelEvent::RestoreTurn { .. }
+                | DefaultAgentChatPanelEvent::OpenFileInReview { .. }
+                | DefaultAgentChatPanelEvent::OpenTurnReview { .. }
+                | DefaultAgentChatPanelEvent::SubagentDetailRequested { .. }
+                | DefaultAgentChatPanelEvent::SubagentDetailUpdated { .. } => {}
             },
         );
 
@@ -1239,6 +1355,17 @@ impl TerminalSidebar {
                     WorkspaceExplorerEvent::SyncTerminalCwd => {
                         cx.emit(TerminalSidebarEvent::SyncWorkingDir);
                     }
+                    WorkspaceExplorerEvent::RootChanged(_) => {}
+                    // 终端侧栏不消费仓库句柄（它只转发工作目录），无需处理。
+                    WorkspaceExplorerEvent::RepositoryChanged => {}
+                    WorkspaceExplorerEvent::CommitMessageRequested => {}
+                    // 终端侧栏没有独立审阅面板，文档切换事件无需处理。
+                    WorkspaceExplorerEvent::DocumentRequested => {}
+                    // 回滚入口只出现在 AI 工作台的轮次页脚，终端侧栏不渲染它。
+                    WorkspaceExplorerEvent::RestorableTurnsChanged { .. } => {}
+                    // 「查看改动」入口与轮末自动摆 diff 同理：只有工作台外壳接得住。
+                    WorkspaceExplorerEvent::ReviewsChanged { .. }
+                    | WorkspaceExplorerEvent::TurnReviewCaptured { .. } => {}
                 },
             );
             subs.push(explorer_sub);
@@ -1261,6 +1388,7 @@ impl TerminalSidebar {
             quick_command_panel,
             history_command_panel,
             ai_chat_panel,
+            ai_connection_resource,
             broadcast_input_panel,
             file_manager_panel,
             file_explorer_panel,
@@ -1487,10 +1615,7 @@ impl TerminalSidebar {
             });
         }
         self.ai_chat_panel.update(cx, |panel, cx| {
-            panel.set_theme(
-                Some(agent_theme_from_terminal_theme(theme, cx.theme().radius)),
-                cx,
-            );
+            panel.set_theme(Some(agent_theme_from_terminal_theme(theme, cx.theme())), cx);
         });
         if let Some(ref broadcast_panel) = self.broadcast_input_panel {
             broadcast_panel.update(cx, |panel, cx| {
@@ -2178,6 +2303,22 @@ mod tests {
     }
 
     #[test]
+    fn ai_chat_is_available_in_the_terminal_sidebar() {
+        for (explorer, manager, monitor, history, broadcast) in [
+            (true, false, false, true, false),
+            (false, true, true, true, true),
+            (false, false, false, false, false),
+        ] {
+            let panels =
+                terminal_sidebar_available_panels(explorer, manager, monitor, history, broadcast);
+            assert!(
+                panels.contains(&SidebarPanel::AiChat),
+                "原始终端侧栏应保留 AI 面板: {panels:?}"
+            );
+        }
+    }
+
+    #[test]
     fn history_command_panel_is_not_available_for_serial_terminals() {
         let panels = terminal_sidebar_available_panels(false, false, false, false, false);
 
@@ -2201,8 +2342,7 @@ mod tests {
     fn agent_theme_preserves_terminal_dark_mode_for_markdown() {
         let application_theme = Theme::from(ThemeColor::dark().as_ref());
         let terminal_theme = TerminalTheme::from_application_theme(&application_theme);
-        let agent_theme =
-            agent_theme_from_terminal_theme(&terminal_theme, application_theme.radius);
+        let agent_theme = agent_theme_from_terminal_theme(&terminal_theme, &application_theme);
         let markdown_style = agent_theme.markdown_style();
 
         assert!(terminal_theme.is_dark());

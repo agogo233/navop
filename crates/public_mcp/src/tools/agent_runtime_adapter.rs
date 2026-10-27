@@ -8,11 +8,25 @@ use agent_runtime::tools::{
     ObservationData, Tool as AgentTool, ToolInvocation, ToolName, ToolNameAllocator,
     ToolObservation, ToolRegistry, ToolSpec,
 };
-use agent_runtime::{RiskLevel, ToolError};
+use agent_runtime::{ResourceContext, ResourceKind, RiskLevel, ToolError};
 use async_trait::async_trait;
-use rmcp::model::{CallToolResult, Tool};
+use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde_json::Value;
 use std::sync::Arc;
+
+/// 允许模型省略 `target` 的工具，及其需要的资源类型。
+///
+/// 省略时由本适配器补上会话的默认资源；显式传 `target` 的行为不变。
+const DEFAULT_TARGET_TOOLS: [(&str, ResourceKind); 1] = [("terminal.read", ResourceKind::Terminal)];
+const TARGET_FIELD: &str = "target";
+const PROPERTIES_FIELD: &str = "properties";
+const REQUIRED_FIELD: &str = "required";
+const DESCRIPTION_FIELD: &str = "description";
+const DEFAULT_TARGET_DESCRIPTION: &str = "Exact `id` of the terminal to read. Omit it to read the default terminal of this session \
+     (the resource marked [current], or the only terminal available). Pass an explicit id from \
+     `connections.list_sessions` with kind=\"terminal\" to read another terminal.";
+const DEFAULT_TARGET_TOOL_HINT: &str = "The `target` field may be omitted to read the default \
+     terminal of this session.";
 
 pub fn agent_runtime_tool_registry(
     registry: PublicMcpToolRegistry,
@@ -28,13 +42,9 @@ pub fn agent_runtime_tool_registry(
         let original_name = tool.name.to_string();
         let adapter = PublicMcpAgentTool {
             name: names.allocate(&original_name),
+            description: agent_description(&original_name, &tool),
+            parameters: agent_parameters(&original_name, &tool),
             original_name,
-            description: tool
-                .description
-                .as_ref()
-                .map(|desc| desc.to_string())
-                .unwrap_or_default(),
-            parameters: Value::Object(tool.input_schema.as_ref().clone()),
             risk: risk_from_mcp_tool(&tool),
             registry: registry.clone(),
             context: context.clone(),
@@ -71,6 +81,7 @@ impl AgentTool for PublicMcpAgentTool {
 
     async fn execute(&self, invocation: ToolInvocation) -> Result<ToolObservation, ToolError> {
         let arguments = invocation_arguments(invocation.arguments.clone())?;
+        let arguments = with_default_target(&self.original_name, arguments, &invocation.resources)?;
         let result = self
             .registry
             .call_tool_with_cancellation(
@@ -114,6 +125,89 @@ impl PublicMcpApprover for AgentApprovedApprover {
     fn request_approval(&self, _request: PublicMcpApprovalRequest) -> PublicMcpApprovalFuture {
         Box::pin(async { PublicMcpApprovalOutcome::Approved })
     }
+}
+
+/// 该工具是否允许省略 `target`；是则返回它需要的资源类型。
+fn default_target_kind(tool_name: &str) -> Option<&'static ResourceKind> {
+    DEFAULT_TARGET_TOOLS
+        .iter()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, kind)| kind)
+}
+
+/// 生成交给模型的参数 schema：允许省略 `target` 的工具去掉必填约束。
+fn agent_parameters(tool_name: &str, tool: &Tool) -> Value {
+    let mut schema = Value::Object(tool.input_schema.as_ref().clone());
+    if default_target_kind(tool_name).is_none() {
+        return schema;
+    }
+    let Some(object) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(Value::Array(required)) = object.get_mut(REQUIRED_FIELD) {
+        required.retain(|field| field.as_str() != Some(TARGET_FIELD));
+        if required.is_empty() {
+            object.remove(REQUIRED_FIELD);
+        }
+    }
+    if let Some(Value::Object(properties)) = object.get_mut(PROPERTIES_FIELD) {
+        if let Some(Value::Object(target)) = properties.get_mut(TARGET_FIELD) {
+            target.insert(
+                DESCRIPTION_FIELD.to_string(),
+                Value::String(DEFAULT_TARGET_DESCRIPTION.to_string()),
+            );
+        }
+    }
+    schema
+}
+
+/// 生成交给模型的工具描述：允许省略 `target` 的工具在末尾补一句提示。
+fn agent_description(tool_name: &str, tool: &Tool) -> String {
+    let description = tool
+        .description
+        .as_ref()
+        .map(|desc| desc.to_string())
+        .unwrap_or_default();
+    if default_target_kind(tool_name).is_none() {
+        return description;
+    }
+    if description.is_empty() {
+        return DEFAULT_TARGET_TOOL_HINT.to_string();
+    }
+    format!("{description} {DEFAULT_TARGET_TOOL_HINT}")
+}
+
+/// 模型省略 `target` 时补上会话的默认资源。
+///
+/// 只有泛型上允许省略的工具才会被替换；显式 target（含空串）保持原样，
+/// 由工具自己报参数错误。找不到可用默认资源时给出可执行的下一步。
+fn with_default_target(
+    tool_name: &str,
+    mut arguments: JsonObject,
+    resources: &ResourceContext,
+) -> Result<JsonObject, ToolError> {
+    let Some(kind) = default_target_kind(tool_name) else {
+        return Ok(arguments);
+    };
+    let explicit = arguments
+        .get(TARGET_FIELD)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    if explicit {
+        return Ok(arguments);
+    }
+    let Some(resource) = resources.default_target_of_kind(kind) else {
+        return Err(ToolError::InvalidArguments(format!(
+            "{tool_name} needs an explicit `target`: this session has no unique {} resource. \
+             Call connections.list_sessions, then pass an `id` from the result",
+            kind.as_str()
+        )));
+    };
+    arguments.insert(
+        TARGET_FIELD.to_string(),
+        Value::String(resource.id.as_str().to_string()),
+    );
+    Ok(arguments)
 }
 
 fn invocation_arguments(arguments: Value) -> Result<rmcp::model::JsonObject, ToolError> {
@@ -169,12 +263,12 @@ fn result_data(result: &CallToolResult) -> ObservationData {
 
 #[cfg(test)]
 mod tests {
-    use super::agent_runtime_tool_registry;
+    use super::{DEFAULT_TARGET_TOOL_HINT, REQUIRED_FIELD, agent_runtime_tool_registry};
     use crate::approval::PublicMcpApprovalManager;
     use crate::permissions::PermissionMode;
     use crate::tools::{PublicMcpToolContext, PublicMcpToolFuture, PublicMcpToolProvider};
     use agent_runtime::{
-        ResourceContext, SessionId, SkillContext, ToolName, TurnId, ids::ToolCallId,
+        ResourceContext, ResourceKind, SessionId, SkillContext, ToolName, TurnId, ids::ToolCallId,
         tools::ToolInvocation,
     };
     use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
@@ -374,6 +468,219 @@ mod tests {
                 Ok(CallToolResult::success(vec![Content::text(
                     value["message"].as_str().unwrap_or_default().to_string(),
                 )]))
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_read_spec_allows_omitting_target() {
+        let provider = Arc::new(TerminalReadProvider::default());
+        let registry = agent_runtime_tool_registry(
+            crate::tools::PublicMcpToolRegistry::new(vec![provider]),
+            PermissionMode::Deny,
+            PublicMcpApprovalManager::default(),
+        );
+
+        let spec = registry
+            .specs(&ResourceContext::new())
+            .into_iter()
+            .find(|spec| spec.name.as_str() == "terminal_read")
+            .expect("terminal.read spec should be registered");
+
+        assert!(
+            spec.parameters.get(REQUIRED_FIELD).is_none(),
+            "target 可省略时不应再有必填字段: {}",
+            spec.parameters
+        );
+        assert!(
+            spec.parameters["properties"]["target"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Omit it")),
+            "target 描述应说明可省略: {}",
+            spec.parameters["properties"]["target"]
+        );
+        assert!(
+            spec.description.contains(DEFAULT_TARGET_TOOL_HINT),
+            "工具描述应提示可省略 target: {}",
+            spec.description
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_read_injects_default_terminal_when_target_omitted() {
+        let provider = Arc::new(TerminalReadProvider::default());
+        let registry = agent_runtime_tool_registry(
+            crate::tools::PublicMcpToolRegistry::new(vec![provider.clone()]),
+            PermissionMode::Deny,
+            PublicMcpApprovalManager::default(),
+        );
+        let resources = ResourceContext::new().with_resource(terminal_resource("term-1"));
+
+        registry
+            .get(&ToolName::new("terminal_read"))
+            .expect("tool should be registered")
+            .execute(invocation_with_resources(
+                "terminal_read",
+                json!({ "lines": 20 }),
+                resources,
+            ))
+            .await
+            .expect("call should succeed");
+
+        assert_eq!(
+            Some(json!({ "lines": 20, "target": "term-1" })),
+            provider.last_arguments()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_read_keeps_explicit_target() {
+        let provider = Arc::new(TerminalReadProvider::default());
+        let registry = agent_runtime_tool_registry(
+            crate::tools::PublicMcpToolRegistry::new(vec![provider.clone()]),
+            PermissionMode::Deny,
+            PublicMcpApprovalManager::default(),
+        );
+
+        registry
+            .get(&ToolName::new("terminal_read"))
+            .expect("tool should be registered")
+            .execute(invocation_with_resources(
+                "terminal_read",
+                json!({ "target": "term-2" }),
+                ResourceContext::new(),
+            ))
+            .await
+            .expect("call should succeed");
+
+        assert_eq!(
+            Some(json!({ "target": "term-2" })),
+            provider.last_arguments()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_read_prefers_terminal_over_current_connection() {
+        let provider = Arc::new(TerminalReadProvider::default());
+        let registry = agent_runtime_tool_registry(
+            crate::tools::PublicMcpToolRegistry::new(vec![provider.clone()]),
+            PermissionMode::Deny,
+            PublicMcpApprovalManager::default(),
+        );
+        let connection = agent_runtime::ResourceRef::new("74", ResourceKind::Ssh, "86服务器");
+        let resources = ResourceContext {
+            current: Some(agent_runtime::ResourceId::new("74")),
+            resources: vec![connection, terminal_resource("term-1")],
+        };
+
+        registry
+            .get(&ToolName::new("terminal_read"))
+            .expect("tool should be registered")
+            .execute(invocation_with_resources(
+                "terminal_read",
+                json!({}),
+                resources,
+            ))
+            .await
+            .expect("call should succeed");
+
+        assert_eq!(
+            Some(json!({ "target": "term-1" })),
+            provider.last_arguments()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_read_without_terminals_asks_for_explicit_target() {
+        let provider = Arc::new(TerminalReadProvider::default());
+        let registry = agent_runtime_tool_registry(
+            crate::tools::PublicMcpToolRegistry::new(vec![provider.clone()]),
+            PermissionMode::Deny,
+            PublicMcpApprovalManager::default(),
+        );
+
+        let error = registry
+            .get(&ToolName::new("terminal_read"))
+            .expect("tool should be registered")
+            .execute(invocation_with_resources(
+                "terminal_read",
+                json!({}),
+                ResourceContext::new(),
+            ))
+            .await
+            .expect_err("缺少默认终端时应报错");
+
+        assert!(
+            error.to_string().contains("connections.list_sessions"),
+            "错误信息应给出下一步: {error}"
+        );
+    }
+
+    fn terminal_resource(id: &str) -> agent_runtime::ResourceRef {
+        agent_runtime::ResourceRef::new(id, ResourceKind::Terminal, "本地终端")
+    }
+
+    fn invocation_with_resources(
+        tool_name: &str,
+        arguments: serde_json::Value,
+        resources: ResourceContext,
+    ) -> ToolInvocation {
+        let mut invocation = invocation_for(tool_name, arguments);
+        invocation.resources = resources;
+        invocation
+    }
+
+    #[derive(Default)]
+    struct TerminalReadProvider {
+        last_arguments: Mutex<Option<serde_json::Value>>,
+    }
+
+    impl TerminalReadProvider {
+        fn last_arguments(&self) -> Option<serde_json::Value> {
+            self.last_arguments
+                .lock()
+                .expect("arguments lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl PublicMcpToolProvider for TerminalReadProvider {
+        fn tools(&self) -> Vec<Tool> {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Exact terminal id" },
+                    "lines": { "type": "integer" }
+                },
+                "required": ["target"]
+            });
+            let schema = match schema {
+                serde_json::Value::Object(object) => object,
+                _ => unreachable!("schema should be an object"),
+            };
+            vec![Tool::new(
+                "terminal.read",
+                "Read visible terminal output",
+                schema,
+            )]
+        }
+
+        fn call_tool(
+            &self,
+            name: &str,
+            arguments: Option<JsonObject>,
+            _context: PublicMcpToolContext,
+        ) -> Option<PublicMcpToolFuture> {
+            if name != "terminal.read" {
+                return None;
+            }
+            let value = serde_json::Value::Object(arguments.unwrap_or_default());
+            *self
+                .last_arguments
+                .lock()
+                .expect("arguments lock should not be poisoned") = Some(value);
+            Some(Box::pin(async {
+                Ok(CallToolResult::success(vec![Content::text("ok")]))
             }))
         }
     }

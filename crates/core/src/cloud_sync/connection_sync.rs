@@ -1,9 +1,11 @@
 use crate::cloud_sync::engine::{SyncEngine, SyncFuture, SyncHandler};
 use crate::cloud_sync::models::{
-    CloudSyncData, ConflictResolution, SyncConflict, SyncPlan, SyncResult, data_type,
+    CloudSyncData, ConflictResolution, SyncConflict, SyncPlan, SyncResult, WorkspaceParentLink,
+    data_type,
 };
 use crate::cloud_sync::queue::SyncOperation;
 use crate::cloud_sync::service::SyncError;
+use crate::cloud_sync::workspace_hierarchy::reconcile_connection_workspaces;
 use crate::storage::traits::Repository;
 use crate::storage::{
     ConnectionRepository, PendingCloudDeletionRepository, StoredConnection, WorkspaceRepository,
@@ -11,6 +13,19 @@ use crate::storage::{
 use std::collections::{HashMap, HashSet};
 
 const CONNECTION_QUEUE_KEY: &str = "connection";
+
+/// 上传时「这条连接属于哪个云端分组」的解析结果
+///
+/// 必须把「没有分组」和「分组还没同步上去」区分开：前者上传成根节点是对的，
+/// 后者上传成根节点会把云端记录永久改成无分组。
+pub(crate) enum WorkspaceUploadLink {
+    /// 没有分组（或团队连接不携带个人分组引用）
+    Root,
+    /// 分组已同步，能拿到稳定的云端引用
+    Group(String),
+    /// 本地分组存在，但还没有云端引用（分组本身还没同步上去）
+    Pending(String),
+}
 
 pub struct ConnectionSyncHandler;
 
@@ -385,6 +400,13 @@ impl SyncEngine {
             }
         }
 
+        // 收尾：所有本地写入都完成后，再按云端记录对齐连接所属分组
+        match self.finalize_connection_workspaces(&active_cloud_data) {
+            Ok(0) => {}
+            Ok(aligned) => tracing::info!("[同步] 对齐连接分组: {} 个", aligned),
+            Err(e) => result.errors.push(format!("对齐连接分组失败: {}", e)),
+        }
+
         self.store_operation_queue(CONNECTION_QUEUE_KEY, queue)?;
 
         Ok(result)
@@ -722,7 +744,13 @@ impl SyncEngine {
 
     async fn upload_connection(&self, conn: &StoredConnection) -> Result<CloudSyncData, SyncError> {
         let teams = self.get_cached_teams();
-        let workspace_cloud_id = self.workspace_cloud_id_for_connection(conn)?;
+        let workspace_cloud_id = match self.workspace_upload_link_for_connection(conn)? {
+            WorkspaceUploadLink::Root => None,
+            WorkspaceUploadLink::Group(cloud_id) => Some(cloud_id),
+            WorkspaceUploadLink::Pending(name) => {
+                return Err(Self::pending_workspace_error(conn, &name));
+            }
+        };
         let cloud_data = {
             let service = self
                 .crypto_service
@@ -750,7 +778,13 @@ impl SyncEngine {
         cloud_data: &CloudSyncData,
     ) -> Result<CloudSyncData, SyncError> {
         let teams = self.get_cached_teams();
-        let workspace_cloud_id = self.workspace_cloud_id_for_connection(local_conn)?;
+        let workspace_cloud_id = match self.workspace_upload_link_for_connection(local_conn)? {
+            WorkspaceUploadLink::Root => None,
+            WorkspaceUploadLink::Group(cloud_id) => Some(cloud_id),
+            WorkspaceUploadLink::Pending(name) => {
+                return Err(Self::pending_workspace_error(local_conn, &name));
+            }
+        };
         let updated_data = {
             let service = self
                 .crypto_service
@@ -785,11 +819,14 @@ impl SyncEngine {
         let (mut local_conn, workspace_cloud_id) =
             service.decrypt_sync_data_connection_with_workspace_cloud_id(cloud_data)?;
         drop(service);
+        let name = local_conn.name.clone();
         local_conn.id = None;
         local_conn.cloud_id = Some(cloud_data.id.clone());
-        local_conn.workspace_id = self.local_workspace_id_for_connection(
-            cloud_data.team_id.as_deref(),
+        local_conn.workspace_id = self.resolve_download_workspace_id(
+            cloud_data,
             workspace_cloud_id.as_deref(),
+            None,
+            &name,
         )?;
         local_conn.last_synced_at = Some(Self::current_timestamp());
 
@@ -803,12 +840,21 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// 写入云端下行的连接，并把 `last_synced_at` 对齐到写库实际使用的 `updated_at`
+    ///
+    /// 写库时 `updated_at` 会被改写成「写库时刻」，而 `last_synced_at` 是写库之前算的，
+    /// 两者跨秒就会让下一轮把刚下载下来的内容误判成本地改动、再原样推回云端。
     fn persist_downloaded_connection(
         repo: &ConnectionRepository,
         local_conn: &mut StoredConnection,
     ) -> Result<(), SyncError> {
         repo.upsert_cloud_connection(local_conn)
-            .map_err(|error| SyncError::StorageError(error.to_string()))
+            .map_err(|error| SyncError::StorageError(error.to_string()))?;
+        if let (Some(id), Some(updated_at)) = (local_conn.id, local_conn.updated_at) {
+            repo.update_sync_status(id, local_conn.cloud_id.clone(), Some(updated_at))
+                .map_err(|error| SyncError::StorageError(error.to_string()))?;
+        }
+        Ok(())
     }
 
     async fn update_local_connection(
@@ -826,9 +872,12 @@ impl SyncEngine {
         drop(service);
         updated.id = local_conn.id;
         updated.cloud_id = Some(cloud_data.id.clone());
-        updated.workspace_id = self.local_workspace_id_for_connection(
-            cloud_data.team_id.as_deref(),
+        let name = updated.name.clone();
+        updated.workspace_id = self.resolve_download_workspace_id(
+            cloud_data,
             workspace_cloud_id.as_deref(),
+            local_conn.workspace_id,
+            &name,
         )?;
         updated.last_synced_at = Some(Self::current_timestamp());
 
@@ -839,8 +888,78 @@ impl SyncEngine {
 
         repo.update(&updated)
             .map_err(|e| SyncError::StorageError(e.to_string()))?;
+        // 同 `persist_downloaded_connection`：把同步基线对齐到写库后的 `updated_at`
+        if let Some(id) = updated.id {
+            let written_updated_at = repo
+                .get(id)
+                .map_err(|e| SyncError::StorageError(e.to_string()))?
+                .and_then(|connection| connection.updated_at);
+            if let Some(updated_at) = written_updated_at {
+                repo.update_sync_status(id, updated.cloud_id.clone(), Some(updated_at))
+                    .map_err(|e| SyncError::StorageError(e.to_string()))?;
+            }
+        }
 
         Ok(())
+    }
+
+    /// 收尾阶段：按云端记录把连接所属分组对齐
+    ///
+    /// 云端记录按 `updated_at` 倒序下发，连接完全可能先于它所属的分组落地，那时归属
+    /// 只能先保持本地现状；所有写入结束后统一按云端引用收敛一次，才能自愈这种情况。
+    ///
+    /// 只对齐「云端明确给了分组引用」的连接：云端没有引用时不动本地分组 —— 那是旧载荷
+    /// （缺少 `workspace_cloud_id` 字段）或历史上被错误上传成根节点的记录，按它清空本地
+    /// 分组正是用户反馈的丢失。
+    fn finalize_connection_workspaces(
+        &self,
+        cloud_data_list: &[CloudSyncData],
+    ) -> Result<usize, SyncError> {
+        let links: Vec<(String, WorkspaceParentLink)> = {
+            let service = self
+                .crypto_service
+                .read()
+                .map_err(|_| SyncError::StorageError("同步服务锁获取失败".to_string()))?;
+            cloud_data_list
+                .iter()
+                .filter(|data| data.team_id.is_none() && data.deleted_at.is_none())
+                .filter_map(|data| {
+                    let (_, workspace_cloud_id) = service
+                        .decrypt_sync_data_connection_with_workspace_cloud_id(data)
+                        .ok()?;
+                    let workspace_cloud_id = workspace_cloud_id?;
+                    Some((
+                        data.id.clone(),
+                        WorkspaceParentLink::Cloud(workspace_cloud_id),
+                    ))
+                })
+                .collect()
+        };
+        if links.is_empty() {
+            return Ok(0);
+        }
+
+        let connections_repo = self
+            .storage
+            .get::<ConnectionRepository>()
+            .ok_or_else(|| SyncError::StorageError("ConnectionRepository not found".to_string()))?;
+        let workspaces_repo = self
+            .storage
+            .get::<WorkspaceRepository>()
+            .ok_or_else(|| SyncError::StorageError("WorkspaceRepository not found".to_string()))?;
+        let connections = connections_repo
+            .list()
+            .map_err(|e| SyncError::StorageError(e.to_string()))?;
+        let workspaces = workspaces_repo
+            .list()
+            .map_err(|e| SyncError::StorageError(e.to_string()))?;
+
+        reconcile_connection_workspaces(
+            connections_repo.as_ref(),
+            &connections,
+            &workspaces,
+            &links,
+        )
     }
 
     fn update_sync_status(
@@ -1158,25 +1277,85 @@ impl SyncEngine {
         Ok(workspace.and_then(|workspace| workspace.cloud_id))
     }
 
-    fn workspace_cloud_id_for_connection(
+    pub(crate) fn workspace_upload_link_for_connection(
         &self,
         connection: &StoredConnection,
-    ) -> Result<Option<String>, SyncError> {
+    ) -> Result<WorkspaceUploadLink, SyncError> {
         if !Self::shares_personal_workspace(connection.team_id.as_deref()) {
-            return Ok(None);
+            return Ok(WorkspaceUploadLink::Root);
         }
-        self.workspace_cloud_id_for_local_id(connection.workspace_id)
+        let Some(workspace_id) = connection.workspace_id else {
+            return Ok(WorkspaceUploadLink::Root);
+        };
+        let repo = self
+            .storage
+            .get::<WorkspaceRepository>()
+            .ok_or_else(|| SyncError::StorageError("WorkspaceRepository not found".to_string()))?;
+
+        let workspace = repo
+            .get(workspace_id)
+            .map_err(|e| SyncError::StorageError(e.to_string()))?;
+        // 分组已被删除：连接本来就落回根节点，按无分组处理
+        let Some(workspace) = workspace else {
+            return Ok(WorkspaceUploadLink::Root);
+        };
+        Ok(match workspace.cloud_id {
+            Some(cloud_id) => WorkspaceUploadLink::Group(cloud_id),
+            None => WorkspaceUploadLink::Pending(workspace.name),
+        })
     }
 
-    pub(crate) fn local_workspace_id_for_connection(
+    /// 把「所属分组还没同步上去」翻译成一次可重试的失败
+    ///
+    /// 直接上传成根节点会永久污染云端记录：本地 `updated_at` 不变，下一轮再也认不出
+    /// 这次上传丢了分组，反而会把本地分组按云端的「无分组」清掉。所以宁可这一轮跳过，
+    /// 等分组拿到云端 ID 之后再传。
+    fn pending_workspace_error(connection: &StoredConnection, workspace_name: &str) -> SyncError {
+        SyncError::StorageError(format!(
+            "连接「{}」所属分组「{}」尚未同步到云端，本轮跳过上传以免丢失分组归属",
+            connection.name, workspace_name
+        ))
+    }
+
+    /// 下载时决定连接该落到哪个本地分组
+    ///
+    /// 三种情况必须分开：
+    /// - 云端给了分组引用，且本地已落地 → 用云端的分组（正常同步）；
+    /// - 云端给了分组引用，但本地还没这个分组 → 保留本地现状，交给收尾阶段再对齐
+    ///   （云端记录按 `updated_at` 倒序下发，分组完全可能晚于连接落地）；
+    /// - 云端没有分组引用（旧载荷缺字段，或历史上被错误上传成根节点）→ 保留本地现有分组。
+    ///   用户反馈的「连接不在之前那个文件夹里了」正是这里被无条件清空造成的。
+    pub(crate) fn resolve_download_workspace_id(
         &self,
-        team_id: Option<&str>,
+        cloud_data: &CloudSyncData,
         workspace_cloud_id: Option<&str>,
+        local_workspace_id: Option<i64>,
+        connection_name: &str,
     ) -> Result<Option<i64>, SyncError> {
-        if !Self::shares_personal_workspace(team_id) {
-            return Ok(None);
+        if !Self::shares_personal_workspace(cloud_data.team_id.as_deref()) {
+            // 团队连接不参与个人分组，保持本地现状
+            return Ok(local_workspace_id);
         }
-        self.local_workspace_id_for_cloud_id(workspace_cloud_id)
+        let Some(workspace_cloud_id) = workspace_cloud_id else {
+            if local_workspace_id.is_some() {
+                tracing::info!(
+                    "[同步] 云端连接「{}」没有分组引用，保留本地分组",
+                    connection_name
+                );
+            }
+            return Ok(local_workspace_id);
+        };
+        match self.local_workspace_id_for_cloud_id(Some(workspace_cloud_id))? {
+            Some(workspace_id) => Ok(Some(workspace_id)),
+            None => {
+                tracing::info!(
+                    "[同步] 分组 {} 尚未落地，先保留连接「{}」的本地分组，收尾时再对齐",
+                    workspace_cloud_id,
+                    connection_name
+                );
+                Ok(local_workspace_id)
+            }
+        }
     }
 
     fn shares_personal_workspace(team_id: Option<&str>) -> bool {

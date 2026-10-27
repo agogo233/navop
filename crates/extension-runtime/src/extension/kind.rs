@@ -7,7 +7,6 @@ pub enum ExtensionKind {
     LanguageBundle,
     DatabaseDriver,
     RemoteDesktopProvider,
-    AcpAgent,
     Composite,
     /// 不再支持的旧 kind（如 mcp_helper）。仅用于容错解析遗留市场清单，
     /// 不参与安装与列表。
@@ -22,7 +21,6 @@ impl ExtensionKind {
             Self::LanguageBundle => "language_bundles",
             Self::DatabaseDriver => "database_drivers",
             Self::RemoteDesktopProvider => "remote_desktop_providers",
-            Self::AcpAgent => "acp_agents",
             Self::Composite => "composite",
             Self::Unsupported => "unsupported",
         }
@@ -34,7 +32,6 @@ impl ExtensionKind {
             Self::LanguageBundle,
             Self::DatabaseDriver,
             Self::RemoteDesktopProvider,
-            Self::AcpAgent,
             Self::Composite,
         ]
     }
