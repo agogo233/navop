@@ -500,6 +500,19 @@ fn visible_process_items<'a>(
     }
 }
 
+/// 过程区里「当前段」的消息 id；渲染时据此让这些消息里的推理块保持展开。
+///
+/// 只在还在跑的时候有「当前段」：已结束的轮次整块收起，段与段之间没有区别。
+fn live_tail_ids<'a>(turn: &'a TurnProjection<'_>) -> HashSet<&'a str> {
+    if !turn.live {
+        return HashSet::new();
+    }
+    turn.process[turn.live_tail_start()..]
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect()
+}
+
 fn render_process(
     turn: &TurnProjection<'_>,
     context: &MessageListContext<'_>,
@@ -579,22 +592,16 @@ fn render_process(
     // 位置由 `process` 决定，所以无论展开还是收起，顺序都是消息的原始顺序。
     let visible = visible_process_items(turn, expanded);
     let items = message_render_items_for(&visible);
+    // 当前段里的推理块保持展开：这一段还在推进，塌下去只会闪。
+    let live_tail = live_tail_ids(turn);
     let children: Vec<AnyElement> = items
         .into_iter()
         .map(|item| match item {
-            crate::message_tool_group::MessageRenderItem::Single(message) => slot(render_one(
-                message,
-                context.code_actions,
-                context.on_action.as_ref(),
-                theme,
-                window,
-                cx,
-            )),
-            crate::message_tool_group::MessageRenderItem::ToolCallGroup(group) => {
-                let inner = group
-                    .messages()
-                    .iter()
-                    .map(|message| {
+            crate::message_tool_group::MessageRenderItem::Single(message) => {
+                let force_open = live_tail.contains(message.id.as_str());
+                slot(crate::reasoning::with_reasoning_force_open(
+                    force_open,
+                    || {
                         render_one(
                             message,
                             context.code_actions,
@@ -603,6 +610,25 @@ fn render_process(
                             window,
                             cx,
                         )
+                    },
+                ))
+            }
+            crate::message_tool_group::MessageRenderItem::ToolCallGroup(group) => {
+                let inner = group
+                    .messages()
+                    .iter()
+                    .map(|message| {
+                        let force_open = live_tail.contains(message.id.as_str());
+                        crate::reasoning::with_reasoning_force_open(force_open, || {
+                            render_one(
+                                message,
+                                context.code_actions,
+                                context.on_action.as_ref(),
+                                theme,
+                                window,
+                                cx,
+                            )
+                        })
                     })
                     .collect();
                 slot(render_tool_call_group(group, inner, theme, cx))
@@ -1067,6 +1093,59 @@ mod tests {
         // 跨天与负值都不应产生越界输出。
         assert_eq!("00:00", format_clock(86_400));
         assert_eq!("23:59", format_clock(-60));
+    }
+
+    /// 只有当前段被标记为「保持展开」：上一段该收起，已结束的轮次则一段都不留。
+    #[test]
+    fn only_the_current_segment_is_marked_live() {
+        use crate::agent_cards::{TOOL_CARD, ToolCardData};
+
+        let tool = |call_id: &str, success: Option<bool>| {
+            ChatMessageUI::card(
+                TOOL_CARD,
+                ToolCardData {
+                    call_id: call_id.to_string(),
+                    tool_name: "fs.read".to_string(),
+                    action: agent_runtime::ToolAction::Read,
+                    target_id: None,
+                    target_label: None,
+                    input_summary: String::new(),
+                    input_json: String::new(),
+                    running: success.is_none(),
+                    success,
+                    summary: String::new(),
+                    data_text: String::new(),
+                    file_changes: Vec::new(),
+                    duration_ms: None,
+                }
+                .to_json(),
+            )
+        };
+        let mut streaming = ChatMessageUI::assistant("正在整理结论");
+        streaming.is_streaming = true;
+        let messages = vec![
+            ChatMessageUI::user("Q1"),
+            tool("c1", None),
+            ChatMessageUI::assistant("先看一眼目录"),
+            tool("c2", None),
+            streaming,
+        ];
+
+        let turns = project_turns(&messages, &TurnTimings::new());
+        let ids = live_tail_ids(&turns[0]);
+        assert!(
+            ids.contains(messages[3].id.as_str()),
+            "当前段里的工具项应当保持展开"
+        );
+        assert!(
+            !ids.contains(messages[1].id.as_str()),
+            "上一段的项不该被算进当前段"
+        );
+
+        // 已结束的轮次：没有「当前段」，全部按折叠头走。
+        let finished = vec![ChatMessageUI::user("Q2"), tool("c3", Some(true))];
+        let turns = project_turns(&finished, &TurnTimings::new());
+        assert!(live_tail_ids(&turns[0]).is_empty());
     }
 
     #[test]
