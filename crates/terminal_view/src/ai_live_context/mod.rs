@@ -13,7 +13,7 @@ use agent_runtime::{ResourceRef, ResourceScope};
 use alacritty_terminal::term::TermMode;
 use terminal::terminal::Terminal;
 
-pub(crate) use context::build_live_resource_context;
+pub(crate) use context::{LiveContextInputs, build_live_resource_context};
 
 /// 作用域键：当前工作目录。
 const SCOPE_WORKING_DIR: &str = "cwd";
@@ -25,6 +25,10 @@ const SCOPE_SELECTION: &str = "selection";
 const SCOPE_SIZE: &str = "size";
 /// 作用域键：终端进程状态。
 const SCOPE_PROCESS: &str = "process";
+/// 作用域键：连接上挂着的活动终端 id（SSH 终端）。
+const SCOPE_LIVE_TERMINAL: &str = "terminal";
+/// 作用域键：终端所属连接的资源 id。
+const SCOPE_CONNECTION: &str = "connection";
 
 /// 选中内容摘要的最大字符数，避免把整段输出塞进提示词。
 const SELECTION_PREVIEW_MAX_CHARS: usize = 120;

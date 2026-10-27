@@ -64,9 +64,26 @@ pub type ResourceContextRefresher =
 
 ### 2.3 默认目标
 
-`build_live_resource_context` 把终端放在资源列表首位并设为 `current`，连接等资源只作为
-target 候选。这样模型省略 `target` 时命中的是**眼前这台终端**，而不是「连接」——
-后者在 SSH 侧边栏里原本指向连接，`terminal.read` 需要先 `list_sessions` 再指定 session。
+分两种侧边栏，默认目标保持不变：
+
+| 侧边栏 | 默认目标 | 资源列表 | 模型拿到的信息 |
+| --- | --- | --- | --- |
+| 本地终端 | 终端自身 | 终端 + 连接候选 | 终端的 `cwd`/`screen`/`selection`… |
+| SSH 终端 | 仍是连接 | 连接（首位）+ 这台终端 + 其它连接 | 连接上 `terminal=<终端 id>`，终端上 `connection=<连接 id>` 与实时状态 |
+
+SSH 终端不抢默认目标，是因为连接级工具（`sftp.*`、`ssh.exec`）原本以连接为默认目标，
+改默认目标会让它们全部需要显式 target。代价只是模型要多看一行 `terminal=…`；
+换来的是它不必先 `connections.list_sessions` 再筛 session，且选中/全屏状态第一轮就可见。
+
+连接被「禁止 AI 操作」时连接不进 catalog，此时刷新器返回 `None`，沿用宿主静态资源池 ——
+不能只把终端塞进池子，否则等于绕过连接级策略。
+
+### 2.4 SSH 终端的接线
+
+`TerminalSidebar::new` 在连接模式下把 AI 默认目标的资源 id 记在
+`ai_connection_resource` 字段里，`view/initialization.rs` 建完侧边栏后把它交给
+`live_terminal_resource_refresher`。刷新器每轮重新读 `load_terminal_ai_connections`，
+所以连接的改名、删除、AI 策略变更都会在下一轮体现。
 
 ## 3. 不做什么
 
@@ -79,7 +96,7 @@ target 候选。这样模型省略 `target` 时命中的是**眼前这台终端*
 
 ## 4. 验证
 
-- `cargo test -p terminal_view ai_live_context`：投影/摘要/替换/`describe()` 共 9 条单测。
+- `cargo test -p terminal_view ai_live_context`：投影/摘要/替换/`describe()`/SSH 接线共 12 条单测。
 - `cargo test -p ai_chat_view`：454 条既有测试通过（资源池、提及、会话切换无回归）。
 - `cargo clippy -p terminal_view -p ai_chat_view --all-targets`：新增代码无告警。
 - 手工：终端里 `cd` / 进 `vim` / 选中若干行后提问，观察模型是否在首轮直接引用当前目录与

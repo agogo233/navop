@@ -242,6 +242,7 @@ fn build_live_terminal_ai_context(
 pub(crate) fn live_terminal_resource_refresher(
     terminal: Entity<crate::Terminal>,
     current_terminal: agent_runtime::ResourceRef,
+    current_connection: Option<String>,
 ) -> ai_chat_view::ResourceContextRefresher {
     let terminal = terminal.downgrade();
     Arc::new(move |cx: &App| {
@@ -254,11 +255,14 @@ pub(crate) fn live_terminal_resource_refresher(
             crate::ai_live_context::live_resource_scopes(terminal_ref)
         };
         let catalog = build_resource_catalog(&connections, &ai_access_levels);
-        Some(crate::ai_live_context::build_live_resource_context(
-            &current_terminal,
-            live_scopes,
-            catalog,
-        ))
+        crate::ai_live_context::build_live_resource_context(
+            crate::ai_live_context::LiveContextInputs {
+                terminal: &current_terminal,
+                live_scopes,
+                catalog,
+                current_connection: current_connection.as_deref(),
+            },
+        )
     })
 }
 
@@ -751,6 +755,8 @@ pub struct TerminalSidebar {
     history_command_panel: Option<Entity<HistoryCommandPanel>>,
     /// AI 聊天面板
     ai_chat_panel: Entity<DefaultAgentChatPanel>,
+    /// 连接模式下 AI 的默认连接资源 id（本地终端为 `None`）
+    ai_connection_resource: Option<String>,
     /// SSH 广播输入面板
     broadcast_input_panel: Option<Entity<BroadcastInputPanel>>,
     /// 文件管理器面板（仅 SSH 终端时创建）
@@ -860,6 +866,11 @@ impl TerminalSidebar {
             return;
         }
         cx.emit(TerminalSidebarEvent::SaveAsConnection);
+    }
+
+    /// AI 面板里的默认连接资源 id（本地终端为 `None`）。
+    pub(crate) fn ai_connection_resource(&self) -> Option<String> {
+        self.ai_connection_resource.clone()
     }
 
     /// 注入「每轮发送前重建资源上下文」的回调。
@@ -1034,11 +1045,18 @@ impl TerminalSidebar {
                 HistoryCommandPanel::new(scope, history_user.clone(), colors.clone(), window, cx)
             })
         });
+        // 连接模式下 AI 的默认目标是连接；记下它的资源 id，刷新器据此把
+        // 正在使用的这台终端挂到连接旁边（见 `live_terminal_resource_refresher`）。
+        let mut ai_connection_resource: Option<String> = None;
         let ai_chat_panel = if let Some(connection) = stored_connection.as_ref() {
             let connections = load_terminal_ai_connections(cx);
             let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
             let (scope, catalog, mentions) =
                 build_terminal_ai_context(connection, &connections, &ai_access_levels);
+            ai_connection_resource = scope
+                .default_target
+                .as_ref()
+                .map(|target| target.resource_id.as_str().to_string());
             cx.new(|cx| {
                 DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(
                     scope, catalog, mentions, window, cx,
@@ -1334,6 +1352,7 @@ impl TerminalSidebar {
             quick_command_panel,
             history_command_panel,
             ai_chat_panel,
+            ai_connection_resource,
             broadcast_input_panel,
             file_manager_panel,
             file_explorer_panel,
