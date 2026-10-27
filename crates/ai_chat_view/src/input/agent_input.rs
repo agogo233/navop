@@ -1363,6 +1363,7 @@ impl Render for AgentInput {
             // 中部：多行输入框
             .child(composer_editor_frame(
                 &theme,
+                self.edge_to_edge,
                 input_focused,
                 Editor::new(&self.input_state)
                     .w_full()
