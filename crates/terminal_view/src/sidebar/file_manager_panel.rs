@@ -1130,6 +1130,13 @@ fn upload_conflict_prompt_labels(position: (usize, usize)) -> FileConflictPrompt
         keep_both: t!("Conflict.keep_both").to_string().into(),
         merge: t!("Conflict.merge").to_string().into(),
         overwrite: t!("Conflict.overwrite").to_string().into(),
+        overwrite_warning_title: t!("Conflict.overwrite_warning_title").to_string().into(),
+        overwrite_warning: t!("Conflict.overwrite_warning").to_string().into(),
+        overwrite_warning_apply_all: t!("Conflict.overwrite_warning_apply_all")
+            .to_string()
+            .into(),
+        overwrite_confirm: t!("Conflict.overwrite_confirm").to_string().into(),
+        cancel: t!("Common.cancel").to_string().into(),
     }
 }
 
