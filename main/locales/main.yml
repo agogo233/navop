@@ -1733,6 +1733,10 @@ Workspace:
 
 # 连接
 Connection:
+  credential_resolve_failed:
+    en: "Unable to resolve the connection credentials: %{error}"
+    zh-CN: "无法解析连接凭据：%{error}"
+    zh-HK: "無法解析連線憑據：%{error}"
   title:
     en: "Connections"
     zh-CN: "连接"

@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use crate::storage::traits::Repository;
 use crate::storage::{
-    ConnectionType, CredentialEntry, CredentialReference, DatabaseType, DbConnectionConfig,
-    FtpParams, JumpServerConfig, MongoDBParams, MongoDriverVariant, ProxyConfig, ProxyType,
-    RedisMode, RedisParams, RedisSentinelConfig, RemoteDesktopBackendPreference,
-    RemoteDesktopParams, RemoteDesktopProtocol, RemoteFileParams, RemoteFileProtocol,
-    SshAccountExpect, SshAuthMethod, SshParams, StoredConnection, TelnetLoginStep, TelnetParams,
-    TerminalExpectSend,
+    ConnectionType, CredentialEntry, CredentialReference, CredentialResolutionError, DatabaseType,
+    DbConnectionConfig, FtpParams, JumpServerConfig, MongoDBParams, MongoDriverVariant,
+    ProxyConfig, ProxyType, RedisMode, RedisParams, RedisSentinelConfig,
+    RemoteDesktopBackendPreference, RemoteDesktopParams, RemoteDesktopProtocol, RemoteFileParams,
+    RemoteFileProtocol, SshAccountExpect, SshAuthMethod, SshParams, StoredConnection,
+    TelnetLoginStep, TelnetParams, TerminalExpectSend,
 };
 
 use super::with_master_key;
@@ -429,10 +429,20 @@ fn resolver_forwards_credential_private_key_even_when_password_auth_is_selected(
             .resolve_ssh(ssh_params(reference))
             .expect("resolve ssh");
 
-        assert!(matches!(
-            ssh.auth_method,
-            SshAuthMethod::Password { ref password } if password == "vault-password"
-        ));
+        assert!(
+            matches!(
+                ssh.auth_method,
+                SshAuthMethod::Chain(ref steps) if matches!(
+                    steps.as_slice(),
+                    [
+                        SshAuthMethod::Password { password },
+                        SshAuthMethod::PrivateKeyContent { private_key, .. }
+                    ] if password == "vault-password" && private_key == "spare-private-key"
+                )
+            ),
+            "记录里同时有密码与私钥时应得到密码在前的认证链，实际：{:?}",
+            ssh.auth_method
+        );
         assert_eq!(Some(true), ssh.forward_agent);
         let forwarded = ssh
             .agent_forward_key
@@ -443,6 +453,169 @@ fn resolver_forwards_credential_private_key_even_when_password_auth_is_selected(
             forwarded.private_key_content.as_deref()
         );
         assert_eq!(Some("spare-passphrase"), forwarded.passphrase.as_deref());
+    });
+}
+
+/// 选了钥匙串后，连接里残留的用户名、认证方式、「连接时输入」标记以及引用里的
+/// 布尔标志都不能参与：登录信息只由钥匙串记录决定，保存的配置本身不被改写。
+#[test]
+fn resolver_ignores_saved_username_auth_method_and_flags_for_ssh_keychain() {
+    with_master_key(|| {
+        let (_temp, _connection, repository) = super::test_repository();
+        let mut key = CredentialEntry::new("Key only");
+        key.username = Some("vault-user".to_string());
+        key.private_key_content = Some("vault-private-key".to_string());
+        key.passphrase = Some("vault-passphrase".to_string());
+        let key_id = repository.insert(&mut key).expect("insert credential");
+
+        // 引用的各个标志全为 false，保存的却是用户名、Agent 认证和「连接时输入」。
+        let mut stored = ssh_params(Some(CredentialReference {
+            credential_id: key_id,
+            credential_cloud_id: None,
+            username: false,
+            password: false,
+            private_key: false,
+            passphrase: false,
+        }));
+        stored.auth_method = SshAuthMethod::Agent;
+        stored.prompt_username = Some(true);
+        stored.prompt_password = Some(true);
+        let before = serde_json::to_string(&stored).expect("serialize stored params");
+
+        let resolved = repository.resolve_ssh(stored.clone()).expect("resolve ssh");
+
+        assert_eq!("vault-user", resolved.username);
+        assert!(matches!(
+            resolved.auth_method,
+            SshAuthMethod::PrivateKeyContent { ref private_key, ref passphrase }
+                if private_key == "vault-private-key"
+                    && passphrase.as_deref() == Some("vault-passphrase")
+        ));
+        assert_eq!(None, resolved.prompt_username);
+        assert_eq!(None, resolved.prompt_password);
+        assert_eq!(
+            before,
+            serde_json::to_string(&stored).expect("serialize stored params again"),
+            "解析只作用于运行时副本"
+        );
+    });
+}
+
+#[test]
+fn resolver_prefers_the_credential_for_ssh_username_and_secret_kinds() {
+    with_master_key(|| {
+        let (_temp, _connection, repository) = super::test_repository();
+
+        let mut password_only = CredentialEntry::new("Password only");
+        password_only.username = Some("pw-user".to_string());
+        password_only.password = Some("pw".to_string());
+        let password_id = repository
+            .insert(&mut password_only)
+            .expect("insert credential");
+        let resolved = repository
+            .resolve_ssh(ssh_params(Some(password_reference(password_id))))
+            .expect("resolve ssh");
+        assert_eq!("pw-user", resolved.username);
+        assert!(matches!(
+            resolved.auth_method,
+            SshAuthMethod::Password { ref password } if password == "pw"
+        ));
+
+        let mut key_path_only = CredentialEntry::new("Key path only");
+        key_path_only.username = Some("key-user".to_string());
+        key_path_only.private_key_path = Some("/local/key".to_string());
+        let key_id = repository
+            .insert(&mut key_path_only)
+            .expect("insert credential");
+        let resolved = repository
+            .resolve_ssh(ssh_params(Some(password_reference(key_id))))
+            .expect("resolve ssh");
+        assert!(matches!(
+            resolved.auth_method,
+            SshAuthMethod::PrivateKey { ref key_path, .. } if key_path == "/local/key"
+        ));
+    });
+}
+
+#[test]
+fn resolver_rejects_ssh_keychain_without_username_or_secret() {
+    with_master_key(|| {
+        let (_temp, _connection, repository) = super::test_repository();
+
+        let mut no_username = CredentialEntry::new("No username");
+        no_username.password = Some("pw".to_string());
+        let id = repository
+            .insert(&mut no_username)
+            .expect("insert credential");
+        let error = repository
+            .resolve_ssh(ssh_params(Some(password_reference(id))))
+            .expect_err("an empty username must never be sent");
+        assert!(matches!(
+            error.downcast_ref::<CredentialResolutionError>(),
+            Some(CredentialResolutionError::EmptyField {
+                field: "username",
+                credential_name,
+                ..
+            }) if credential_name == "No username"
+        ));
+
+        let mut no_secret = CredentialEntry::new("No secret");
+        no_secret.username = Some("user".to_string());
+        let id = repository
+            .insert(&mut no_secret)
+            .expect("insert credential");
+        let error = repository
+            .resolve_ssh(ssh_params(Some(password_reference(id))))
+            .expect_err("nothing to authenticate with");
+        assert!(matches!(
+            error.downcast_ref::<CredentialResolutionError>(),
+            Some(CredentialResolutionError::EmptyField {
+                field: "password or private key",
+                credential_name,
+                ..
+            }) if credential_name == "No secret"
+        ));
+    });
+}
+
+#[test]
+fn resolver_applies_the_same_rules_to_the_jump_server() {
+    with_master_key(|| {
+        let (_temp, _connection, repository) = super::test_repository();
+        let mut key = CredentialEntry::new("Jump key");
+        key.username = Some("jump-user".to_string());
+        key.password = Some("jump-password".to_string());
+        key.private_key_content = Some("jump-key".to_string());
+        let key_id = repository.insert(&mut key).expect("insert credential");
+
+        let mut ssh = ssh_params(None);
+        ssh.jump_server = Some(JumpServerConfig {
+            host: "jump.example.com".to_string(),
+            port: 22,
+            username: "stale-user".to_string(),
+            auth_method: SshAuthMethod::Agent,
+            credential_reference: Some(CredentialReference {
+                credential_id: key_id,
+                credential_cloud_id: None,
+                username: false,
+                password: false,
+                private_key: false,
+                passphrase: false,
+            }),
+        });
+        let resolved = repository.resolve_ssh(ssh).expect("resolve ssh");
+        let jump = resolved.jump_server.expect("jump server");
+        assert_eq!("jump-user", jump.username);
+        assert!(matches!(
+            jump.auth_method,
+            SshAuthMethod::Chain(ref steps) if matches!(
+                steps.as_slice(),
+                [
+                    SshAuthMethod::Password { password },
+                    SshAuthMethod::PrivateKeyContent { private_key, .. }
+                ] if password == "jump-password" && private_key == "jump-key"
+            )
+        ));
     });
 }
 
@@ -496,7 +669,10 @@ fn resolver_uses_stable_cloud_id_without_falling_back_to_foreign_local_id() {
         let error = repository
             .resolve_ssh(ssh_params(missing_cloud_reference))
             .expect_err("cloud id must not fall back to a possibly foreign local id");
-        assert!(error.to_string().contains("credential"));
+        assert!(matches!(
+            error.downcast_ref::<CredentialResolutionError>(),
+            Some(CredentialResolutionError::MissingCredential(_))
+        ));
     });
 }
 
@@ -552,9 +728,9 @@ fn resolve_connection_returns_a_temporary_clone_and_supports_password_with_priva
                         SshAuthMethod::PrivateKey { key_path, .. }
                     ] if password == "combined-password" && key_path == "/local/combined-key"
                 ),
-                "组合认证应保留密码与私钥两个因素，实际：{steps:?}"
+                "记录里的密码与私钥都应保留，实际：{steps:?}"
             ),
-            other => panic!("期望「密码 + 密钥」认证链，实际：{other:?}"),
+            other => panic!("期望认证链，实际：{other:?}"),
         }
     });
 }

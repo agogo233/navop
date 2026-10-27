@@ -299,7 +299,14 @@ pub(crate) fn resolve_connection_credentials(
                 "无法解析连接引用的凭据"
             );
             window.push_notification(
-                Notification::error(format!("无法解析连接凭据：{error:#}")).autohide(true),
+                Notification::error(
+                    t!(
+                        "Connection.credential_resolve_failed",
+                        error = format!("{error:#}")
+                    )
+                    .to_string(),
+                )
+                .autohide(true),
                 cx,
             );
             None
