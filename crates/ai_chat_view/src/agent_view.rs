@@ -11633,6 +11633,34 @@ mod tests {
             );
         }
 
+        // 计划 / 子代理搬到了卡片顶部的能力行：它们不该再出现在底栏里，
+        // 底栏只回答「怎么发出去」；能力行在编辑器之上，标签有整行宽度。
+        let editor = cx
+            .debug_bounds("agent-input-editor")
+            .expect("编辑区应当渲染");
+        let capability_row = cx
+            .debug_bounds("agent-input-capability-row")
+            .expect("能力行应当渲染");
+        assert!(
+            capability_row.origin.y + capability_row.size.height <= editor.origin.y,
+            "能力行必须在编辑区之上：row={capability_row:?}, editor={editor:?}"
+        );
+        for selector in ["acp-plan-trigger", "acp-subagents-trigger"] {
+            let chip = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} 应当渲染"));
+            assert!(
+                chip.origin.y >= capability_row.origin.y
+                    && chip.origin.y + chip.size.height
+                        <= capability_row.origin.y + capability_row.size.height,
+                "{selector} 必须落在能力行里：chip={chip:?}, row={capability_row:?}"
+            );
+            assert!(
+                chip.origin.y + chip.size.height <= editor.origin.y,
+                "{selector} 不该再挤在底栏：chip={chip:?}, editor={editor:?}"
+            );
+        }
+
         // 身份行已去掉：底栏之上不该再有第二行 chrome。
         refresh_frame(cx);
         assert!(
@@ -11805,10 +11833,10 @@ mod tests {
         );
     }
 
-    /// ACP 的参数行：计划与子代理是左端的两颗 chip，与模式同一根中线。
+    /// ACP 的能力行：计划与子代理是卡片顶部一排的两颗 chip，模式仍留在底栏。
     ///
-    /// 这两栏不再是“撑满一行、外面还套个框”的能力栏，而是参数行里两颗普通 chip；
-    /// 身份行与折叠开关都已去掉，它们没有收起状态、始终在。
+    /// 侧栏一窄，一行里挤四类控件会把两边都挤成省略号；计划 / 子代理搬到编辑区
+    /// 上方之后，能力行有整行宽度，底栏只留「怎么发出去」。
     #[gpui::test]
     fn acp_composer_keeps_plan_and_subagent_tabs(cx: &mut TestAppContext) {
         init_test_ui(cx);
@@ -11832,22 +11860,35 @@ mod tests {
         let mode = cx
             .debug_bounds("agent-input-acp-mode")
             .expect("模式 chip 应当渲染");
+        let editor = cx
+            .debug_bounds("agent-input-editor")
+            .expect("编辑区应当渲染");
 
-        // 参数行左端：计划 → 子代理 → … → 模式（右侧还有模型 / 附件 / 发送）。
+        // 能力行：计划 → 子代理，横向排列。
         assert!(
-            plan.origin.x < subagents.origin.x && subagents.origin.x < mode.origin.x,
-            "顺序应为 计划 → 子代理 → … → 模式：plan={plan:?}, subagents={subagents:?}, \
-             mode={mode:?}"
+            plan.origin.x < subagents.origin.x,
+            "顺序应为 计划 → 子代理：plan={plan:?}, subagents={subagents:?}"
         );
-        // 三颗都是 26 高的 chip，真的同高，所以比中线就够。
+        // 两颗都是 26 高的 chip，真的同高，所以比中线就够。
         let row_center = plan.origin.y + plan.size.height / 2.0;
-        for bounds in [plan, subagents, mode] {
+        for bounds in [plan, subagents] {
             let center = bounds.origin.y + bounds.size.height / 2.0;
             assert!(
                 (center - row_center).abs() <= px(2.0),
-                "计划、子代理与模式必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
+                "计划与子代理必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
             );
         }
+        // 能力行在编辑区之上；模式在编辑区之下（底栏）。
+        for bounds in [plan, subagents] {
+            assert!(
+                bounds.origin.y + bounds.size.height <= editor.origin.y,
+                "能力 chip 必须落在编辑区之上：{bounds:?}, editor={editor:?}"
+            );
+        }
+        assert!(
+            mode.origin.y >= editor.origin.y + editor.size.height,
+            "模式应留在底栏（编辑区之下）：mode={mode:?}, editor={editor:?}"
+        );
 
         // 身份行与折叠开关一起没了：这两栏不再有收起状态，任何时刻都在。
         refresh_frame(cx);

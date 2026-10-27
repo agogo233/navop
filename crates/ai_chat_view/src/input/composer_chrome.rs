@@ -162,7 +162,27 @@ pub(crate) fn composer_editor_fill(theme: &AgentChatTheme, edge_to_edge: bool) -
     }
 }
 
-/// 参数行：`[能力 chip] … [模型][模式][附件][发送]`。
+/// 能力行：卡片顶部一行 `[计划][子代理][上下文][Skill]`。
+///
+/// 与参数行分家的原因不是好看，是窄侧栏里挤不下：四颗 chip 和模型 / 权限 /
+/// 附件 / 发送键同处一行时，两边一起退到 `CHIP_MIN_WIDTH`，标签只剩省略号
+/// —— 那才是「显示不全」。分成两行后，能力行有整行宽度把标签写全，参数行
+/// 专心放「这一轮怎么发出去」。
+pub(crate) fn composer_capability_row(theme: &AgentChatTheme) -> Div {
+    h_flex()
+        .debug_selector(|| "agent-input-capability-row".to_string())
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .text_color(theme.foreground)
+        .gap(sp(TOOLBAR_GAP))
+        .px(sp(ROW_PADDING_X))
+        .pb(sp(2.0))
+        .overflow_hidden()
+        .flex_shrink_0()
+}
+
+/// 参数行：`[模型][模式][权限][附件][发送]`。
 pub(crate) fn composer_toolbar(theme: &AgentChatTheme) -> Div {
     h_flex()
         .debug_selector(|| "agent-input-toolbar".to_string())
