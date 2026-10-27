@@ -28,7 +28,7 @@
 | 层 | 机制 | 位置 |
 | --- | --- | --- |
 | 状态 | 每轮发送前重建资源池，把终端实时状态投影成资源作用域 | `ai_chat_view::ResourceContextRefresher` + `terminal_view::ai_live_context` |
-| 内容 | 完整屏幕内容仍由 `terminal.read` 按需读取 | `public_mcp` 既有实现，未改动 |
+| 内容 | 完整屏幕内容仍由 `terminal.read` 按需读取，可省略 target 且返回全屏/选中/光标现场 | `public_mcp` |
 
 ### 2.1 每轮重建（地基）
 
@@ -85,6 +85,24 @@ SSH 终端不抢默认目标，是因为连接级工具（`sftp.*`、`ssh.exec`�
 `live_terminal_resource_refresher`。刷新器每轮重新读 `load_terminal_ai_connections`，
 所以连接的改名、删除、AI 策略变更都会在下一轮体现。
 
+### 2.5 内容层：`terminal.read` 省略 target 与现场字段
+
+状态层只回答「在哪、在干什么」，正文仍按需拉取，但去掉两次绕路：
+
+- **target 可省略**：`public_mcp` 的 agent 适配器（`agent_runtime_adapter`）在建
+  `ToolSpec` 时把 `target` 从 `required` 里摘掉，并替换 `target` 的描述；模型不传
+  target 时，`execute` 用 `ResourceContext::default_target_of_kind` 补上会话里唯一的
+  终端资源。MCP 直连表面（外部 CLI）的 schema 不变，仍强制 target，避免把
+  「当前资源」这种只存在于 agent 会话的概念泄漏给外部客户端。
+- **补不上就明说**：没有终端资源、或同类资源多于一个时，工具直接报错并让模型先
+  `connections.list_sessions` 再传 id，不猜。
+- **返回现场**：`TerminalReadResult` 增补 `alt_screen`（全屏程序占屏，此时正文是
+  它的界面）、`display_offset`（用户是否在回看历史）、`cursor_row` / `cursor_column`、
+  `selection`（用户当前选中的原文）。都在终端锁内一次取全，避免多次加锁读到不一致状态。
+
+有了这三项，模型「读一次」就能判断该按 esc 还是该输入命令，而不是把 vim 界面当
+shell 输出继续分析。
+
 ## 3. 不做什么
 
 - **不把整屏塞进 prompt**：40 行约 600–800 token/轮，还会随对话历史反复发送。
@@ -99,6 +117,10 @@ SSH 终端不抢默认目标，是因为连接级工具（`sftp.*`、`ssh.exec`�
 - `cargo test -p terminal_view ai_live_context`：投影/摘要/替换/`describe()`/SSH 接线共 12 条单测。
 - `cargo test -p ai_chat_view`：454 条既有测试通过（资源池、提及、会话切换无回归）。
 - `cargo clippy -p terminal_view -p ai_chat_view --all-targets`：新增代码无告警。
+- `cargo test -p terminal`: `recent_text_tracks_alt_screen_mode`、
+  `recent_text_reports_selection_and_display_offset` 覆盖全屏/选中/回滚现场。
+- `cargo test -p public_mcp`: 45 条单测（含 4 条 target 可省略：schema、描述、注入、
+  多终端不猜）+ 14+ 条集成测试；`terminal.read` 现场字段的透传。
 - 手工：终端里 `cd` / 进 `vim` / 选中若干行后提问，观察模型是否在首轮直接引用当前目录与
   全屏状态；`terminal.read` 不传 target 时是否读到当前终端。
 

@@ -365,9 +365,7 @@ impl TerminalControlSessionHandle for ThreadSafeTerminalControlHandle {
                 target,
                 action: request.action,
                 sent: output.sent,
-                readiness_before: output
-                    .readiness_before
-                    .map(map_control_readiness),
+                readiness_before: output.readiness_before.map(map_control_readiness),
             })
         })
     }
@@ -393,6 +391,11 @@ impl TerminalReadSessionHandle for ThreadSafeTerminalReadHandle {
             screen_lines: snapshot.screen_lines,
             columns: snapshot.columns,
             truncated: false,
+            alt_screen: snapshot.alt_screen,
+            display_offset: snapshot.display_offset,
+            cursor_row: snapshot.cursor_row,
+            cursor_column: snapshot.cursor_column,
+            selection: snapshot.selection,
         })
     }
 }
