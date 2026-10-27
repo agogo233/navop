@@ -40,9 +40,9 @@ use crate::input::PromptHistory;
 use crate::input::attachment::ImageAttachment;
 use crate::input::completion::ComposerCompletionProvider;
 use crate::input::composer_chrome::{
-    action_button_radius, action_button_size, capability_chip, composer_capability_slot,
-    composer_card, composer_editor_frame, composer_model_chip, composer_permission_slot,
-    composer_root, composer_toolbar, ghost_chip, model_menu_width,
+    action_button_radius, action_button_size, capability_chip, composer_capability_row,
+    composer_capability_slot, composer_card, composer_editor_frame, composer_model_chip,
+    composer_permission_slot, composer_root, composer_toolbar, ghost_chip, model_menu_width,
 };
 use crate::input::context::{
     AgentComposerContext, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
@@ -1223,6 +1223,20 @@ impl AgentInput {
         )
     }
 
+    /// 能力行（卡片顶部）：计划 / 子代理 / 上下文 / Skill。
+    ///
+    /// 这四颗 chip 以前和模型、权限、附件、发送键挤在同一行里，侧栏一窄就一起
+    /// 退到宽度下限、标签只剩省略号。挪到编辑器上方后，能力行有整行宽度写全
+    /// 标签，参数行只管「怎么发出去」；与 ACP 那份共用同一把尺子。
+    fn render_capability_row(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+        composer_capability_row(&theme)
+            .child(composer_capability_slot().child(self.render_plan_mode_tab(cx)))
+            .child(composer_capability_slot().child(self.render_subagent_mode_tab(cx)))
+            .child(composer_capability_slot().child(self.render_context_mode_tab(cx)))
+            .child(composer_capability_slot().child(self.render_skill_mode_tab(cx)))
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
         let queue_mode = self.is_running || self.pending_queue_blocked;
@@ -1230,13 +1244,9 @@ impl AgentInput {
         let action_radius = action_button_radius();
         let attach_count = self.attachments.len();
 
-        // 参数行：左段是「这一轮能用到什么」（计划 / 子代理 / 上下文 / Skill），
-        // 中间弹性留白，右段是模型 / 权限 / 附件 / 发送。与 ACP 那份同一行同一尺子。
+        // 参数行：中间弹性留白，右段是模型 / 权限 / 附件 / 发送。与 ACP 那份
+        // 同一行同一尺子；计划 / 子代理 / 上下文 / Skill 挪到了卡片顶部的能力行。
         let mut toolbar = composer_toolbar(&theme)
-            .child(composer_capability_slot().child(self.render_plan_mode_tab(cx)))
-            .child(composer_capability_slot().child(self.render_subagent_mode_tab(cx)))
-            .child(composer_capability_slot().child(self.render_context_mode_tab(cx)))
-            .child(composer_capability_slot().child(self.render_skill_mode_tab(cx)))
             .child(div().flex_1().min_w_0())
             .child(self.render_model_menu(cx))
             .child(composer_permission_slot().child(self.render_permission_menu(cx)))
@@ -1336,6 +1346,7 @@ impl Render for AgentInput {
         }
         let attachments = self.render_attachments(cx);
         let queued_submissions = self.render_queued_submissions(cx);
+        let capability_row = self.render_capability_row(cx);
         let toolbar = self.render_toolbar(cx);
         let theme = self.local_theme(cx);
         let input_state = self.input_state.read(cx);
@@ -1346,9 +1357,9 @@ impl Render for AgentInput {
         let drop_wash = theme.accent.opacity(0.08);
         let drop_ring = theme.accent;
 
-        // 输入卡片：与 ACP 那份同一套骨架（上下 8、圆角、编辑区内框、参数行）。
-        // 附件预览落在编辑区之上；卡片外没有上下文行 —— 工作区/分支/Worktree 是
-        // ACP 特有的概念，内置 agent 不显示。
+        // 输入卡片：与 ACP 那份同一套骨架（上下 8、圆角、编辑区内框、能力行、
+        // 参数行）。能力行在最上面，附件预览落在编辑区之上；卡片外没有上下文行
+        // —— 工作区/分支/Worktree 是 ACP 特有的概念，内置 agent 不显示。
         let card = composer_card(&theme, self.edge_to_edge)
             // 从 Finder 拖文件进来:悬停给卡片染一层,松手落成附件或路径。
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
@@ -1357,6 +1368,8 @@ impl Render for AgentInput {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_dropped_paths(paths.paths(), window, cx);
             }))
+            // 顶部：计划 / 子代理 / 上下文 / Skill
+            .child(capability_row)
             // 附件预览（如果有）
             .children(attachments)
             .when_some(queued_submissions, |this, queued| this.child(queued))
@@ -2490,8 +2503,8 @@ impl Focusable for AgentInput {
 mod tests {
     use super::*;
     use crate::input::composer_chrome::{
-        ACTION_BUTTON_SIZE, CHIP_MIN_WIDTH, MODEL_MENU_CHROME_WIDTH, MODEL_MENU_MAX_WIDTH,
-        MODEL_MENU_MIN_WIDTH, MODEL_TRIGGER_MAX_WIDTH, estimated_label_width,
+        ACTION_BUTTON_SIZE, CAPABILITY_CHIP_MAX_WIDTH, CHIP_MIN_WIDTH, MODEL_MENU_CHROME_WIDTH,
+        MODEL_MENU_MAX_WIDTH, MODEL_MENU_MIN_WIDTH, MODEL_TRIGGER_MAX_WIDTH, estimated_label_width,
     };
     use crate::input::context::ComposerModel;
     use gpui::{Modifiers, Pixels, TestAppContext, VisualTestContext, size};
@@ -2761,6 +2774,83 @@ mod tests {
                 "controls must stay on one row at narrow width: {bounds:?} (row_y={row_y:?})"
             );
         }
+    }
+
+    /// 能力 chip 单独占卡片顶部一行：侧栏被拖窄时它们不必和模型 / 权限 / 发送
+    /// 抢宽度，标签不会被挤成省略号；参数行只剩「模型 / 权限 / 附件 / 发送」。
+    #[gpui::test]
+    fn capability_row_sits_above_the_editor_and_holds_every_capability_chip(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        const NARROW: f32 = 420.0;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            AgentInputLayoutRoot::with_composer_context(px(NARROW), window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let row = cx
+            .debug_bounds("agent-input-capability-row")
+            .expect("capability row should render");
+        let editor = cx
+            .debug_bounds("agent-input-editor")
+            .expect("editor should render");
+        let toolbar = cx
+            .debug_bounds("agent-input-toolbar")
+            .expect("toolbar should render");
+        let card = cx
+            .debug_bounds("agent-input-card")
+            .expect("input card should render");
+
+        assert!(
+            row.origin.y + row.size.height <= editor.origin.y,
+            "capability row must stay above the editor: row={row:?}, editor={editor:?}"
+        );
+        assert!(
+            editor.origin.y + editor.size.height <= toolbar.origin.y,
+            "toolbar must stay below the editor: editor={editor:?}, toolbar={toolbar:?}"
+        );
+        assert!(
+            row.size.width <= card.size.width,
+            "capability row must stay inside the card: row={row:?}, card={card:?}"
+        );
+
+        // 四颗能力 chip 全在能力行里，且没有退到宽度下限（退了就是只剩省略号）。
+        for (selector, name) in [
+            ("agent-plan-trigger", "plan"),
+            ("agent-subagents-trigger", "subagents"),
+            ("agent-context-mode", "context"),
+            ("agent-skill-trigger", "skill"),
+        ] {
+            let chip = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{name} chip should render"));
+            assert!(
+                chip.origin.y >= row.origin.y
+                    && chip.origin.y + chip.size.height <= row.origin.y + row.size.height,
+                "{name} chip must live in the capability row: chip={chip:?}, row={row:?}"
+            );
+            assert!(
+                chip.size.width > px(CHIP_MIN_WIDTH),
+                "{name} chip must keep room for its label: chip={chip:?}"
+            );
+            assert!(
+                chip.size.width <= px(CAPABILITY_CHIP_MAX_WIDTH) + px(1.0),
+                "{name} chip must stay within the cap: chip={chip:?}"
+            );
+        }
+
+        // 参数行不再挂能力 chip：它只回答「怎么发出去」。
+        let plan = cx
+            .debug_bounds("agent-plan-trigger")
+            .expect("plan chip should render");
+        assert!(
+            plan.origin.y + plan.size.height <= toolbar.origin.y,
+            "capability chips must not sit in the toolbar row: plan={plan:?}, toolbar={toolbar:?}"
+        );
     }
 
     #[gpui::test]

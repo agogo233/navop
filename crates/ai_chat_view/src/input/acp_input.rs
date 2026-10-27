@@ -50,9 +50,10 @@ use crate::input::attachment::ImageAttachment;
 use crate::input::completion::ComposerCompletionProvider;
 use crate::input::composer_chrome::{
     CHIP_HEIGHT, CHIP_MAX_WIDTH, CHIP_MIN_WIDTH, CHIP_RADIUS, action_button_radius,
-    action_button_size, capability_chip, composer_card, composer_chip_label, composer_context_row,
-    composer_editor_frame, composer_model_chip, composer_root, composer_toolbar,
-    estimated_label_width, ghost_chip, ghost_chip_muted, model_menu_width,
+    action_button_size, capability_chip, composer_capability_row, composer_capability_slot,
+    composer_card, composer_chip_label, composer_context_row, composer_editor_frame,
+    composer_model_chip, composer_root, composer_toolbar, estimated_label_width, ghost_chip,
+    ghost_chip_muted, model_menu_width,
 };
 use crate::input::context::{
     AgentComposerContext, ComposerBranchOption, ComposerMenuOption, ComposerModelOption,
@@ -1608,10 +1609,22 @@ impl AcpAgentInput {
         )
     }
 
-    /// 参数行：`[计划][子代理] … [模型][模式][附件][发送 / 停止]`。
+    /// 能力行（卡片顶部）：`[计划][子代理]`。
     ///
-    /// 卡片的最后一行，管的是“这一轮怎么跑、怎么发出去”：左边两栏是 agent 自己的
-    /// 计划与子代理（折叠开关收在身份行尾端），右边是模型、模式、附件与发送键。
+    /// agent 自己声明的两类能力放在编辑器上方，参数行只剩模型 / 模式 / 附件 /
+    /// 发送键。侧栏一窄，一行里两类控件会一起退到 `CHIP_MIN_WIDTH`、标签只剩
+    /// 省略号；分成两行后各自都有地方把标签写全，与 One agent 那份同一把尺子。
+    fn render_capability_row(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+        composer_capability_row(&theme)
+            .child(composer_capability_slot().child(self.render_plan_tab(cx)))
+            .child(composer_capability_slot().child(self.render_subagent_tab(cx)))
+    }
+
+    /// 参数行：`… [模型][模式][附件][发送 / 停止]`。
+    ///
+    /// 卡片的最后一行，管的是“这一轮怎么跑、怎么发出去”：左边留白，右边依次是
+    /// 模型、模式、附件与发送键。
     ///
     /// 与上一版的三处不同：工作区 / 分支 / Worktree 搬去了卡片外的上下文行；
     /// 附件从“图标 + 数量 + 竖线”收成一颗纯图标钮（有附件时输入框上方本来就长
@@ -1632,12 +1645,10 @@ impl AcpAgentInput {
 
         let action_size = action_button_size();
         let mut row = composer_toolbar(&theme);
-        // 计划 / 子代理两栏始终在：折叠开关随身份行一起去掉之后，
-        // 这条参数行就是它们唯一的家。
+        // 参数行只放「怎么跑、怎么发」：模型 / 模式 / 附件 / 发送。计划与子代理
+        // 搬去了卡片顶部的能力行 —— 一行塞不下两类控件时，两边都会退成省略号。
         row = row
-            .child(self.render_plan_tab(cx))
-            .child(self.render_subagent_tab(cx))
-            // 空白把“这一轮的待办”与“怎么跑”分开；两组之间不再画竖线。
+            // 空白把参数区推到右端，与 One agent 那份同一种排法。
             .child(div().flex_1().min_w_0())
             .child(self.render_model_menu(cx))
             .child(self.render_mode_chip(cx))
@@ -2020,6 +2031,7 @@ impl Render for AcpAgentInput {
         let queued_submissions = self.render_queued_submissions(cx);
         self.ensure_elicitation_inputs(window, cx);
         let pending_elicitation = self.render_pending_elicitation(cx);
+        let capability_row = self.render_capability_row(cx);
         let toolbar = self.render_toolbar(cx);
         let context_row = self.render_context_row(cx);
         let theme = self.local_theme(cx);
@@ -2038,6 +2050,8 @@ impl Render for AcpAgentInput {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_dropped_paths(paths.paths(), window, cx);
             }))
+            // 顶部：计划 / 子代理（agent 自己声明的能力）
+            .child(capability_row)
             // 附件紧贴输入框上方：它是“这一轮要发出去的东西”
             .children(attachments)
             .when_some(queued_submissions, |this, queued| this.child(queued))
@@ -2057,7 +2071,7 @@ impl Render for AcpAgentInput {
                     .bordered(false)
                     .text_color(theme.foreground),
             ))
-            // 底部：计划 / 子代理 / 模型 / 模式 / 附件 / 发送，一整行
+            // 底部：模型 / 模式 / 附件 / 发送，一整行
             .child(toolbar);
 
         composer_root(&theme, self.edge_to_edge, "agent-input-acp-root")
