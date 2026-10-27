@@ -28,7 +28,7 @@ use gpui::{
     Pixels, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, Window, div, img, prelude::FluentBuilder, px, relative,
 };
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::progress::ProgressCircle;
@@ -48,6 +48,12 @@ use crate::acp::{
 use crate::input::PromptHistory;
 use crate::input::attachment::ImageAttachment;
 use crate::input::completion::ComposerCompletionProvider;
+use crate::input::composer_chrome::{
+    CHIP_HEIGHT, CHIP_MAX_WIDTH, CHIP_MIN_WIDTH, CHIP_RADIUS, action_button_radius,
+    action_button_size, capability_chip, composer_card, composer_chip_label, composer_context_row,
+    composer_editor_frame, composer_model_chip, composer_root, composer_toolbar,
+    estimated_label_width, ghost_chip, ghost_chip_muted, model_menu_width,
+};
 use crate::input::context::{
     AgentComposerContext, ComposerBranchOption, ComposerMenuOption, ComposerModelOption,
     ComposerPlanItem, ComposerSubAgentItem, ComposerWorkspaceOption,
@@ -61,33 +67,8 @@ const COMPOSER_EDITOR_MIN_ROWS: usize = 3;
 const COMPOSER_EDITOR_MAX_ROWS: usize = 10;
 const COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT: f32 = 20.0;
 const COMPOSER_EDITOR_VERTICAL_PADDING: f32 = 12.0;
-/// 参数行 / 上下文行里所有 chip（含发送键）的高度。
-///
-/// 26 是 waku composer 的实测值。整块卡片里没有第二种高度：参数行的控件、
-/// 上下文行的控件、发送键都对齐这一条。
-const COMPOSER_CHIP_HEIGHT: f32 = 26.0;
-/// chip 的圆角；比卡片小一档（卡片 12 / chip 6），跟组件库的控件圆角同值。
-const COMPOSER_CHIP_RADIUS: f32 = 6.0;
-/// 发送 / 排队 / 停止键的边长，与 chip 同高。
-const TOOLBAR_ACTION_BUTTON_SIZE: f32 = COMPOSER_CHIP_HEIGHT;
 /// 用量圆环的直径；比 chip 小一号，收在上下文行尾端。
 const USAGE_GAUGE_DIAMETER: f32 = 16.0;
-/// 上文档位 chip 收缩到的最小宽度（标签走省略号）。
-const COMPOSER_CHIP_MIN_WIDTH: f32 = 44.0;
-/// 上下文档位 chip 的自然宽度上限。
-const COMPOSER_CHIP_MAX_WIDTH: f32 = 220.0;
-/// 模型 chip 的宽度上限：模型名长起来没边，超了就省略（全名进 tooltip）。
-const MODEL_TRIGGER_MAX_WIDTH: f32 = 200.0;
-/// 卡片上下内边距。
-const COMPOSER_CARD_PADDING_VERTICAL: f32 = 8.0;
-/// 参数行与上下文行的水平内边距。
-const COMPOSER_ROW_PADDING_X: f32 = 10.0;
-/// 上下文行的高度：`[工作区][分支][Worktree] … [用量]`。
-const COMPOSER_CONTEXT_ROW_HEIGHT: f32 = 28.0;
-/// 模型下拉弹层的宽度区间（弹层不跟着被挤扁的触发器缩）。
-const MODEL_MENU_MIN_WIDTH: f32 = 320.0;
-const MODEL_MENU_MAX_WIDTH: f32 = 400.0;
-const MODEL_MENU_CHROME_WIDTH: f32 = 56.0;
 /// 分支下拉弹层的宽度区间：分支名长短差别很大（`main` 到 `feature/xxx-yyy`），
 /// 按最长的那个估，保证点开能读到完整的名字。
 const BRANCH_MENU_MIN_WIDTH: f32 = 260.0;
@@ -117,117 +98,6 @@ fn composer_editor_height(state: &EditorState) -> Pixels {
         .line_height()
         .unwrap_or(px(COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT));
     line_height * rows as f32 + px(COMPOSER_EDITOR_VERTICAL_PADDING)
-}
-
-/// chip 的内容：`[图标] [可截断标签]`。
-///
-/// 不带 `⌄`：整块卡片原来有六条小箭头，一起消失是这次减线里最见效的一步。
-/// “可点”改由 hover 底色与 tooltip 表达。
-///
-/// 字号与图标尺寸跟着**同一行**的基准走：标签 `sp(12.5)`（= 身份行与上下文行
-/// 的字号）、图标 14（`.small()`）。早前标签写 `text_xs()`（0.75rem）、图标写
-/// `.xsmall()`（12），两样都比同一行里的身份行小一档多 —— 参数行和上下文行
-/// 因此读起来像“附注”，而模型那串（组件库 `Select` 的 `text_sm`）反而成了最大
-/// 的字。同一块卡片里的 chrome 不该有第三种字号。
-fn composer_chip_label(
-    icon: IconName,
-    icon_color: gpui::Hsla,
-    label: SharedString,
-) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .items_center()
-        .gap_1()
-        .child(
-            Icon::new(icon)
-                .small()
-                .flex_shrink_0()
-                .text_color(icon_color),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(sp(12.5))
-                .child(label),
-        )
-}
-
-/// 参数行统一的 ghost chip：无描边、无底色，hover 才浮一层 `overlay`。
-///
-/// 组件库的 `Button::ghost()` 拿 accent 当 hover，铺在整行里太抢眼；这里用 `custom`
-/// 把底色钉成中性 overlay，与其余自绘 chip 同一种反馈（去掉的是线，不是反馈）。
-fn ghost_chip(button: Button, theme: &AgentChatTheme, cx: &App) -> Button {
-    ghost_chip_with(button, theme.foreground, theme, cx)
-}
-
-/// 上下文行的 ghost chip：整行是元数据，文字压到次要色——它不该跟参数行的
-/// 控件（模型 / 模式 / 发送）抢语气。
-fn ghost_chip_muted(button: Button, theme: &AgentChatTheme, cx: &App) -> Button {
-    ghost_chip_with(button, theme.muted_foreground, theme, cx)
-}
-
-fn ghost_chip_with(
-    button: Button,
-    foreground: gpui::Hsla,
-    theme: &AgentChatTheme,
-    cx: &App,
-) -> Button {
-    button
-        .h(sp(COMPOSER_CHIP_HEIGHT))
-        .rounded(px(COMPOSER_CHIP_RADIUS))
-        .custom(
-            ButtonCustomVariant::new(cx)
-                .foreground(foreground)
-                .hover(theme.overlay)
-                .active(theme.overlay),
-        )
-}
-
-/// 模型下拉弹层的宽度：按最长的选项估，保证点开能读到完整的候选名。
-fn model_menu_width(options: &[ComposerModelOption]) -> gpui::Rems {
-    let longest = options
-        .iter()
-        .map(|option| {
-            let label = estimated_label_width(&option.display_label());
-            let hint = option
-                .hint
-                .as_deref()
-                .map(estimated_label_width)
-                .unwrap_or(0.0);
-            label.max(hint)
-        })
-        .fold(0.0_f32, f32::max);
-    sp((longest + MODEL_MENU_CHROME_WIDTH).clamp(MODEL_MENU_MIN_WIDTH, MODEL_MENU_MAX_WIDTH))
-}
-
-/// 估算一段文案的渲染宽度：CJK 等全角字符按 13px，其余按 7.5px。
-fn estimated_label_width(label: &str) -> f32 {
-    label
-        .chars()
-        .map(|ch| if is_full_width_char(ch) { 13.0 } else { 7.5 })
-        .sum()
-}
-
-/// 常见全角字符区间（中日韩文字、全角标点等）。
-fn is_full_width_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE4F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x20000..=0x3FFFD
-    )
 }
 
 /// 上下键历史浏览的方向。
@@ -1248,8 +1118,8 @@ impl AcpAgentInput {
 
     /// 参数行里的能力 chip（计划 / 子代理）：26 高的 ghost chip，宽度随内容。
     ///
-    /// 原先这两个是撑满整行、外面还套一个带框容器的"栏"；现在它们是参数行左端两个
-    /// 普通 chip，容器与竖分隔线一起消失。标签截断时 tooltip 给出全文。
+    /// 形态与 One agent 那份共用 [`capability_chip`]：两份输入框的能力 chip 本来就
+    /// 该长一个样，只有挂的面板内容不同。标签截断时 tooltip 给出全文。
     fn render_capability_trigger(
         &self,
         id: &'static str,
@@ -1257,29 +1127,8 @@ impl AcpAgentInput {
         icon: IconName,
         cx: &mut Context<Self>,
     ) -> Button {
-        let label = label.into();
         let theme = self.local_theme(cx);
-        let tooltip = label.clone();
-        ghost_chip(
-            Button::new(id)
-                .debug_selector(move || id.to_string())
-                .small()
-                .max_w(sp(180.0))
-                .flex_shrink_0()
-                .tooltip(tooltip)
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .items_center()
-                        .gap_1()
-                        .text_size(sp(12.5))
-                        .text_color(theme.muted_foreground)
-                        .child(Icon::new(icon).small().flex_shrink_0())
-                        .child(div().truncate().child(label)),
-                ),
-            &theme,
-            cx,
-        )
+        capability_chip(id, label, icon, theme.muted_foreground, &theme, cx)
     }
 
     /// 模式 chip：选中后 emit `SelectExecutionMode`，id 里带着 `acp-mode:` 前缀，
@@ -1312,10 +1161,10 @@ impl AcpAgentInput {
         );
 
         div()
-            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
-            .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
+            .min_w(sp(CHIP_MIN_WIDTH))
+            .max_w(sp(CHIP_MAX_WIDTH))
             .flex_shrink_0()
-            .h(sp(COMPOSER_CHIP_HEIGHT))
+            .h(sp(CHIP_HEIGHT))
             .overflow_hidden()
             .child(
                 Popover::new("acp-mode-popover")
@@ -1349,10 +1198,8 @@ impl AcpAgentInput {
 
     /// 模型下拉：agent 声明的模型候选（`configOptions` 里的 select 值）。
     ///
-    /// 组件库的 `Select` 在 `appearance(false)` 下是透明底、透明描边，正好当 chip 用；
-    /// 但它自己不画 hover（连 focus ring 也只在 `appearance` 为真时才画），所以外面
-    /// 套一层带 hover 的壳。`.icon()` 换掉尾标：原来的 `⌄` 被模型图标顶掉，与其余
-    /// chip 的“无箭头”保持一致；名字被省略时 tooltip 给全名。
+    /// 组件库 `Select` 在 `appearance(false)` 下是透明底、透明描边，正好当 chip 用；
+    /// 形态与 One agent 那份共用 [`composer_model_chip`]。名字被省略时 tooltip 给全名。
     fn render_model_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
         let model_label = match &self.context.model {
@@ -1360,35 +1207,16 @@ impl AcpAgentInput {
             Some(model) => SharedString::from(format!("{} / {}", model.provider, model.model)),
             None => SharedString::from(t!("AgentUi.select_model").to_string()),
         };
-
-        div()
-            .id("acp-model-control")
-            .debug_selector(|| "agent-input-acp-model-control".to_string())
-            .flex_shrink(1.0)
-            .max_w(sp(MODEL_TRIGGER_MAX_WIDTH))
-            .h(sp(COMPOSER_CHIP_HEIGHT))
-            .rounded(px(COMPOSER_CHIP_RADIUS))
-            .overflow_hidden()
-            .hover(|this| this.bg(theme.overlay))
-            .text_color(theme.foreground)
-            .tooltip({
-                let full = model_label.clone();
-                move |window, cx| Tooltip::new(full.clone()).build(window, cx)
-            })
-            .child(
-                Select::new(&self.model_select)
-                    .id("acp-model")
-                    .w_full()
-                    .h(sp(COMPOSER_CHIP_HEIGHT))
-                    .small()
-                    .icon(IconName::AILine)
-                    .appearance(false)
-                    .placeholder(model_label)
-                    .search_placeholder(t!("AgentUi.search_model").to_string())
-                    .menu_width(model_menu_width(&self.model_options))
-                    .menu_max_h(sp(320.0))
-                    .disabled(self.is_running),
-            )
+        composer_model_chip(
+            &self.model_select,
+            "acp-model-control",
+            "acp-model",
+            "agent-input-acp-model-control",
+            model_label,
+            model_menu_width(&self.model_options),
+            self.is_running,
+            &theme,
+        )
     }
 
     /// 上下文行里的「工作区」下拉。
@@ -1429,10 +1257,10 @@ impl AcpAgentInput {
         );
 
         div()
-            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
-            .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
+            .min_w(sp(CHIP_MIN_WIDTH))
+            .max_w(sp(CHIP_MAX_WIDTH))
             .flex_shrink_0()
-            .h(sp(COMPOSER_CHIP_HEIGHT))
+            .h(sp(CHIP_HEIGHT))
             .overflow_hidden()
             .child(
                 Popover::new("acp-workspace-popover")
@@ -1491,11 +1319,11 @@ impl AcpAgentInput {
         div()
             .id("acp-branch-control")
             .debug_selector(|| "agent-input-branch".to_string())
-            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
-            .max_w(sp(COMPOSER_CHIP_MAX_WIDTH))
+            .min_w(sp(CHIP_MIN_WIDTH))
+            .max_w(sp(CHIP_MAX_WIDTH))
             .flex_shrink_0()
-            .h(sp(COMPOSER_CHIP_HEIGHT))
-            .rounded(px(COMPOSER_CHIP_RADIUS))
+            .h(sp(CHIP_HEIGHT))
+            .rounded(px(CHIP_RADIUS))
             .overflow_hidden()
             .hover(|this| this.bg(theme.overlay))
             .text_color(theme.muted_foreground)
@@ -1507,7 +1335,7 @@ impl AcpAgentInput {
                 Select::new(&self.branch_select)
                     .id("acp-branch")
                     .w_full()
-                    .h(sp(COMPOSER_CHIP_HEIGHT))
+                    .h(sp(CHIP_HEIGHT))
                     .small()
                     .icon(IconName::GitBranch)
                     .appearance(false)
@@ -1546,7 +1374,7 @@ impl AcpAgentInput {
         // 而这一行只是元数据。
         div()
             .debug_selector(|| "agent-input-worktree".to_string())
-            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
+            .min_w(sp(CHIP_MIN_WIDTH))
             .flex_shrink_0()
             .overflow_hidden()
             .child(ghost_chip_muted(
@@ -1750,7 +1578,7 @@ impl AcpAgentInput {
                     ),
                 )
                 .small()
-                .size(sp(COMPOSER_CHIP_HEIGHT))
+                .size(sp(CHIP_HEIGHT))
                 .flex_shrink_0()
                 .tooltip(label),
             &theme,
@@ -1791,7 +1619,6 @@ impl AcpAgentInput {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
         let queue_mode = self.is_running || self.pending_queue_blocked;
-        let action_button_size = sp(TOOLBAR_ACTION_BUTTON_SIZE);
         let attach_count = self.attachments.len();
         let attach_tooltip = if attach_count == 0 {
             t!("AgentUi.attach_images").to_string()
@@ -1803,18 +1630,8 @@ impl AcpAgentInput {
             )
         };
 
-        let mut row = h_flex()
-            .debug_selector(|| "agent-input-toolbar".to_string())
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .text_color(theme.foreground)
-            .gap(sp(4.0))
-            .px(sp(COMPOSER_ROW_PADDING_X))
-            .mt(sp(8.0))
-            // 极端窄宽度下宁可裁掉中段的尾巴，也不让内容画到输入卡片外面。
-            .overflow_hidden()
-            .flex_shrink_0();
+        let action_size = action_button_size();
+        let mut row = composer_toolbar(&theme);
         // 计划 / 子代理两栏始终在：折叠开关随身份行一起去掉之后，
         // 这条参数行就是它们唯一的家。
         row = row
@@ -1830,7 +1647,7 @@ impl AcpAgentInput {
                     .icon(IconName::File)
                     .xsmall()
                     .glyph_size(px(16.0))
-                    .size(action_button_size)
+                    .size(action_size)
                     .flex_shrink_0()
                     .tooltip(attach_tooltip)
                     .on_click(cx.listener(|this, _, window, cx| this.open_file_picker(window, cx))),
@@ -1842,8 +1659,8 @@ impl AcpAgentInput {
             row = row
                 .child(
                     div()
-                        .w(action_button_size)
-                        .h(action_button_size)
+                        .w(action_size)
+                        .h(action_size)
                         .flex_shrink_0()
                         .debug_selector(|| "agent-input-queue-send".to_string())
                         .child(
@@ -1853,8 +1670,8 @@ impl AcpAgentInput {
                                 .primary()
                                 .small()
                                 .glyph_size(px(16.0))
-                                .size(action_button_size)
-                                .rounded(px(TOOLBAR_ACTION_BUTTON_SIZE / 2.0))
+                                .size(action_size)
+                                .rounded(action_button_radius())
                                 .tooltip(t!("AgentUi.queue_for_next_turn").to_string())
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.submit(window, cx)),
@@ -1863,8 +1680,8 @@ impl AcpAgentInput {
                 )
                 .child(
                     div()
-                        .w(action_button_size)
-                        .h(action_button_size)
+                        .w(action_size)
+                        .h(action_size)
                         .flex_shrink_0()
                         .debug_selector(|| "agent-input-stop".to_string())
                         .child(
@@ -1874,8 +1691,8 @@ impl AcpAgentInput {
                                 .danger()
                                 .small()
                                 .glyph_size(px(16.0))
-                                .size(action_button_size)
-                                .rounded(px(TOOLBAR_ACTION_BUTTON_SIZE / 2.0))
+                                .size(action_size)
+                                .rounded(action_button_radius())
                                 .tooltip(t!("AgentUi.stop").to_string())
                                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                         ),
@@ -1883,8 +1700,8 @@ impl AcpAgentInput {
         } else {
             row = row.child(
                 div()
-                    .w(action_button_size)
-                    .h(action_button_size)
+                    .w(action_size)
+                    .h(action_size)
                     .flex_shrink_0()
                     .debug_selector(|| "agent-input-send-control".to_string())
                     .child(
@@ -1894,8 +1711,8 @@ impl AcpAgentInput {
                             .primary()
                             .small()
                             .glyph_size(px(16.0))
-                            .size(action_button_size)
-                            .rounded(px(TOOLBAR_ACTION_BUTTON_SIZE / 2.0))
+                            .size(action_size)
+                            .rounded(action_button_radius())
                             .tooltip(t!("AgentUi.send").to_string())
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -1934,18 +1751,7 @@ impl AcpAgentInput {
                 .child(self.render_worktree_toggle(cx));
         }
 
-        h_flex()
-            .debug_selector(|| "agent-input-context-row".to_string())
-            .w_full()
-            .min_w_0()
-            .min_h(sp(COMPOSER_CONTEXT_ROW_HEIGHT))
-            .items_center()
-            .gap(sp(2.0))
-            .py(sp(1.0))
-            .px(sp(COMPOSER_ROW_PADDING_X))
-            .flex_shrink_0()
-            .text_size(sp(12.5))
-            .text_color(theme.muted_foreground)
+        composer_context_row(&theme)
             .child(group)
             .children(self.render_usage_gauge(cx))
     }
@@ -2224,20 +2030,7 @@ impl Render for AcpAgentInput {
         // 本地副本（Hsla 是 Copy），而不是把 `theme` 移进去。
         let drop_wash = theme.accent.opacity(0.08);
         let drop_ring = theme.accent;
-        let card = v_flex()
-            .debug_selector(|| "agent-input-card".to_string())
-            .w_full()
-            .min_w_0()
-            .py(sp(COMPOSER_CARD_PADDING_VERTICAL))
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .when(!self.edge_to_edge, |this| {
-                this.rounded(cx.theme().radius * 2.0)
-                    .border_1()
-                    .border_color(theme.border)
-                    .shadow_sm()
-            })
-            .when(self.edge_to_edge, |this| this.min_h_0())
+        let card = composer_card(&theme, self.edge_to_edge)
             // 从 Finder 拖文件进来：悬停给卡片染一层，松手落成附件或路径。
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style.bg(drop_wash).border_color(drop_ring)
@@ -2250,52 +2043,24 @@ impl Render for AcpAgentInput {
             .when_some(queued_submissions, |this, queued| this.child(queued))
             // agent 提问：放在输入框正上方，答完才收起
             .when_some(pending_elicitation, |this, pending| this.child(pending))
-            // 中部：多行输入框。它自己带一个框——卡片那条外框颜色太淡，光靠它
-            // 看不出"该在这里打字"。与本地 agent 那份输入框同一套做法：聚焦时
-            // 这里的描边转 accent，卡片外框保持安静。
-            .child(
-                div()
-                    .debug_selector(|| "agent-input-editor".to_string())
+            // 中部：多行输入框。它自己带一个框——与 One agent 那份共用同一套
+            // 尺子：`theme.inset` 打底（面板调色板里「内嵌一层」的那个表面），
+            // 聚焦时这里的描边转 accent，卡片外框保持安静。
+            .child(composer_editor_frame(
+                &theme,
+                input_focused,
+                Editor::new(&self.input_state)
                     .w_full()
-                    .min_w_0()
-                    .px_3()
-                    .pt(px(2.0))
-                    .max_h(sp(220.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .rounded(cx.theme().radius)
-                            .border_1()
-                            .border_color(if input_focused {
-                                theme.accent
-                            } else {
-                                theme.border
-                            })
-                            .bg(cx.theme().input_background())
-                            .child(
-                                Editor::new(&self.input_state)
-                                    .w_full()
-                                    .h(editor_height)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .text_color(theme.foreground),
-                            ),
-                    ),
-            )
+                    .h(editor_height)
+                    .appearance(false)
+                    .bordered(false)
+                    .text_color(theme.foreground),
+            ))
             // 底部：计划 / 子代理 / 模型 / 模式 / 附件 / 发送，一整行
             .child(toolbar);
 
-        v_flex()
-            .id("agent-input-root")
-            .debug_selector(|| "agent-input-acp-root".to_string())
+        composer_root(&theme, self.edge_to_edge, "agent-input-acp-root")
             .track_focus(&self.focus_handle)
-            .w_full()
-            .min_w_0()
-            .when(self.edge_to_edge, |this| this.min_h_0().flex_shrink_0())
-            .when(!self.edge_to_edge, |this| this.flex_shrink_0())
-            .bg(theme.background)
-            .text_color(theme.foreground)
             .child(card)
             // 卡片外：上下文行（工作区 / 分支 / Worktree / 用量）
             .child(context_row)
@@ -2570,7 +2335,7 @@ impl SelectItem for BranchChoice {
     }
 
     fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
+        let muted = crate::theme::active_agent_chat_theme(cx).muted_foreground;
         // 行高由列表按**第一行**量一次、全体共用（`List::prepare_items_if_needed`），
         // 所以这里必须是死的一行：名字下面再压一行（远端标记）会撑破后面的行 ——
         // 屏幕上就是一行叠在一行上。远端标记因此并到同一行的右侧。

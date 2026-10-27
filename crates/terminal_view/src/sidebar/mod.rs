@@ -142,8 +142,12 @@ fn terminal_ai_system_instruction(connection_kind: TerminalConnectionKind) -> St
     )
 }
 
-/// 终端侧边栏的对话主题：基础色用终端自有配色，语义槽（状态色 / 用量档位 /
-/// 图表色）仍取应用主题——终端可以有一套自己的底色，但「危险」到哪都该是那个红。
+/// 终端侧边栏的对话主题：基础色（含浮层 / 内嵌两个表面层）用终端自有配色，
+/// 语义槽（状态色 / 用量档位 / 图表色）仍取应用主题——终端可以有一套自己的底色，
+/// 但「危险」到哪都该是那个红。
+///
+/// 表面层必须跟着终端配色走：终端是深色而应用主题是浅色时，浮层与输入框
+/// 若取应用主题就会在深色侧边栏里白成一片。
 fn agent_theme_from_terminal_theme(
     theme: &TerminalTheme,
     application_theme: &Theme,
@@ -178,6 +182,10 @@ fn agent_theme_from_terminal_theme(
                 theme.selection.alpha(0.4)
             },
             surface_radius: application_theme.radius,
+            // 终端配色里没有独立的浮层 / 输入框色：`muted` 就是这套调色板里
+            // 「比底色亮一级」的那个表面，浮层与 inset 容器都用它。
+            raised: colors.muted,
+            inset: colors.muted,
         },
         application_theme,
     )

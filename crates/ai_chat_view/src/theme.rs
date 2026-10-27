@@ -44,13 +44,20 @@ pub struct AgentChatTheme {
     pub link: Hsla,
     pub text_selection: Hsla,
     pub surface_radius: Pixels,
+    /// 浮层表面：popover / 菜单 / 命令面板 / 悬浮卡。
+    ///
+    /// 属于**调色板**而不是语义槽：它回答的是「这块面板上浮起来的一层是什么颜色」，
+    /// 与面板底色是同一件事的两级。跟着应用主题走会在深色侧边栏里浮出一块浅色
+    /// （终端 + 浅色应用主题的组合必然踩到），所以由基础槽提供。
+    pub raised: Hsla,
+    /// 内嵌区表面：输入框、代码槽、inset 容器这类「比卡片更沉一层」的底。
+    ///
+    /// 同样属于调色板：终端侧边栏里它就取终端自己的 `muted`，而不是应用主题的
+    /// 输入框底色 —— 后者在浅色主题下是白的，正是「深色面板里一块白」的来源。
+    pub inset: Hsla,
 
     // ── 语义槽：面板内的层次与状态色。全部取自宿主主题，不另立调色板，
     // 这样 navop 换肤 / 深浅切换时面板自动跟随。
-    /// 浮层表面：popover / 菜单 / 命令面板 / 悬浮卡。
-    pub raised: Hsla,
-    /// 内嵌区表面：比 `panel` 更沉，用于代码槽、inset 容器。
-    pub inset: Hsla,
     /// 悬停 / 选中叠加层，半透明，画在内容之下。
     pub overlay: Hsla,
     /// 更强的叠加层（按下 / 选中强调）。
@@ -79,8 +86,9 @@ pub struct AgentChatTheme {
 
 /// 自定义配色的面板构造对话主题时的基础槽。
 ///
-/// 只包含「这块面板自己决定」的十九个基础槽。状态色、用量档位、图表色等语义槽
-/// **故意不在这里**：它们由 [`AgentChatTheme::from_base_colors`] 从应用主题统一取。
+/// 包含「这块面板自己决定」的二十一个基础槽（含 `raised` / `inset` 两个表面层级）。
+/// 状态色、用量档位、图表色等语义槽**故意不在这里**：它们由
+/// [`AgentChatTheme::from_base_colors`] 从应用主题统一取。
 ///
 /// 这样分的目的是让新增语义槽只改一处。反面教材：终端侧边栏曾经逐字段列举整
 /// 个 `AgentChatTheme`，于是每次加一个语义槽都会把那个构造点打爆一次。
@@ -105,6 +113,8 @@ pub struct AgentChatThemeBase {
     pub link: Hsla,
     pub text_selection: Hsla,
     pub surface_radius: Pixels,
+    pub raised: Hsla,
+    pub inset: Hsla,
 }
 
 impl AgentChatTheme {
@@ -117,6 +127,9 @@ impl AgentChatTheme {
     /// 语义槽（状态色 / 用量档位 / 图表色 / 分隔线 / 浮层叠加）一律取自
     /// `theme`：它们的含义是全局面板共有的（「危险」到哪都是那个红），不该
     /// 因为某块面板保留自有配色就自成一系。
+    ///
+    /// `raised` / `inset` 不在此列，见 [`AgentChatThemeBase`]：它们是表面层级，
+    /// 必须跟面板自己的底色配套，否则深色面板上会长出浅色浮层与白色输入框。
     pub fn from_base_colors(base: AgentChatThemeBase, theme: &Theme) -> Self {
         let colors = &theme.colors;
         let AgentChatThemeBase {
@@ -139,6 +152,8 @@ impl AgentChatTheme {
             link,
             text_selection,
             surface_radius,
+            raised,
+            inset,
         } = base;
         Self {
             is_dark,
@@ -160,8 +175,8 @@ impl AgentChatTheme {
             link,
             text_selection,
             surface_radius,
-            raised: colors.popover,
-            inset: colors.input,
+            raised,
+            inset,
             overlay: colors.overlay,
             overlay_strong: colors.overlay.opacity(1.6),
             border_strong: colors.window_border,
@@ -252,6 +267,9 @@ fn base_from_app_theme(theme: &Theme) -> AgentChatThemeBase {
         link: theme.link,
         text_selection: theme.selection,
         surface_radius: theme.radius,
+        // 应用主题自己的浮层与输入框底色：`from_app` 出来的主题必须与宿主一致。
+        raised: theme.popover,
+        inset: theme.input,
     }
 }
 
@@ -329,13 +347,20 @@ mod tests {
             link: color(0x00aaff),
             text_selection: color(0x445566),
             surface_radius: gpui::px(4.0),
+            raised: color(0x2a3a4a),
+            inset: color(0x0a1a2a),
         }
     }
 
-    /// 自定义配色的面板：基础槽听自己的，语义槽听应用主题。
+    /// 自定义配色的面板：基础槽（含 `raised` / `inset` 两个表面层）听自己的，
+    /// 语义槽听应用主题。
     ///
     /// 卡的是「面板换了自己的底色之后，状态色与图表色不能变成没填的透明值」——
     /// 那会让用量圆环、骨架屏、图表在终端侧边栏里直接隐形。
+    ///
+    /// 另外卡「表面层必须跟面板底色走」：终端侧边栏配的是深色终端配色，若
+    /// `raised` / `inset` 仍取应用主题（浅色）的 popover / input，浮层与输入框
+    /// 就会在深色面板上白成一片 —— 这正是 composer 编辑区白框的来源。
     #[test]
     fn custom_base_colors_keep_application_semantic_slots() {
         let application_theme = Theme::from(ThemeColor::dark().as_ref());
@@ -347,6 +372,11 @@ mod tests {
         assert_eq!(color(0x112233), theme.background);
         assert_eq!(color(0xeeeeee), theme.foreground);
         assert_eq!(gpui::px(4.0), theme.surface_radius);
+        // 表面层来自面板自己的调色板，不随应用主题漂移。
+        assert_eq!(color(0x2a3a4a), theme.raised);
+        assert_eq!(color(0x0a1a2a), theme.inset);
+        assert_ne!(application_theme.colors.popover, theme.raised);
+        assert_ne!(application_theme.colors.input, theme.inset);
 
         let colors = &application_theme.colors;
         assert_eq!(colors.danger, theme.danger);
@@ -389,6 +419,9 @@ mod tests {
             assert_eq!(app_theme.colors.danger, theme.danger);
             assert_eq!(app_theme.colors.progress_bar, theme.gauge);
             assert_eq!(app_theme.colors.skeleton, theme.skeleton);
+            // 应用主题自己的表面层要和宿主一致：面板在应用主题下不该有第二种层次。
+            assert_eq!(app_theme.colors.popover, theme.raised);
+            assert_eq!(app_theme.colors.input, theme.inset);
             assert!(theme.text_ghost.a > 0.0);
         });
     }

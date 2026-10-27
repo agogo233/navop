@@ -23,14 +23,14 @@ use std::sync::Arc;
 use gpui::{
     App, AppContext, Context, Entity, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, InteractiveElement, IntoElement, Modifiers, ParentElement, PathPromptOptions,
-    Pixels, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
-    Subscription, Window, div, img, prelude::FluentBuilder, px,
+    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    img, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::searchable_list::SearchableVec;
-use gpui_component::select::{Select, SelectEvent, SelectGroup, SelectState};
+use gpui_component::select::{SelectEvent, SelectGroup, SelectState};
 use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, h_flex, v_flex};
 use one_assets::IconName;
 use rust_i18n::t;
@@ -39,6 +39,11 @@ use serde_json::Value;
 use crate::input::PromptHistory;
 use crate::input::attachment::ImageAttachment;
 use crate::input::completion::ComposerCompletionProvider;
+use crate::input::composer_chrome::{
+    action_button_radius, action_button_size, capability_chip, composer_capability_slot,
+    composer_card, composer_editor_frame, composer_model_chip, composer_permission_slot,
+    composer_root, composer_toolbar, ghost_chip, model_menu_width,
+};
 use crate::input::context::{
     AgentComposerContext, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
     ComposerResourcePoolItem, ComposerResourceSourceOption, ComposerResourceTypeFilter,
@@ -172,41 +177,6 @@ const COMPOSER_EDITOR_MIN_ROWS: usize = 3;
 const COMPOSER_EDITOR_MAX_ROWS: usize = 10;
 const COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT: f32 = 20.0;
 const COMPOSER_EDITOR_VERTICAL_PADDING: f32 = 12.0;
-/// 底部工具栏操作按钮(发送 / 排队 / 停止)的边长,同时也是工具栏控件高度。
-const TOOLBAR_ACTION_BUTTON_SIZE: f32 = 32.0;
-/// 工具栏右侧上下文用量圆环的直径。
-///
-/// 取 20:比 32 的按钮小一号,不跟发送键抢视线,又能把百分比读出来。
-/// 底部那一行里上下文档位 chip 的固定高度。
-///
-/// 与发送 / 附件按钮同高：整行只有一种控件高度，7 项并排时不会参差。
-const COMPOSER_CHIP_HEIGHT: f32 = TOOLBAR_ACTION_BUTTON_SIZE;
-/// 上下文档位 chip 收缩到的最小宽度（标签走省略号）。
-///
-/// 侧栏被拖窄时模型与权限仍要在同一行：宽度不足靠 `flex_shrink` + `truncate`
-/// 消化，完整内容在点开后的弹层里。
-const COMPOSER_CHIP_MIN_WIDTH: f32 = 44.0;
-/// 下拉触发器里除文字外的固定占位:左右内边距 + 箭头 + 间距。
-const TRIGGER_CHROME_WIDTH: f32 = 48.0;
-/// 模型触发器在这一行里能被压到的最小宽度。
-///
-/// 模型是这一行唯一 `flex_1` 的项:空间富余时它吸收余量,空间不足时缩到这里为止
-/// (再缩下去连「9Router / deepsee…」都放不下,不如把宽度让给两侧的 chip)。
-const MODEL_TRIGGER_MIN_WIDTH: f32 = 150.0;
-/// 模型下拉弹层的宽度区间。
-///
-/// 组件库 `Select` 的 `menu_width` 默认是 `Length::Auto` —— 弹层宽度**取触发器宽度**
-/// (见 `gpui_component::select` 的 `Length::Auto => this.w(bounds.size.width)`)。
-/// 触发器被挤到 [`MODEL_TRIGGER_MIN_WIDTH`] 时标题只剩 `9Router / deepsee…`;
-/// 弹层若跟着按 150px 渲染,用户点开看到的还是同一个省略号 ——「挤不下的点开看全文」
-/// 这条兜底就失效了。所以这里按选项里最长的 `provider / model` 估宽度并夹在区间内:
-/// 短列表不塌成一条,长列表收在上限,超宽时由组件库的 `Positioner` 按窗口边缘收敛
-/// (它带 8px margin,会把浮层压回视口内)。
-const MODEL_MENU_MIN_WIDTH: f32 = 320.0;
-const MODEL_MENU_MAX_WIDTH: f32 = 400.0;
-/// 弹层里除标签外还要留的宽度:选项行左右内边距 + 选中标记。
-const MODEL_MENU_CHROME_WIDTH: f32 = 56.0;
-
 fn composer_editor_height(state: &EditorState) -> Pixels {
     let rows = state
         .text()
@@ -218,42 +188,6 @@ fn composer_editor_height(state: &EditorState) -> Pixels {
         .line_height()
         .unwrap_or(px(COMPOSER_EDITOR_FALLBACK_LINE_HEIGHT));
     line_height * rows as f32 + px(COMPOSER_EDITOR_VERTICAL_PADDING)
-}
-
-/// 底部那一行里单个 chip 的内容:`[图标] [可截断标签] [⌄]`。
-///
-/// 这个函数只管内容;承载它的容器(直接可点的 chip / 下拉触发器)由调用方决定,
-/// 但都必须给足宽度约束(容器 `min_w_0` + 这里 `flex_1 min_w_0`)标签才会走省略号。
-fn composer_chip_label(icon: IconName, label: SharedString) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .items_center()
-        .gap_1()
-        .child(Icon::new(icon).xsmall().flex_shrink_0())
-        .child(div().flex_1().min_w_0().truncate().text_xs().child(label))
-        .child(Icon::new(IconName::ChevronDown).xsmall().flex_shrink_0())
-}
-
-/// 模型下拉弹层的宽度:按最长的选项估,保证点开能读到完整的 `provider / model`。
-///
-/// 不能沿用组件库默认值(那是「触发器多宽弹层多宽」,见 [`MODEL_MENU_MIN_WIDTH`]),
-/// 也不适合只给一个固定值:ACP agent 报上来的模型名长短差别很大,固定宽要么空一大片
-/// 要么还是截断。这里按内容估(标签与副标题取宽者),再夹进区间。
-fn model_menu_width(options: &[ComposerModelOption]) -> gpui::Rems {
-    let longest = options
-        .iter()
-        .map(|option| {
-            let label = estimated_label_width(&option.display_label());
-            let hint = option
-                .hint
-                .as_deref()
-                .map(estimated_label_width)
-                .unwrap_or(0.0);
-            label.max(hint)
-        })
-        .fold(0.0_f32, f32::max);
-    sp((longest + MODEL_MENU_CHROME_WIDTH).clamp(MODEL_MENU_MIN_WIDTH, MODEL_MENU_MAX_WIDTH))
 }
 
 fn menu_state_after_open_change(
@@ -269,47 +203,6 @@ fn current_execution_mode_label(label: &SharedString) -> SharedString {
     } else {
         label.clone()
     }
-}
-
-/// 执行模式下拉触发器的宽度。
-///
-/// 执行模式只承载「自动 / 只读 / 手动确认」这类短标签,固定 124px 会在窄侧边栏里
-/// 吃掉模型选择的空间,把发送 / 停止按钮挤成细条。这里按标签估算宽度并夹在区间内:
-/// 中文短标签收窄,英文长标签仍保留原来的可用宽度上限。
-fn execution_trigger_width(label: &str, queue_mode: bool) -> gpui::Rems {
-    let (min, max) = if queue_mode {
-        (72.0, 88.0)
-    } else {
-        (80.0, 124.0)
-    };
-    sp((estimated_label_width(label) + TRIGGER_CHROME_WIDTH).clamp(min, max))
-}
-
-/// 估算一段文案的渲染宽度:CJK 等全角字符按 13px,其余按 7.5px。
-fn estimated_label_width(label: &str) -> f32 {
-    label
-        .chars()
-        .map(|ch| if is_full_width_char(ch) { 13.0 } else { 7.5 })
-        .sum()
-}
-
-/// 常见全角字符区间(中日韩文字、全角标点等)。
-fn is_full_width_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE4F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x20000..=0x3FFFD
-    )
 }
 
 /// Agent 输入框组件。
@@ -366,8 +259,6 @@ pub struct AgentInput {
     /// 顺手把它收起来，让用量历史浮层不被自己的 popover 压住。
     /// 顶部计划面板中已展开的只读计划项。
     expanded_plan_items: HashSet<String>,
-    /// 是否折叠顶部计划 / Agent / 上下文能力区。
-    top_capabilities_collapsed: bool,
     /// 可选的局部聊天主题。终端侧边栏会注入终端主题,普通 Agent tab 继续使用应用主题。
     theme: Option<AgentChatTheme>,
     edge_to_edge: bool,
@@ -546,7 +437,6 @@ impl AgentInput {
             context_search_needs_reset: false,
             open_menu: None,
             expanded_plan_items: HashSet::new(),
-            top_capabilities_collapsed: false,
             theme: None,
             edge_to_edge: false,
             _subscriptions: vec![
@@ -898,40 +788,6 @@ impl AgentInput {
         cx.notify();
     }
 
-    fn render_context_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.local_theme(cx);
-
-        v_flex()
-            .w_full()
-            .flex_shrink_0()
-            .when(!self.top_capabilities_collapsed, |this| {
-                this.border_b_1()
-                    .border_color(theme.border)
-                    .child(self.render_mode_tabs(cx))
-            })
-    }
-
-    fn render_mode_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.local_theme(cx);
-        v_flex().w_full().px_3().pt_2().pb_1p5().child(
-            h_flex()
-                .w_full()
-                .h(sp(38.0))
-                .items_center()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.panel)
-                .child(self.render_plan_mode_tab(cx))
-                .child(self.render_mode_separator(cx))
-                .child(self.render_subagent_mode_tab(cx))
-                .child(self.render_mode_separator(cx))
-                .child(self.render_context_mode_tab(cx))
-                .child(self.render_mode_separator(cx))
-                .child(self.render_skill_mode_tab(cx)),
-        )
-    }
-
     fn render_plan_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let view = cx.entity();
         let is_open = self.open_menu == Some(ComposerMenuKind::Plan);
@@ -1002,6 +858,10 @@ impl AgentInput {
             })
     }
 
+    /// 参数行里的能力 chip（计划 / 子代理 / 上下文 / Skill）：26 高的 ghost chip。
+    ///
+    /// 形态与 ACP 那份共用 [`capability_chip`]：两份输入框的能力 chip 本来就该长一个
+    /// 样，只有挂的面板内容不同。标签截断时 tooltip 给出全文。
     fn render_capability_trigger(
         &self,
         id: &'static str,
@@ -1009,25 +869,8 @@ impl AgentInput {
         icon: IconName,
         cx: &mut Context<Self>,
     ) -> Button {
-        let label = label.into();
         let theme = self.local_theme(cx);
-        Button::new(id)
-            .debug_selector(move || id.to_string())
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .ghost()
-            .small()
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .text_color(theme.muted_foreground)
-                    .child(Icon::new(icon).xsmall())
-                    .child(div().text_sm().truncate().child(label)),
-            )
+        capability_chip(id, label, icon, theme.muted_foreground, &theme, cx)
     }
 
     fn render_context_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1094,33 +937,20 @@ impl AgentInput {
 
     fn render_context_mode_trigger(&self, cx: &mut Context<Self>) -> Button {
         let theme = self.local_theme(cx);
+        // 还没选资源池时压暗一级：这颗粒子此时是「可以点，但还没选」。
         let fg = if self.context.target.is_some() {
             theme.foreground
         } else {
             theme.muted_foreground
         };
-        Button::new("agent-context-mode")
-            .debug_selector(|| "agent-context-mode".to_string())
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .ghost()
-            .small()
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .text_color(fg)
-                    .child(Icon::new(IconName::File).xsmall())
-                    .child(
-                        div()
-                            .text_sm()
-                            .truncate()
-                            .child(resource_pool_trigger_label(&self.context)),
-                    ),
-            )
+        capability_chip(
+            "agent-context-mode",
+            resource_pool_trigger_label(&self.context),
+            IconName::File,
+            fg,
+            &theme,
+            cx,
+        )
     }
 
     fn render_skill_mode_tab(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1156,15 +986,11 @@ impl AgentInput {
             })
     }
 
-    fn render_mode_separator(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.local_theme(cx);
-        div().h(sp(20.0)).w(px(1.0)).bg(theme.border)
-    }
-
-    /// 底部那一行的「权限级别」下拉。
+    /// 底部那一行里的「权限级别」下拉。
     ///
     /// 承载的仍是 ACP 工具执行模式(自动 / 只读 / 手动确认):状态、选项与回调都与
-    /// 原先工具栏里的那个下拉一致,只是收成了 chip 形态。
+    /// 原先工具栏里的那个下拉一致,形态统一成参数行的 ghost chip —— 与 ACP 那份的
+    /// 模式 chip 是同一颗尺子(26 高、6 圆角、hover overlay、无箭头)。
     fn render_permission_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let view = cx.entity();
         let is_open = self.open_menu == Some(ComposerMenuKind::Mode);
@@ -1173,129 +999,42 @@ impl AgentInput {
             execution_mode_label: label.clone(),
             options: self.execution_mode_options.clone(),
         };
-
         let theme = self.local_theme(cx);
-        let queue_mode = self.is_running || self.pending_queue_blocked;
-        let chip_width = execution_trigger_width(&label, queue_mode);
-        let trigger = themed_outline_button(
-            Button::new("agent-permission")
-                .debug_selector(|| "agent-input-permission".to_string())
-                .small()
-                .w_full()
-                .h(sp(COMPOSER_CHIP_HEIGHT))
-                .justify_between()
-                .outline()
-                .disabled(self.is_running)
-                .child(composer_chip_label(IconName::Key, label)),
+        let trigger = capability_chip(
+            "agent-input-permission",
+            label,
+            IconName::Key,
+            theme.foreground,
             &theme,
-        );
+            cx,
+        )
+        .disabled(self.is_running);
 
-        div()
-            .w(chip_width)
-            .min_w(sp(COMPOSER_CHIP_MIN_WIDTH))
-            .flex_shrink(1.0)
-            .h(sp(COMPOSER_CHIP_HEIGHT))
-            .overflow_hidden()
-            .child(
-                Popover::new("agent-permission-popover")
-                    .p_0()
-                    .open(is_open)
-                    .trigger_style(StyleRefinement::default().w_full())
-                    .on_open_change({
-                        let view = view.clone();
-                        move |open, _window, cx| {
-                            let open = *open;
-                            view.update(cx, |this, cx| {
-                                this.open_menu = if open && !this.is_running {
-                                    Some(ComposerMenuKind::Mode)
-                                } else {
-                                    None
-                                };
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .trigger(trigger)
-                    .content({
-                        let view = view.clone();
-                        let theme = theme.clone();
-                        move |_state, _window, cx| {
-                            render_mode_content(view.clone(), data.clone(), &theme, cx)
-                        }
-                    }),
-            )
-    }
-
-    /// 底部那一行里「附件 / 上下文档位 / 操作按钮」三段中的中间段。
-    ///
-    /// 顺序:`[模型][权限]`。这一组独占剩余宽度:空间不足时模型先被挤窄,
-    /// 由本组自己的 `overflow_hidden` 兜底,绝不把右侧的发送按钮挤出可视区。
-    ///
-    /// 工作区 / 分支 / Worktree 不在这里:内置 agent 没有这些概念(对齐 dev,
-    /// 它们只属于 ACP 那份输入框)。
-    fn render_context_group(
-        &self,
-        cx: &mut Context<Self>,
-        row_gap: gpui::Rems,
-    ) -> impl IntoElement + use<> {
-        let model_label = match &self.context.model {
-            Some(m) if m.model_only => m.model.clone(),
-            Some(m) => SharedString::from(format!("{} / {}", m.provider, m.model)),
-            None => SharedString::from(t!("AgentUi.select_model").to_string()),
-        };
-        let model_min_width = if self.is_running || self.pending_queue_blocked {
-            96.0
-        } else {
-            MODEL_TRIGGER_MIN_WIDTH
-        };
-        // 触发器会被挤扁,弹层不能跟着缩 —— 见 `model_menu_width`。
-        let model_menu_width = model_menu_width(&self.model_options);
-        let action_button_size = sp(TOOLBAR_ACTION_BUTTON_SIZE);
-
-        let group = h_flex()
-            .debug_selector(|| "agent-input-context-group".to_string())
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .items_center()
-            .gap(row_gap)
-            .text_color(self.local_theme(cx).foreground);
-        // 模型留在这一行:它是唯一需要「搜索 + 滚动 + 键盘导航」的控件,
-        // 用 `flex_1` 吸收整行余量,其余项保持内容宽度。
-        let group = group.child(
-            div()
-                .flex_1()
-                .min_w(sp(model_min_width))
-                .h(action_button_size)
-                .overflow_hidden()
-                .child(self.render_model_menu(model_label, model_menu_width))
-                .debug_selector(|| "agent-input-model-control".to_string()),
-        );
-        group.child(self.render_permission_menu(cx))
-    }
-
-    /// 模型下拉:交给组件库的 `Select` —— 搜索框、滚动、键盘导航都由它提供。
-    ///
-    /// 选项不从这里传:它们在 `set_menu_options` 时置脏、`render` 里灌进 `model_select`。
-    ///
-    /// `menu_width` 必须显式传:组件库默认让弹层跟着触发器宽度走,而这一行的触发器会被
-    /// 挤到 [`MODEL_TRIGGER_MIN_WIDTH`],弹层跟着缩就等于「点开也看不全」—— 那条
-    /// 「挤不下的点开看全文」的兜底会在最需要它的宽度上失效(见 [`model_menu_width`])。
-    fn render_model_menu(
-        &self,
-        placeholder: SharedString,
-        menu_width: gpui::Rems,
-    ) -> impl IntoElement + use<> {
-        Select::new(&self.model_select)
-            .id("agent-model")
-            .w_full()
-            .h(sp(32.0))
-            .small()
-            .placeholder(placeholder)
-            .search_placeholder(t!("AgentUi.search_model").to_string())
-            .menu_width(menu_width)
-            .menu_max_h(sp(320.0))
-            .disabled(self.is_running)
+        Popover::new("agent-permission-popover")
+            .p_0()
+            .open(is_open)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| {
+                        this.open_menu = if open && !this.is_running {
+                            Some(ComposerMenuKind::Mode)
+                        } else {
+                            None
+                        };
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(trigger)
+            .content({
+                let view = view.clone();
+                let theme = theme.clone();
+                move |_state, _window, cx| {
+                    render_mode_content(view.clone(), data.clone(), &theme, cx)
+                }
+            })
     }
 
     /// 把当前选项与选中项灌进组件库的 `Select`。
@@ -1368,6 +1107,29 @@ impl AgentInput {
                 .pt_2()
                 .children(thumbs)
                 .into_any_element(),
+        )
+    }
+
+    /// 模型下拉：交给组件库的 `Select` —— 搜索框、滚动、键盘导航都由它提供。
+    ///
+    /// 外壳与 ACP 那份共用 [`composer_model_chip`]：透明底、26 高、6 圆角、hover
+    /// overlay，弹层宽度按最长候选估，名字被省略时 tooltip 给全名。
+    fn render_model_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.local_theme(cx);
+        let model_label = match &self.context.model {
+            Some(model) if model.model_only => model.model.clone(),
+            Some(model) => SharedString::from(format!("{} / {}", model.provider, model.model)),
+            None => SharedString::from(t!("AgentUi.select_model").to_string()),
+        };
+        composer_model_chip(
+            &self.model_select,
+            "agent-model-control",
+            "agent-model",
+            "agent-input-model-control",
+            model_label,
+            model_menu_width(&self.model_options),
+            self.is_running,
+            &theme,
         )
     }
 
@@ -1461,96 +1223,43 @@ impl AgentInput {
         )
     }
 
-    fn render_editor_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        // Finch 式改版：附件入口迁到底部 chips 行（render_toolbar），顶栏只留
-        // 能力折叠与撤销，靠右排布。
-        h_flex()
-            .w_full()
-            .items_center()
-            .justify_end()
-            .px_3()
-            .pt_2()
-            .pb_1()
-            .child(
-                Button::new("agent-editor-menu")
-                    .icon(if self.top_capabilities_collapsed {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .ghost()
-                    .small()
-                    .tooltip(t!("AgentUi.collapse_capabilities").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.top_capabilities_collapsed = !this.top_capabilities_collapsed;
-                        if this.top_capabilities_collapsed {
-                            this.open_menu = None;
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("agent-editor-undo")
-                    .icon(IconName::Undo)
-                    .ghost()
-                    .small()
-                    .tooltip(t!("AgentUi.undo").to_string()),
-            )
-    }
-
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
-        let running = self.is_running;
-        let queue_mode = running || self.pending_queue_blocked;
-        let row_gap = if queue_mode { sp(4.0) } else { sp(8.0) };
-        let action_button_size = sp(TOOLBAR_ACTION_BUTTON_SIZE);
+        let queue_mode = self.is_running || self.pending_queue_blocked;
+        let action_size = action_button_size();
+        let action_radius = action_button_radius();
         let attach_count = self.attachments.len();
 
-        // 左段:附件入口 + 附件计数(固定宽度,不参与收缩)。
-        let attach_group = h_flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap(row_gap)
-            .child(
+        // 参数行：左段是「这一轮能用到什么」（计划 / 子代理 / 上下文 / Skill），
+        // 中间弹性留白，右段是模型 / 权限 / 附件 / 发送。与 ACP 那份同一行同一尺子。
+        let mut toolbar = composer_toolbar(&theme)
+            .child(composer_capability_slot().child(self.render_plan_mode_tab(cx)))
+            .child(composer_capability_slot().child(self.render_subagent_mode_tab(cx)))
+            .child(composer_capability_slot().child(self.render_context_mode_tab(cx)))
+            .child(composer_capability_slot().child(self.render_skill_mode_tab(cx)))
+            .child(div().flex_1().min_w_0())
+            .child(self.render_model_menu(cx))
+            .child(composer_permission_slot().child(self.render_permission_menu(cx)))
+            .child(ghost_chip(
                 Button::new("agent-attach")
+                    .debug_selector(|| "agent-input-attach".to_string())
                     .icon(IconName::File)
-                    .ghost()
-                    .small()
-                    .tooltip(t!("AgentUi.attach_images").to_string())
+                    .xsmall()
+                    .glyph_size(px(16.0))
+                    .size(action_size)
+                    .flex_shrink_0()
+                    .tooltip(t!("AgentUi.attachment_count", count = attach_count).to_string())
                     .on_click(cx.listener(|this, _, window, cx| this.open_file_picker(window, cx))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(t!("AgentUi.attachment_count", count = attach_count).to_string()),
-            )
-            .child(div().h(sp(18.0)).w(px(1.0)).bg(theme.border));
-
-        // 中段:工作区 / 分支 / 模型 / Worktree / 权限。
-        let context_group = self.render_context_group(cx, row_gap);
-
-        let mut toolbar = h_flex()
-            .debug_selector(|| "agent-input-toolbar".to_string())
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .text_color(theme.foreground)
-            .gap(row_gap)
-            .px_3()
-            .py_2()
-            // 极端窄宽度下宁可裁掉中段的尾巴,也不让内容画到输入卡片外面。
-            .overflow_hidden()
-            .flex_shrink_0()
-            .child(attach_group)
-            .child(context_group);
+                &theme,
+                cx,
+            ));
 
         if queue_mode {
             toolbar = toolbar
                 .child(
                     div()
-                        .w(action_button_size)
-                        .h(action_button_size)
+                        .w(action_size)
+                        .h(action_size)
                         .flex_shrink_0()
                         .debug_selector(|| "agent-input-queue-send".to_string())
                         .child(
@@ -1559,7 +1268,8 @@ impl AgentInput {
                                 .icon(IconName::ArrowUp)
                                 .primary()
                                 .small()
-                                .size(action_button_size)
+                                .size(action_size)
+                                .rounded(action_radius)
                                 .tooltip(t!("AgentUi.queue_for_next_turn").to_string())
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.submit(window, cx)),
@@ -1568,8 +1278,8 @@ impl AgentInput {
                 )
                 .child(
                     div()
-                        .w(action_button_size)
-                        .h(action_button_size)
+                        .w(action_size)
+                        .h(action_size)
                         .flex_shrink_0()
                         .debug_selector(|| "agent-input-stop".to_string())
                         .child(
@@ -1578,7 +1288,8 @@ impl AgentInput {
                                 .icon(IconName::Close)
                                 .danger()
                                 .small()
-                                .size(action_button_size)
+                                .size(action_size)
+                                .rounded(action_radius)
                                 .tooltip(t!("AgentUi.stop").to_string())
                                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                         ),
@@ -1586,8 +1297,8 @@ impl AgentInput {
         } else {
             toolbar = toolbar.child(
                 div()
-                    .w(action_button_size)
-                    .h(action_button_size)
+                    .w(action_size)
+                    .h(action_size)
                     .flex_shrink_0()
                     .debug_selector(|| "agent-input-send-control".to_string())
                     .child(
@@ -1596,7 +1307,8 @@ impl AgentInput {
                             .icon(IconName::ArrowUp)
                             .primary()
                             .small()
-                            .size(action_button_size)
+                            .size(action_size)
+                            .rounded(action_radius)
                             .tooltip(t!("AgentUi.send").to_string())
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -1607,19 +1319,73 @@ impl AgentInput {
     }
 }
 
+impl Render for AgentInput {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 打开上下文面板时,在 render 时(持有 &mut Window)清空搜索框。
+        if self.context_search_needs_reset {
+            self.context_search_input.update(cx, |state, cx| {
+                state.set_value("", _window, cx);
+            });
+            self.context_search_query = SharedString::default();
+            self.context_search_needs_reset = false;
+        }
+        // 模型下拉换了选项 / 选中项:同一套路,趁手里有窗口时灌进组件库的 state。
+        if self.model_select_dirty {
+            self.sync_model_select(_window, cx);
+            self.model_select_dirty = false;
+        }
+        let attachments = self.render_attachments(cx);
+        let queued_submissions = self.render_queued_submissions(cx);
+        let toolbar = self.render_toolbar(cx);
+        let theme = self.local_theme(cx);
+        let input_state = self.input_state.read(cx);
+        let input_focused = input_state.focus_handle(cx).is_focused(_window);
+        let editor_height = composer_editor_height(input_state);
+        // 拖放悬停时的染色。`drag_over` 的闭包要 `'static`,所以先把颜色取成
+        // 本地副本(Hsla 是 Copy),而不是把 `theme` 移进去——后面还有别的闭包要用。
+        let drop_wash = theme.accent.opacity(0.08);
+        let drop_ring = theme.accent;
+
+        // 输入卡片：与 ACP 那份同一套骨架（上下 8、圆角、编辑区内框、参数行）。
+        // 附件预览落在编辑区之上；卡片外没有上下文行 —— 工作区/分支/Worktree 是
+        // ACP 特有的概念，内置 agent 不显示。
+        let card = composer_card(&theme, self.edge_to_edge)
+            // 从 Finder 拖文件进来:悬停给卡片染一层,松手落成附件或路径。
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.bg(drop_wash).border_color(drop_ring)
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.add_dropped_paths(paths.paths(), window, cx);
+            }))
+            // 附件预览（如果有）
+            .children(attachments)
+            .when_some(queued_submissions, |this, queued| this.child(queued))
+            // 中部：多行输入框
+            .child(composer_editor_frame(
+                &theme,
+                input_focused,
+                Editor::new(&self.input_state)
+                    .w_full()
+                    .h(editor_height)
+                    .appearance(false)
+                    .bordered(false)
+                    .text_color(theme.foreground),
+            ))
+            // 底部：计划 / 子代理 / 上下文 / Skill / 模型 / 权限 / 附件 / 发送，一整行
+            .child(toolbar);
+
+        composer_root(&theme, self.edge_to_edge, "agent-input-root")
+            .track_focus(&self.focus_handle)
+            .child(card)
+    }
+}
+
 fn referenced_mentions_in_text(text: &str, mentions: &[MentionItem]) -> Vec<MentionItem> {
     mentions
         .iter()
         .filter(|mention| text_contains_mention(text, &mention.label))
         .cloned()
         .collect()
-}
-
-fn themed_outline_button(button: Button, theme: &AgentChatTheme) -> Button {
-    button
-        .bg(theme.panel)
-        .border_color(theme.border)
-        .text_color(theme.foreground)
 }
 
 fn text_contains_mention(text: &str, label: &str) -> bool {
@@ -1892,7 +1658,7 @@ fn plan_item_row(
 
     let mut wrapper = v_flex().w_full().child(row);
     if expanded {
-        wrapper = wrapper.child(plan_item_details(item, muted, cx));
+        wrapper = wrapper.child(plan_item_details(item, &theme));
     }
     wrapper.into_any_element()
 }
@@ -1901,11 +1667,8 @@ fn plan_item_key(index: usize, item: &ComposerPlanItem) -> String {
     format!("{index}:{}:{}", item.title, item.status)
 }
 
-fn plan_item_details(
-    item: ComposerPlanItem,
-    muted: gpui::Hsla,
-    cx: &mut Context<gpui_component::popover::PopoverState>,
-) -> gpui::AnyElement {
+fn plan_item_details(item: ComposerPlanItem, theme: &AgentChatTheme) -> gpui::AnyElement {
+    let muted = theme.muted_foreground;
     let mut details = v_flex()
         .w_full()
         .gap(sp(2.0))
@@ -1913,13 +1676,13 @@ fn plan_item_details(
         .pb_2()
         .pl_7()
         .border_b_1()
-        .border_color(cx.theme().border);
+        .border_color(theme.border);
 
     if !item.description.is_empty() {
         details = details.child(
             div()
                 .text_xs()
-                .text_color(cx.theme().foreground)
+                .text_color(theme.foreground)
                 .child(item.description),
         );
     }
@@ -2722,114 +2485,13 @@ impl Focusable for AgentInput {
     }
 }
 
-impl Render for AgentInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 打开上下文面板时,在 render 时(持有 &mut Window)清空搜索框。
-        if self.context_search_needs_reset {
-            self.context_search_input.update(cx, |state, cx| {
-                state.set_value("", _window, cx);
-            });
-            self.context_search_query = SharedString::default();
-            self.context_search_needs_reset = false;
-        }
-        // 模型下拉换了选项 / 选中项:同一套路,趁手里有窗口时灌进组件库的 state。
-        if self.model_select_dirty {
-            self.sync_model_select(_window, cx);
-            self.model_select_dirty = false;
-        }
-        let context_bar = self.render_context_bar(cx);
-        let attachments = self.render_attachments(cx);
-        let editor_top_bar = self.render_editor_top_bar(cx);
-        let queued_submissions = self.render_queued_submissions(cx);
-        let toolbar = self.render_toolbar(cx);
-        let theme = self.local_theme(cx);
-        let input_state = self.input_state.read(cx);
-        let input_focused = input_state.focus_handle(cx).is_focused(_window);
-        let editor_height = composer_editor_height(input_state);
-        // 拖放悬停时的染色。`drag_over` 的闭包要 `'static`,所以先把颜色取成
-        // 本地副本(Hsla 是 Copy),而不是把 `theme` 移进去——后面还有别的闭包要用。
-        let drop_wash = theme.accent.opacity(0.08);
-        let drop_ring = theme.accent;
-
-        // 输入卡片：带边框的那一块（工作区 / 分支 / 模型 / Worktree / 权限
-        // 与附件、发送按钮同处卡片底部的**同一行**）。
-        let card = v_flex()
-            .debug_selector(|| "agent-input-card".to_string())
-            .w_full()
-            .min_w_0()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .when(!self.edge_to_edge, |this| {
-                this.rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .shadow_sm()
-            })
-            .when(self.edge_to_edge, |this| this.min_h_0())
-            // 从 Finder 拖文件进来:悬停给卡片染一层,松手落成附件或路径。
-            .drag_over::<ExternalPaths>(move |style, _, _, _| {
-                style.bg(drop_wash).border_color(drop_ring)
-            })
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.add_dropped_paths(paths.paths(), window, cx);
-            }))
-            // 顶部：计划 / Agent / 上下文入口
-            .child(context_bar)
-            // 附件预览（如果有）
-            .children(attachments)
-            .child(editor_top_bar)
-            .when_some(queued_submissions, |this, queued| this.child(queued))
-            // 中部：多行输入框
-            .child(
-                div()
-                    .debug_selector(|| "agent-input-editor".to_string())
-                    .w_full()
-                    .min_w_0()
-                    .px_3()
-                    .pt_1()
-                    .max_h(sp(220.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .border_1()
-                            .rounded(cx.theme().radius)
-                            .border_color(if input_focused {
-                                theme.accent
-                            } else {
-                                theme.border
-                            })
-                            .bg(theme.background)
-                            .child(
-                                Editor::new(&self.input_state)
-                                    .w_full()
-                                    .h(editor_height)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .text_color(theme.foreground),
-                            ),
-                    ),
-            )
-            // 底部：附件 / 工作区 / 分支 / 模型 / Worktree / 权限 / 发送，一整行
-            .child(toolbar);
-
-        v_flex()
-            .id("agent-input-root")
-            .debug_selector(|| "agent-input-root".to_string())
-            .track_focus(&self.focus_handle)
-            .w_full()
-            .min_w_0()
-            .when(self.edge_to_edge, |this| this.min_h_0().flex_shrink_0())
-            .when(!self.edge_to_edge, |this| this.flex_shrink_0())
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(card)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::composer_chrome::{
+        ACTION_BUTTON_SIZE, CHIP_MIN_WIDTH, MODEL_MENU_CHROME_WIDTH, MODEL_MENU_MAX_WIDTH,
+        MODEL_MENU_MIN_WIDTH, MODEL_TRIGGER_MAX_WIDTH, estimated_label_width,
+    };
     use crate::input::context::ComposerModel;
     use gpui::{Modifiers, Pixels, TestAppContext, VisualTestContext, size};
 
@@ -3011,9 +2673,9 @@ mod tests {
         let card = cx
             .debug_bounds("agent-input-card")
             .expect("input card should render");
-        let group = cx
-            .debug_bounds("agent-input-context-group")
-            .expect("context group should render");
+        let toolbar = cx
+            .debug_bounds("agent-input-toolbar")
+            .expect("toolbar should render");
         let model = cx
             .debug_bounds("agent-input-model-control")
             .expect("model control should render");
@@ -3046,8 +2708,8 @@ mod tests {
             );
         }
         assert!(
-            group.origin.x + group.size.width <= send.origin.x,
-            "the context group must not overlap the send button: group={group:?}, send={send:?}"
+            toolbar.origin.x + toolbar.size.width <= card.origin.x + card.size.width,
+            "the toolbar must stay inside the input card: toolbar={toolbar:?}, card={card:?}"
         );
     }
 
@@ -3083,7 +2745,7 @@ mod tests {
             "send control must stay inside the card: send={send:?}, card={card:?}"
         );
         assert!(
-            permission.size.width >= px(COMPOSER_CHIP_MIN_WIDTH),
+            permission.size.width >= px(CHIP_MIN_WIDTH),
             "permission chip must not shrink below the readable floor: {permission:?}"
         );
         assert!(
@@ -3116,8 +2778,12 @@ mod tests {
             .debug_bounds("agent-input-send-control")
             .expect("send control should be rendered");
 
-        assert!(model.size.width >= px(150.0));
-        assert!(send.size.width >= px(28.0));
+        assert!(model.size.width > px(0.0));
+        assert_eq!(
+            model.size.height, send.size.height,
+            "model and send chips share one ruler: model={model:?}, send={send:?}"
+        );
+        assert!(send.size.width >= px(24.0));
         assert!(
             model.origin.x + model.size.width <= send.origin.x,
             "model and send controls must not overlap: model={model:?}, send={send:?}"
@@ -3141,8 +2807,8 @@ mod tests {
             .expect("send control should be rendered");
 
         assert!(
-            model.size.width >= px(280.0),
-            "model control should use available toolbar width: model={model:?}"
+            model.size.width <= px(MODEL_TRIGGER_MAX_WIDTH + 1.0),
+            "model chip is content sized, capped at the trigger ceiling: model={model:?}"
         );
         assert_eq!(
             model.size.height, send.size.height,
@@ -3169,7 +2835,6 @@ mod tests {
             .debug_bounds("agent-input-stop")
             .expect("stop control should be rendered");
 
-        assert!(model.size.width >= px(96.0));
         assert!(
             model.origin.x + model.size.width <= queue.origin.x,
             "model and queue controls must not overlap: model={model:?}, queue={queue:?}"
@@ -3177,26 +2842,6 @@ mod tests {
         assert!(
             queue.origin.x + queue.size.width <= stop.origin.x,
             "queue and stop controls must not overlap: queue={queue:?}, stop={stop:?}"
-        );
-    }
-
-    #[test]
-    fn execution_trigger_width_tracks_label_length() {
-        // 中文短标签收窄到下限,给模型选择与操作按钮让出空间。
-        assert_eq!(execution_trigger_width("自动", false), sp(80.0));
-        assert_eq!(execution_trigger_width("只读", false), sp(80.0));
-        // 四字标签按内容展开,仍明显窄于旧的固定 124px。
-        assert_eq!(execution_trigger_width("手动确认", false), sp(100.0));
-        // 英文长标签不突破上限,保留原有的可用宽度。
-        assert_eq!(
-            execution_trigger_width("Manual Confirmation", false),
-            sp(124.0)
-        );
-        // 运行中还要容纳排队与停止两个按钮,上限更低。
-        let running = execution_trigger_width("自动", true);
-        assert!(
-            running.to_pixels(px(14.0)) < px(80.0),
-            "running trigger should stay narrower: {running:?}"
         );
     }
 
@@ -3214,9 +2859,10 @@ mod tests {
             gpui_component::init(cx);
             crate::init(cx);
         });
-        // 底栏只剩模型与权限之后，620px 的默认卡片已经放得下完整触发器；
-        // 要证明兜底还在，得把卡片和窗口一起收窄到 300px。
-        const SQUEEZED: f32 = 300.0;
+        // 参数行要塞下四颗能力 chip、模型、权限、附件与发送键，620px 的默认卡片
+        // 已经放得下完整触发器；要证明「弹层比被挤窄的触发器宽」还在，得把卡片和
+        // 窗口一起收窄到 420px。
+        const SQUEEZED: f32 = 420.0;
         let (_, cx) = cx.add_window_view(|window, cx| {
             AgentInputLayoutRoot::with_composer_context(px(SQUEEZED), window, cx)
         });
@@ -3230,8 +2876,8 @@ mod tests {
             .expect("model control should render");
         // 前置条件:这一行必须真的把触发器挤到下限,否则下面的断言证明不了兜底。
         assert!(
-            trigger.size.width <= px(MODEL_TRIGGER_MIN_WIDTH + 1.0),
-            "模型触发器应被挤到下限: trigger={trigger:?}, min={MODEL_TRIGGER_MIN_WIDTH}"
+            trigger.size.width <= px(MODEL_TRIGGER_MAX_WIDTH + 1.0),
+            "模型 chip 不会超过它的宽度上限: trigger={trigger:?}"
         );
         assert!(
             cx.debug_bounds("agent-model-option").is_none(),
@@ -3258,8 +2904,8 @@ mod tests {
     #[test]
     fn model_menu_stays_wider_than_a_squeezed_trigger() {
         assert!(
-            MODEL_MENU_MIN_WIDTH > MODEL_TRIGGER_MIN_WIDTH,
-            "弹层下限必须大于触发器下限: menu={MODEL_MENU_MIN_WIDTH}, trigger={MODEL_TRIGGER_MIN_WIDTH}"
+            MODEL_MENU_MIN_WIDTH > MODEL_TRIGGER_MAX_WIDTH,
+            "弹层下限必须大于 chip 宽度上限: menu={MODEL_MENU_MIN_WIDTH}, chip={MODEL_TRIGGER_MAX_WIDTH}"
         );
         // ACP agent 报上来的模型名常见就有这么长,弹层下限要能放下整个标签。
         let long = "9Router / deepseek-v3.1-terminus";
@@ -3287,7 +2933,7 @@ mod tests {
         );
     }
 
-    /// 工具栏一行内同时有「附件 + 上下文档位 + 发送」；发送按钮仍是 32x32。
+    /// 工具栏一行内同时有「上下文档位 + 模型 + 权限 + 发送」；发送键仍是正方形。
     #[gpui::test]
     fn toolbar_keeps_action_button_square_and_permission_in_the_same_row(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -3302,11 +2948,8 @@ mod tests {
             .expect("send button should be rendered");
         assert_eq!(
             (send.size.width, send.size.height),
-            (
-                px(TOOLBAR_ACTION_BUTTON_SIZE),
-                px(TOOLBAR_ACTION_BUTTON_SIZE)
-            ),
-            "send button must stay a 32x32 tap target: send={send:?}"
+            (px(ACTION_BUTTON_SIZE), px(ACTION_BUTTON_SIZE)),
+            "send button must stay a square tap target: send={send:?}"
         );
 
         let toolbar = cx
@@ -3327,7 +2970,7 @@ mod tests {
             "permission chip should hug its short label: permission={permission:?}"
         );
         assert!(
-            permission.size.height <= px(TOOLBAR_ACTION_BUTTON_SIZE),
+            permission.size.height <= px(ACTION_BUTTON_SIZE),
             "permission chip must not outgrow the toolbar buttons: permission={permission:?}"
         );
     }
@@ -3347,11 +2990,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} should be rendered"));
             assert_eq!(
                 (bounds.size.width, bounds.size.height),
-                (
-                    px(TOOLBAR_ACTION_BUTTON_SIZE),
-                    px(TOOLBAR_ACTION_BUTTON_SIZE)
-                ),
-                "{id} must stay a 32x32 tap target: {bounds:?}"
+                (px(ACTION_BUTTON_SIZE), px(ACTION_BUTTON_SIZE)),
+                "{id} must stay a square tap target: {bounds:?}"
             );
         }
     }

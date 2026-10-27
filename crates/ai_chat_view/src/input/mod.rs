@@ -4,6 +4,7 @@ mod acp_input;
 mod agent_input;
 mod attachment;
 mod completion;
+pub(crate) mod composer_chrome;
 mod context;
 mod history;
 mod mention;

@@ -85,6 +85,7 @@ use crate::expansion_state::ExpansionState;
 use crate::find_shortcut::{
     AI_CHAT_SEARCH_CONTEXT, FindNextInTranscript, FindPreviousInTranscript, ToggleTranscriptFind,
 };
+use crate::input::composer_chrome::CONTAINER_PADDING_BOTTOM;
 use crate::input::{
     AcpAgentInput, AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption,
     ComposerBranchOption, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
@@ -7898,7 +7899,13 @@ impl Render for AgentChatView {
                         v_flex()
                             .w_full()
                             .min_w_0()
-                            .when(self.sidebar_mode, |this| this.min_h_0().overflow_hidden())
+                            .when(self.sidebar_mode, |this| {
+                                // 侧栏顶到窗口下沿：给输入区底部留一口气，最后一行
+                                // （ACP 的上下文行）不再被窗口边缘切掉。
+                                this.min_h_0()
+                                    .overflow_hidden()
+                                    .pb(sp(CONTAINER_PADDING_BOTTOM))
+                            })
                             .when(!self.sidebar_mode, |this| this.p_3())
                             .child(self.render_composer()),
                     ),
