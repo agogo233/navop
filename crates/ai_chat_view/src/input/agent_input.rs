@@ -317,7 +317,7 @@ impl AgentInput {
         // InputState,二者互不影响)。
         let weak = cx.entity().downgrade();
         let paste_sub = cx.intercept_keystrokes(move |ev, window, cx| {
-            if ev.keystroke.key != "v" || !ev.keystroke.modifiers.secondary() {
+            if ev.keystroke.key != "v" || !ev.keystroke.modifiers.secondary(cx) {
                 return;
             }
             let Some(this) = weak.upgrade() else {

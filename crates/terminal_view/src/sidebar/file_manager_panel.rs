@@ -6055,7 +6055,7 @@ impl FileManagerPanel {
                                                                   cx| {
                                                                 let mode = selection_mode(
                                                                     event.modifiers.shift,
-                                                                    event.modifiers.secondary(),
+                                                                    event.modifiers.secondary(cx),
                                                                 );
                                                                 this.select_row(
                                                                     filtered_ix,

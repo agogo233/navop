@@ -161,7 +161,8 @@ mod tests {
     }
 
     fn key(source: &str) -> Option<RemoteKey> {
-        let keystroke = Keystroke::parse(source).expect("valid test keystroke");
+        let keystroke = Keystroke::parse_with_os(source, gpui::OperatingSystem::Mac)
+            .expect("valid test keystroke");
         keystroke_to_remote_key_for_protocol(&keystroke, RemoteDesktopProtocol::Rdp)
     }
 
@@ -217,7 +218,8 @@ mod tests {
         let key_event_state = state.with_capslock(Capslock { on: false });
         inputs.extend(keyboard_state_inputs(state, key_event_state));
         state = key_event_state;
-        let keystroke = Keystroke::parse(source).expect("valid shifted symbol keystroke");
+        let keystroke = Keystroke::parse_with_os(source, gpui::OperatingSystem::Mac)
+            .expect("valid shifted symbol keystroke");
         let key = keystroke_to_remote_key_for_protocol(&keystroke, RemoteDesktopProtocol::Rdp)
             .expect("mapped RDP symbol");
         assert_eq!(key, RemoteKey::Scancode(expected_scancode));

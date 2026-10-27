@@ -9217,9 +9217,8 @@ mod tests {
     };
     use async_trait::async_trait;
     use gpui::{
-        Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, ScrollDelta,
-        ScrollWheelEvent, Styled, TestAppContext, TouchPhase, VisualTestContext, Window, div,
-        point, px,
+        Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, ScrollDelta, ScrollEvent,
+        Styled, TestAppContext, TouchPhase, VisualTestContext, Window, div, point, px,
     };
     use one_core::llm::{ProviderConfig, ProviderType};
     use serde_json::json;
@@ -10424,11 +10423,12 @@ mod tests {
             .center();
         // 手势要 Started 再 Moved：单独一条 Moved 会被当作续接而忽略。
         for phase in [TouchPhase::Started, TouchPhase::Moved] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(600.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: phase,
+                source: gpui::ScrollSource::default(),
             });
             cx.run_until_parked();
         }
@@ -10452,11 +10452,12 @@ mod tests {
 
         // 滚回底部后：自动恢复跟随。
         for phase in [TouchPhase::Started, TouchPhase::Moved] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(-5000.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: phase,
+                source: gpui::ScrollSource::default(),
             });
             cx.run_until_parked();
         }
@@ -16045,11 +16046,12 @@ mod tests {
         let approve_before_scroll = cx
             .debug_bounds("agent-tool-approve")
             .expect("approval button should render before scrolling");
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: approve_before_scroll.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-280.0))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Moved,
+            source: gpui::ScrollSource::default(),
         });
         cx.run_until_parked();
 

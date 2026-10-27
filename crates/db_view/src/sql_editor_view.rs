@@ -181,9 +181,9 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
     );
     let mut keybindings = current_shortcuts
         .iter()
-        .map(|key| KeyBinding::new(key, RunCurrentQuery, Some(SQL_EDITOR_CONTEXT)))
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, RunCurrentQuery, Some(SQL_EDITOR_CONTEXT), cx))
         .collect::<Vec<_>>();
-    keybindings.push(secondary_enter_binding(&current_shortcuts));
+    keybindings.push(secondary_enter_binding(&current_shortcuts, cx));
     keybindings.extend(
         shortcuts_for(
             cx,
@@ -191,12 +191,12 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &RUN_ALL_QUERY_KEY_BINDINGS,
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, RunAllQuery, Some(SQL_EDITOR_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, RunAllQuery, Some(SQL_EDITOR_CONTEXT), cx)),
     );
     keybindings.extend(
         toggle_line_comment_shortcuts(cx)
             .into_iter()
-            .map(|key| KeyBinding::new(&key, ToggleLineComment, Some(SQL_EDITOR_INPUT_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ToggleLineComment, Some(SQL_EDITOR_INPUT_CONTEXT), cx)),
     );
     keybindings
 }
@@ -227,7 +227,7 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
         Some(SQL_EDITOR_CONTEXT),
         RunCurrentQuery,
     );
-    keybindings.push(secondary_enter_binding(&current_shortcuts));
+    keybindings.push(secondary_enter_binding(&current_shortcuts, cx));
     keybindings.extend(rebind_keybindings(
         cx,
         action_id::SQL_RUN_ALL_QUERY,
@@ -246,15 +246,21 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
     keybindings
 }
 
-fn secondary_enter_binding(current_shortcuts: &[String]) -> KeyBinding {
+fn secondary_enter_binding(current_shortcuts: &[String], cx: &App) -> KeyBinding {
     if should_bind_secondary_enter(current_shortcuts) {
-        KeyBinding::new(
+        one_core::keybindings::load_dynamic_keybinding(
             "secondary-enter",
             RunCurrentQuery,
             Some(SQL_EDITOR_INPUT_CONTEXT),
+            cx,
         )
     } else {
-        KeyBinding::new("secondary-enter", NoAction, Some(SQL_EDITOR_INPUT_CONTEXT))
+        one_core::keybindings::load_dynamic_keybinding(
+            "secondary-enter",
+            NoAction,
+            Some(SQL_EDITOR_INPUT_CONTEXT),
+            cx,
+        )
     }
 }
 
@@ -6562,28 +6568,36 @@ mod tests {
         assert!(RUN_ALL_QUERY_KEY_BINDINGS.contains(&"ctrl-shift-enter"));
     }
 
-    #[test]
-    fn secondary_enter_binding_wins_inside_sql_input_context() {
-        let keymap = Keymap::new(vec![
-            KeyBinding::new(
-                "secondary-enter",
-                input::Enter {
-                    secondary: true,
-                    shift: false,
-                },
-                Some("Input"),
-            ),
-            KeyBinding::new(
-                "secondary-enter",
-                RunCurrentQuery,
-                Some("SqlEditor > Input"),
-            ),
-        ]);
+    #[gpui::test]
+    fn secondary_enter_binding_wins_inside_sql_input_context(cx: &mut gpui::TestAppContext) {
+        // `secondary-` 别名只有 parse_with_os 能解析；这里按 macOS 语义（cmd）构造绑定。
+        let secondary_enter = "cmd-enter";
+        let (input_binding, sql_binding) = cx.read(|cx| {
+            (
+                one_core::keybindings::load_dynamic_keybinding(
+                    secondary_enter,
+                    input::Enter {
+                        secondary: true,
+                        shift: false,
+                    },
+                    Some("Input"),
+                    cx,
+                ),
+                one_core::keybindings::load_dynamic_keybinding(
+                    secondary_enter,
+                    RunCurrentQuery,
+                    Some("SqlEditor > Input"),
+                    cx,
+                ),
+            )
+        });
+        let keymap = Keymap::new(vec![input_binding, sql_binding]);
         let contexts = vec![
             KeyContext::parse(SQL_EDITOR_CONTEXT).expect("valid context"),
             KeyContext::parse("Input").expect("valid context"),
         ];
-        let keystroke = Keystroke::parse("secondary-enter").expect("valid keystroke");
+        let keystroke = Keystroke::parse_with_os(secondary_enter, gpui::OperatingSystem::Mac)
+            .expect("valid keystroke");
         let (bindings, _) = keymap.bindings_for_input(&[keystroke], &contexts);
 
         assert!(

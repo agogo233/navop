@@ -3483,14 +3483,11 @@ mod tests {
 
         // Cmd/Ctrl+hover first: gpui-kit only offers an identifier to the
         // definition provider while the secondary modifier is held.
-        visual.simulate_mouse_move(
-            point,
-            Option::<MouseButton>::None,
-            Modifiers::secondary_key(),
-        );
+        let secondary = visual.read(|cx| Modifiers::secondary_key(cx));
+        visual.simulate_mouse_move(point, Option::<MouseButton>::None, secondary);
         settle(visual);
 
-        visual.simulate_mouse_down(point, MouseButton::Left, Modifiers::secondary_key());
+        visual.simulate_mouse_down(point, MouseButton::Left, visual.read(|cx| Modifiers::secondary_key(cx)));
         settle(visual);
         let tabs = visual.read(|cx| details_tabs(&fixture, cx));
         assert_eq!(1, tabs.len(), "Cmd/Ctrl+click opens the details tab");
@@ -3510,7 +3507,7 @@ mod tests {
         });
 
         // Re-resolving the same object must reuse its tab, not stack a copy.
-        visual.simulate_mouse_down(point, MouseButton::Left, Modifiers::secondary_key());
+        visual.simulate_mouse_down(point, MouseButton::Left, visual.read(|cx| Modifiers::secondary_key(cx)));
         settle(visual);
         visual.read(|cx| {
             assert_eq!(1, details_tabs(&fixture, cx).len(), "details tabs reuse");
@@ -3525,11 +3522,8 @@ mod tests {
 
         // Cmd/Ctrl+hover arms the link, but a plain click must only move the
         // caret - opening details on every click would be unusable.
-        visual.simulate_mouse_move(
-            point,
-            Option::<MouseButton>::None,
-            Modifiers::secondary_key(),
-        );
+        let secondary = visual.read(|cx| Modifiers::secondary_key(cx));
+        visual.simulate_mouse_move(point, Option::<MouseButton>::None, secondary);
         settle(visual);
 
         visual.simulate_click(point, Modifiers::default());

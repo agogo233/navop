@@ -106,7 +106,12 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         &default_back_shortcuts(),
     ) {
         for context in NAVIGATION_CONTEXTS {
-            keybindings.push(KeyBinding::new(&key, NavigateSessionBack, Some(context)));
+            keybindings.push(one_core::keybindings::load_dynamic_keybinding(
+                &key,
+                NavigateSessionBack,
+                Some(context),
+                cx,
+            ));
         }
     }
     for key in shortcuts_for(
@@ -115,7 +120,12 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         &default_forward_shortcuts(),
     ) {
         for context in NAVIGATION_CONTEXTS {
-            keybindings.push(KeyBinding::new(&key, NavigateSessionForward, Some(context)));
+            keybindings.push(one_core::keybindings::load_dynamic_keybinding(
+                &key,
+                NavigateSessionForward,
+                Some(context),
+                cx,
+            ));
         }
     }
     for key in shortcuts_for(
@@ -124,7 +134,12 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         &default_switcher_shortcuts(),
     ) {
         for context in NAVIGATION_CONTEXTS {
-            keybindings.push(KeyBinding::new(&key, ToggleSessionSwitcher, Some(context)));
+            keybindings.push(one_core::keybindings::load_dynamic_keybinding(
+                &key,
+                ToggleSessionSwitcher,
+                Some(context),
+                cx,
+            ));
         }
     }
 

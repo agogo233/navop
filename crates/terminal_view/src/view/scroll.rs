@@ -41,7 +41,7 @@ impl TerminalView {
 
     pub(super) fn handle_scroll(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {

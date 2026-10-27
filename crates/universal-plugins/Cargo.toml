@@ -19,7 +19,6 @@ extension_view.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-shell = { workspace = true, optional = true }
-gpui-component-shell = { workspace = true, optional = true }
 one-core.workspace = true
 resource_view.workspace = true
 rust-i18n.workspace = true
@@ -35,7 +34,7 @@ tempfile = "3"
 
 [features]
 default = []
-shell-plugins = ["dep:gpui-shell", "dep:gpui-component-shell"]
+shell-plugins = ["dep:gpui-shell"]
 
 [lints]
 workspace = true

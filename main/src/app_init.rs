@@ -258,7 +258,7 @@ mod system_hotkey {
     }
 
     pub(crate) fn parse_project_hotkey(spec: &str) -> anyhow::Result<HotKey> {
-        let keystroke = Keystroke::parse(spec)?;
+        let keystroke = Keystroke::parse_with_os(spec, one_core::keybindings::current_os())?;
         let hotkey = keystroke_to_hotkey_string(&keystroke);
         Ok(hotkey.parse::<HotKey>()?)
     }

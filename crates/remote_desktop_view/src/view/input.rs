@@ -223,7 +223,7 @@ impl RemoteDesktopView {
         self.send_input(RemoteDesktopInput::MouseButton { button, pressed });
     }
 
-    pub(super) fn send_scroll(&self, event: &ScrollWheelEvent) {
+    pub(super) fn send_scroll(&self, event: &ScrollEvent) {
         match event.delta {
             ScrollDelta::Lines(delta) => self.send_scroll_delta(delta.x, delta.y, 100.0),
             ScrollDelta::Pixels(delta) => {

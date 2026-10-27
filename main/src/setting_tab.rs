@@ -3318,7 +3318,7 @@ fn shortcut_specs_for_entry(entry: &ShortcutEntry, cx: &App) -> Vec<String> {
 }
 
 fn render_shortcut_value(key_str: &str, cx: &App) -> gpui::AnyElement {
-    match Keystroke::parse(key_str) {
+    match Keystroke::parse_with_os(key_str, one_core::keybindings::current_os()) {
         Ok(keystroke) => Kbd::new(keystroke).into_any_element(),
         Err(_) => div()
             .text_sm()
@@ -3447,7 +3447,7 @@ fn capture_shortcut(
     let is_valid = if system_hotkey {
         is_valid_system_hotkey(&spec)
     } else {
-        Keystroke::parse(&spec).is_ok()
+        Keystroke::parse_with_os(&spec, one_core::keybindings::current_os()).is_ok()
     };
 
     if !is_valid {

@@ -38,7 +38,7 @@ impl NotesShortcutCapture {
         let Some(spec) = shortcut_spec(&event.keystroke) else {
             return;
         };
-        if Keystroke::parse(&spec).is_err() {
+        if Keystroke::parse_with_os(&spec, one_core::keybindings::current_os()).is_err() {
             mark_invalid(&self.state, cx);
             return;
         }

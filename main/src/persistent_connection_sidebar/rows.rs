@@ -418,7 +418,7 @@ impl PersistentConnectionSidebar {
                 if batch_mode {
                     let mode = if event.modifiers().shift {
                         ConnectionSelectionMode::Range
-                    } else if event.modifiers().secondary() {
+                    } else if event.modifiers().secondary(cx) {
                         ConnectionSelectionMode::Toggle
                     } else {
                         ConnectionSelectionMode::Replace

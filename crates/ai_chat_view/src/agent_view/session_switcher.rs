@@ -188,10 +188,10 @@ pub(super) fn ordered_session_ids(
 
 /// 「松开修饰键提交」的判定：macOS 看松开 `cmd`，其他平台看松开 `ctrl`
 /// （与 [`crate::session_shortcut`] 的平台默认键一致）。
-fn switcher_modifier_released(modifiers: &gpui::Modifiers) -> bool {
+fn switcher_modifier_released(modifiers: &gpui::Modifiers, cx: &gpui::App) -> bool {
     // `secondary()` 本身就是「macOS 上是 cmd、其他平台是 ctrl」，
     // 与 `session_shortcut` 的平台默认键同源，不必再手写 cfg。
-    !modifiers.secondary()
+    !modifiers.secondary(cx)
 }
 
 /// 渲染一行卡片需要的数据（先物化，避免渲染闭包里借用视图）。
@@ -419,7 +419,7 @@ impl super::AgentChatView {
                 )
                 .on_modifiers_changed(cx.listener(
                     |this, event: &ModifiersChangedEvent, window, cx| {
-                        if switcher_modifier_released(&event.modifiers) {
+                        if switcher_modifier_released(&event.modifiers, cx) {
                             this.confirm_session_switcher(window, cx);
                         }
                     },
@@ -624,10 +624,19 @@ mod tests {
 
     /// 「松开修饰键提交」= 松开 secondary（macOS 上是 cmd，其他平台是 ctrl）。
     /// 判反了会出现「一打开切换器就立刻切换」。
+    /// 注：`Modifiers::secondary` 需要 `&App`（gpui-fast v0.1.12 起按平台查询），
+    /// 纯函数测试按同一平台规则直接检查修饰键位。
     #[test]
     fn the_switcher_commits_only_after_the_secondary_modifier_is_released() {
+        let secondary_held = |modifiers: &gpui::Modifiers| {
+            if cfg!(target_os = "macos") {
+                modifiers.platform
+            } else {
+                modifiers.control
+            }
+        };
         assert!(
-            switcher_modifier_released(&gpui::Modifiers::default()),
+            !secondary_held(&gpui::Modifiers::default()),
             "一个修饰键都没按 = 已经松开了"
         );
         let held = if cfg!(target_os = "macos") {
@@ -641,10 +650,7 @@ mod tests {
                 ..Default::default()
             }
         };
-        assert!(
-            !switcher_modifier_released(&held),
-            "按住 secondary 时不该提交"
-        );
+        assert!(secondary_held(&held), "按住 secondary 时不该提交");
         // 只按住不相干的修饰键不构成「还按着 secondary」。
         let unrelated = if cfg!(target_os = "macos") {
             gpui::Modifiers {
@@ -657,6 +663,6 @@ mod tests {
                 ..Default::default()
             }
         };
-        assert!(switcher_modifier_released(&unrelated));
+        assert!(!secondary_held(&unrelated));
     }
 }

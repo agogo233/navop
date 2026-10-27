@@ -149,7 +149,9 @@ fn validated_quick_command_shortcut(
 
     shortcut
         .map(|shortcut| {
-            let keystroke = Keystroke::parse(&shortcut).map_err(|_| ())?;
+            let keystroke =
+                Keystroke::parse_with_os(&shortcut, one_core::keybindings::current_os())
+                    .map_err(|_| ())?;
             match capture_quick_command_shortcut(&keystroke) {
                 ShortcutCapture::Shortcut(shortcut) => Ok(shortcut),
                 ShortcutCapture::Clear | ShortcutCapture::Invalid => Err(()),

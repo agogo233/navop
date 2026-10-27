@@ -2048,7 +2048,7 @@ impl Render for FileListPanel {
                                                 move |this, event: &MouseDownEvent, _window, cx| {
                                                     let mode = selection_mode(
                                                         event.modifiers.shift,
-                                                        event.modifiers.secondary(),
+                                                        event.modifiers.secondary(cx),
                                                     );
                                                     this.select_row(filtered_ix, mode);
                                                     cx.notify();

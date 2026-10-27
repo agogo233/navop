@@ -876,7 +876,7 @@ fn terminal_command_bar_keeps_oxideterm_keyboard_and_overlay_contracts() {
     assert!(quick_source.contains("group_quick_commands"));
     assert!(quick_source.contains("bottom(px(self.popover_bottom_offset()))"));
     assert!(quick_source.contains("relative(0.96)"));
-    assert!(!quick_source.contains("on_scroll_wheel"));
+    assert!(!quick_source.contains("on_scroll"));
     assert!(!quick_source.contains("on_mouse_down(MouseButton::Left"));
     assert!(quick_source.contains("on_mouse_down_out"));
     assert!(quick_source.contains("window.defer(cx"));
