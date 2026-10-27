@@ -1,4 +1,4 @@
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, actions};
 
 pub(crate) const MARKDOWN_CONTEXT: &str = "NotesMarkdown";
 
