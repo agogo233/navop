@@ -76,7 +76,7 @@ fn strict_resolution_rejects_missing_or_empty_selected_fields() {
     let manual = ReferencedCredentialFields::default();
     let missing = resolve_credential_reference_strict(manual.clone(), &reference, None)
         .expect_err("missing credential must fail");
-    assert!(missing.to_string().contains("credential 42 was not found"));
+    assert!(missing.to_string().contains("Keychain entry 42 was not found"));
 
     let credential = CredentialEntry::new("Empty");
     let empty = resolve_credential_reference_strict(manual, &reference, Some(&credential))
