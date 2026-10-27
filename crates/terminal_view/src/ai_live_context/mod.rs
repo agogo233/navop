@@ -10,6 +10,7 @@
 mod context;
 
 use agent_runtime::{ResourceRef, ResourceScope};
+use ai_chat_view::ContextAttachment;
 use alacritty_terminal::term::TermMode;
 use terminal::terminal::Terminal;
 
@@ -32,6 +33,10 @@ const SCOPE_CONNECTION: &str = "connection";
 
 /// 选中内容摘要的最大字符数，避免把整段输出塞进提示词。
 const SELECTION_PREVIEW_MAX_CHARS: usize = 120;
+/// 选中正文随消息附送时的字符上限；超出部分截断，让模型按需再读。
+const ATTACHMENT_MAX_CHARS: usize = 8_000;
+/// 包裹选中正文的标签；选中内容里可能含围栏或角括号，用标签界定最稳。
+const ATTACHMENT_TAG: &str = "terminal_selection";
 /// 摘要里代替换行的占位符，保证摘要始终是单行。
 const NEWLINE_PLACEHOLDER: &str = "⏎";
 
@@ -115,6 +120,57 @@ impl TerminalLiveState {
     }
 }
 
+/// 把终端此刻的选中内容包成「随本条用户消息一起发送」的正文。
+///
+/// 只有存在非空选中时才返回；正文用标签包住并在标签上标明来源、行数与是否
+/// 截断，模型既知道自己在看什么，也知道有没有看到全部。标签外的内容仍由
+/// `terminal.read` 按需拉取，这里只带用户明确选中的部分。
+pub(crate) fn selection_attachment(
+    terminal: &Terminal,
+    source_label: &str,
+) -> Option<ContextAttachment> {
+    let selection = terminal.selection_text()?;
+    if selection.trim().is_empty() {
+        return None;
+    }
+    let lines = selection.lines().count().max(1);
+    let (text, truncated) = truncate_chars(&selection, ATTACHMENT_MAX_CHARS);
+    let label = format!("{lines} lines of terminal selection");
+    Some(ContextAttachment::new(
+        label,
+        wrap_selection(text, lines, truncated, source_label),
+    ))
+}
+
+fn wrap_selection(text: &str, lines: usize, truncated: bool, source_label: &str) -> String {
+    format!(
+        "<{ATTACHMENT_TAG} source=\"{source}\" lines=\"{lines}\" truncated=\"{truncated}\">\n{body}\n</{ATTACHMENT_TAG}>",
+        source = sanitize_attribute(source_label),
+        body = text.trim_end(),
+    )
+}
+
+/// 属性值只保留单行安全字符，避免标签被来源名里的引号截断。
+fn sanitize_attribute(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\'' | '<' | '>' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 按字符数截断，返回截断后的切片与是否发生了截断。
+fn truncate_chars(text: &str, max_chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => (&text[..index], true),
+        None => (text, false),
+    }
+}
+
 /// 抓取终端现场并投影成作用域。
 pub(crate) fn live_resource_scopes(terminal: &Terminal) -> Vec<ResourceScope> {
     TerminalLiveState::from_terminal(terminal).scopes()
@@ -143,7 +199,7 @@ fn selection_summary(selection: &str) -> String {
     let lines = selection.lines().count().max(1);
     let chars = selection.chars().count();
     let preview = selection_preview(selection);
-    format!("{lines} lines / {chars} chars: {preview}")
+    format!("{lines} lines / {chars} chars: {preview}; full text is attached to this message")
 }
 
 fn selection_preview(selection: &str) -> String {
@@ -241,8 +297,9 @@ mod tests {
         state.selection = Some("x".repeat(SELECTION_PREVIEW_MAX_CHARS + 50));
 
         let selection = scope_value(&state.scopes(), SCOPE_SELECTION).expect("selection scope");
-        assert!(selection.ends_with('…'));
-        assert!(selection.chars().count() < SELECTION_PREVIEW_MAX_CHARS + 40);
+        assert!(selection.contains('…'));
+        // 预览截断后仍要留出「正文已随消息附送」这句话的位置。
+        assert!(selection.chars().count() < SELECTION_PREVIEW_MAX_CHARS + 90);
     }
 
     #[test]
@@ -273,5 +330,47 @@ mod tests {
             scope_value(&resource.scopes, SCOPE_SCREEN).as_deref(),
             Some("normal shell")
         );
+    }
+
+    #[test]
+    fn selection_summary_points_at_attached_body() {
+        let mut live = state();
+        live.selection = Some("echo one\necho two".to_string());
+
+        let summary = scope_value(&live.scopes(), SCOPE_SELECTION).expect("selection scope");
+
+        assert!(summary.contains("2 lines"), "{summary}");
+        assert!(summary.contains("attached to this message"), "{summary}");
+    }
+
+    #[test]
+    fn wrapped_selection_keeps_metadata_on_the_tag() {
+        let body = wrap_selection("fn main() {}", 3, true, "本地终端 \"demo\"");
+
+        assert!(
+            body.starts_with("<terminal_selection source=\"本地终端  demo\""),
+            "{body}"
+        );
+        assert!(body.contains("lines=\"3\""), "{body}");
+        assert!(body.contains("truncated=\"true\""), "{body}");
+        assert!(body.ends_with("</terminal_selection>"), "{body}");
+    }
+
+    #[test]
+    fn truncation_marks_only_when_over_limit() {
+        assert_eq!(truncate_chars("abc", 4), ("abc", false));
+
+        let (text, truncated) = truncate_chars("abcdef", 3);
+
+        assert_eq!(text, "abc");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn truncation_does_not_split_multibyte_chars() {
+        let (text, truncated) = truncate_chars("中文选区", 2);
+
+        assert_eq!(text, "中文");
+        assert!(truncated);
     }
 }

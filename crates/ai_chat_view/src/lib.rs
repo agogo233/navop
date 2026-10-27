@@ -108,7 +108,8 @@ pub use agent_tool_config::emit_agent_tool_config_changed;
 pub use agent_transcript::AgentTranscript;
 pub use agent_view::{
     AgentChatView, AgentChatViewConfig, AgentChatViewEvent, AgentRuntimeFactory,
-    ComposerContextSnapshot, ComposerContextSource, ResourceContextRefresher,
+    ComposerContextSnapshot, ComposerContextSource, ContextAttachment, ContextAttachmentProvider,
+    ResourceContextRefresher,
 };
 // 工作台外壳也要画同一份 ACP 会话行，所以把行构造器和模型提到 crate 可见。
 pub(crate) use agent_view::acp_sessions::{

@@ -211,6 +211,28 @@ pub type AgentRuntimeFactory =
 pub type ResourceContextRefresher =
     Arc<dyn Fn(&App) -> Option<agent_runtime::ResourceContext> + Send + Sync>;
 
+/// 宿主随本轮用户消息一并送出的正文（如终端选中内容）。
+///
+/// `label` 用于追溯与测试；`body` 会拼在用户输入前面一起发送，因此转录里
+/// 原样可见 —— 用户能回看自己究竟送出了什么，而不是只在后台悄悄附加。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextAttachment {
+    pub label: SharedString,
+    pub body: String,
+}
+
+impl ContextAttachment {
+    pub fn new(label: impl Into<SharedString>, body: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            body: body.into(),
+        }
+    }
+}
+
+/// 发送前抓取「随消息附加正文」的回调；返回 `None` 表示本轮没有附件。
+pub type ContextAttachmentProvider = Arc<dyn Fn(&App) -> Option<ContextAttachment> + Send + Sync>;
+
 const MAX_CACHED_SESSION_TRANSCRIPTS: usize = 32;
 const MAX_RUNTIME_EVENT_BATCH_SIZE: usize = 64;
 
@@ -773,6 +795,21 @@ fn current_agent_task_title() -> String {
     t!("AgentUi.current_agent_task").to_string()
 }
 
+/// 把上下文附件拼到用户输入前面。
+///
+/// 附件正文为空（或只有空白）时原样返回用户输入，避免消息里出现空块；标题
+/// 由宿主写进 `body`，这里不额外加标记，好让发送后的转录与模型看到的完全一致。
+fn compose_prompt_with_attachment(text: &str, attachment: Option<&ContextAttachment>) -> String {
+    let Some(attachment) = attachment else {
+        return text.to_string();
+    };
+    let body = attachment.body.trim_end();
+    if body.is_empty() {
+        return text.to_string();
+    }
+    format!("{body}\n\n{text}")
+}
+
 fn persistence_title_from_input(text: &str) -> String {
     const MAX_TITLE_CHARS: usize = 40;
 
@@ -1267,6 +1304,7 @@ pub struct AgentChatView {
     resources: ResourceContext,
     /// 每轮发送前重建资源上下文的回调（侧边栏用它注入终端等实时状态）。
     resource_context_refresher: Option<ResourceContextRefresher>,
+    context_attachment_provider: Option<ContextAttachmentProvider>,
     available_resources: Vec<ResourceRef>,
     transcript: AgentTranscript,
     input: Entity<AgentInput>,
@@ -1806,6 +1844,7 @@ impl AgentChatView {
             session_id,
             resources,
             resource_context_refresher: None,
+            context_attachment_provider: None,
             available_resources,
             transcript,
             input,
@@ -3477,6 +3516,8 @@ impl AgentChatView {
             }
         };
         self.refresh_resources_before_turn(&session, cx);
+        let attachment = self.context_attachment(cx);
+        let prompt = compose_prompt_with_attachment(&submission.text, attachment.as_ref());
         let mut resources = session.resources();
         if apply_mentioned_resources(
             &mut resources,
@@ -3489,12 +3530,7 @@ impl AgentChatView {
                 self.sync_resource_targets(cx);
             }
         }
-        self.push_user_to_session(
-            session_uid,
-            submission.text.as_str(),
-            &submission.images,
-            &resources,
-        );
+        self.push_user_to_session(session_uid, prompt.as_str(), &submission.images, &resources);
         self.upsert_live_summary(
             session_uid.to_string(),
             persistence_title_from_input(&submission.text),
@@ -3504,7 +3540,7 @@ impl AgentChatView {
         if session_uid == self.current_session.as_str() {
             self.request_scroll_to_bottom();
         }
-        let input = UserInput::new(submission.text.clone()).with_images(input_images);
+        let input = UserInput::new(prompt.clone()).with_images(input_images);
         let operation_generation = self.next_local_operation_generation(session_uid);
         self.set_session_running(session_uid, true, cx);
         self.runtime
@@ -6725,6 +6761,23 @@ impl AgentChatView {
     ) {
         self.resource_context_refresher = refresher;
         cx.notify();
+    }
+
+    /// 设置「随消息附加正文」的回调（回调返回 `Some` 时正文拼在本轮输入前面）。
+    pub fn set_context_attachment_provider(
+        &mut self,
+        provider: Option<ContextAttachmentProvider>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_attachment_provider = provider;
+        cx.notify();
+    }
+
+    /// 本轮要附加的正文；没有回调或回调返回空正文时为 `None`。
+    fn context_attachment(&self, cx: &App) -> Option<ContextAttachment> {
+        self.context_attachment_provider
+            .as_ref()
+            .and_then(|provider| provider(cx))
     }
 
     /// 发送前重建资源上下文，让本轮 prompt 带上资源的最新状态。
@@ -19378,5 +19431,32 @@ mod acp_probe_hosting_tests {
             !region.contains("crate::acp::probe_agent("),
             "不要在 GPUI foreground future 里直接 await 异步探测"
         );
+    }
+
+    #[test]
+    fn context_attachment_is_prepended_to_user_text() {
+        use crate::agent_view::{ContextAttachment, compose_prompt_with_attachment};
+
+        let attachment =
+            ContextAttachment::new("选中", "<terminal_selection>\nls\n</terminal_selection>");
+
+        let prompt = compose_prompt_with_attachment("这个目录有什么", Some(&attachment));
+
+        assert_eq!(
+            prompt,
+            "<terminal_selection>\nls\n</terminal_selection>\n\n这个目录有什么"
+        );
+    }
+
+    #[test]
+    fn blank_context_attachment_keeps_user_text_verbatim() {
+        use crate::agent_view::{ContextAttachment, compose_prompt_with_attachment};
+
+        let attachment = ContextAttachment::new("空", "   \n");
+
+        let prompt = compose_prompt_with_attachment("hi", Some(&attachment));
+
+        assert_eq!(prompt, "hi");
+        assert_eq!(compose_prompt_with_attachment("hi", None), "hi");
     }
 }

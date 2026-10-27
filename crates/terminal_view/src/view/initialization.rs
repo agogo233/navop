@@ -136,6 +136,8 @@ impl TerminalView {
         // 连接的资源 id，让刷新器把活动终端挂到连接旁边（默认目标不变）。
         if let Some(resource) = terminal_ai_resource {
             let current_connection = sidebar.read(cx).ai_connection_resource();
+            // 附件正文里要写明来源，资源被移交前先留一份标签。
+            let source_label = resource.label.clone();
             let refresher = crate::sidebar::live_terminal_resource_refresher(
                 terminal.clone(),
                 resource,
@@ -143,6 +145,14 @@ impl TerminalView {
             );
             sidebar.update(cx, |sidebar, cx| {
                 sidebar.set_ai_resource_context_refresher(refresher, cx);
+            });
+            // 用户选中的正文随下一轮消息一起发送，模型不用再猜「选了什么」。
+            let attachment = crate::sidebar::live_terminal_context_attachment_provider(
+                terminal.clone(),
+                source_label,
+            );
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_ai_context_attachment_provider(attachment, cx);
             });
         }
         let sidebar_toolbar = cx.new(|_| TerminalSidebarToolbar::new(sidebar.clone()));

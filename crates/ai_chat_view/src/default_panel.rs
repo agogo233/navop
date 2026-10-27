@@ -128,6 +128,7 @@ pub struct DefaultAgentChatPanel {
     pending_resource_catalog: Option<(Vec<MentionItem>, Vec<agent_runtime::ResourceRef>)>,
     /// 每轮发送前重建资源上下文的回调（侧边栏用它注入终端等实时状态）。
     resource_context_refresher: Option<crate::ResourceContextRefresher>,
+    context_attachment_provider: Option<crate::ContextAttachmentProvider>,
     pending_code_block_actions: Vec<CodeBlockAction>,
     pending_sidebar_shown: bool,
     connection_subscription: Option<Subscription>,
@@ -289,6 +290,7 @@ impl DefaultAgentChatPanel {
             )),
             pending_resource_catalog: None,
             resource_context_refresher: None,
+            context_attachment_provider: None,
             pending_code_block_actions: Vec::new(),
             pending_sidebar_shown: false,
             connection_subscription: None,
@@ -541,6 +543,20 @@ impl DefaultAgentChatPanel {
         if let Some(view) = &self.view {
             view.update(cx, |view, cx| {
                 view.set_resource_context_refresher(refresher, cx);
+            });
+        }
+    }
+
+    /// 设置「随消息附加正文」的回调（如终端选中内容）。
+    pub fn set_context_attachment_provider(
+        &mut self,
+        provider: Option<crate::ContextAttachmentProvider>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_attachment_provider = provider.clone();
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_context_attachment_provider(provider, cx);
             });
         }
     }
@@ -984,6 +1000,11 @@ impl DefaultAgentChatPanel {
                             if let Some(refresher) = panel.resource_context_refresher.clone() {
                                 view.update(cx, |view, cx| {
                                     view.set_resource_context_refresher(Some(refresher), cx);
+                                });
+                            }
+                            if let Some(provider) = panel.context_attachment_provider.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_context_attachment_provider(Some(provider), cx);
                                 });
                             }
                             panel.view = Some(view);

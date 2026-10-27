@@ -266,6 +266,23 @@ pub(crate) fn live_terminal_resource_refresher(
     })
 }
 
+/// 构造「终端选中内容随消息发送」的回调。
+///
+/// 与资源刷新回调分开：刷新回调决定模型「看到什么现场」，这个回调决定用户
+/// 明确选中的正文「送进这一轮消息」。选区为空时不附加，消息与用户输入
+/// 逐字一致，不会平白多出空块。
+pub(crate) fn live_terminal_context_attachment_provider(
+    terminal: Entity<crate::Terminal>,
+    source_label: String,
+) -> ai_chat_view::ContextAttachmentProvider {
+    let terminal = terminal.downgrade();
+    Arc::new(move |cx: &App| {
+        let terminal = terminal.upgrade()?;
+        let terminal_ref = terminal.read(cx);
+        crate::ai_live_context::selection_attachment(terminal_ref, &source_label)
+    })
+}
+
 fn terminal_ai_connection_catalog(
     current_connection: &StoredConnection,
     all_connections: &[StoredConnection],
@@ -884,6 +901,17 @@ impl TerminalSidebar {
     ) {
         self.ai_chat_panel.update(cx, |panel, cx| {
             panel.set_resource_context_refresher(Some(refresher), cx);
+        });
+    }
+
+    /// 接入「选中正文随消息发送」，AI 面板建好之前也能设置。
+    pub(crate) fn set_ai_context_attachment_provider(
+        &mut self,
+        provider: ai_chat_view::ContextAttachmentProvider,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_chat_panel.update(cx, |panel, cx| {
+            panel.set_context_attachment_provider(Some(provider), cx);
         });
     }
 

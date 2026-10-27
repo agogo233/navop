@@ -103,19 +103,37 @@ SSH 终端不抢默认目标，是因为连接级工具（`sftp.*`、`ssh.exec`�
 有了这三项，模型「读一次」就能判断该按 esc 还是该输入命令，而不是把 vim 界面当
 shell 输出继续分析。
 
+### 2.6 意图层：选中正文随消息发送
+
+状态层只说「选中了 12 行」，正文本身由 `ContextAttachment` 通道送进这一轮消息：
+
+- **宿主提供正文**：`AgentChatView::set_context_attachment_provider` 接收
+  `Fn(&App) -> Option<ContextAttachment>`；终端侧边栏在初始化时接上
+  `live_terminal_context_attachment_provider`，每次发送前读一次终端选区。
+- **拼在用户输入前面**：`compose_prompt_with_attachment` 把正文块放在用户问题之上
+  （空正文原样返回）。发送后的转录里能看到同一份正文，用户回看时知道自己送出了什么。
+- **标签界定**：正文用 `<terminal_selection source=… lines=… truncated=…>` 包住，
+  选中内容里含代码围栏或角括号也不会串行；超过 8000 字截断并标 `truncated="true"`，
+  剩下的部分交给 `terminal.read`。
+- **与作用域配合**：`selection` 作用域追加 `full text is attached to this message`，
+  模型知道正文就在消息里，不用再调工具。
+- **只作用于本地内置会话**：ACP 会话有自己的输入通道，不经过这里。
+
 ## 3. 不做什么
 
 - **不把整屏塞进 prompt**：40 行约 600–800 token/轮，还会随对话历史反复发送。
 - **不写「每轮必须读屏」的硬规则**：多一轮工具调用（3–5s 延迟），且模型会读没用的内容；
   有了 `screen` / `process` 作用域，它自己判断该不该读。
 - **不把状态放进用户消息**：会污染历史。资源池每轮重建、不落历史，天然 ephemeral。
+- **不把选中正文放进资源作用域**：作用域每个 step 都会重发，长正文会反复计费；
+  摘要进作用域、正文随消息发一次。
 - **不在数据库/Redis/Mongo 侧边栏先行接入**：它们没有「屏幕现场」概念，等有明确需求再复用
   同一个 `ResourceContextRefresher`。
 
 ## 4. 验证
 
-- `cargo test -p terminal_view ai_live_context`：投影/摘要/替换/`describe()`/SSH 接线共 12 条单测。
-- `cargo test -p ai_chat_view`：454 条既有测试通过（资源池、提及、会话切换无回归）。
+- `cargo test -p terminal_view ai_live_context`：投影/摘要/替换/`describe()`/SSH 接线/附件包装共 16 条单测。
+- `cargo test -p ai_chat_view`：943 条既有测试 + 2 条附件拼接测试通过（资源池、提及、会话切换无回归）。
 - `cargo clippy -p terminal_view -p ai_chat_view --all-targets`：新增代码无告警。
 - `cargo test -p terminal`: `recent_text_tracks_alt_screen_mode`、
   `recent_text_reports_selection_and_display_offset` 覆盖全屏/选中/回滚现场。
@@ -130,5 +148,8 @@ shell 输出继续分析。
   精确到秒、每个 step 都在变，前缀缓存当前并未生效；若要修复缓存，应把时间与资源池一起
   挪到消息尾部，而不是单独处理资源池。
 - **选中内容时效**：只在发送瞬间抓取；发送后用户继续选中不会影响本轮。
+- **选区不清空就重复发送**：选区在发送后仍留在终端里，下一次提问会再附带一次。要做到
+  「发送即清空」，需要给 provider 可写的上下文（当前签名是只读 `Fn(&App)`）或让侧边栏
+  订阅发送事件后清选区，等有实际抱怨再改。
 - **状态读取有锁**：`mode()` / `selection_text()` 需要 `FairMutex`，与解析线程争锁的临界区
   很短，尚未观察到发送卡顿；如遇大量输出导致卡顿，可改为非阻塞尝试并回退到上一次的状态。
