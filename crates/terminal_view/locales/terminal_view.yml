@@ -2892,3 +2892,18 @@ File:
     en: "File actions"
     zh-CN: "文件操作"
     zh-HK: "文件操作"
+
+# 侧栏 composer 的上下文行：工作区目录选择、worktree 创建失败的提示。
+# `t!` 只查调用方 crate 的语言包，不能指望 workspace_explorer / main 里那两份。
+WorkspaceExplorer:
+  frame:
+    choose_root:
+      en: "Choose Workspace Folder"
+      zh-CN: "选择工作区目录"
+      zh-HK: "選擇工作區資料夾"
+
+Home:
+  worktree_create_failed:
+    en: "Could not create the Git worktree, message not sent: %{error}"
+    zh-CN: "Git worktree 创建失败，消息未发送：%{error}"
+    zh-HK: "Git worktree 建立失敗，訊息未傳送：%{error}"
