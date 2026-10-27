@@ -7,6 +7,7 @@
 //! - 文件管理器面板（仅 SSH 终端）
 
 mod broadcast_input_panel;
+mod composer_context;
 pub mod file_manager_panel;
 mod history_command_panel;
 mod quick_command_panel;
@@ -1111,6 +1112,16 @@ impl TerminalSidebar {
         } else {
             cx.new(|cx| DefaultAgentChatPanel::new(window, cx))
         };
+
+        // 终端侧栏拿不到 AI 工作台那份宿主数据源（它长在 `WorkbenchShell` 上），
+        // 不注入的话底栏只剩一颗空的「选择工作区」，分支与 Worktree 永远不出现。
+        // 这里按当前工作区自己算一份，口径与工作台一致。
+        let composer_context_source =
+            composer_context::composer_context_source(ai_chat_panel.downgrade(), cx);
+        ai_chat_panel.update(cx, |panel, cx| {
+            panel.set_composer_context_source(composer_context_source, cx);
+            panel.set_workspace_root(composer_context::current_workspace_root(cx), cx);
+        });
 
         // 仅 SSH 终端（有 StoredConnection）时创建文件管理器面板
         let file_manager_panel =
