@@ -148,6 +148,20 @@ impl TurnProjection<'_> {
         self.live
     }
 
+    /// 「当前段」在 [`Self::process`] 里的起点。
+    ///
+    /// 一段 = 上一次助手叙事正文之后的过程项（推理、工具、状态）。过程区是按段
+    /// 推进的：用户正在读的是最后这一段，所以只有这一段里的推理默认保持展开；
+    /// 更早的段落随折叠头一起收起 —— 既不是整轮不收（长轮次会把屏幕撑满），
+    /// 也不是每步都收（那会一直闪）。
+    pub fn live_tail_start(&self) -> usize {
+        self.process
+            .iter()
+            .rposition(|message| is_answer_candidate(message))
+            .map(|position| position + 1)
+            .unwrap_or(0)
+    }
+
     /// 这一轮里是否已经有一条**还在跑**的状态消息（例如「OpenCode 正在继续响应…」）。
     ///
     /// 那条消息本身就是「本轮仍在进行」的指示，且比页脚的「进行中」具体 ——
@@ -432,6 +446,11 @@ fn build_turn<'a>(
         .unwrap_or_default();
     let outcome = turn_id.as_deref().and_then(|id| timings.outcome(id));
 
+    // 消息此刻都没在流式，不等于这一轮结束了：工具执行完、等下一段推理的那段
+    // 空档里没有 live 消息，但终态事件也还没到。只看消息会让过程区在每个空档
+    // 收起一次、下一步又展开 —— 用户看到的就是「一直闪」。有时间表时以它为准。
+    let running = timing.started_at.is_some() && timing.finished_at.is_none() && outcome.is_none();
+
     TurnProjection {
         key,
         turn_id,
@@ -441,7 +460,7 @@ fn build_turn<'a>(
         process,
         answer,
         risks,
-        live,
+        live: live || running,
     }
 }
 
@@ -658,6 +677,62 @@ mod tests {
         assert!(turns[0].default_process_expanded());
     }
 
+    /// 终态事件没到 = 这一轮还在跑：消息此刻都不在流式也不该把过程区收起来。
+    ///
+    /// 「工具返回 → 等下一段推理」的空档里没有任何 live 消息，只看消息会让过程区
+    /// 每个空档收起一次、下一步再展开 —— 用户看到的就是一直闪。
+    #[test]
+    fn a_turn_without_terminal_event_stays_live_between_steps() {
+        let messages = vec![user("Q1", "t1"), tool_card("c1", "fs.read", Some(true))];
+
+        let mut timings = TurnTimings::new();
+        timings.note_started("t1", 100);
+        let turns = project_turns(&messages, &timings);
+        assert!(turns[0].live, "已开始、未收尾的轮次算还在跑");
+        assert!(turns[0].default_process_expanded());
+
+        timings.note_finished("t1", 160);
+        timings.note_outcome("t1", TurnOutcome::Completed);
+        let turns = project_turns(&messages, &timings);
+        assert!(!turns[0].live);
+        assert!(!turns[0].default_process_expanded());
+    }
+
+    /// 分段：当前段是「最后一次助手叙事正文之后」的过程项，之前的算历史段。
+    #[test]
+    fn the_live_tail_starts_after_the_last_narrative_text() {
+        let mut streaming = assistant("正在整理结论", "t1");
+        streaming.is_streaming = true;
+        let messages = vec![
+            user("Q1", "t1"),
+            tool_card("c1", "fs.read", Some(true)),
+            assistant("先看一眼目录", "t1"),
+            tool_card("c2", "fs.grep", Some(true)),
+            streaming,
+        ];
+
+        let turns = project_turns(&messages, &TurnTimings::new());
+
+        assert_eq!(3, turns[0].process.len(), "叙事正文+两张工具卡");
+        assert_eq!(
+            2,
+            turns[0].live_tail_start(),
+            "当前段从叙事正文之后的那张工具卡开始"
+        );
+    }
+
+    #[test]
+    fn a_turn_without_narrative_has_a_single_segment() {
+        let messages = vec![
+            user("Q1", "t1"),
+            tool_card("c1", "fs.read", Some(true)),
+            tool_card("c2", "fs.grep", Some(true)),
+        ];
+
+        let turns = project_turns(&messages, &TurnTimings::new());
+
+        assert_eq!(0, turns[0].live_tail_start(), "没有分段线就是一段到底");
+    }
     #[test]
     fn an_unfinished_status_message_keeps_process_expanded() {
         let messages = vec![user("Q1", "t1"), ChatMessageUI::status("思考中", false)];
