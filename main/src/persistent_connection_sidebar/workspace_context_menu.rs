@@ -1,9 +1,13 @@
 use gpui::{Entity, Window};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use one_assets::IconName;
+use one_core::storage::Workspace;
 use rust_i18n::t;
 
 use super::PersistentConnectionSidebar;
+use super::connection_context_menu::{
+    MoveTargetLabels, MoveTargetNode, move_target_menu_excluding,
+};
 use crate::home::home_workspace_filter::{WorkspaceDialogConfig, show_workspace_dialog};
 
 impl PersistentConnectionSidebar {
@@ -31,8 +35,12 @@ impl PersistentConnectionSidebar {
         let new_home = home.clone();
         let rename_home = home.clone();
         let delete_home = home.clone();
+        // 重命名条目会消费掉 `workspace`，移动子菜单要用克隆的那份。
+        let move_workspace = workspace.clone();
+        let move_home = home.clone();
 
-        menu.item(new_child_item(child_home, workspace_id, sort_order))
+        let menu = menu
+            .item(new_child_item(child_home, workspace_id, sort_order))
             .item(new_connection_item(new_home, workspace_id))
             .separator()
             .item(
@@ -58,19 +66,156 @@ impl PersistentConnectionSidebar {
                             cx,
                         );
                     }),
-            )
-            .item(
-                PopupMenuItem::new(t!("Workspace.delete").to_string())
-                    .icon(IconName::Remove)
-                    .on_click(move |_, window, cx| {
-                        delete_home.update(cx, |home, cx| {
-                            home.delete_workspace(workspace_id, window, cx);
-                        });
-                    }),
-            )
-            .separator()
-            .item(refresh_item(home))
+            );
+        let menu = append_move_to_parent_submenu(menu, &move_home, &move_workspace, window, cx);
+        menu.item(
+            PopupMenuItem::new(t!("Workspace.delete").to_string())
+                .icon(IconName::Remove)
+                .on_click(move |_, window, cx| {
+                    delete_home.update(cx, |home, cx| {
+                        home.delete_workspace(workspace_id, window, cx);
+                    });
+                }),
+        )
+        .separator()
+        .item(refresh_item(home))
     }
+}
+
+/// 分组右键菜单里的「移动到」：把分组（连同它的子树）挂到另一个分组下面，
+/// 或者移回顶层。
+///
+/// 没有这个入口时，子分组一旦建出来就再也回不到根级——编辑对话框把
+/// `parent_id: None` 当作「不修改父级」（`parent_id.or(ws.parent_id)`），
+/// 所以「移回顶层」必须有独立的一次写入。
+fn append_move_to_parent_submenu(
+    menu: PopupMenu,
+    home: &Entity<crate::home_tab::HomePage>,
+    workspace: &Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<PopupMenu>,
+) -> PopupMenu {
+    let workspace_id = workspace.id.unwrap_or_default();
+    let workspaces = home.read(cx).workspaces.clone();
+    // 目标里不能出现自己和自己的子孙，否则一定成环。
+    let excluded = home.read(cx).workspace_subtree_ids(workspace_id);
+    let root_label = t!("Workspace.move_target_root").to_string();
+    let root_group_label = t!("Connection.move_target_root_group").to_string();
+    let targets = move_target_menu_excluding(
+        &workspaces,
+        MoveTargetLabels {
+            unassigned: &root_label,
+            root_group: &root_group_label,
+        },
+        &excluded,
+    );
+    let current_parent = workspace.parent_id;
+    let home_for_submenu = home.clone();
+    menu.submenu_with_icon(
+        Some(IconName::Folder.into()),
+        t!("Workspace.move_to_parent").to_string(),
+        window,
+        cx,
+        move |submenu, window, cx| {
+            let submenu = if targets.needs_hint() {
+                submenu.label(
+                    t!("Workspace.move_target_hint", count = targets.group_count).to_string(),
+                )
+            } else {
+                submenu
+            };
+            append_workspace_move_targets(
+                submenu,
+                targets.entries.clone(),
+                &home_for_submenu,
+                workspace_id,
+                current_parent,
+                window,
+                cx,
+            )
+        },
+    )
+}
+
+/// 按层级把纯逻辑条目渲染进菜单；含子分组的条目展开成子菜单。
+fn append_workspace_move_targets(
+    mut menu: PopupMenu,
+    nodes: Vec<MoveTargetNode>,
+    home: &Entity<crate::home_tab::HomePage>,
+    workspace_id: i64,
+    current_parent: Option<i64>,
+    window: &mut Window,
+    cx: &mut gpui::Context<PopupMenu>,
+) -> PopupMenu {
+    for node in nodes {
+        let MoveTargetNode {
+            label,
+            workspace_id: target_parent,
+            children,
+        } = node;
+        if children.is_empty() {
+            menu = workspace_move_target_item(
+                menu,
+                home,
+                workspace_id,
+                target_parent,
+                current_parent,
+                label,
+                window,
+            );
+            continue;
+        }
+        let home_for_submenu = home.clone();
+        menu = menu.submenu_with_icon(
+            Some(IconName::Folder.into()),
+            label,
+            window,
+            cx,
+            move |submenu, window, cx| {
+                // 父分组本身也要能作为目标。
+                let submenu = workspace_move_target_item(
+                    submenu,
+                    &home_for_submenu,
+                    workspace_id,
+                    target_parent,
+                    current_parent,
+                    t!("Workspace.move_to_this_group").to_string(),
+                    window,
+                );
+                let submenu = submenu.separator();
+                append_workspace_move_targets(
+                    submenu,
+                    children.clone(),
+                    &home_for_submenu,
+                    workspace_id,
+                    current_parent,
+                    window,
+                    cx,
+                )
+            },
+        );
+    }
+    menu
+}
+
+fn workspace_move_target_item(
+    menu: PopupMenu,
+    home: &Entity<crate::home_tab::HomePage>,
+    workspace_id: i64,
+    parent_id: Option<i64>,
+    current_parent: Option<i64>,
+    label: String,
+    window: &mut Window,
+) -> PopupMenu {
+    let home = home.clone();
+    menu.item(
+        PopupMenuItem::new(label)
+            .checked(parent_id == current_parent)
+            .disabled(parent_id == current_parent)
+            .on_click(window.listener_for(&home, move |home, _, _, cx| {
+                home.move_workspace_to_parent(workspace_id, parent_id, cx);
+            })),
+    )
 }
 
 fn new_child_item(

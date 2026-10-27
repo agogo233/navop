@@ -1903,6 +1903,22 @@ Workspace:
     en: Delete Group
     zh-CN: 删除分组
     zh-HK: 刪除分組
+  move_to_parent:
+    en: Move to
+    zh-CN: 移动到
+    zh-HK: 移動到
+  move_target_root:
+    en: Top Level (no group)
+    zh-CN: 顶层（不放进任何分组）
+    zh-HK: 頂層（不放入任何分組）
+  move_to_this_group:
+    en: Move into This Group
+    zh-CN: 移到此分组
+    zh-HK: 移到此分組
+  move_target_hint:
+    en: "%{count} groups, expanded by hierarchy"
+    zh-CN: "共 %{count} 个分组，按层级展开"
+    zh-HK: "共 %{count} 個分組，按層級展開"
   delete_confirm:
     en: "Are you sure you want to delete group \"%{workspace_name}\"?"
     zh-CN: "确定要删除分组 \"%{workspace_name}\" 吗？"
