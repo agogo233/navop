@@ -128,7 +128,12 @@ pub(crate) fn build_connection_tree_rows(
             builder.append_workspace(workspace.id, 0);
         }
     }
-    append_unassigned_connections(connections, &mut builder.rows, sections);
+    append_unassigned_connections(
+        connections,
+        &builder.workspace_by_id,
+        &mut builder.rows,
+        sections,
+    );
     // “分组”标题固定在最近连接区之后、第一个分组之前：把实际渲染的分组
     // （已被折叠/空分组过滤影响）数量作为计数，没有分组时不出空标题。
     let group_count = builder
@@ -290,12 +295,20 @@ impl TreeBuilder<'_> {
 
 fn append_unassigned_connections(
     connections: &[ConnectionNodeInput],
+    workspace_by_id: &HashMap<i64, &WorkspaceNodeInput>,
     rows: &mut Vec<ConnectionTreeRow>,
     sections: TreeSectionOptions,
 ) {
+    // 除了真正的「未分组」，分组已经不在列表里的连接也归到这里：它们既不属于
+    // 任何现存分组，又不会出现在下面的分组行里，否则会从侧栏里彻底消失
+    // （分组被别处删除、同步中分组尚未落地时都能碰到）。
     let unassigned = connections
         .iter()
-        .filter(|connection| connection.workspace_id.is_none())
+        .filter(|connection| {
+            connection
+                .workspace_id
+                .is_none_or(|workspace_id| !workspace_by_id.contains_key(&workspace_id))
+        })
         .collect::<Vec<_>>();
     if unassigned.is_empty() {
         return;
@@ -477,6 +490,39 @@ mod tests {
             Some(ConnectionTreeRow::UnassignedHeader {
                 count: 2,
                 expanded: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn connection_pointing_at_a_missing_workspace_falls_back_to_unassigned() {
+        // 分组已被删掉（或同步中尚未落地）时，连接既不在任何分组行里，
+        // 也曾经不算「未分组」⇒ 会从侧栏彻底消失，这类连接必须落到未分组区。
+        let rows = build_connection_tree_rows(
+            &[workspace(1, None, "Root")],
+            &[
+                connection(10, Some(1), "Workspace connection"),
+                connection(20, Some(99), "Orphan connection"),
+            ],
+            &HashSet::new(),
+            sectioned(false, true, true),
+        );
+
+        assert_eq!(
+            vec![
+                ("workspace", 0),
+                ("connection", 1),
+                ("unassigned-header", 0),
+                ("connection", 0),
+            ],
+            row_shape(&rows)
+        );
+        assert!(matches!(
+            rows.last(),
+            Some(ConnectionTreeRow::Connection {
+                id: 20,
+                workspace_id: None,
+                ..
             })
         ));
     }

@@ -180,6 +180,8 @@ impl HomePage {
         query: &str,
         cx: &App,
     ) -> Vec<(Option<i64>, String, Vec<StoredConnection>)> {
+        let known_workspace_ids: HashSet<i64> =
+            self.workspaces.iter().filter_map(|ws| ws.id).collect();
         let mut groups: Vec<_> = self
             .workspaces
             .iter()
@@ -191,23 +193,30 @@ impl HomePage {
             })
             .map(|ws| (ws.id, ws.name.clone(), Vec::new()))
             .collect();
-        if self.filtered_workspace_ids.is_empty() {
-            groups.push((
-                None,
-                t!("Home.unassigned_workspace").to_string(),
-                Vec::new(),
-            ));
+        // 「未分组」不受分组过滤影响：它不对应任何分组，过滤掉它就等于让没有分组的
+        // 连接（尤其是刚在过滤状态下新建的那些）从首页凭空消失，而侧栏仍在显示。
+        groups.push((
+            None,
+            t!("Home.unassigned_workspace").to_string(),
+            Vec::new(),
+        ));
+        for connection in &self.connections {
+            if !(self.match_connection_type(connection) && self.match_connection(connection, query))
+            {
+                continue;
+            }
+            let Some(bucket) = crate::home_tab::connection_grouping::connection_bucket(
+                connection.workspace_id,
+                &known_workspace_ids,
+                &self.filtered_workspace_ids,
+            ) else {
+                continue;
+            };
+            if let Some((_, _, connections)) = groups.iter_mut().find(|(id, _, _)| *id == bucket) {
+                connections.push(connection.clone());
+            }
         }
-        for (id, _, connections) in &mut groups {
-            *connections = self
-                .connections
-                .iter()
-                .filter(|conn| conn.workspace_id == *id)
-                .filter(|conn| {
-                    self.match_connection_type(conn) && self.match_connection(conn, query)
-                })
-                .cloned()
-                .collect();
+        for (_, _, connections) in &mut groups {
             crate::connection_sort::sort_connections(
                 connections,
                 AppSettings::global(cx).connection_sort_order,

@@ -111,3 +111,66 @@ impl HomePage {
             })
     }
 }
+
+/// 首页列表里一条连接应该落在哪个分组桶里。
+///
+/// 返回 `None` 表示当前分组过滤把它隐藏了；返回 `Some(None)` 表示「未分组」桶。
+/// 分组已被删除（或本地暂时缺失）的连接一律并进「未分组」桶：它们既不属于任何
+/// 现存分组，又不会出现在任何分组标题下，否则会从首页彻底消失。
+pub(crate) fn connection_bucket(
+    workspace_id: Option<i64>,
+    known_workspace_ids: &HashSet<i64>,
+    filtered_workspace_ids: &HashSet<i64>,
+) -> Option<Option<i64>> {
+    match workspace_id {
+        Some(workspace_id) if !known_workspace_ids.contains(&workspace_id) => Some(None),
+        Some(workspace_id)
+            if filtered_workspace_ids.is_empty()
+                || filtered_workspace_ids.contains(&workspace_id) =>
+        {
+            Some(Some(workspace_id))
+        }
+        Some(_) => None,
+        None => Some(None),
+    }
+}
+
+#[cfg(test)]
+mod connection_bucket_tests {
+    use super::*;
+
+    fn ids(values: &[i64]) -> HashSet<i64> {
+        values.iter().copied().collect()
+    }
+
+    #[test]
+    fn ungrouped_connections_stay_visible_under_a_group_filter() {
+        // 过滤只挑分组，不能把「未分组」一起过滤掉：否则在过滤状态下新建的连接
+        // 会从首页消失（侧栏却还在显示）。
+        assert_eq!(
+            Some(None),
+            connection_bucket(None, &ids(&[1, 2]), &ids(&[1]))
+        );
+    }
+
+    #[test]
+    fn connections_of_filtered_out_groups_are_hidden() {
+        assert_eq!(None, connection_bucket(Some(2), &ids(&[1, 2]), &ids(&[1])));
+        assert_eq!(
+            Some(Some(1)),
+            connection_bucket(Some(1), &ids(&[1, 2]), &ids(&[1]))
+        );
+    }
+
+    #[test]
+    fn connections_of_deleted_groups_fall_back_to_unassigned() {
+        assert_eq!(
+            Some(None),
+            connection_bucket(Some(9), &ids(&[1, 2]), &ids(&[]))
+        );
+        assert_eq!(
+            Some(None),
+            connection_bucket(Some(9), &ids(&[1, 2]), &ids(&[1]))
+        );
+    }
+}
