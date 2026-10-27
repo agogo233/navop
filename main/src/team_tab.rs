@@ -22,6 +22,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
+    scroll::ScrollableElement as _,
     v_flex,
 };
 use one_assets::IconName;
@@ -458,47 +459,57 @@ impl Render for TeamTab {
         let entity = cx.entity();
         let (team_count, missing_key_count) = team_key_summary(&teams);
 
+        // 左栏宽度固定，标题、统计与操作按钮各占一行：单行塞不下「新建团队 + 刷新团队列表」，
+        // 溢出部分会被右侧详情面板盖住（只露出半截按钮）。
         let left = v_flex()
             .w(px(264.0))
             .h_full()
+            .min_h_0()
             .flex_shrink_0()
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                h_flex()
+                v_flex()
                     .w_full()
-                    .items_center()
-                    .justify_between()
                     .gap_2()
                     .p_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        v_flex()
-                            .gap_0p5()
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(t!("TeamManagement.title").to_string()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(cx.theme().muted_foreground)
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(t!("TeamManagement.title").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        t!(
-                                            "TeamManagement.status_summary",
-                                            teams = team_count,
-                                            missing = missing_key_count
-                                        )
-                                        .to_string(),
-                                    ),
+                                t!(
+                                    "TeamManagement.status_summary",
+                                    teams = team_count,
+                                    missing = missing_key_count
+                                )
+                                .to_string(),
                             ),
                     )
                     .child(
                         h_flex()
+                            .w_full()
+                            .min_w_0()
                             .items_center()
+                            .flex_wrap()
                             .gap_2()
                             .when(GlobalCloudUser::get_user(cx).is_some(), |this| {
                                 let entity = entity.clone();
@@ -529,41 +540,55 @@ impl Render for TeamTab {
                             ),
                     ),
             )
+            // 滚动条必须挂在真正的滚动容器上：外层 flex 项只负责限高 + 裁切。
             .child(
                 div()
                     .id("team-tab-list")
+                    .w_full()
                     .flex_1()
-                    .overflow_y_scroll()
-                    .p_2()
-                    .child(self.render_team_list(&teams, cx)),
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .size_full()
+                            .overflow_y_scrollbar()
+                            .p_2()
+                            .child(self.render_team_list(&teams, cx)),
+                    ),
             );
 
         let right = v_flex()
-            .id("team-tab-detail")
             .flex_1()
             .h_full()
             .min_w_0()
-            .overflow_y_scroll()
-            .child(match selected_team.as_ref() {
-                Some(team) => self.render_team_detail(team, cx),
-                None => v_flex()
-                    .w_full()
-                    .p_6()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(t!("TeamManagement.no_teams").to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t!("TeamManagement.no_teams_hint").to_string()),
-                    )
-                    .into_any_element(),
-            });
+            .min_h_0()
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .id("team-tab-detail")
+                    .size_full()
+                    .overflow_y_scrollbar()
+                    .child(match selected_team.as_ref() {
+                        Some(team) => self.render_team_detail(team, cx),
+                        None => v_flex()
+                            .w_full()
+                            .p_6()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(t!("TeamManagement.no_teams").to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(t!("TeamManagement.no_teams_hint").to_string()),
+                            )
+                            .into_any_element(),
+                    }),
+            );
 
         h_flex().size_full().child(left).child(right)
     }
@@ -616,8 +641,10 @@ fn profile_meta_row(label: String, value: String, cx: &App) -> AnyElement {
 /// 角色徽标：owner / admin / member 三档。
 fn team_role_badge(role: Option<&str>, cx: &App) -> AnyElement {
     let label = team_role_label(role);
+    // accent 是表面色（用作背景/强调填充），拿它当文字色在浅色主题下几乎看不清，
+    // 所以 owner 用 primary，admin 用 info。
     let color = match role {
-        Some("owner") => cx.theme().accent,
+        Some("owner") => cx.theme().primary,
         Some("admin") => cx.theme().info,
         _ => cx.theme().muted_foreground,
     };
@@ -681,10 +708,12 @@ fn render_member_row(
                 .gap_0p5()
                 .child(
                     h_flex()
+                        .min_w_0()
                         .items_center()
                         .gap_2()
                         .child(
                             div()
+                                .min_w_0()
                                 .text_sm()
                                 .overflow_hidden()
                                 .text_ellipsis()
@@ -694,8 +723,9 @@ fn render_member_row(
                         .when(is_current_user, |this| {
                             this.child(
                                 div()
+                                    .flex_shrink_0()
                                     .text_xs()
-                                    .text_color(cx.theme().accent)
+                                    .text_color(cx.theme().primary)
                                     .child(t!("TeamManagement.member_you").to_string()),
                             )
                         }),
@@ -762,39 +792,25 @@ fn render_member_row(
 }
 
 /// 团队密钥管理区：状态徽标 + 保存本机密钥 / 轮换 / 移除。
+/// 刷新入口只在左栏顶部保留一个，这里不再重复放按钮。
 fn render_team_key_management_section(team: &TeamOption, cx: &mut App) -> AnyElement {
     card(cx)
         .child(
-            h_flex()
+            v_flex()
                 .w_full()
-                .items_start()
-                .justify_between()
-                .gap_3()
+                .min_w_0()
+                .gap_1()
                 .child(
-                    v_flex()
-                        .min_w_0()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(t!("TeamSync.manage_keys").to_string()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(t!("TeamSync.page_desc").to_string()),
-                        ),
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t!("TeamSync.manage_keys").to_string()),
                 )
                 .child(
-                    Button::new("team-key-refresh")
-                        .icon(IconName::Refresh)
-                        .label(t!("TeamSync.refresh_teams").to_string())
-                        .small()
-                        .on_click(|_, window, cx| {
-                            refresh_team_key_cache(window, cx);
-                        }),
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("TeamSync.page_desc").to_string()),
                 ),
         )
         .child(render_team_key_row(team, cx))
@@ -863,6 +879,8 @@ fn render_team_key_row(team: &TeamOption, cx: &mut App) -> AnyElement {
                 )
                 .child(
                     h_flex()
+                        .justify_end()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             Button::new(format!("team-key-save-{}", team.id))
@@ -2210,6 +2228,56 @@ mod tests {
             .expect("密钥区");
         let member_ix = detail.find("render_member_section").expect("成员区");
         assert!(profile_ix < key_ix && key_ix < member_ix);
+    }
+
+    /// 左栏团队列表和右栏详情都必须能滚动：外层 flex 项只负责限高裁切，
+    /// 滚动条挂在真正的滚动容器上，而且要用 overflow_y_scrollbar ——
+    /// overflow_y_scroll 不画滚动条，内容超高时用户根本看不出还能滚。
+    #[test]
+    fn team_tab_scroll_regions_keep_visible_scrollbars() {
+        let source = implementation_source();
+
+        let left = source
+            .split("let left = v_flex()")
+            .nth(1)
+            .expect("左栏存在")
+            .split("let right = v_flex()")
+            .next()
+            .expect("左栏有结尾");
+        assert!(left.contains(".id(\"team-tab-list\")"));
+        assert!(left.contains(".min_h_0()"));
+        assert!(left.contains(".overflow_y_scrollbar()"));
+        assert!(!left.contains(".overflow_y_scroll()"));
+        // 264px 的左栏塞不下「标题 + 统计 + 新建/刷新」单行排布，
+        // 按钮行必须换行，否则会被右侧详情面板盖掉半截。
+        assert!(left.contains(".flex_wrap()"));
+
+        let right = source
+            .split("let right = v_flex()")
+            .nth(1)
+            .expect("右栏存在")
+            .split("h_flex().size_full().child(left).child(right)")
+            .next()
+            .expect("右栏有结尾");
+        assert!(right.contains(".id(\"team-tab-detail\")"));
+        assert!(right.contains(".min_h_0()"));
+        assert!(right.contains(".overflow_y_scrollbar()"));
+        assert!(!right.contains(".overflow_y_scroll()"));
+    }
+
+    /// accent 是表面色，当文字色在浅色主题下几乎看不见；owner 徽标必须用 primary。
+    #[test]
+    fn team_role_badge_uses_a_readable_owner_color() {
+        let source = implementation_source();
+        let badge = source
+            .split("fn team_role_badge(")
+            .nth(1)
+            .expect("角色徽标存在")
+            .split("fn membership_notice(")
+            .next()
+            .expect("角色徽标有结尾");
+        assert!(badge.contains("Some(\"owner\") => cx.theme().primary"));
+        assert!(!badge.contains("Some(\"owner\") => cx.theme().accent"));
     }
 
     #[test]

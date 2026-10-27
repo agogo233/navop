@@ -1411,9 +1411,9 @@ TeamSync:
     zh-CN: 暂无已缓存团队。创建或加入团队后，请刷新团队列表。
     zh-HK: 暫無已快取團隊。建立或加入團隊後，請重新整理團隊列表。
   page_desc:
-    en: Manage local keys for each team you joined or administer. Team keys are encrypted and stored only on this device.
-    zh-CN: 管理你加入或管理的各个团队的本地密钥。团队密钥只会加密保存在本机。
-    zh-HK: 管理你加入或管理的各個團隊的本地密鑰。團隊密鑰只會加密保存在本機。
+    en: The team key encrypts this team's shared connections and is stored encrypted only on this device.
+    zh-CN: 团队密钥用于加密该团队的共享连接，只会在本机加密保存。
+    zh-HK: 團隊密鑰用於加密該團隊的共享連接，只會在本機加密保存。
   empty_title:
     en: No cached teams
     zh-CN: 暂无已缓存团队
