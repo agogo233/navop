@@ -33,6 +33,7 @@ use one_core::settings::{AppSettings, installed_grid_monospace_font};
 use one_core::storage::DatabaseType;
 use one_ui::edit_table::{
     CellEditor, Column, ColumnSort, EditTableDelegate, EditTableEvent, EditTableState,
+    TableSelection,
     filter_panel::{FilterValue, FilterValueKey},
     tsv::parse_tsv_rows,
 };
@@ -272,6 +273,19 @@ fn normalize_sort_identifier(identifier: &str) -> String {
     };
 
     unquoted.to_ascii_lowercase()
+}
+
+/// 右键菜单「删除记录...」实际要删除的显示行号（issue #458）。
+///
+/// 右键点落在选区内时整批删除选中的行，否则只删右键那一行：右键本身不改选区
+/// （见 `EditTableState::on_row_right_click`），所以点在选区外必须按单行处理，
+/// 不能把用户没在看着的那片选区一起删掉。
+fn context_delete_row_indices(selection: &TableSelection, clicked_row: usize) -> Vec<usize> {
+    if selection.contains_row(clicked_row) {
+        selection.selected_rows()
+    } else {
+        vec![clicked_row]
+    }
 }
 
 impl Clone for EditorTableDelegate {
@@ -2327,7 +2341,12 @@ impl EditTableDelegate for EditorTableDelegate {
                     let table = table_delete.clone();
                     move |_, window, cx| {
                         table.update(cx, |state, cx| {
-                            state.delete_row(row_ix, window, cx);
+                            let row_indices = context_delete_row_indices(state.selection(), row_ix);
+                            if row_indices.len() > 1 {
+                                state.delete_rows(&row_indices, window, cx);
+                            } else {
+                                state.delete_row(row_ix, window, cx);
+                            }
                         });
                     }
                 }),
@@ -3772,12 +3791,13 @@ mod tests {
     use super::{
         EditorTableDelegate, RowStatus, VerticalCellValue, VerticalRowField, binary_cell_copy_text,
         binary_cell_image_format, binary_download_file_name, binary_edit_values_equal,
-        header_comment_line, normalize_sort_identifier, parse_primary_order_by_clause,
+        context_delete_row_indices, header_comment_line, normalize_sort_identifier,
+        parse_primary_order_by_clause,
     };
     use db::{ColumnInfo, FieldType, TableCellValue, binary_value::parse_binary_input};
     use gpui::SharedString;
     use one_core::storage::DatabaseType;
-    use one_ui::edit_table::{Column, ColumnSort, FilterValueKey};
+    use one_ui::edit_table::{Column, ColumnSort, FilterValueKey, TableSelection};
     use std::collections::{HashMap, HashSet};
 
     fn test_delegate(rows: Vec<Vec<Option<String>>>) -> EditorTableDelegate {
@@ -4518,6 +4538,57 @@ mod tests {
         assert_eq!(2, delegate.filtered_row_count());
         assert_eq!(Some(1), delegate.resolve_display_row(0));
         assert_eq!(Some(3), delegate.resolve_display_row(1));
+    }
+
+    /// 回归：多选后右键「删除记录...」必须删掉整批选中的行（issue #458）。
+    ///
+    /// 旧实现无论选区多大都只把右键那一行交给 `delete_row`，用户看到的是“选中 3 行、
+    /// 保存后只删掉 1 行”。右键本身不改选区，所以点在选区内时必须整批删除。
+    #[test]
+    fn context_menu_deletes_every_selected_row_when_clicked_inside_selection() {
+        let mut delegate = test_delegate(vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+            vec![Some("4".to_string())],
+        ]);
+        let mut selection = TableSelection::new();
+        selection.select_row(1, 0, 0);
+        selection.extend_row_to(3, 0, 0);
+
+        // 右键落在选区中间那一行上。
+        let row_indices = context_delete_row_indices(&selection, 2);
+        assert_eq!(vec![1, 2, 3], row_indices);
+        delegate.delete_rows_at_display_indices(&row_indices);
+
+        assert_eq!(
+            HashSet::from([1, 2, 3]),
+            delegate.deleted_original_rows,
+            "选中的 3 行都要进待删除集合"
+        );
+        assert!(
+            !delegate.row_status.contains_key(&0),
+            "选区外的第 0 行不能删"
+        );
+    }
+
+    /// 右键点在选区外时只删右键行，不能把用户没在看着的选区一起删掉。
+    #[test]
+    fn context_menu_deletes_only_the_clicked_row_when_outside_selection() {
+        let mut selection = TableSelection::new();
+        selection.select_row(1, 0, 0);
+        selection.extend_row_to(3, 0, 0);
+
+        assert_eq!(vec![0], context_delete_row_indices(&selection, 0));
+        assert_eq!(vec![5], context_delete_row_indices(&selection, 5));
+    }
+
+    /// 没有选区（行选中模式）时右键删除仍然只作用于右键那一行。
+    #[test]
+    fn context_menu_deletes_the_clicked_row_without_selection() {
+        let selection = TableSelection::new();
+
+        assert_eq!(vec![2], context_delete_row_indices(&selection, 2));
     }
 
     /// 反向换算与正向换算必须互为逆运算。
