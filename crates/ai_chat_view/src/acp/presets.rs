@@ -120,6 +120,32 @@ const PRESETS: &[BuiltinAcpAgentPreset] = &[
         command: "goose",
         args: &["acp"],
     },
+    BuiltinAcpAgentPreset {
+        id: "dsh-acp",
+        name: "DeepSeek Harness",
+        // `dsh <profile>` 启动的是 profile 里的 app，`acp` 档位跑的就是 ACP server。
+        command: "dsh",
+        args: &["acp"],
+    },
+    BuiltinAcpAgentPreset {
+        id: "pi-acp",
+        name: "Pi",
+        command: "npm",
+        args: &["exec", "--yes", "--", "pi-acp@0.0.34"],
+    },
+    BuiltinAcpAgentPreset {
+        id: "cline-acp",
+        name: "Cline",
+        command: "npm",
+        args: &[
+            "exec",
+            "--yes",
+            "--package=cline@3.0.74",
+            "--",
+            "cline",
+            "--acp",
+        ],
+    },
 ];
 
 /// 按 id 找预设。
@@ -168,7 +194,14 @@ mod tests {
 
     #[test]
     fn npm_backed_presets_pin_the_package_explicitly() {
-        for id in ["claude-acp", "codex-acp", "qwen-acp", "copilot-acp"] {
+        for id in [
+            "claude-acp",
+            "codex-acp",
+            "qwen-acp",
+            "copilot-acp",
+            "pi-acp",
+            "cline-acp",
+        ] {
             let preset = builtin_acp_agent_preset(id).expect(id);
             assert_eq!("npm", preset.command, "{id}");
             let config = preset.config();
@@ -177,9 +210,20 @@ mod tests {
             assert!(args.contains(&"exec".to_string()), "{id}");
             // 两种写法都固定了包名与版本：`-- pkg@ver` 或 `--package=pkg@ver -- bin`。
             let pinned = args.iter().any(|arg| {
-                arg.starts_with("--package=") || (arg.starts_with('@') && arg.contains('@'))
+                arg.starts_with("--package=") || (arg.contains('@') && !arg.starts_with('-'))
             });
             assert!(pinned, "npm presets must pin the package: {id}");
         }
+    }
+
+    #[test]
+    fn dsh_preset_boots_the_acp_profile() {
+        let preset = builtin_acp_agent_preset("dsh-acp").expect("dsh preset");
+        let config = preset.config();
+
+        assert_eq!("DeepSeek Harness", config.name.as_ref());
+        let crate::acp::AcpTransport::Stdio { command, args, .. } = &config.transport;
+        assert_eq!("dsh", command);
+        assert_eq!(&vec!["acp".to_string()], args);
     }
 }
