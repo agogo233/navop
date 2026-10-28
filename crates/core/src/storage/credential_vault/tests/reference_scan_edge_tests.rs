@@ -367,3 +367,132 @@ fn delete_checked_rejects_cross_device_cloud_id_tunnel_reference() {
             .count()
     );
 }
+
+fn insert_raw_connection(
+    connection: &crate::storage::connection::SqliteConnection,
+    name: &str,
+    connection_type: &str,
+    params: &str,
+) -> i64 {
+    connection
+        .with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO connections (name, connection_type, params, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, 1)",
+                rusqlite::params![name, connection_type, params],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .expect("insert raw connection")
+}
+
+#[test]
+fn unrecognized_connection_type_does_not_block_credential_deletion() {
+    // 未来版本写入、损坏或跨版本导入的类型不能把「删除任意凭据」变成永久失败。
+    let (temp, connection, repository) = repositories();
+    let credential_id = insert_credential(&repository);
+    insert_raw_connection(&connection, "Future", "Extention", "{}");
+
+    let outcome = repository
+        .credential_repository()
+        .delete_checked(credential_id)
+        .expect("unknown type must not fail the scan");
+    assert_eq!(
+        crate::storage::DeleteCredentialOutcome::Deleted,
+        outcome,
+        "{temp:?}"
+    );
+}
+
+#[test]
+fn known_connection_types_in_database_do_not_block_unrelated_deletion() {
+    // 回归：Ftp 与 Extension 曾从扫描器的类型白名单里漏掉，
+    // 库里只要有一条这类连接，删除任何凭据都会报
+    // "Unknown connection type ... while scanning credentials"。
+    let (_temp, connection, repository) = repositories();
+    let credential_id = insert_credential(&repository);
+    insert_raw_connection(
+        &connection,
+        "Plain FTP",
+        "Ftp",
+        r#"{"host":"ftp.example.com","port":21,"username":"u","password":"p"}"#,
+    );
+    insert_raw_connection(
+        &connection,
+        "Extension",
+        "Extension",
+        r#"{"schema_version":1,"extension_id":"com.example.demo","contribution_id":"demo","config":{},"secrets":{}}"#,
+    );
+
+    let outcome = repository
+        .credential_repository()
+        .delete_checked(credential_id)
+        .expect("known types must scan cleanly");
+    assert_eq!(crate::storage::DeleteCredentialOutcome::Deleted, outcome);
+}
+
+#[test]
+fn ftp_primary_reference_is_scanned() {
+    let (_temp, connection, repository) = repositories();
+    let credential_id = insert_credential(&repository);
+    let params = format!(
+        r#"{{"host":"ftp.example.com","port":21,"username":"u","password":"p",
+            "credential_reference":{{"credential_id":{credential_id},"username":true,"password":true}}}}"#
+    );
+    let connection_id = insert_raw_connection(&connection, "FTP", "Ftp", &params);
+
+    let hits = repository
+        .credential_repository()
+        .referencing_connections(credential_id)
+        .expect("scan FTP references");
+
+    assert_eq!(1, hits.len());
+    assert_eq!(connection_id, hits[0].connection_id);
+    assert_eq!(ConnectionType::Ftp, hits[0].connection_type);
+    assert_eq!(CredentialReferenceLocation::Primary, hits[0].location);
+}
+
+#[test]
+fn extension_nested_and_flat_references_are_scanned() {
+    let (_temp, connection, repository) = repositories();
+    let credential_id = insert_credential(&repository);
+    let nested = format!(
+        r#"{{"schema_version":1,"extension_id":"com.example.demo","contribution_id":"demo",
+            "config":{{"auth":{{"credential_reference":{{"credential_id":{credential_id},"username":true,"password":true}}}}}},
+            "secrets":{{}}}}"#
+    );
+    let flat = format!(
+        r#"{{"schema_version":1,"extension_id":"com.navop.middleware.mqtt","contribution_id":"mqtt",
+            "config":{{"host":"broker","port":1883,
+                "credential_reference":{{"credential_id":{credential_id},"username":true,"password":true}}}},
+            "secrets":{{}}}}"#
+    );
+    let nested_id = insert_raw_connection(&connection, "Nested", "Extension", &nested);
+    let flat_id = insert_raw_connection(&connection, "Flat", "Extension", &flat);
+
+    let hits = repository
+        .credential_repository()
+        .referencing_connections(credential_id)
+        .expect("scan Extension references");
+
+    assert_eq!(2, hits.len(), "{hits:?}");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.connection_id)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(std::collections::HashSet::from([nested_id, flat_id]), ids);
+}
+
+#[test]
+fn malformed_extension_params_do_not_block_deletion() {
+    // 扩展记录的 schema 不合法时不能让删除重新失败，只跳过它的引用信息。
+    let (_temp, connection, repository) = repositories();
+    let credential_id = insert_credential(&repository);
+    insert_raw_connection(&connection, "Broken", "Extension", r#"{"config":[]}"#);
+
+    let outcome = repository
+        .credential_repository()
+        .delete_checked(credential_id)
+        .expect("malformed extension params must not fail the scan");
+    assert_eq!(crate::storage::DeleteCredentialOutcome::Deleted, outcome);
+}

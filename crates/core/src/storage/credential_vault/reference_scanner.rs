@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, TransactionBehavior};
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::storage::{
-    ConnectionType, CredentialReference, DbConnectionConfig, MongoDBParams, RedisParams,
-    RemoteDesktopParams, RemoteFileProtocol, SshParams, TelnetParams,
+    ConnectionType, CredentialReference, DbConnectionConfig, FtpParams, MongoDBParams, MqttParams,
+    RedisParams, RemoteDesktopParams, RemoteFileProtocol, SshParams, TelnetParams,
 };
 
 use super::tunnel_reference_scanner::append_tunnel_hits;
@@ -119,32 +121,50 @@ fn load_connections(connection: &rusqlite::Connection) -> Result<Vec<ScannedConn
             row.get::<_, String>("params")?,
         ))
     })?;
-    rows.map(|row| {
-        let (id, name, connection_type, params) = row?;
-        Ok(ScannedConnection {
+    rows.filter_map(|row| {
+        let (id, name, raw_connection_type, params) = match row {
+            Ok(row) => row,
+            Err(error) => return Some(Err(error.into())),
+        };
+        let Some(connection_type) = parse_connection_type(&raw_connection_type) else {
+            // 未知类型（未来版本写入、损坏或跨版本导入）不应让删除任意凭据
+            // 永远失败；跳过该行，仅失去它自身的引用信息。
+            tracing::warn!(
+                "跳过连接 {id}（{name}）：无法识别的连接类型 {raw_connection_type}，不参与凭据引用扫描"
+            );
+            return None;
+        };
+        Some(Ok(ScannedConnection {
             id,
             name,
-            connection_type: parse_connection_type(&connection_type)?,
+            connection_type,
             params,
-        })
+        }))
     })
     .collect()
 }
 
-fn parse_connection_type(value: &str) -> Result<ConnectionType> {
-    match value {
-        "Database" => Ok(ConnectionType::Database),
-        "SshSftp" => Ok(ConnectionType::SshSftp),
-        "Redis" => Ok(ConnectionType::Redis),
-        "MongoDB" => Ok(ConnectionType::MongoDB),
-        "Mqtt" => Ok(ConnectionType::Mqtt),
-        "Serial" => Ok(ConnectionType::Serial),
-        "Telnet" => Ok(ConnectionType::Telnet),
-        "PortForwarding" => Ok(ConnectionType::PortForwarding),
-        "Rdp" => Ok(ConnectionType::Rdp),
-        "Vnc" => Ok(ConnectionType::Vnc),
-        _ => bail!("Unknown connection type {value} while scanning credentials"),
-    }
+/// 解析落库的 `connection_type`，无法识别时返回 `None`。
+///
+/// 这张表必须与 [`ConnectionType`] 的 Display 输出保持同步：漏掉任何一个
+/// 变体，只要库里存在该类型的连接，删除「任意」凭据都会整体失败，因此
+/// 调用方按「跳过并告警」处理，而不是让整个扫描失败。
+fn parse_connection_type(value: &str) -> Option<ConnectionType> {
+    Some(match value {
+        "Database" => ConnectionType::Database,
+        "SshSftp" => ConnectionType::SshSftp,
+        "Ftp" => ConnectionType::Ftp,
+        "Redis" => ConnectionType::Redis,
+        "MongoDB" => ConnectionType::MongoDB,
+        "Mqtt" => ConnectionType::Mqtt,
+        "Serial" => ConnectionType::Serial,
+        "Telnet" => ConnectionType::Telnet,
+        "PortForwarding" => ConnectionType::PortForwarding,
+        "Rdp" => ConnectionType::Rdp,
+        "Vnc" => ConnectionType::Vnc,
+        "Extension" => ConnectionType::Extension,
+        _ => return None,
+    })
 }
 
 fn append_direct_hits(
@@ -181,12 +201,15 @@ fn direct_locations(
     let locations = match connection.connection_type {
         ConnectionType::SshSftp => ssh_locations(connection, identity)?,
         ConnectionType::Database => database_locations(connection, identity)?,
+        ConnectionType::Ftp => ftp_locations(connection, identity)?,
         ConnectionType::Redis => redis_locations(connection, identity)?,
         ConnectionType::MongoDB => mongodb_locations(connection, identity)?,
+        ConnectionType::Mqtt => mqtt_locations(connection, identity)?,
         ConnectionType::Telnet => telnet_locations(connection, identity)?,
         ConnectionType::Rdp | ConnectionType::Vnc => {
             remote_desktop_locations(connection, identity)?
         }
+        ConnectionType::Extension => extension_locations(connection, identity)?,
         _ => Vec::new(),
     };
     Ok(locations)
@@ -317,6 +340,65 @@ fn remote_desktop_locations(
             .and_then(|proxy| proxy.credential_reference.as_ref()),
         identity,
     ))
+}
+
+fn ftp_locations(
+    connection: &ScannedConnection,
+    identity: &CredentialIdentity,
+) -> Result<Vec<CredentialReferenceLocation>> {
+    let params: FtpParams = parse_params(connection)?;
+    Ok(matching_locations(
+        [(
+            CredentialReferenceLocation::Primary,
+            params.credential_reference.as_ref(),
+        )],
+        identity,
+    ))
+}
+
+fn mqtt_locations(
+    connection: &ScannedConnection,
+    identity: &CredentialIdentity,
+) -> Result<Vec<CredentialReferenceLocation>> {
+    let params: MqttParams = parse_params(connection)?;
+    Ok(matching_locations(
+        [(
+            CredentialReferenceLocation::Primary,
+            params.credential_reference.as_ref(),
+        )],
+        identity,
+    ))
+}
+
+fn extension_locations(
+    connection: &ScannedConnection,
+    identity: &CredentialIdentity,
+) -> Result<Vec<CredentialReferenceLocation>> {
+    // 扩展连接的凭据引用有两种落点：
+    // - `config[<field>].credential_reference`：运行时按 auth 字段解析；
+    // - `config.credential_reference`：旧 MQTT 迁移惰性保留的扁平引用，运行时
+    //   不解析，但仍是用户选过的钥匙串，删除前同样要提示。
+    // 这里不调用 `ExtensionConnectionParams::validate`：它校验 schema 与
+    // secrets/config 键冲突，坏记录会让删除重新变成永久失败。
+    let params: Value = parse_params(connection)?;
+    let Some(config) = params.get("config").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let nested = config
+        .values()
+        .filter_map(|value| value.as_object())
+        .filter_map(|object| object.get("credential_reference"));
+    let direct = config.get("credential_reference").into_iter();
+    let mut locations = Vec::new();
+    for reference in direct.chain(nested) {
+        let Ok(reference) = CredentialReference::deserialize(reference) else {
+            continue;
+        };
+        if reference_matches(&reference, identity) {
+            locations.push(CredentialReferenceLocation::Primary);
+        }
+    }
+    Ok(locations)
 }
 
 fn primary_and_proxy_locations(
