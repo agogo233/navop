@@ -101,6 +101,12 @@ mod tests {
     }
 
     /// `spawn_detached` 必须先返回（调用线程不阻塞），子进程随后照常跑完。
+    ///
+    /// 标记文件预先创建为子进程的 stdout：让子进程直接 `echo done` 写进去，
+    /// 而不是把路径嵌进 `cmd /C "echo done > \"路径\""` —— std 的 Windows 参数
+    /// 转义会把整条命令再包一层引号并转义内层引号，cmd /C 的去引号规则会把
+    /// 重定向目标剥成 `\C:\...\` 语法错（CI 实测 "filename, directory name,
+    /// or volume label syntax is incorrect"，标记文件永远不出现）。
     #[test]
     fn spawn_detached_runs_child_without_blocking_caller() {
         let marker = std::env::temp_dir().join(format!(
@@ -112,16 +118,25 @@ mod tests {
                 .unwrap_or_default()
         ));
         let _ = std::fs::remove_file(&marker);
+        let marker_file = std::fs::File::create(&marker).expect("create marker file");
+        let marker_len = std::fs::metadata(&marker)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        assert_eq!(0, marker_len, "标记文件必须是空文件，测试前提才成立");
 
         #[cfg(windows)]
-        let (program, flag) = ("cmd", "/C");
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.arg("/C").arg("echo done");
+            command
+        };
         #[cfg(not(windows))]
-        let (program, flag) = ("/bin/sh", "-c");
-
-        let mut command = std::process::Command::new(program);
-        command
-            .arg(flag)
-            .arg(format!("echo done > \"{}\"", marker.display()));
+        let mut command = {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.arg("-c").arg("echo done");
+            command
+        };
+        command.stdout(marker_file);
 
         spawn_detached(command, "test-marker").expect("thread should start");
 
