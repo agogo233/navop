@@ -1,6 +1,7 @@
 use ai_chat_view::{
     AcpAgentConfig, AcpAgentEntry, AcpAgentSource, AcpConfigDiagnostic, AcpProbeRecord,
-    AcpTransport, builtin_acp_agent_presets, probe_fingerprint, set_acp_agent_config_provider,
+    AcpTransport, builtin_acp_agent_preset, builtin_acp_agent_presets, probe_fingerprint,
+    set_acp_agent_config_provider,
 };
 use anyhow::bail;
 use gpui::App;
@@ -150,9 +151,8 @@ pub fn reset_agent_override(id: &str) -> anyhow::Result<()> {
 pub fn set_agent_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
     let mut config = load_user_config()?;
     let entry = config.agents.entry(id.to_string()).or_default();
-    if entry.command.is_none() && enabled {
-        // 内置预设默认就是启用的，不需要留一条空记录。
-        entry.enabled = None;
+    if entry.command.is_none() {
+        entry.enabled = preset_enabled_override(id, enabled);
     } else {
         entry.enabled = Some(enabled);
     }
@@ -160,6 +160,20 @@ pub fn set_agent_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
         config.agents.remove(id);
     }
     save_user_config(&config)
+}
+
+/// 打开/关掉一条内置预设时该写下的 `enabled` 值。
+///
+/// 默认就启用的预设，打开它不需要留记录（读配置时没有覆盖就是启用）；
+/// 默认关闭的预设必须写 `Some(true)`，否则下一次读回来还是关着的。
+fn preset_enabled_override(id: &str, enabled: bool) -> Option<bool> {
+    let enabled_by_default =
+        builtin_acp_agent_preset(id).is_some_and(|preset| preset.enabled_by_default());
+    if enabled_by_default && enabled {
+        None
+    } else {
+        Some(enabled)
+    }
 }
 
 /// 记录「当前使用」的 agent（设置页直接切换）。
