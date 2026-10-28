@@ -205,13 +205,18 @@ fn preset_agent_entries_with(
     builtin_acp_agent_presets()
         .iter()
         .map(|preset| {
+            // 预设条目默认只开常用几个：全量列表留给设置页，切换器不塞满。
+            let enabled_by_default = preset.enabled_by_default();
             let mut config = preset.config();
             if let Err(diagnostic) = resolve_preset_command(&mut config, &resolve) {
                 return AcpAgentEntry::invalid(preset.id, preset.name, diagnostic)
-                    .with_source(AcpAgentSource::Preset);
+                    .with_source(AcpAgentSource::Preset)
+                    .with_enabled(enabled_by_default);
             }
             let Some(override_config) = user_config.agents.get(preset.id) else {
-                return AcpAgentEntry::ready(config).with_source(AcpAgentSource::Preset);
+                return AcpAgentEntry::ready(config)
+                    .with_source(AcpAgentSource::Preset)
+                    .with_enabled(enabled_by_default);
             };
             let enabled = override_config.is_enabled();
             match resolve_override(override_config, lookup) {
