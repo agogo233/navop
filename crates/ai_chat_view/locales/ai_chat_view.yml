@@ -1375,18 +1375,6 @@ AgentUi:
     en: AI Chat
     zh-CN: AI 对话
     zh-HK: AI 對話
-  decision_dock_title:
-    en: "Waiting for approval · %{target}"
-    zh-CN: "等待审批 · %{target}"
-    zh-HK: "等待審批 · %{target}"
-  decision_dock_subtitle:
-    en: Same decision as the card in this turn's timeline — acting once is enough.
-    zh-CN: 与本轮时间线中的卡片是同一决策；只按一次即可。
-    zh-HK: 與本輪時間線中的卡片是同一個決策；只需按一次。
-  decision_dock_more:
-    en: "%{count} more pending"
-    zh-CN: "另有 %{count} 项待处理"
-    zh-HK: "另有 %{count} 項待處理"
   decision_show_details:
     en: Show details
     zh-CN: 显示详情
@@ -1395,10 +1383,6 @@ AgentUi:
     en: Hide details
     zh-CN: 隐藏详情
     zh-HK: 隱藏詳情
-  decision_details_masked:
-    en: Parameters are masked; secrets are never shown here.
-    zh-CN: 参数已脱敏，此处不会显示密钥。
-    zh-HK: 參數已脫敏，此處不會顯示密鑰。
   decision_authority_local:
     en: Local tool
     zh-CN: 本地工具

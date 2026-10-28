@@ -625,6 +625,17 @@ impl AgentTranscript {
 
     fn append_reasoning_delta(&mut self, delta: &str) {
         self.finish_active_status();
+        // 当前这段已经写出正文了：新的思考属于下一段，必须另起一条消息。
+        // 否则下一段的推理会挂在上一段正文的上方，滚动时看起来像正文长出了
+        // 一段本不属于它的「思考过程」。
+        let segment_has_text = self
+            .streaming_id
+            .as_ref()
+            .and_then(|id| self.messages.iter().find(|message| &message.id == id))
+            .is_some_and(|message| !message.content.trim().is_empty());
+        if segment_has_text {
+            self.streaming_id = None;
+        }
         if let Some(id) = &self.streaming_id {
             if let Some(msg) = self.messages.iter_mut().find(|m| &m.id == id) {
                 append_bounded(
@@ -2401,6 +2412,34 @@ mod tests {
         });
 
         assert_eq!("先分析", tr.messages[0].reasoning_content);
+    }
+
+    /// 上一段正文已经落笔，下一段的思考必须另起一条消息：否则它会被挂到
+    /// 上一段正文的头顶，用户滚动时看到「思考过程」出现在正文上方。
+    #[test]
+    fn reasoning_after_written_text_starts_a_new_segment() {
+        let mut tr = AgentTranscript::new();
+        tr.apply(&RuntimeEvent::AssistantMessageDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "终端选中 mysql.sql。先看大小:".to_string(),
+        });
+        tr.apply(&RuntimeEvent::ReasoningDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "先查一下文件有多大".to_string(),
+        });
+        tr.apply(&RuntimeEvent::AssistantMessageDelta {
+            session_id: sid(),
+            turn_id: tid(),
+            delta: "文件 2MB，直接读。".to_string(),
+        });
+
+        assert_eq!(2, tr.messages.len(), "正文之后的新思考应另起一条消息");
+        assert_eq!("终端选中 mysql.sql。先看大小:", tr.messages[0].content);
+        assert_eq!("", tr.messages[0].reasoning_content);
+        assert_eq!("先查一下文件有多大", tr.messages[1].reasoning_content);
+        assert_eq!("文件 2MB，直接读。", tr.messages[1].content);
     }
 
     #[test]

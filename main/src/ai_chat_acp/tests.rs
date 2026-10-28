@@ -48,6 +48,43 @@ fn presets_resolve_commands_and_extend_the_child_path() {
 }
 
 #[test]
+fn presets_are_enabled_only_where_the_default_list_says_so() {
+    let user_config = parse_user_config(r#"{"version": 2, "agents": {}}"#).unwrap();
+    let entries =
+        preset_agent_entries_with(&user_config, &|_| None, fake_resolver("/opt/acp/bin/npm"));
+
+    let enabled = entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| entry.id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vec![
+            "claude-acp",
+            "codex-acp",
+            "opencode-acp",
+            "dsh-acp",
+            "pi-acp",
+        ],
+        enabled
+    );
+}
+
+#[test]
+fn enabling_a_default_off_preset_writes_an_override() {
+    use super::preset_enabled_override;
+
+    // 默认启用的预设：打开就是默认状态，不写记录。
+    assert_eq!(None, preset_enabled_override("claude-acp", true));
+    // 默认关闭的预设：必须写 true，否则读回来仍然关闭。
+    assert_eq!(Some(true), preset_enabled_override("cline-acp", true));
+    // 关掉默认启用的预设：必须写 false。
+    assert_eq!(Some(false), preset_enabled_override("claude-acp", false));
+    // 用户自定义 agent 没有默认值，永远写明确状态。
+    assert_eq!(Some(true), preset_enabled_override("my-own-agent", true));
+}
+
+#[test]
 fn missing_preset_command_is_reported_without_hiding_other_presets() {
     let user_config = parse_user_config(r#"{"version": 2, "agents": {}}"#).unwrap();
     let entries = preset_agent_entries_with(&user_config, &|_| None, |command| {

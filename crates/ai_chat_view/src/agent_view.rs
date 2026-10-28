@@ -118,7 +118,6 @@ pub(crate) mod acp_sessions;
 mod acp_ui;
 mod attachment_preview;
 mod composer_slot;
-mod decision_dock;
 mod findbar;
 mod message_image_preview;
 mod selection;
@@ -1425,7 +1424,6 @@ pub struct AgentChatView {
     /// 决策栏里**显式展开详情**的那一项 id；`None` 表示全部收起。
     ///
     /// 详情展开是纯展示动作，不取键盘焦点——绝不让「用户正在打字」时 Enter 变成「允许」。
-    decision_details: Option<String>,
     /// 会话内搜索状态（纯逻辑）；渲染层只读它。
     search: TranscriptSearch,
     /// 上次重算命中时的转录版本号；正文没变不重算。
@@ -1887,7 +1885,6 @@ impl AgentChatView {
             turn_timings: TurnTimings::new(),
             restorable_turns: HashMap::new(),
             reviewed_turns: HashMap::new(),
-            decision_details: None,
             search: TranscriptSearch::new(),
             search_revision: 0,
             findbar_open: false,
@@ -7361,7 +7358,11 @@ impl AgentChatView {
             return v_flex()
                 .w(sp(300.0))
                 .p_3()
-                .bg(theme.background)
+                .bg(theme.raised)
+                .border_1()
+                .border_color(border)
+                .rounded(theme.surface_radius)
+                .shadow_md()
                 .child(
                     div()
                         .text_sm()
@@ -7380,7 +7381,12 @@ impl AgentChatView {
 
         v_flex()
             .w(sp(300.0))
-            .bg(theme.background)
+            // 弹层自己的表面，与其余 composer 弹层同一套：raised + border + 圆角。
+            .bg(theme.raised)
+            .border_1()
+            .border_color(border)
+            .rounded(theme.surface_radius)
+            .shadow_md()
             .text_color(theme.foreground)
             .child(
                 PanelHeader::new("agent-history-header")
@@ -7880,7 +7886,6 @@ impl Render for AgentChatView {
                 cx,
             )
         };
-        let decision_dock = self.render_decision_dock(&chat_theme, cx);
         let input_area = div()
             .id("agent-input-area")
             .debug_selector(|| "agent-input-area".to_string())
@@ -7901,7 +7906,6 @@ impl Render for AgentChatView {
                     .min_w_0()
                     .when(self.sidebar_mode, |this| this.min_h_0().overflow_hidden())
                     // 决策栏贴输入区顶部、通栏铺开（与内联卡片同一决策源）。
-                    .when_some(decision_dock, |this, dock| this.child(dock))
                     .child(
                         v_flex()
                             .w_full()
@@ -8479,7 +8483,12 @@ fn render_agent_switcher_content(
         .min_w(sp(300.0))
         .max_h(sp(AGENT_SWITCHER_MAX_HEIGHT))
         .overflow_y_scroll()
-        .bg(theme.background)
+        // 弹层自己的表面：Popover 的内容容器不画底色，用面板底色会看不出是浮层。
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.surface_radius)
+        .shadow_md()
         .text_color(theme.foreground);
 
     col = col.child(header_switcher_group_label("Agent", theme));
@@ -18367,192 +18376,6 @@ mod tests {
         assert!(!view.read_with(cx, |view, _| view.palette_open));
         assert!(view.read_with(cx, |view, _| view.showing_archived_sessions()));
         assert!(cx.debug_bounds("ai-chat-palette").is_none());
-    }
-
-    // ===== 决策栏（DecisionDock）=====
-
-    /// 决策栏与时间线卡片是**同一个决策**：点决策栏的按钮，走的就是内联卡片用的那个 action。
-    #[gpui::test]
-    fn gpui_decision_dock_mirrors_the_inline_confirm_card(cx: &mut TestAppContext) {
-        init_test_ui(cx);
-        let model = Arc::new(MockModelClient::new([
-            ModelResponse::tool_call(function_tool_call(
-                "c_write",
-                "write_data",
-                json!({"value": "x"}).to_string(),
-            )),
-            ModelResponse::text("写入已完成。"),
-        ]));
-        let runtime = test_runtime_with_model_and_write_tool(model.clone());
-        let config = AgentChatViewConfig::new(runtime, ResourceContext::new(), vec![]);
-
-        let (view, cx) =
-            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
-        view.update_in(cx, |view, window, cx| {
-            view.tool_execution_mode = ToolExecutionMode::Manual;
-            let input = view.input.clone();
-            view.on_input_event(
-                &input,
-                &AgentInputEvent::Submit {
-                    text: "写入 x".into(),
-                    mentions: Vec::new(),
-                    images: Vec::new(),
-                },
-                window,
-                cx,
-            );
-        });
-        run_gpui_until(cx, || model.request_count() >= 1);
-        cx.run_until_parked();
-
-        // 决策栏出现，且与内联确认卡是同一条决策。
-        cx.debug_bounds("ai-chat-decision-dock")
-            .expect("decision dock should render while the tool awaits approval");
-        let pending = view.read_with(cx, |view, _| view.transcript.pending_decisions());
-        assert_eq!(1, pending.len());
-        assert_eq!("c_write", pending[0].id);
-        assert_eq!(crate::DecisionAuthority::LocalTool, pending[0].authority);
-
-        let allow = cx
-            .debug_bounds("decision-option-c_write-allow")
-            .expect("dock allow button should render");
-        let deny = cx
-            .debug_bounds("decision-option-c_write-deny")
-            .expect("dock deny button should render");
-        assert_eq!(allow.origin.y, deny.origin.y, "options share one row");
-        // 详情默认收起；展开是显式动作，不抢焦点。
-        assert!(cx.debug_bounds("ai-chat-decision-details").is_none());
-
-        // 真点决策栏的按钮 —— 与点内联卡片走同一个命令入口。
-        cx.simulate_click(allow.center(), Modifiers::default());
-        run_gpui_until(cx, || model.request_count() >= 2);
-
-        assert_eq!(2, model.request_count());
-        // 决策落地后决策栏整条消失，不留空条。
-        assert!(cx.debug_bounds("ai-chat-decision-dock").is_none());
-    }
-
-    /// ACP 权限：决策栏只做来源标注与转发，落地仍是 `SelectAcpPermissionOption`，
-    /// 且 provider 下发的 `option_id` 原样回传（不虚构、不本地化改写）。
-    #[gpui::test]
-    fn gpui_decision_dock_forwards_the_provider_option_id_for_acp(cx: &mut TestAppContext) {
-        init_test_ui(cx);
-        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
-        let (view, cx) =
-            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
-        let (envelope, mut outcome_rx) = AcpPermissionEnvelope::new(test_acp_permission_request());
-
-        view.update(cx, |view, cx| view.receive_acp_permission(envelope, cx));
-        let cx: &mut VisualTestContext = cx;
-
-        cx.debug_bounds("ai-chat-decision-dock")
-            .expect("decision dock should render for a pending ACP permission");
-
-        // 内联卡片的选项 id 之一；决策栏必须把同一个 id 转发出去。
-        let option = view.read_with(cx, |view, _| {
-            view.transcript
-                .messages
-                .iter()
-                .find(|message| message.variant.card_kind() == Some(ACP_PERMISSION_CARD))
-                .and_then(|message| AcpPermissionCardData::from_json(&message.content))
-                .expect("ACP permission card")
-                .options
-                .first()
-                .cloned()
-                .expect("provider option")
-        });
-        cx.dispatch_action(SelectAcpPermissionOption {
-            request_id: "session:call".into(),
-            option_id: option.option_id.clone(),
-        });
-        cx.run_until_parked();
-
-        assert!(matches!(
-            outcome_rx.try_recv(),
-            Ok(AcpPermissionOutcome::Selected { option_id }) if option_id == option.option_id
-        ));
-        assert!(cx.debug_bounds("ai-chat-decision-dock").is_none());
-    }
-
-    /// 详情展开是纯展示动作：显式点开才有内容，且不影响决策本身。
-    #[gpui::test]
-    fn gpui_decision_dock_details_expand_only_on_request(cx: &mut TestAppContext) {
-        init_test_ui(cx);
-        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
-        let (view, cx) =
-            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
-        view.update(cx, |view, cx| {
-            view.transcript.messages.push(crate::ChatMessageUI::card(
-                TOOL_CONFIRM_CARD,
-                ToolConfirmCardData {
-                    call_id: "call_details".into(),
-                    tool_name: "fs.write".into(),
-                    items: Vec::new(),
-                    input_summary: "navop/.env".into(),
-                    input_json: r#"{"path":".env","token":"••••"}"#.into(),
-                    question: "需要确认".into(),
-                    status: "pending".into(),
-                }
-                .to_json(),
-            ));
-            cx.notify();
-        });
-        let cx: &mut VisualTestContext = cx;
-
-        assert!(cx.debug_bounds("ai-chat-decision-details").is_none());
-        view.update(cx, |view, cx| {
-            view.decision_details = Some("call_details".into());
-            cx.notify();
-        });
-        assert!(
-            cx.debug_bounds("ai-chat-decision-details").is_some(),
-            "explicitly opening details should render them"
-        );
-        // 展开详情不解算决策：卡片仍是 pending。
-        assert!(view.read_with(cx, |view, _| {
-            view.transcript.has_pending_tool_confirm("call_details")
-        }));
-    }
-
-    /// Public MCP 与本地工具共用 `agent.confirm` 卡，但**授权域不合并**：
-    /// 同一个按钮只作用于它自己那一域，落地路径也各走各的。
-    #[gpui::test]
-    fn gpui_decision_dock_keeps_public_mcp_in_its_own_authority(cx: &mut TestAppContext) {
-        init_test_ui(cx);
-        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
-        let (view, cx) =
-            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
-        let request_id = "public-mcp:approval-dock";
-        let (envelope, mut outcome_rx) =
-            AcpPublicMcpApprovalEnvelope::new(AcpPublicMcpApprovalRequest {
-                request_id: request_id.into(),
-                tool_name: "terminal.exec".into(),
-                summary: "Call Execute in terminal".into(),
-                details: json!({"requestArguments": {"command": "du -xhd1 /"}}),
-            });
-        view.update(cx, |view, cx| {
-            view.receive_public_mcp_approval(envelope, cx)
-        });
-        cx.run_until_parked();
-
-        let authority = view.read_with(cx, |view, _| {
-            view.transcript
-                .pending_decisions()
-                .into_iter()
-                .find(|decision| decision.id == request_id)
-                .map(|decision| decision.authority)
-        });
-        assert_eq!(Some(crate::DecisionAuthority::PublicMcp), authority);
-
-        cx.dispatch_action(ApproveToolCall {
-            call_id: request_id.into(),
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            AcpPublicMcpApprovalOutcome::Approved,
-            outcome_rx.try_recv().expect("Public MCP approval response")
-        );
     }
 
     // ===== 会话内搜索（findbar）=====
