@@ -375,6 +375,14 @@ mod tests {
     use super::*;
     use crate::agent_diff::FileChangeSummary;
 
+    /// `TOOL_GROUP_TOGGLES` 是进程级全局表，并行测试互相 clear 会让
+    /// 「长度恰好等于上限」这类断言随机失败，碰这张表的测试必须串行。
+    static TOGGLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn toggle_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TOGGLE_TEST_LOCK.lock().expect("toggle test lock")
+    }
+
     fn tool_message_with(
         call_id: &str,
         action: ToolAction,
@@ -552,6 +560,7 @@ mod tests {
 
     #[test]
     fn blocks_default_to_expanded_while_running_and_collapsed_when_done() {
+        let _guard = toggle_test_lock();
         let toggles = tool_group_toggles();
         toggles.lock().expect("lock").clear();
 
@@ -561,6 +570,7 @@ mod tests {
 
     #[test]
     fn a_manual_toggle_overrides_the_default_in_both_directions() {
+        let _guard = toggle_test_lock();
         let toggles = tool_group_toggles();
         toggles.lock().expect("lock").clear();
 
@@ -580,6 +590,7 @@ mod tests {
 
     #[test]
     fn toggle_state_is_bounded_and_repeated_toggles_do_not_accumulate() {
+        let _guard = toggle_test_lock();
         let toggles = tool_group_toggles();
         toggles.lock().expect("lock").clear();
 
