@@ -125,8 +125,12 @@ fn test_scope() -> CloudAccountScope {
 }
 
 fn test_repo(label: &str) -> TeamKeyCacheRepository {
+    // 纳秒时间戳在 macOS 上步进仅 1µs，并行测试同时取值可能撞名 → 同一
+    // db 文件被两个连接并发迁移，撞 `_migrations` 主键。计数器兜底保证唯一。
+    static DB_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let counter = DB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "navop-team-key-manager-status-{label}-{}-{}.db",
+        "navop-team-key-manager-status-{label}-{}-{}-{counter}.db",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
