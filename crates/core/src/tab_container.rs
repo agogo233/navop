@@ -188,6 +188,12 @@ fn status_badge(id: String, icon: IconName, tooltip_text: String) -> AnyElement 
         .into_any_element()
 }
 
+/// 标签栏放不下时，非活动标签按 flex 收缩到 `TAB_MIN_WIDTH`（类似 SecureCRT）；
+/// 活动标签与正在重命名的标签始终保持完整宽度。
+fn tab_keeps_full_width(is_active: bool, is_renaming: bool) -> bool {
+    is_active || is_renaming
+}
+
 fn tab_width_bounds(tab_max_width: Pixels, is_renaming: bool) -> (Pixels, Pixels) {
     if !is_renaming {
         return (TAB_MIN_WIDTH, tab_max_width);
@@ -4223,13 +4229,18 @@ impl TabContainer {
                             tab_width_bounds(tab_max_width, rename_input_for_tab.is_some());
                         let show_title_tooltip = rename_input_for_tab.is_none() && !title.is_empty();
                         let tooltip_title = title.clone();
+                        let keep_full_width = tab_keeps_full_width(
+                            is_active,
+                            rename_input_for_tab.is_some(),
+                        );
 
                         div()
                             .id(idx)
                             .debug_selector(move || format!("tab-container.tab-{idx}"))
                             .flex()
                             .relative()
-                            .flex_shrink_0()
+                            .when(keep_full_width, |el| el.flex_shrink_0())
+                            .when(!keep_full_width, |el| el.flex_shrink_1())
                             .overflow_hidden()
                             .items_center()
                             .gap_2()
@@ -5426,6 +5437,17 @@ mod tests {
         assert!(source.contains(".min_w(tab_min_width)"));
         assert!(source.contains(".max_w(tab_max_width)"));
         assert!(!source.contains(&fixed_width));
+    }
+
+    #[test]
+    fn inactive_tabs_shrink_before_tab_bar_scrolls() {
+        assert!(tab_keeps_full_width(true, false));
+        assert!(tab_keeps_full_width(false, true));
+        assert!(!tab_keeps_full_width(false, false));
+
+        let source = include_str!("tab_container.rs");
+        assert!(source.contains(".when(keep_full_width, |el| el.flex_shrink_0())"));
+        assert!(source.contains(".when(!keep_full_width, |el| el.flex_shrink_1())"));
     }
 
     #[test]
