@@ -424,7 +424,7 @@ mod tests {
         for descriptor in descriptors {
             assert!(ids.insert(descriptor.command_id));
             for key in descriptor.default_keys {
-                Keystroke::parse(&key).unwrap();
+                Keystroke::parse_with_os(&key, gpui::OperatingSystem::Mac).unwrap();
             }
         }
     }

@@ -46,7 +46,7 @@ gpui::actions!(edit_table, [SelectPrevColumn, SelectNextColumn]);
 
 /// 初始化 EditTable 的键盘绑定
 pub fn init(cx: &mut App, keybindings: &TableKeybindings) {
-    cx.bind_keys(init_keybindings(keybindings));
+    cx.bind_keys(init_keybindings(keybindings, cx));
 }
 
 pub fn refresh_keybindings(cx: &mut App, keybindings: TableKeybindings) {
@@ -124,13 +124,41 @@ impl Default for TableKeybindings {
     }
 }
 
-fn init_keybindings(bindings: &TableKeybindings) -> Vec<KeyBinding> {
+
+/// 动态字符串构造 KeyBinding（gpui-fast v0.1.12 起 KeyBinding::new 只收 &'static str）。
+fn load_dynamic_keybinding<A: Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> KeyBinding {
+    let context_predicate = context
+        .map(|context| gpui::KeyBindingContextPredicate::parse(context).unwrap().into());
+    KeyBinding::load(keystrokes, Box::new(action), context_predicate, false, None, cx).unwrap()
+}
+
+/// 编译目标对应的 gpui `OperatingSystem`。
+fn current_os() -> gpui::OperatingSystem {
+    match std::env::consts::OS {
+        "macos" => gpui::OperatingSystem::Mac,
+        "windows" => gpui::OperatingSystem::Windows,
+        "linux" => gpui::OperatingSystem::Linux,
+        "freebsd" => gpui::OperatingSystem::FreeBsd,
+        "ios" => gpui::OperatingSystem::Ios,
+        "android" => gpui::OperatingSystem::Android,
+        _ => gpui::OperatingSystem::Unknown,
+    }
+}
+
+fn init_keybindings(bindings: &TableKeybindings, cx: &App) -> Vec<KeyBinding> {
     let mut keybindings = Vec::new();
     keybindings.extend(
         bindings
             .cancel
             .iter()
-            .map(|key| KeyBinding::new(&key, Cancel, Some(CONTEXT))),
+            .map(|key| {
+                load_dynamic_keybinding(key, Cancel, Some(CONTEXT), cx)
+            }),
     );
     keybindings.extend([
         KeyBinding::new("up", SelectUp, Some(CONTEXT)),
@@ -146,19 +174,19 @@ fn init_keybindings(bindings: &TableKeybindings) -> Vec<KeyBinding> {
         bindings
             .copy
             .iter()
-            .map(|key| KeyBinding::new(&key, Copy, Some(CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, Copy, Some(CONTEXT), cx)),
     );
     keybindings.extend(
         bindings
             .paste
             .iter()
-            .map(|key| KeyBinding::new(&key, Paste, Some(CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, Paste, Some(CONTEXT), cx)),
     );
     keybindings.extend(
         bindings
             .select_all
             .iter()
-            .map(|key| KeyBinding::new(&key, SelectAll, Some(CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, SelectAll, Some(CONTEXT), cx)),
     );
     keybindings.extend([
         KeyBinding::new("tab", SelectNextColumn, Some(CONTEXT)),
@@ -168,31 +196,31 @@ fn init_keybindings(bindings: &TableKeybindings) -> Vec<KeyBinding> {
         bindings
             .find
             .iter()
-            .map(|key| KeyBinding::new(key, Find, Some(CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, Find, Some(CONTEXT), cx)),
     );
     keybindings.extend(
         bindings
             .find_next
             .iter()
-            .map(|key| KeyBinding::new(key, FindNext, Some(CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, FindNext, Some(CONTEXT), cx)),
     );
     keybindings.extend(
         bindings
             .find_previous
             .iter()
-            .map(|key| KeyBinding::new(key, FindPrevious, Some(CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, FindPrevious, Some(CONTEXT), cx)),
     );
     keybindings.extend(
         bindings
             .find_next
             .iter()
-            .map(|key| KeyBinding::new(key, FindNext, Some(HOSTED_FIND_CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, FindNext, Some(HOSTED_FIND_CONTEXT), cx)),
     );
     keybindings.extend(
         bindings
             .find_previous
             .iter()
-            .map(|key| KeyBinding::new(key, FindPrevious, Some(HOSTED_FIND_CONTEXT))),
+            .map(|key| load_dynamic_keybinding(key, FindPrevious, Some(HOSTED_FIND_CONTEXT), cx)),
     );
     keybindings
 }
@@ -284,12 +312,12 @@ where
         .collect::<Vec<_>>();
     let mut keybindings = shadow_shortcuts(defaults, current, active)
         .into_iter()
-        .map(|key| KeyBinding::new(&key, NoAction, context))
+        .map(|key| load_dynamic_keybinding(&key, NoAction, context, cx))
         .collect::<Vec<_>>();
     keybindings.extend(
         current
             .iter()
-            .map(|key| KeyBinding::new(key, action.clone(), context)),
+            .map(|key| load_dynamic_keybinding(key, action.clone(), context, cx)),
     );
     keybindings
 }
@@ -305,7 +333,7 @@ fn shadow_shortcuts(
         .map(|key| key.to_string())
         .chain(active)
         .chain(current.iter().cloned())
-        .filter(|key| Keystroke::parse(key).is_ok() && seen.insert(key.clone()))
+        .filter(|key| Keystroke::parse_with_os(key, current_os()).is_ok() && seen.insert(key.clone()))
         .collect()
 }
 
@@ -313,7 +341,7 @@ fn binding_shortcut(binding: &KeyBinding) -> String {
     binding
         .keystrokes()
         .iter()
-        .map(ToString::to_string)
+        .map(|keystroke| keystroke.display(current_os()).to_string())
         .collect::<Vec<_>>()
         .join(" ")
 }

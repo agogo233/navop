@@ -8,7 +8,7 @@ use crate::file_system::LoadedFile;
 use crate::git::{GitChange, GitRepository};
 use crate::theme::WorkspaceTheme;
 use crate::{WorkspaceBackend, local_backend};
-use gpui::{App, Context, Entity, EventEmitter, KeyBinding, Subscription, actions};
+use gpui::{Action, App, Context, Entity, EventEmitter, KeyBinding, Subscription, actions};
 use gpui_component::diff::DiffState;
 use gpui_component::input::EditorState;
 use notes::NotesView;
@@ -22,12 +22,30 @@ actions!(workspace_editor, [SaveDocument]);
 pub(crate) const WORKSPACE_EDITOR_KEY_CONTEXT: &str = "WorkspaceEditor";
 
 /// 编辑器键盘快捷键。`secondary-s` 在 macOS 上为 Cmd+S,其他平台为 Ctrl+S。
-pub(crate) fn keybindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new(
+pub(crate) fn keybindings(cx: &App) -> Vec<KeyBinding> {
+    vec![load_shortcut(
         "secondary-s",
         SaveDocument,
         Some(WORKSPACE_EDITOR_KEY_CONTEXT),
+        cx,
     )]
+}
+
+/// 用动态字符串构造 `KeyBinding`。
+///
+/// `secondary-` 别名要按宿主 OS 解析：`KeyBinding::new` 只收 `&'static str`，并且用
+/// 哑键盘映射器解析，遇到 `secondary-` 前缀直接返回 `InvalidKeystrokeError`——在启动
+/// 注册快捷键时就会 panic。字面量里带 `secondary-` 的绑定必须走这条路径。
+fn load_shortcut<A: Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> KeyBinding {
+    let context_predicate =
+        context.map(|context| gpui::KeyBindingContextPredicate::parse(context).unwrap().into());
+    KeyBinding::load(keystrokes, Box::new(action), context_predicate, true, None, cx)
+        .unwrap_or_else(|error| panic!("invalid shortcut {keystrokes:?}: {error}"))
 }
 
 #[derive(Clone, Debug)]

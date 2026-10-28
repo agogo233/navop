@@ -495,15 +495,41 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
     },
 ];
 
+/// 编译目标对应的 gpui `OperatingSystem`。
+fn current_os() -> gpui::OperatingSystem {
+    match std::env::consts::OS {
+        "macos" => gpui::OperatingSystem::Mac,
+        "windows" => gpui::OperatingSystem::Windows,
+        "linux" => gpui::OperatingSystem::Linux,
+        "freebsd" => gpui::OperatingSystem::FreeBsd,
+        "ios" => gpui::OperatingSystem::Ios,
+        "android" => gpui::OperatingSystem::Android,
+        _ => gpui::OperatingSystem::Unknown,
+    }
+}
+
+/// 动态字符串构造 KeyBinding（gpui-fast v0.1.12 起 KeyBinding::new 只收 &'static str）。
+fn load_dynamic_keybinding<A: gpui::Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> KeyBinding {
+    let context_predicate = context
+        .map(|context| gpui::KeyBindingContextPredicate::parse(context).unwrap().into());
+    KeyBinding::load(keystrokes, Box::new(action), context_predicate, false, None, cx).unwrap()
+}
+
 pub(crate) fn normalize_shortcut_keys(keys: &[String]) -> Option<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut normalized = Vec::new();
+    let os = current_os();
     for key in keys {
-        let parsed = Keystroke::parse(key.trim()).ok()?;
+        let parsed = Keystroke::parse_with_os(key.trim(), os).ok()?;
         if parsed.is_ime_in_progress() {
             return None;
         }
-        let key = parsed.unparse();
+        let key = parsed.unparse(os);
         if seen.insert(key.clone()) {
             normalized.push(key);
         }
@@ -651,71 +677,75 @@ fn key_binding_for(
     command: ShortcutCommand,
     key: &str,
     context: Option<&'static str>,
+    cx: &App,
 ) -> KeyBinding {
     match command {
-        ShortcutCommand::Newline => KeyBinding::new(key, Newline, context),
-        ShortcutCommand::DeleteBack => KeyBinding::new(key, DeleteBack, context),
-        ShortcutCommand::Delete => KeyBinding::new(key, Delete, context),
-        ShortcutCommand::WordDeleteBack => KeyBinding::new(key, WordDeleteBack, context),
-        ShortcutCommand::WordDeleteForward => KeyBinding::new(key, WordDeleteForward, context),
-        ShortcutCommand::FocusPrev => KeyBinding::new(key, FocusPrev, context),
-        ShortcutCommand::FocusNext => KeyBinding::new(key, FocusNext, context),
-        ShortcutCommand::MoveLeft => KeyBinding::new(key, MoveLeft, context),
-        ShortcutCommand::MoveRight => KeyBinding::new(key, MoveRight, context),
-        ShortcutCommand::WordMoveLeft => KeyBinding::new(key, WordMoveLeft, context),
-        ShortcutCommand::WordMoveRight => KeyBinding::new(key, WordMoveRight, context),
-        ShortcutCommand::Home => KeyBinding::new(key, Home, context),
-        ShortcutCommand::End => KeyBinding::new(key, End, context),
-        ShortcutCommand::BlockUp => KeyBinding::new(key, BlockUp, context),
-        ShortcutCommand::BlockDown => KeyBinding::new(key, BlockDown, context),
-        ShortcutCommand::PageUp => KeyBinding::new(key, PageUp, context),
-        ShortcutCommand::PageDown => KeyBinding::new(key, PageDown, context),
-        ShortcutCommand::JumpToTop => KeyBinding::new(key, JumpToTop, context),
-        ShortcutCommand::JumpToBottom => KeyBinding::new(key, JumpToBottom, context),
-        ShortcutCommand::SelectLeft => KeyBinding::new(key, SelectLeft, context),
-        ShortcutCommand::SelectRight => KeyBinding::new(key, SelectRight, context),
-        ShortcutCommand::WordSelectLeft => KeyBinding::new(key, WordSelectLeft, context),
-        ShortcutCommand::WordSelectRight => KeyBinding::new(key, WordSelectRight, context),
-        ShortcutCommand::SelectHome => KeyBinding::new(key, SelectHome, context),
-        ShortcutCommand::SelectEnd => KeyBinding::new(key, SelectEnd, context),
-        ShortcutCommand::SelectAll => KeyBinding::new(key, SelectAll, context),
-        ShortcutCommand::Copy => KeyBinding::new(key, Copy, context),
-        ShortcutCommand::Cut => KeyBinding::new(key, Cut, context),
-        ShortcutCommand::Paste => KeyBinding::new(key, Paste, context),
-        ShortcutCommand::Undo => KeyBinding::new(key, Undo, context),
-        ShortcutCommand::Redo => KeyBinding::new(key, Redo, context),
-        ShortcutCommand::BoldSelection => KeyBinding::new(key, BoldSelection, context),
-        ShortcutCommand::ItalicSelection => KeyBinding::new(key, ItalicSelection, context),
-        ShortcutCommand::UnderlineSelection => KeyBinding::new(key, UnderlineSelection, context),
+        ShortcutCommand::Newline => load_dynamic_keybinding(key, Newline, context, cx),
+        ShortcutCommand::DeleteBack => load_dynamic_keybinding(key, DeleteBack, context, cx),
+        ShortcutCommand::Delete => load_dynamic_keybinding(key, Delete, context, cx),
+        ShortcutCommand::WordDeleteBack => load_dynamic_keybinding(key, WordDeleteBack, context, cx),
+        ShortcutCommand::WordDeleteForward => load_dynamic_keybinding(key, WordDeleteForward, context, cx),
+        ShortcutCommand::FocusPrev => load_dynamic_keybinding(key, FocusPrev, context, cx),
+        ShortcutCommand::FocusNext => load_dynamic_keybinding(key, FocusNext, context, cx),
+        ShortcutCommand::MoveLeft => load_dynamic_keybinding(key, MoveLeft, context, cx),
+        ShortcutCommand::MoveRight => load_dynamic_keybinding(key, MoveRight, context, cx),
+        ShortcutCommand::WordMoveLeft => load_dynamic_keybinding(key, WordMoveLeft, context, cx),
+        ShortcutCommand::WordMoveRight => load_dynamic_keybinding(key, WordMoveRight, context, cx),
+        ShortcutCommand::Home => load_dynamic_keybinding(key, Home, context, cx),
+        ShortcutCommand::End => load_dynamic_keybinding(key, End, context, cx),
+        ShortcutCommand::BlockUp => load_dynamic_keybinding(key, BlockUp, context, cx),
+        ShortcutCommand::BlockDown => load_dynamic_keybinding(key, BlockDown, context, cx),
+        ShortcutCommand::PageUp => load_dynamic_keybinding(key, PageUp, context, cx),
+        ShortcutCommand::PageDown => load_dynamic_keybinding(key, PageDown, context, cx),
+        ShortcutCommand::JumpToTop => load_dynamic_keybinding(key, JumpToTop, context, cx),
+        ShortcutCommand::JumpToBottom => load_dynamic_keybinding(key, JumpToBottom, context, cx),
+        ShortcutCommand::SelectLeft => load_dynamic_keybinding(key, SelectLeft, context, cx),
+        ShortcutCommand::SelectRight => load_dynamic_keybinding(key, SelectRight, context, cx),
+        ShortcutCommand::WordSelectLeft => load_dynamic_keybinding(key, WordSelectLeft, context, cx),
+        ShortcutCommand::WordSelectRight => load_dynamic_keybinding(key, WordSelectRight, context, cx),
+        ShortcutCommand::SelectHome => load_dynamic_keybinding(key, SelectHome, context, cx),
+        ShortcutCommand::SelectEnd => load_dynamic_keybinding(key, SelectEnd, context, cx),
+        ShortcutCommand::SelectAll => load_dynamic_keybinding(key, SelectAll, context, cx),
+        ShortcutCommand::Copy => load_dynamic_keybinding(key, Copy, context, cx),
+        ShortcutCommand::Cut => load_dynamic_keybinding(key, Cut, context, cx),
+        ShortcutCommand::Paste => load_dynamic_keybinding(key, Paste, context, cx),
+        ShortcutCommand::Undo => load_dynamic_keybinding(key, Undo, context, cx),
+        ShortcutCommand::Redo => load_dynamic_keybinding(key, Redo, context, cx),
+        ShortcutCommand::BoldSelection => load_dynamic_keybinding(key, BoldSelection, context, cx),
+        ShortcutCommand::ItalicSelection => load_dynamic_keybinding(key, ItalicSelection, context, cx),
+        ShortcutCommand::UnderlineSelection => load_dynamic_keybinding(key, UnderlineSelection, context, cx),
         ShortcutCommand::StrikethroughSelection => {
-            KeyBinding::new(key, StrikethroughSelection, context)
+            load_dynamic_keybinding(key, StrikethroughSelection, context, cx)
         }
-        ShortcutCommand::CodeSelection => KeyBinding::new(key, CodeSelection, context),
-        ShortcutCommand::SetParagraph => KeyBinding::new(key, SetParagraph, context),
-        ShortcutCommand::SetHeading1 => KeyBinding::new(key, SetHeading1, context),
-        ShortcutCommand::SetHeading2 => KeyBinding::new(key, SetHeading2, context),
-        ShortcutCommand::SetHeading3 => KeyBinding::new(key, SetHeading3, context),
-        ShortcutCommand::SetHeading4 => KeyBinding::new(key, SetHeading4, context),
-        ShortcutCommand::SetHeading5 => KeyBinding::new(key, SetHeading5, context),
-        ShortcutCommand::SetHeading6 => KeyBinding::new(key, SetHeading6, context),
-        ShortcutCommand::ToggleBulletList => KeyBinding::new(key, ToggleBulletList, context),
-        ShortcutCommand::ToggleOrderedList => KeyBinding::new(key, ToggleOrderedList, context),
-        ShortcutCommand::ToggleTaskList => KeyBinding::new(key, ToggleTaskList, context),
-        ShortcutCommand::ToggleQuote => KeyBinding::new(key, ToggleQuote, context),
-        ShortcutCommand::ToggleCodeBlock => KeyBinding::new(key, ToggleCodeBlock, context),
-        ShortcutCommand::MoveBlockUp => KeyBinding::new(key, MoveBlockUp, context),
-        ShortcutCommand::MoveBlockDown => KeyBinding::new(key, MoveBlockDown, context),
-        ShortcutCommand::DuplicateBlock => KeyBinding::new(key, DuplicateBlock, context),
-        ShortcutCommand::DeleteBlock => KeyBinding::new(key, DeleteBlock, context),
-        ShortcutCommand::IndentBlock => KeyBinding::new(key, IndentBlock, context),
-        ShortcutCommand::OutdentBlock => KeyBinding::new(key, OutdentBlock, context),
-        ShortcutCommand::ExitCodeBlock => KeyBinding::new(key, ExitCodeBlock, context),
-        ShortcutCommand::DismissTransientUi => KeyBinding::new(key, DismissTransientUi, context),
-        ShortcutCommand::ToggleViewMode => KeyBinding::new(key, ToggleViewMode, context),
+        ShortcutCommand::CodeSelection => load_dynamic_keybinding(key, CodeSelection, context, cx),
+        ShortcutCommand::SetParagraph => load_dynamic_keybinding(key, SetParagraph, context, cx),
+        ShortcutCommand::SetHeading1 => load_dynamic_keybinding(key, SetHeading1, context, cx),
+        ShortcutCommand::SetHeading2 => load_dynamic_keybinding(key, SetHeading2, context, cx),
+        ShortcutCommand::SetHeading3 => load_dynamic_keybinding(key, SetHeading3, context, cx),
+        ShortcutCommand::SetHeading4 => load_dynamic_keybinding(key, SetHeading4, context, cx),
+        ShortcutCommand::SetHeading5 => load_dynamic_keybinding(key, SetHeading5, context, cx),
+        ShortcutCommand::SetHeading6 => load_dynamic_keybinding(key, SetHeading6, context, cx),
+        ShortcutCommand::ToggleBulletList => load_dynamic_keybinding(key, ToggleBulletList, context, cx),
+        ShortcutCommand::ToggleOrderedList => load_dynamic_keybinding(key, ToggleOrderedList, context, cx),
+        ShortcutCommand::ToggleTaskList => load_dynamic_keybinding(key, ToggleTaskList, context, cx),
+        ShortcutCommand::ToggleQuote => load_dynamic_keybinding(key, ToggleQuote, context, cx),
+        ShortcutCommand::ToggleCodeBlock => load_dynamic_keybinding(key, ToggleCodeBlock, context, cx),
+        ShortcutCommand::MoveBlockUp => load_dynamic_keybinding(key, MoveBlockUp, context, cx),
+        ShortcutCommand::MoveBlockDown => load_dynamic_keybinding(key, MoveBlockDown, context, cx),
+        ShortcutCommand::DuplicateBlock => load_dynamic_keybinding(key, DuplicateBlock, context, cx),
+        ShortcutCommand::DeleteBlock => load_dynamic_keybinding(key, DeleteBlock, context, cx),
+        ShortcutCommand::IndentBlock => load_dynamic_keybinding(key, IndentBlock, context, cx),
+        ShortcutCommand::OutdentBlock => load_dynamic_keybinding(key, OutdentBlock, context, cx),
+        ShortcutCommand::ExitCodeBlock => load_dynamic_keybinding(key, ExitCodeBlock, context, cx),
+        ShortcutCommand::DismissTransientUi => load_dynamic_keybinding(key, DismissTransientUi, context, cx),
+        ShortcutCommand::ToggleViewMode => load_dynamic_keybinding(key, ToggleViewMode, context, cx),
     }
 }
 
-pub(crate) fn resolved_keybindings(config: &BTreeMap<String, Vec<String>>) -> Vec<KeyBinding> {
+pub(crate) fn resolved_keybindings(
+    config: &BTreeMap<String, Vec<String>>,
+    cx: &App,
+) -> Vec<KeyBinding> {
     let normalized = normalize_shortcut_config(config);
     let mut bindings = Vec::new();
     for definition in SHORTCUT_DEFINITIONS {
@@ -725,14 +755,14 @@ pub(crate) fn resolved_keybindings(config: &BTreeMap<String, Vec<String>>) -> Ve
             .unwrap_or_else(|| default_keys(*definition));
         bindings.extend(
             keys.iter()
-                .map(|key| key_binding_for(definition.command, key, definition.context)),
+                .map(|key| key_binding_for(definition.command, key, definition.context, cx)),
         );
     }
     bindings
 }
 
 pub(crate) fn install_keybindings(cx: &mut App, config: &BTreeMap<String, Vec<String>>) {
-    cx.bind_keys(resolved_keybindings(config));
+    cx.bind_keys(resolved_keybindings(config, cx));
 }
 
 /// Register key bindings for the block editor.

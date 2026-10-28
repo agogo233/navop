@@ -87,7 +87,8 @@ mod tests {
     }
 
     fn key(source: &str) -> Keystroke {
-        Keystroke::parse(source).expect("valid test keystroke")
+        Keystroke::parse_with_os(source, gpui::OperatingSystem::Mac)
+            .expect("valid test keystroke")
     }
 
     fn input(key: RemoteKey, pressed: bool) -> RemoteDesktopInput {

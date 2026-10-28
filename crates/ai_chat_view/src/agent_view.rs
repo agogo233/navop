@@ -880,6 +880,12 @@ const PALETTE_BODY_MIN_QUERY: usize = 2;
 /// 正文命中最多列几条。
 const PALETTE_BODY_LIMIT: usize = 12;
 
+/// agent 切换弹层的最大高度：超出的部分滚动，弹层不跟着 agent 数量长胖。
+///
+/// 这个列表一行两行文字（名字 + 状态），六七个 agent 就会顶到窗口边缘；
+/// 顶部弹层一旦比窗口高，靠下的 agent 点不到，换成固定高度 + 滚动才可靠。
+const AGENT_SWITCHER_MAX_HEIGHT: f32 = 320.0;
+
 fn merge_live_session_summaries(
     persisted: Vec<SessionSummary>,
     live: &[SessionSummary],
@@ -7579,6 +7585,7 @@ impl AgentChatView {
             self.acp_connecting,
         );
         let trigger = Button::new("agent-header-switcher-btn")
+            .debug_selector(|| "agent-header-switcher-btn".to_string())
             .small()
             .icon(current_agent_icon(self.backend))
             .label(compact_agent_label(label.as_ref(), 24))
@@ -8462,10 +8469,16 @@ fn render_agent_switcher_content(
     cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
     let muted = theme.muted_foreground;
+    // 选项的 `on_click` 只能拿到 `&mut App`，要关掉弹层就得先握住它的实体。
+    let popover = cx.entity();
     let mut col = v_flex()
+        .id("agent-header-switcher-list")
+        .debug_selector(|| "agent-header-switcher-content".to_string())
         .p_1()
         .gap(sp(2.0))
         .min_w(sp(300.0))
+        .max_h(sp(AGENT_SWITCHER_MAX_HEIGHT))
+        .overflow_y_scroll()
         .bg(theme.background)
         .text_color(theme.foreground);
 
@@ -8486,10 +8499,10 @@ fn render_agent_switcher_content(
     for agent in agents {
         col = col.child(header_agent_option_row(
             view.clone(),
+            popover.clone(),
             agent,
             muted,
             theme,
-            cx,
         ));
     }
     col.into_any_element()
@@ -8507,10 +8520,10 @@ fn header_switcher_group_label(label: &'static str, theme: &AgentChatTheme) -> g
 
 fn header_agent_option_row(
     view: Entity<AgentChatView>,
+    popover: Entity<gpui_component::popover::PopoverState>,
     agent: ComposerAgentOption,
     muted: gpui::Hsla,
     theme: &AgentChatTheme,
-    cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
     let hover_bg = theme.hover_background();
     let selected_bg = theme.selection_background();
@@ -8518,26 +8531,32 @@ fn header_agent_option_row(
     let icon_fg = if agent.selected { theme.accent } else { muted };
     let target = agent.id.clone();
     let disabled = agent_option_disabled(&agent);
+    let element_id = SharedString::from(format!("agent-header-option-{}", agent.element_id()));
+    // 测试要点某一项：`id` 只给交互树用，`debug_bounds` 认的是 debug selector。
+    let debug_selector = element_id.clone();
 
     h_flex()
-        .id(SharedString::from(format!(
-            "agent-header-option-{}",
-            agent.element_id()
-        )))
+        .id(element_id)
+        .debug_selector(move || debug_selector.to_string())
         .w_full()
         .items_center()
         .gap_2()
         .px_2()
         .py_1p5()
-        .rounded(cx.theme().radius)
+        .rounded(theme.surface_radius)
         .when(agent.selected, |this| this.bg(selected_bg))
         .when(agent.selected, |this| this.text_color(selected_fg))
         .when(disabled, |this| this.opacity(0.5))
         .when(!disabled, |this| {
             this.cursor_pointer()
                 .hover(move |this| this.bg(hover_bg))
-                .on_click(move |_, _window, cx| {
+                .on_click(move |_, window, cx| {
                     let target = target.clone();
+                    let view = view.clone();
+                    let popover = popover.clone();
+                    // 先收弹层再换后端：换后端会重建 header 与内容区，弹层留在
+                    // 最上层就会盖着新视图不走（用户点了却像没反应）。
+                    popover.update(cx, |state, cx| state.dismiss(window, cx));
                     view.update(cx, |this, cx| {
                         if !this.is_running {
                             this.select_backend(target, cx);
@@ -9217,9 +9236,8 @@ mod tests {
     };
     use async_trait::async_trait;
     use gpui::{
-        Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, ScrollDelta,
-        ScrollWheelEvent, Styled, TestAppContext, TouchPhase, VisualTestContext, Window, div,
-        point, px,
+        Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, ScrollDelta, ScrollEvent,
+        Styled, TestAppContext, TouchPhase, VisualTestContext, Window, div, point, px,
     };
     use one_core::llm::{ProviderConfig, ProviderType};
     use serde_json::json;
@@ -10424,11 +10442,12 @@ mod tests {
             .center();
         // 手势要 Started 再 Moved：单独一条 Moved 会被当作续接而忽略。
         for phase in [TouchPhase::Started, TouchPhase::Moved] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(600.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: phase,
+                source: gpui::ScrollSource::default(),
             });
             cx.run_until_parked();
         }
@@ -10452,11 +10471,12 @@ mod tests {
 
         // 滚回底部后：自动恢复跟随。
         for phase in [TouchPhase::Started, TouchPhase::Moved] {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(0.0), px(-5000.0))),
                 modifiers: Modifiers::default(),
                 touch_phase: phase,
+                source: gpui::ScrollSource::default(),
             });
             cx.run_until_parked();
         }
@@ -15079,6 +15099,58 @@ mod tests {
         assert_eq!(vec!["One Agent", "Codex", "OpenCode"], labels);
     }
 
+    /// 切换弹层：选中之后要自己收起来，且列表再长也有个头（超出滚动）。
+    ///
+    /// 两个问题都只在真弹层里看得见 —— 选项行本身漏掉 dismiss，或者内容列
+    /// 不设上限，单元数据层面都断言不出来。
+    #[gpui::test]
+    fn header_agent_switcher_closes_after_pick_and_caps_its_height(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agents = (0..10)
+            .map(|index| {
+                AcpAgentEntry::ready(AcpAgentConfig::new(
+                    format!("agent-{index}"),
+                    format!("Agent {index}"),
+                    "agent",
+                ))
+            })
+            .collect::<Vec<_>>();
+        // 切入口就在面板头部，侧栏形态才渲染 `render_sidebar_mode_header`。
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .with_acp_agents(agents)
+            .sidebar_mode(true);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+
+        let trigger = cx
+            .debug_bounds("agent-header-switcher-btn")
+            .expect("头部要有 agent 切换入口");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let content = cx
+            .debug_bounds("agent-header-switcher-content")
+            .expect("点开后弹层要渲染出内容");
+        // 十个 agent 排下来远超上限；上限不生效的话高度会跟着条数长。
+        assert!(
+            content.size.height <= px(AGENT_SWITCHER_MAX_HEIGHT + 1.0),
+            "弹层高度要收在上限内、超出部分靠滚动: content={content:?}"
+        );
+
+        let option = cx
+            .debug_bounds("agent-header-option-agent-option-local")
+            .expect("弹层里要有「One Agent」这一项");
+        cx.simulate_click(option.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        assert!(
+            cx.debug_bounds("agent-header-switcher-content").is_none(),
+            "选中一项之后弹层必须自己关掉"
+        );
+        assert_eq!(Backend::Local, view.read_with(cx, |view, _| view.backend));
+    }
+
     #[test]
     fn header_agent_switcher_keeps_local_available_while_acp_connects() {
         let acp_agents = vec![AcpAgentEntry::ready(AcpAgentConfig::new(
@@ -16045,11 +16117,12 @@ mod tests {
         let approve_before_scroll = cx
             .debug_bounds("agent-tool-approve")
             .expect("approval button should render before scrolling");
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: approve_before_scroll.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-280.0))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Moved,
+            source: gpui::ScrollSource::default(),
         });
         cx.run_until_parked();
 

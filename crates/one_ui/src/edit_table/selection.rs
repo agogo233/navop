@@ -195,6 +195,21 @@ impl TableSelection {
         result
     }
 
+    /// 获取选区覆盖的显示行号（升序去重）。
+    ///
+    /// 整行操作（删除记录、复制整行）只关心行：按范围收集行号而不是展开单元格，
+    /// 避免整块选区时把每个单元格的坐标都算出来。
+    pub fn selected_rows(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = self
+            .ranges
+            .iter()
+            .flat_map(|range| range.row_range())
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
     /// 获取第一个选中范围（用于复制）
     pub fn first_range(&self) -> Option<&CellRange> {
         self.ranges.first()
@@ -401,5 +416,22 @@ mod tests {
         assert!(selection.contains(1, 4));
         assert_eq!(Some((0, 1)), selection.anchor);
         assert_eq!(Some((0, 1)), selection.active);
+    }
+
+    #[test]
+    fn selected_rows_sorts_and_dedups_multiple_ranges() {
+        let mut selection = TableSelection::new();
+        selection.ranges.push(CellRange::new((2, 0), (4, 2)));
+        selection.ranges.push(CellRange::new((4, 0), (5, 1)));
+        selection.ranges.push(CellRange::new((0, 0), (0, 2)));
+
+        assert_eq!(vec![0, 2, 3, 4, 5], selection.selected_rows());
+    }
+
+    #[test]
+    fn selected_rows_is_empty_without_ranges() {
+        let selection = TableSelection::new();
+
+        assert!(selection.selected_rows().is_empty());
     }
 }

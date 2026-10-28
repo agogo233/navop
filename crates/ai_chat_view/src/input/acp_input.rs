@@ -213,7 +213,7 @@ impl AcpAgentInput {
         // 聚焦时 cmd/ctrl-v 把剪贴板图片补进附件（文本粘贴仍交给 InputState）。
         let weak = cx.entity().downgrade();
         let paste_sub = cx.intercept_keystrokes(move |ev, window, cx| {
-            if ev.keystroke.key != "v" || !ev.keystroke.modifiers.secondary() {
+            if ev.keystroke.key != "v" || !ev.keystroke.modifiers.secondary(cx) {
                 return;
             }
             let Some(this) = weak.upgrade() else {

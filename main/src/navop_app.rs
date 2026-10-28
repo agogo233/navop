@@ -535,7 +535,7 @@ fn always_on_top_shortcut_label(cx: &App) -> String {
 }
 
 fn shortcut_label(shortcut: &str) -> String {
-    Keystroke::parse(shortcut)
+    Keystroke::parse_with_os(shortcut, one_core::keybindings::current_os())
         .map(|keystroke| Kbd::format(&keystroke).to_string())
         .unwrap_or_else(|_| shortcut.to_string())
 }
@@ -1089,7 +1089,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
     keybindings.extend(
         shortcuts_for(cx, action_id::WINDOW_TOGGLE_ZOOM, &["shift-escape"])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, ToggleZoom, None)),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ToggleZoom, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1098,7 +1098,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[close_active_window_default_shortcut()],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, CloseActiveWindow, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, CloseActiveWindow, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1107,7 +1107,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("cmd-b", "ctrl-b")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ToggleConnectionSidebar, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ToggleConnectionSidebar, None, cx)),
     );
     keybindings.extend(vec![
         #[cfg(target_os = "macos")]
@@ -1154,7 +1154,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("ctrl-cmd-f", "alt-enter")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ToggleFullscreen, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ToggleFullscreen, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1163,7 +1163,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("ctrl-cmd-t", "ctrl-alt-t")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ToggleAlwaysOnTop, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ToggleAlwaysOnTop, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1172,7 +1172,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("cmd-shift-t", "alt-shift-t")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, DuplicateTab, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, DuplicateTab, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1181,17 +1181,17 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("cmd-j", "ctrl-j")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, OpenTabSwitcher, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, OpenTabSwitcher, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::APP_SWITCH_NEXT_TAB, &["ctrl-tab"])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, SwitchNextTab, None)),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SwitchNextTab, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::APP_SWITCH_PREVIOUS_TAB, &["ctrl-shift-tab"])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, SwitchPreviousTab, None)),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SwitchPreviousTab, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1200,7 +1200,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("cmd-shift-w", "alt-shift-w")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, CloseActiveTab, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, CloseActiveTab, None, cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -1209,7 +1209,7 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[default_shortcut("cmd-q", "alt-f4")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, QuitApp, None)),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, QuitApp, None, cx)),
     );
     keybindings.push(KeyBinding::new(
         default_shortcut("cmd-v", "ctrl-v"),

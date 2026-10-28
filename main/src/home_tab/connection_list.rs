@@ -70,7 +70,7 @@ impl HomePage {
                     if let Some(id) = conn_id {
                         let mode = if event.modifiers().shift {
                             connection_selection::ConnectionSelectionMode::Range
-                        } else if event.modifiers().secondary() {
+                        } else if event.modifiers().secondary(cx) {
                             connection_selection::ConnectionSelectionMode::Toggle
                         } else {
                             connection_selection::ConnectionSelectionMode::Replace

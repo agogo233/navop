@@ -7,7 +7,7 @@ use crate::view::text_input::{
 use crate::view::workspace_support::TerminalRenderMode;
 
 fn keystroke(shortcut: &str) -> Keystroke {
-    Keystroke::parse(shortcut).expect("解析快捷键失败")
+    Keystroke::parse_with_os(shortcut, one_core::keybindings::current_os()).expect("解析快捷键失败")
 }
 
 #[test]

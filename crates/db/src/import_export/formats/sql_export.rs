@@ -35,7 +35,8 @@ pub(super) async fn export_table_data_in_pages(
         let Some(page_limit) = next_export_page_limit(remaining, rows_per_statement) else {
             break;
         };
-        let paginated_query = export_page_select_sql(plugin, config, table, page_limit, offset);
+        let paginated_query =
+            export_page_select_sql(plugin, connection, config, table, page_limit, offset).await?;
         let mut query_result = query_export_page(connection, &paginated_query).await?;
         if plugin.name() == DatabaseType::MySQL {
             if schema_columns.is_none() {
@@ -98,13 +99,14 @@ fn next_export_page_limit(remaining: Option<usize>, rows_per_statement: usize) -
     (page_limit > 0).then_some(page_limit)
 }
 
-fn export_page_select_sql(
+async fn export_page_select_sql(
     plugin: &dyn DatabasePlugin,
+    connection: &dyn DbConnection,
     config: &ExportConfig,
     table: &str,
     page_limit: usize,
     offset: usize,
-) -> PaginatedQuery {
+) -> Result<PaginatedQuery> {
     let table_ref =
         plugin.format_table_reference(&config.database, config.schema.as_deref(), table);
     let columns = config
@@ -123,7 +125,16 @@ fn export_page_select_sql(
         select_sql.push_str(" WHERE ");
         select_sql.push_str(where_c);
     }
-    plugin.build_paginated_query(&select_sql, page_limit, offset, "")
+    plugin
+        .paginated_query_for_connection(
+            connection,
+            &config.database,
+            &select_sql,
+            page_limit,
+            offset,
+            "",
+        )
+        .await
 }
 
 async fn query_export_page(

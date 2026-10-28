@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Action, App, KeyBinding, Keystroke, NoAction};
+use gpui::{Action, App, KeyBinding, Keystroke, NoAction, OperatingSystem};
 
 use crate::settings::AppSettings;
 
@@ -85,12 +85,32 @@ pub fn shortcuts_for(cx: &App, action_id: &str, defaults: &[&str]) -> Vec<String
 pub fn keystroke_matches_shortcuts(keystroke: &Keystroke, shortcuts: &[String]) -> bool {
     shortcut_spec_from_keystroke(keystroke).is_some_and(|spec| {
         shortcuts.iter().any(|shortcut| {
-            Keystroke::parse(shortcut)
+            Keystroke::parse_with_os(shortcut, current_os())
                 .ok()
                 .and_then(|shortcut| shortcut_spec_from_keystroke(&shortcut))
                 .is_some_and(|shortcut| shortcut == spec)
         })
     })
+}
+
+/// 动态字符串构造 KeyBinding（gpui-fast v0.1.12 起 KeyBinding::new 只收 &'static str）。
+pub fn load_dynamic_keybinding<A: Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> KeyBinding {
+    let context_predicate = context
+        .map(|context| gpui::KeyBindingContextPredicate::parse(context).unwrap().into());
+    KeyBinding::load(
+        keystrokes,
+        Box::new(action),
+        context_predicate,
+        true,
+        None,
+        cx,
+    )
+    .unwrap()
 }
 
 pub fn rebind_keybindings<A>(
@@ -108,16 +128,16 @@ where
         .key_bindings()
         .borrow()
         .bindings_for_action(&action)
-        .map(|binding| shortcut_spec_from_binding(binding))
+        .map(|binding| shortcut_spec_from_binding(binding, cx.platform_info().os))
         .collect::<Vec<_>>();
     let mut keybindings = rebind_shadow_shortcuts(defaults, &current, active)
         .into_iter()
-        .map(|shortcut| KeyBinding::new(&shortcut, NoAction, context))
+        .map(|shortcut| load_dynamic_keybinding(&shortcut, NoAction, context, cx))
         .collect::<Vec<_>>();
     keybindings.extend(
         current
             .into_iter()
-            .map(|shortcut| KeyBinding::new(&shortcut, action.clone(), context)),
+            .map(|shortcut| load_dynamic_keybinding(&shortcut, action.clone(), context, cx)),
     );
     keybindings
 }
@@ -150,7 +170,20 @@ pub fn resolve_shortcuts(
 }
 
 fn is_valid_shortcut(shortcut: &str) -> bool {
-    Keystroke::parse(shortcut).is_ok()
+    Keystroke::parse_with_os(shortcut, current_os()).is_ok()
+}
+
+/// 编译目标对应的 gpui `OperatingSystem`（gpui-fast v0.1.12 起动态解析键位需要）。
+pub fn current_os() -> OperatingSystem {
+    match std::env::consts::OS {
+        "macos" => OperatingSystem::Mac,
+        "windows" => OperatingSystem::Windows,
+        "linux" => OperatingSystem::Linux,
+        "freebsd" => OperatingSystem::FreeBsd,
+        "ios" => OperatingSystem::Ios,
+        "android" => OperatingSystem::Android,
+        _ => OperatingSystem::Unknown,
+    }
 }
 
 pub fn rebind_shadow_shortcuts(
@@ -173,11 +206,11 @@ pub fn rebind_shadow_shortcuts(
     shortcuts
 }
 
-fn shortcut_spec_from_binding(binding: &KeyBinding) -> String {
+fn shortcut_spec_from_binding(binding: &KeyBinding, os: OperatingSystem) -> String {
     binding
         .keystrokes()
         .iter()
-        .map(|keystroke| keystroke.to_string())
+        .map(|keystroke| keystroke.display(os).to_string())
         .collect::<Vec<_>>()
         .join(" ")
 }

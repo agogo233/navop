@@ -110,7 +110,12 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
 
     for key in shortcuts_for(cx, action_id::AI_CHAT_FIND, &default_find_shortcuts()) {
         for context in FIND_CONTEXTS {
-            keybindings.push(KeyBinding::new(&key, ToggleTranscriptFind, Some(context)));
+            keybindings.push(one_core::keybindings::load_dynamic_keybinding(
+                &key,
+                ToggleTranscriptFind,
+                Some(context),
+                cx,
+            ));
         }
     }
     for key in shortcuts_for(
@@ -119,7 +124,12 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         &default_find_next_shortcuts(),
     ) {
         for context in FIND_CONTEXTS {
-            keybindings.push(KeyBinding::new(&key, FindNextInTranscript, Some(context)));
+            keybindings.push(one_core::keybindings::load_dynamic_keybinding(
+                &key,
+                FindNextInTranscript,
+                Some(context),
+                cx,
+            ));
         }
     }
     for key in shortcuts_for(
@@ -128,10 +138,11 @@ fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
         &default_find_previous_shortcuts(),
     ) {
         for context in FIND_CONTEXTS {
-            keybindings.push(KeyBinding::new(
+            keybindings.push(one_core::keybindings::load_dynamic_keybinding(
                 &key,
                 FindPreviousInTranscript,
                 Some(context),
+                cx,
             ));
         }
     }
@@ -248,6 +259,9 @@ mod tests {
     gpui::actions!(ai_chat_find_shortcut_tests, [ForeignInputAction]);
 
     fn resolve(keystroke: &str, contexts: &[&str]) -> Option<Box<dyn gpui::Action>> {
+        // `KeyBinding::new` 只收 `&'static str`；测试键位都是已知合法的字面量，
+        // 泄漏一个 &) 无伤大雅，比整链改成 `KeyBinding::load` 更贴近被测生产行为。
+        let keystroke: &'static str = Box::leak(keystroke.to_string().into_boxed_str());
         let keymap = Keymap::new(vec![
             // 先注册：`gpui_component::init` 在 `ai_chat_view::init` 之前跑。
             KeyBinding::new(keystroke, ForeignInputAction, Some("Input")),
@@ -267,7 +281,8 @@ mod tests {
             .iter()
             .map(|context| KeyContext::parse(context).expect("valid context"))
             .collect::<Vec<_>>();
-        let keystroke = Keystroke::parse(keystroke).expect("valid keystroke");
+        let keystroke = Keystroke::parse_with_os(keystroke, gpui::OperatingSystem::Mac)
+            .expect("valid keystroke");
         let (bindings, _) = keymap.bindings_for_input(&[keystroke], &contexts);
         bindings
             .first()
@@ -318,7 +333,8 @@ mod tests {
             .iter()
             .map(|context| KeyContext::parse(context).expect("valid context"))
             .collect::<Vec<_>>();
-        let keystroke = Keystroke::parse(CLOSE_FINDBAR_SHORTCUT).expect("valid keystroke");
+        let keystroke = Keystroke::parse_with_os(CLOSE_FINDBAR_SHORTCUT, gpui::OperatingSystem::Mac)
+            .expect("valid keystroke");
         let (bindings, _) = keymap.bindings_for_input(&[keystroke], &contexts);
 
         assert!(

@@ -111,7 +111,7 @@ impl TerminalView {
             .flex_1()
             .relative()
             .overflow_hidden()
-            .on_scroll_wheel(cx.listener(Self::handle_scroll))
+            .on_scroll(cx.listener(Self::handle_scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_down(
                 MouseButton::Middle,

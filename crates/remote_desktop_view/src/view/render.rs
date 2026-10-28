@@ -507,7 +507,7 @@ impl Render for RemoteDesktopView {
                                 cx.stop_propagation();
                             }),
                         )
-                        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                             this.send_scroll(event);
                             cx.stop_propagation();
                         }))

@@ -174,8 +174,16 @@ async fn wait_for_ready(
     timeout: std::time::Duration,
     ready_rx: oneshot::Receiver<ReadyMessage>,
 ) -> ReadyWait {
-    let _runtime = handle.enter();
-    tokio::time::timeout(timeout, ready_rx).await
+    // GPUI foreground executor 是单线程的：多个 ACP 连接并发时，各自跨 await 持有
+    // `EnterGuard` 无法保证按 LIFO 顺序 drop，tokio 1.53 起会直接 panic
+    // （"EnterGuard values dropped out of order"）。这里只让 guard 覆盖 timer 的
+    // 创建范围——timer 在创建时就把自己注册到 driver，await 期间不再需要 runtime
+    // context。
+    let wait = {
+        let _runtime = handle.enter();
+        tokio::time::timeout(timeout, ready_rx)
+    };
+    wait.await
 }
 
 fn prepare_shared(

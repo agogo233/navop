@@ -15,7 +15,7 @@
 //! 页面在这个台子里只需要能画出来，`navop.workbench` / `navop.dev` / `navop.log`
 //! 一律用返回空数据的桩替代，所以不需要连接、不需要 catalog。
 //!
-//! 需要 `--features shell-plugins`（`gpui-shell` / `gpui-component-shell` 是可选依赖）：
+//! 需要 `--features shell-plugins`（`gpui-shell` 是可选依赖）：
 //! ```bash
 //! cargo test -p universal-plugins --features shell-plugins -- extension_
 //! ```
@@ -192,9 +192,9 @@ mod tests {
         Rc<gpui_shell::ShellRuntime>,
     ) {
         cx.update(|cx| {
-            gpui_component_shell::init(cx);
+            gpui_shell::components::init(cx);
         });
-        let runtime = gpui_component_shell::new_isolated_runtime().expect("isolated runtime");
+        let runtime = gpui_shell::components::new_isolated_runtime().expect("isolated runtime");
         let options = ViewLoadOptions::new(root.to_path_buf(), entry, extension_policy());
         let window = cx.add_window(|_, _| Empty);
         let mut context = VisualTestContext::from_window(*window.deref(), cx);

@@ -229,9 +229,21 @@ impl FormatHandler for TxtFormatHandler {
                 base_sql.push_str(" WHERE ");
                 base_sql.push_str(where_clause);
             }
-            let paginated_query = config
-                .limit
-                .map(|limit| plugin.build_paginated_query(&base_sql, limit, 0, ""));
+            let paginated_query = match config.limit {
+                Some(limit) => Some(
+                    plugin
+                        .paginated_query_for_connection(
+                            connection,
+                            &config.database,
+                            &base_sql,
+                            limit,
+                            0,
+                            "",
+                        )
+                        .await?,
+                ),
+                None => None,
+            };
             let select_sql = paginated_query
                 .as_ref()
                 .map(|query| query.sql.as_str())

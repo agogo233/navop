@@ -28,15 +28,17 @@ gpui::actions!(
 /// 时把焦点交给转录（见 `AgentChatView::begin_transcript_selection`），换来两条
 /// 复制路径互不打扰。
 pub fn init(cx: &mut App) {
-    cx.bind_keys(keybindings());
+    cx.bind_keys(keybindings(cx));
 }
 
-fn keybindings() -> Vec<KeyBinding> {
+fn keybindings(cx: &App) -> Vec<KeyBinding> {
     let copy = [
-        KeyBinding::new(
+        // `secondary-` 别名需要宿主 OS 才能解析，走动态加载路径。
+        one_core::keybindings::load_dynamic_keybinding(
             "secondary-c",
             CopyTranscriptSelection,
             Some(AI_CHAT_SEARCH_CONTEXT),
+            cx,
         ),
         KeyBinding::new(
             "ctrl-c",

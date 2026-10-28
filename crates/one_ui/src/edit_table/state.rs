@@ -19,7 +19,7 @@ use gpui::{
     AnyElement, AppContext, Axis, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
     IsZero, ListSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Stateful, StatefulInteractiveElement as _,
+    ScrollStrategy, ScrollEvent, SharedString, Stateful, StatefulInteractiveElement as _,
     Styled, Subscription, Task, UniformListScrollHandle, Window, canvas, div,
     prelude::FluentBuilder, px, uniform_list,
 };
@@ -455,7 +455,7 @@ where
 
     fn handle_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1680,7 +1680,7 @@ where
         let multi_select_enabled = self.delegate.multi_select_enabled(cx);
         let is_row_number_col = self.delegate.row_number_enabled(cx) && col_ix == 0;
         let shift_pressed = e.modifiers().shift;
-        let ctrl_pressed = e.modifiers().secondary();
+        let ctrl_pressed = e.modifiers().secondary(cx);
 
         // 处理正在编辑的单元格
         if edit_enabled {
@@ -2874,7 +2874,7 @@ where
                     if is_row_number_col {
                         return;
                     }
-                    let add_to_selection = e.modifiers.secondary();
+                    let add_to_selection = e.modifiers.secondary(cx);
                     this.prepare_drag_selection(row_ix, col_ix, add_to_selection, cx);
                 }),
             )
@@ -4348,7 +4348,7 @@ where
 
         div()
             .size_full()
-            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+            .on_scroll(cx.listener(Self::handle_scroll_wheel))
             .children(loading_view)
             .when(!loading, |this| {
                 this.child(inner_table)

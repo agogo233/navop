@@ -362,11 +362,7 @@ test("the embedded webview is an opt-in feature on every platform", () => {
   );
   assert.match(
     universalPluginsCargo,
-    /gpui-component-shell = \{[^}]*optional = true[^}]*\}/,
-  );
-  assert.match(
-    universalPluginsCargo,
-    /shell-plugins = \["dep:gpui-shell", "dep:gpui-component-shell"\]/,
+    /shell-plugins = \["dep:gpui-shell"\]/,
   );
   assert.match(
     workspaceCargo,

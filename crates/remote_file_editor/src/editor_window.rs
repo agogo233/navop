@@ -200,12 +200,12 @@ fn init_keybinding_items(cx: &App) -> Vec<KeyBinding> {
     keybindings.extend(
         shortcuts_for(cx, action_id::REMOTE_EDITOR_SEARCH, &[search_shortcut()])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, OpenSearch, Some(REMOTE_FILE_EDITOR_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, OpenSearch, Some(REMOTE_FILE_EDITOR_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::REMOTE_EDITOR_REPLACE, &[replace_shortcut()])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, OpenReplace, Some(REMOTE_FILE_EDITOR_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, OpenReplace, Some(REMOTE_FILE_EDITOR_CONTEXT), cx)),
     );
     keybindings
 }
