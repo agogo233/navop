@@ -47,6 +47,33 @@ fn presets_resolve_commands_and_extend_the_child_path() {
     assert!(path.starts_with("/opt/acp/bin"), "{path}");
 }
 
+/// 覆盖项里重写了 PATH 时，用户目录要保留，程序目录与兜底工具链目录也不能丢：
+/// 适配器（如 pi-acp）还会再 spawn 兄弟 CLI，依赖这些目录。
+#[test]
+fn overridden_path_keeps_program_dir_and_toolchain_dirs() {
+    let user_config = parse_user_config(
+        r#"{"version": 2, "agents": {"pi-acp": {"env": {"PATH": "/custom/toolchain/bin"}}}}"#,
+    )
+    .unwrap();
+    let entries =
+        preset_agent_entries_with(&user_config, &|_| None, fake_resolver("/opt/acp/bin/npm"));
+
+    let pi = entries
+        .iter()
+        .find(|entry| entry.id.as_ref() == "pi-acp")
+        .expect("pi preset");
+    let config = pi.config.as_ref().expect("resolved config");
+    let AcpTransport::Stdio { env, .. } = &config.transport;
+    let path = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.as_str())
+        .expect("PATH is injected for npm-backed presets");
+    assert!(path.starts_with("/opt/acp/bin"), "{path}");
+    assert!(path.contains("/custom/toolchain/bin"), "{path}");
+    assert!(path.contains("/usr/bin"), "{path}");
+}
+
 #[test]
 fn presets_are_enabled_only_where_the_default_list_says_so() {
     let user_config = parse_user_config(r#"{"version": 2, "agents": {}}"#).unwrap();

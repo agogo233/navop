@@ -23,6 +23,11 @@ const SYSTEM_PROGRAM_DIRS: &[&str] = &[
     "/snap/bin",
 ];
 
+/// macOS / Linux 上任何进程都该有的基础目录：GUI 进程的 PATH 被裁剪到极短，
+/// 甚至可能只剩工具链目录，`sh` / `env` 这类基础命令不能因此丢失。
+#[cfg(not(windows))]
+const BASE_SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
 /// 用户目录下与版本管理器相关的 bin 目录（不含 nvm / fnm 的版本目录）。
 #[cfg(not(windows))]
 const HOME_PROGRAM_DIRS: &[&str] = &[
@@ -55,23 +60,48 @@ pub fn build_command<S: AsRef<OsStr>>(name: &str, args: &[S]) -> Option<Command>
 }
 
 /// 把程序所在目录前置进子进程 PATH，其余部分保持当前进程的 PATH 顺序。
+///
+/// 除了当前进程的 PATH，还会补上 GUI 进程看不到的工具链目录（Homebrew、
+/// `/usr/local/bin`、nvm / fnm / volta 的版本目录等）。原因不只是「找到自己」：
+/// 拉起的外部命令常常再 `spawn` 一个兄弟 CLI——例如 ACP 的 `pi-acp` 适配器会去
+/// `PATH` 里找 `pi`，而 `pi` 常常装在本机 nvm 的版本目录下。只把 npm 所在目录塞进
+/// 子进程 PATH 时，适配器本身起得来，真正干活的 CLI 却报
+/// `Could not start pi: executable not found (command: pi)`。
 #[must_use]
 pub fn child_path_with_program_dir(program: &Path) -> OsString {
-    let dir = program.parent().filter(|dir| !dir.as_os_str().is_empty());
-    let Some(dir) = dir else {
-        return std::env::var_os("PATH").unwrap_or_default();
-    };
-    let mut parts: Vec<PathBuf> = vec![dir.to_path_buf()];
-    if let Some(path) = std::env::var_os("PATH") {
-        parts.extend(std::env::split_paths(&path).filter(|part| !part.as_os_str().is_empty()));
+    let path = std::env::var_os("PATH");
+    child_path_in(program, path.as_deref(), &fallback_program_dirs())
+}
+
+/// 以调用方给的 PATH 为底，做和 [`child_path_with_program_dir`] 一样的补全。
+///
+/// 用于「配置里已经写了 PATH」的场景：用户显式配置的目录要排在兜底目录之前，
+/// 不能因为补全逻辑把整条 PATH 换掉。
+#[must_use]
+pub fn child_path_with_program_dir_and_path(program: &Path, path: Option<&OsStr>) -> OsString {
+    child_path_in(program, path, &fallback_program_dirs())
+}
+
+/// `child_path_with_program_dir` 的显式版本：顺序 = 程序目录 → 当前 PATH →
+/// 兜底工具链目录 → 基础系统目录，并去重。参数显式传入，便于不依赖宿主环境测试。
+fn child_path_in(program: &Path, path: Option<&OsStr>, fallback_dirs: &[PathBuf]) -> OsString {
+    let mut parts: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = program.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        parts.push(dir.to_path_buf());
     }
+    if let Some(path) = path {
+        parts.extend(std::env::split_paths(path).filter(|part| !part.as_os_str().is_empty()));
+    }
+    parts.extend(fallback_dirs.iter().cloned());
+    #[cfg(not(windows))]
+    parts.extend(BASE_SYSTEM_DIRS.iter().map(PathBuf::from));
     let mut unique: Vec<PathBuf> = Vec::with_capacity(parts.len());
     for part in parts {
         if !unique.contains(&part) {
             unique.push(part);
         }
     }
-    std::env::join_paths(unique).unwrap_or_else(|_| dir.as_os_str().to_os_string())
+    std::env::join_paths(unique).unwrap_or_else(|_| path.unwrap_or_default().to_os_string())
 }
 
 fn resolve_program_in(
@@ -354,6 +384,62 @@ mod tests {
         );
         assert!(needs_shell_wrapper(Path::new("C:/node/npx.cmd")));
         assert!(!needs_shell_wrapper(Path::new("C:/node/npx.exe")));
+    }
+
+    /// 子进程 PATH 必须带上 GUI 进程看不到的工具链目录，否则被拉起的 CLI
+    /// 找不到同机安装的兄弟命令（`pi-acp` 找 `pi` 就是这么失败的）。
+    #[test]
+    fn child_path_appends_gui_invisible_toolchain_dirs() {
+        let fallback = temp_dir("child-path-fallback");
+        let program = Path::new("/opt/navop-toolchain/bin/npx");
+        let process_path = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")])
+            .expect("join process path");
+
+        let path = child_path_in(
+            program,
+            Some(process_path.as_os_str()),
+            std::slice::from_ref(&fallback),
+        );
+        let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
+
+        assert_eq!(
+            Some(Path::new("/opt/navop-toolchain/bin")),
+            parts.first().map(PathBuf::as_path),
+            "程序目录必须排在最前，npx 才能找到同目录的 node"
+        );
+        assert!(
+            parts.contains(&PathBuf::from("/usr/bin")),
+            "当前进程的 PATH 不能被丢掉：{parts:?}"
+        );
+        assert_eq!(
+            Some(fallback.as_path()),
+            parts
+                .iter()
+                .find(|part| part.as_path() == fallback)
+                .map(PathBuf::as_path),
+            "兜底工具链目录必须补进去：{parts:?}"
+        );
+        assert_eq!(
+            1,
+            parts.iter().filter(|part| *part == &fallback).count(),
+            "兜底目录只出现一次"
+        );
+        let _ = std::fs::remove_dir_all(&fallback);
+    }
+
+    /// PATH 被裁剪到只剩工具链目录时，`sh` / `env` 这类基础命令也不能丢。
+    #[cfg(not(windows))]
+    #[test]
+    fn child_path_always_keeps_base_system_dirs() {
+        let path = child_path_in(Path::new("/opt/navop-toolchain/bin/npx"), None, &[]);
+        let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
+
+        for dir in BASE_SYSTEM_DIRS {
+            assert!(
+                parts.contains(&PathBuf::from(dir)),
+                "缺少基础目录 {dir}: {parts:?}"
+            );
+        }
     }
 
     #[cfg(not(windows))]

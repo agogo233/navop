@@ -282,12 +282,29 @@ fn resolve_preset_command(
     };
     // 把程序目录补进子进程 PATH：npm/npx 需要找到同目录的 node，
     // 否则 GUI 里拉起时会以 `env: node: No such file or directory` 失败。
-    let program_dir_path = process_util::child_path_with_program_dir(&resolved);
-    let program_dir = program_dir_path.to_string_lossy().to_string();
-    env.retain(|(name, _)| name != "PATH");
-    env.push(("PATH".to_string(), program_dir));
+    // 只补目录还不够：适配器会再 spawn 兄弟 CLI（`pi-acp` 找 `pi`），所以补全逻辑
+    // 还要带上 GUI 进程看不到的工具链目录（nvm / fnm / volta 等）。
+    extend_child_path(env, &resolved);
     *command = resolved.to_string_lossy().to_string();
     Ok(())
+}
+
+/// 给 ACP 子进程的 PATH 补上程序目录与 GUI 进程看不到的工具链目录。
+///
+/// 以配置里已写的 PATH（若有）为底：用户显式配置的目录要排在兜底目录之前，
+/// 不能因为补全逻辑把整条 PATH 换掉。
+fn extend_child_path(env: &mut Vec<(String, String)>, program: &Path) {
+    let configured = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone());
+    let path = process_util::child_path_with_program_dir_and_path(
+        program,
+        configured.as_deref().map(std::ffi::OsStr::new),
+    );
+    let path = path.to_string_lossy().to_string();
+    env.retain(|(name, _)| name != "PATH");
+    env.push(("PATH".to_string(), path));
 }
 
 /// 用户自己定义的 agent（配置里带 `command` 的条目）。
@@ -353,8 +370,14 @@ fn apply_user_override(config: &mut AcpAgentConfig, user: AcpResolvedAgentOverri
         *current_args = args;
     }
     // 传输只剩 stdio 一种形态，直接解构即可（留着 `if let` 只会被警告说恒真）。
-    let AcpTransport::Stdio { env, .. } = &mut config.transport;
+    let AcpTransport::Stdio { command, env, .. } = &mut config.transport;
     merge_env(env, user.env);
+    // 覆盖项里重写了 PATH 时，用户目录要留，但程序目录与工具链目录也不能丢：
+    // 适配器再 spawn 兄弟 CLI 时仍然依赖它们。
+    if env.iter().any(|(name, _)| name == "PATH") {
+        let command = command.clone();
+        extend_child_path(env, Path::new(&command));
+    }
     user.timeouts.apply(&mut config.timeouts);
 }
 

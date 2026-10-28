@@ -1,6 +1,9 @@
 mod program;
 
-pub use program::{build_command, child_path_with_program_dir, resolve_program};
+pub use program::{
+    build_command, child_path_with_program_dir, child_path_with_program_dir_and_path,
+    resolve_program,
+};
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
