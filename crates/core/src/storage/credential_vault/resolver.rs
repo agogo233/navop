@@ -2,10 +2,11 @@ use anyhow::{Result, bail};
 
 use crate::storage::traits::Repository;
 use crate::storage::{
-    ConnectionType, CredentialRepository, DbConnectionConfig, FtpParams, MongoDBParams,
-    ProxyConfig, RedisParams, ReferencedCredentialFields, RemoteDesktopParams, RemoteFileParams,
-    RemoteFileProtocol, SshAccountExpect, SshAgentForwardKey, SshAuthMethod, SshParams,
-    StoredConnection, TelnetLoginStep, TelnetParams, resolve_credential_reference_strict,
+    ConnectionType, CredentialRepository, CredentialResolutionError, DbConnectionConfig, FtpParams,
+    MongoDBParams, ProxyConfig, RedisParams, ReferencedCredentialFields, RemoteDesktopParams,
+    RemoteFileParams, RemoteFileProtocol, SshAccountExpect, SshAgentForwardKey, SshAuthMethod,
+    SshParams, StoredConnection, TelnetLoginStep, TelnetParams,
+    resolve_credential_reference_strict,
 };
 
 impl CredentialRepository {
@@ -48,15 +49,13 @@ impl CredentialRepository {
             return Ok(params);
         };
         let credential = self.resolve_reference_entry(reference)?;
-        let manual = ssh_fields(&params);
-        let fields = resolve_credential_reference_strict(manual, reference, credential.as_ref())?;
-        params.username = fields.username.clone().unwrap_or_default();
-        apply_ssh_auth(
-            &mut params.auth_method,
-            reference,
-            fields,
-            credential.as_ref(),
-        )?;
+        // 选了钥匙串后表单里的用户名、认证方式、「连接时输入」都被隐藏，
+        // 保存下来的值不再参与：登录信息完全由钥匙串记录决定。
+        let login = ssh_login_from_credential(reference, credential.as_ref())?;
+        params.username = login.username;
+        params.auth_method = login.auth_method;
+        params.prompt_username = None;
+        params.prompt_password = None;
         if let Some(credential) = credential.as_ref() {
             params.account_expect = credential.ssh_expect.clone();
             // 仅当凭据带私钥且标记「转发到 ssh-agent」时开启 ForwardAgent，
@@ -281,23 +280,11 @@ impl CredentialRepository {
             return Ok(());
         };
         let credential = self.resolve_reference_entry(reference)?;
-        let fields = resolve_credential_reference_strict(
-            ReferencedCredentialFields::new(
-                Some(jump.username.clone()),
-                password_from_auth(&jump.auth_method),
-                private_key_from_auth(&jump.auth_method),
-                passphrase_from_auth(&jump.auth_method),
-            ),
-            reference,
-            credential.as_ref(),
-        )?;
-        jump.username = fields.username.clone().unwrap_or_default();
-        apply_ssh_auth(
-            &mut jump.auth_method,
-            reference,
-            fields,
-            credential.as_ref(),
-        )
+        // 选了钥匙串后表单里的用户名与认证方式都被隐藏，保存值不再参与。
+        let login = ssh_login_from_credential(reference, credential.as_ref())?;
+        jump.username = login.username;
+        jump.auth_method = login.auth_method;
+        Ok(())
     }
 
     fn resolve_reference_entry(
@@ -312,115 +299,78 @@ impl CredentialRepository {
     }
 }
 
-fn ssh_fields(params: &SshParams) -> ReferencedCredentialFields {
-    ReferencedCredentialFields::new(
-        Some(params.username.clone()),
-        password_from_auth(&params.auth_method),
-        private_key_from_auth(&params.auth_method),
-        passphrase_from_auth(&params.auth_method),
-    )
+/// 钥匙串记录解析出的 SSH 登录信息。
+struct SshCredentialLogin {
+    username: String,
+    auth_method: SshAuthMethod,
 }
 
-fn password_from_auth(auth: &SshAuthMethod) -> Option<String> {
-    match auth {
-        SshAuthMethod::Password { password } => Some(password.clone()),
-        SshAuthMethod::Chain(steps) => steps.iter().find_map(password_from_auth),
-        _ => None,
-    }
-}
-
-fn private_key_from_auth(auth: &SshAuthMethod) -> Option<String> {
-    match auth {
-        SshAuthMethod::PrivateKey { key_path, .. } => Some(key_path.clone()),
-        SshAuthMethod::PrivateKeyContent { private_key, .. } => Some(private_key.clone()),
-        SshAuthMethod::Chain(steps) => steps.iter().find_map(private_key_from_auth),
-        _ => None,
-    }
-}
-
-fn passphrase_from_auth(auth: &SshAuthMethod) -> Option<String> {
-    match auth {
-        SshAuthMethod::PrivateKey { passphrase, .. }
-        | SshAuthMethod::PrivateKeyContent { passphrase, .. } => passphrase.clone(),
-        SshAuthMethod::Chain(steps) => steps.iter().find_map(passphrase_from_auth),
-        _ => None,
-    }
-}
-
-/// 用解析后的字段构造私钥认证方式；凭据里有内联私钥内容时优先用它。
-fn build_private_key_auth(
-    private_key: Option<String>,
-    passphrase: Option<String>,
-    credential: Option<&crate::storage::CredentialEntry>,
-) -> Result<SshAuthMethod> {
-    let credential =
-        credential.ok_or_else(|| anyhow::anyhow!("private-key credential is missing"))?;
-    if let Some(private_key_content) = credential
-        .private_key_content
-        .clone()
-        .filter(|value| !value.is_empty())
-    {
-        Ok(SshAuthMethod::PrivateKeyContent {
-            private_key: private_key_content,
-            passphrase,
-        })
-    } else {
-        Ok(SshAuthMethod::PrivateKey {
-            key_path: private_key.unwrap_or_default(),
-            passphrase,
-        })
-    }
-}
-
-fn apply_ssh_auth(
-    auth: &mut SshAuthMethod,
+/// 完全按钥匙串记录的内容得出 SSH 用户名与认证方式。
+///
+/// 选中钥匙串后，表单会隐藏用户名与认证方式，用户无法再改它们，所以连接里
+/// 残留的保存值不能参与；`credential_reference` 里的各个布尔标志同样由表单
+/// 根据当时隐藏的状态算出，也不作依据。规则只有两条：
+///
+/// - 用户名取记录里的用户名，为空就报错，绝不带着空用户名去连接；
+/// - 记录里有什么凭据就用什么：只有密码用密码，只有私钥用私钥，两者都有时
+///   交给 `SshAuthMethod::Chain`，由 SSH 层按服务器通告的方法决定试哪个
+///   （服务器只接受其中一种就只用那一种，两种都接受则按下面的顺序：先密码）。
+fn ssh_login_from_credential(
     reference: &crate::storage::CredentialReference,
-    fields: ReferencedCredentialFields,
     credential: Option<&crate::storage::CredentialEntry>,
-) -> Result<()> {
-    if reference.password && reference.private_key {
-        // 服务器要求「密码 + 密钥」两个因素时，凭据引用需要同时提供两份凭据。
-        let password = fields.password.unwrap_or_default();
-        let private_key =
-            build_private_key_auth(fields.private_key, fields.passphrase, credential)?;
-        *auth = SshAuthMethod::Chain(vec![SshAuthMethod::Password { password }, private_key]);
-    } else if reference.password {
-        *auth = SshAuthMethod::Password {
-            password: fields.password.unwrap_or_default(),
-        };
-    } else if reference.private_key {
-        *auth = build_private_key_auth(fields.private_key, fields.passphrase, credential)?;
-    } else if reference.passphrase {
-        match auth {
-            SshAuthMethod::PrivateKey { passphrase, .. }
-            | SshAuthMethod::PrivateKeyContent { passphrase, .. } => {
-                *passphrase = fields.passphrase;
-            }
-            SshAuthMethod::Chain(steps) => {
-                let key_factor = steps
-                    .iter_mut()
-                    .find(|step| step.contains_private_key())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "a passphrase reference requires private-key authentication"
-                        )
-                    })?;
-                match key_factor {
-                    SshAuthMethod::PrivateKey { passphrase, .. }
-                    | SshAuthMethod::PrivateKeyContent { passphrase, .. } => {
-                        *passphrase = fields.passphrase;
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(
-                            "a passphrase reference requires private-key authentication"
-                        ));
-                    }
-                }
-            }
-            _ => bail!("a passphrase reference requires private-key authentication"),
+) -> Result<SshCredentialLogin> {
+    let credential_id = reference.credential_id;
+    let credential = credential.ok_or_else(|| {
+        anyhow::anyhow!(CredentialResolutionError::MissingCredential(credential_id))
+    })?;
+
+    let username = credential
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(CredentialResolutionError::EmptyField {
+                credential_id,
+                credential_name: credential.name.clone(),
+                field: "username",
+            })
+        })?
+        .to_string();
+
+    let non_empty = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+    let passphrase = non_empty(&credential.passphrase);
+    let password =
+        non_empty(&credential.password).map(|password| SshAuthMethod::Password { password });
+    // 内联私钥内容优先于文件路径。
+    let private_key = non_empty(&credential.private_key_content)
+        .map(|private_key| SshAuthMethod::PrivateKeyContent {
+            private_key,
+            passphrase: passphrase.clone(),
+        })
+        .or_else(|| {
+            non_empty(&credential.private_key_path).map(|key_path| SshAuthMethod::PrivateKey {
+                key_path,
+                passphrase: passphrase.clone(),
+            })
+        });
+
+    let auth_method = match (password, private_key) {
+        (Some(password), Some(private_key)) => SshAuthMethod::Chain(vec![password, private_key]),
+        (Some(single), None) | (None, Some(single)) => single,
+        (None, None) => {
+            return Err(anyhow::anyhow!(CredentialResolutionError::EmptyField {
+                credential_id,
+                credential_name: credential.name.clone(),
+                field: "password or private key",
+            }));
         }
-    }
-    Ok(())
+    };
+
+    Ok(SshCredentialLogin {
+        username,
+        auth_method,
+    })
 }
 
 fn telnet_login_script_from_credential(
@@ -437,4 +387,181 @@ fn telnet_login_script_from_credential(
         send: step.send.clone(),
     })
     .collect()
+}
+
+#[cfg(test)]
+mod ssh_login_tests {
+    use crate::storage::{
+        CredentialEntry, CredentialReference, CredentialResolutionError, SshAuthMethod,
+    };
+
+    use super::ssh_login_from_credential;
+
+    fn reference(flags_password: bool, flags_key: bool) -> CredentialReference {
+        // 标志位故意随意设置：解析结果必须与它们无关。
+        CredentialReference {
+            credential_id: 7,
+            credential_cloud_id: None,
+            username: false,
+            password: flags_password,
+            private_key: flags_key,
+            passphrase: false,
+        }
+    }
+
+    fn entry(
+        username: Option<&str>,
+        password: Option<&str>,
+        key_content: Option<&str>,
+        key_path: Option<&str>,
+    ) -> CredentialEntry {
+        let mut entry = CredentialEntry::new("entry");
+        entry.username = username.map(str::to_string);
+        entry.password = password.map(str::to_string);
+        entry.private_key_content = key_content.map(str::to_string);
+        entry.private_key_path = key_path.map(str::to_string);
+        entry.passphrase = Some("phrase".to_string());
+        entry
+    }
+
+    fn resolve(
+        reference: &CredentialReference,
+        entry: &CredentialEntry,
+    ) -> anyhow::Result<(String, SshAuthMethod)> {
+        ssh_login_from_credential(reference, Some(entry))
+            .map(|login| (login.username, login.auth_method))
+    }
+
+    #[test]
+    fn username_comes_from_the_credential_regardless_of_flags() {
+        for flags in [(false, false), (true, false), (false, true), (true, true)] {
+            let (username, _) = resolve(
+                &reference(flags.0, flags.1),
+                &entry(Some("  vault-user "), Some("pw"), None, None),
+            )
+            .expect("resolve");
+            assert_eq!("vault-user", username);
+        }
+    }
+
+    #[test]
+    fn missing_or_blank_username_is_an_error_not_an_empty_login() {
+        for username in [None, Some(""), Some("   ")] {
+            let error = resolve(
+                &reference(false, false),
+                &entry(username, Some("pw"), None, None),
+            )
+            .expect_err("an empty username must be rejected");
+            assert!(matches!(
+                error.downcast_ref::<CredentialResolutionError>(),
+                Some(CredentialResolutionError::EmptyField {
+                    field: "username",
+                    credential_id: 7,
+                    credential_name,
+                }) if credential_name == "entry"
+            ));
+        }
+    }
+
+    #[test]
+    fn password_only_uses_password_auth() {
+        let (_, auth) = resolve(
+            &reference(false, false),
+            &entry(Some("u"), Some("vault-password"), None, None),
+        )
+        .expect("resolve");
+        assert!(
+            matches!(auth, SshAuthMethod::Password { ref password } if password == "vault-password")
+        );
+    }
+
+    #[test]
+    fn key_only_prefers_inline_content_and_carries_the_passphrase() {
+        let (_, auth) = resolve(
+            &reference(false, false),
+            &entry(Some("u"), None, Some("inline-key"), Some("/path/key")),
+        )
+        .expect("resolve");
+        assert!(matches!(
+            auth,
+            SshAuthMethod::PrivateKeyContent { ref private_key, ref passphrase }
+                if private_key == "inline-key" && passphrase.as_deref() == Some("phrase")
+        ));
+
+        let (_, auth) = resolve(
+            &reference(false, false),
+            &entry(Some("u"), None, None, Some("/path/key")),
+        )
+        .expect("resolve");
+        assert!(matches!(
+            auth,
+            SshAuthMethod::PrivateKey { ref key_path, ref passphrase }
+                if key_path == "/path/key" && passphrase.as_deref() == Some("phrase")
+        ));
+    }
+
+    #[test]
+    fn password_and_key_become_a_chain_with_the_password_first() {
+        for flags in [(false, false), (true, false), (false, true), (true, true)] {
+            let (_, auth) = resolve(
+                &reference(flags.0, flags.1),
+                &entry(Some("u"), Some("vault-password"), Some("inline-key"), None),
+            )
+            .expect("resolve");
+            match auth {
+                SshAuthMethod::Chain(steps) => assert!(matches!(
+                    steps.as_slice(),
+                    [
+                        SshAuthMethod::Password { password },
+                        SshAuthMethod::PrivateKeyContent { private_key, .. }
+                    ] if password == "vault-password" && private_key == "inline-key"
+                )),
+                other => panic!("期望认证链，实际：{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_credential_without_any_secret_is_an_error() {
+        let error = resolve(&reference(true, true), &entry(Some("u"), None, None, None))
+            .expect_err("nothing to authenticate with");
+        assert!(matches!(
+            error.downcast_ref::<CredentialResolutionError>(),
+            Some(CredentialResolutionError::EmptyField {
+                field: "password or private key",
+                credential_id: 7,
+                credential_name,
+            }) if credential_name == "entry"
+        ));
+    }
+
+    #[test]
+    fn user_facing_messages_name_the_keychain_entry_and_are_translated() {
+        let error = resolve(
+            &reference(false, false),
+            &entry(Some(""), Some("pw"), None, None),
+        )
+        .expect_err("empty username");
+        let message = error.to_string();
+        assert!(
+            message.contains("entry"),
+            "应显示钥匙串记录名称而不是数字 ID，实际：{message}"
+        );
+        assert!(
+            !message.contains("CredentialError."),
+            "翻译键没有被解析，实际：{message}"
+        );
+        assert!(!message.contains('7'), "不应暴露内部 ID，实际：{message}");
+    }
+
+    #[test]
+    fn a_missing_credential_keeps_the_dedicated_error_for_the_runtime_fallback() {
+        let error = ssh_login_from_credential(&reference(false, false), None)
+            .err()
+            .expect("missing credential");
+        assert!(matches!(
+            error.downcast_ref::<CredentialResolutionError>(),
+            Some(CredentialResolutionError::MissingCredential(7))
+        ));
+    }
 }
