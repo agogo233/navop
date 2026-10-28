@@ -7361,7 +7361,11 @@ impl AgentChatView {
             return v_flex()
                 .w(sp(300.0))
                 .p_3()
-                .bg(theme.background)
+                .bg(theme.raised)
+                .border_1()
+                .border_color(border)
+                .rounded(theme.surface_radius)
+                .shadow_md()
                 .child(
                     div()
                         .text_sm()
@@ -7380,7 +7384,12 @@ impl AgentChatView {
 
         v_flex()
             .w(sp(300.0))
-            .bg(theme.background)
+            // 弹层自己的表面，与其余 composer 弹层同一套：raised + border + 圆角。
+            .bg(theme.raised)
+            .border_1()
+            .border_color(border)
+            .rounded(theme.surface_radius)
+            .shadow_md()
             .text_color(theme.foreground)
             .child(
                 PanelHeader::new("agent-history-header")
@@ -8479,7 +8488,12 @@ fn render_agent_switcher_content(
         .min_w(sp(300.0))
         .max_h(sp(AGENT_SWITCHER_MAX_HEIGHT))
         .overflow_y_scroll()
-        .bg(theme.background)
+        // 弹层自己的表面：Popover 的内容容器不画底色，用面板底色会看不出是浮层。
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.surface_radius)
+        .shadow_md()
         .text_color(theme.foreground);
 
     col = col.child(header_switcher_group_label("Agent", theme));
