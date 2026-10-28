@@ -1420,8 +1420,9 @@ impl SshFormWindow {
         let jump_host = self.jump_host_input.read(cx).text().to_string();
         let jump_username = self.jump_username_input.read(cx).text().to_string();
         let jump_picker = self.jump_credential_picker.read(cx);
-        let jump_username_referenced = jump_picker.field_referenced(CredentialField::Username);
-        if jump_host.is_empty() || (jump_username.is_empty() && !jump_username_referenced) {
+        // 选了钥匙串后用户名与认证方式都被隐藏，登录信息在连接时由钥匙串解析。
+        let jump_keychain_selected = jump_picker.selected_reference().is_some();
+        if jump_host.is_empty() || (jump_username.is_empty() && !jump_keychain_selected) {
             return None;
         }
         let jump_port: u16 = self
@@ -1466,10 +1467,11 @@ impl SshFormWindow {
         let username = self.username_input.read(cx).text().to_string();
         let credential_picker = self.credential_picker.read(cx);
         let credential_reference = credential_picker.selected_reference();
-        let username_referenced = credential_picker.field_referenced(CredentialField::Username);
-        let password_referenced = credential_picker.field_referenced(CredentialField::Password);
+        // 选了钥匙串后用户名、认证方式、「连接时输入」选项都被隐藏，不再参与校验与保存；
+        // 用户名为空之类的问题在连接时由钥匙串解析给出明确提示。
+        let keychain_selected = credential_reference.is_some();
 
-        if host.is_empty() || (username.is_empty() && self.save_username && !username_referenced) {
+        if host.is_empty() || (username.is_empty() && self.save_username && !keychain_selected) {
             return None;
         }
 
@@ -1704,10 +1706,10 @@ impl SshFormWindow {
             username,
             auth_method,
             credential_reference,
-            prompt_username: (!self.save_username && !username_referenced).then_some(true),
+            prompt_username: (!self.save_username && !keychain_selected).then_some(true),
             prompt_password: (!self.save_password
                 && self.auth_method.requires_password()
-                && !password_referenced)
+                && !keychain_selected)
                 .then_some(true),
             keyboard_interactive: (!self.keyboard_interactive).then_some(false),
             terminal_encoding: self

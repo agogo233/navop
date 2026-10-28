@@ -308,6 +308,7 @@ fn sftp_config_resolves_vault_username_before_connecting() {
     let credentials = repo.credential_repository();
     let mut credential = CredentialEntry::new("shared ssh account");
     credential.username = Some("vault-user".to_string());
+    credential.private_key_path = Some("/tmp/vault-key".to_string());
     let credential_id = credentials
         .insert(&mut credential)
         .expect("credential should insert");

@@ -136,6 +136,36 @@ Window:
     zh-CN: 已保存，但窗口没能关闭。可以再次关闭窗口重试，数据已经保存好了。
     zh-HK: 已儲存，但視窗未能關閉。可以再次關閉視窗重試，資料已經儲存好了。
 
+CredentialError:
+  not_found:
+    en: "Keychain entry %{id} was not found"
+    zh-CN: "未找到钥匙串记录 %{id}"
+    zh-HK: "找不到鑰匙串記錄 %{id}"
+  empty_field:
+    en: "Keychain entry \"%{name}\" has no %{field}"
+    zh-CN: "钥匙串记录“%{name}”中没有%{field}"
+    zh-HK: "鑰匙串記錄「%{name}」中沒有%{field}"
+  field_username:
+    en: username
+    zh-CN: 用户名
+    zh-HK: 使用者名稱
+  field_password:
+    en: password
+    zh-CN: 密码
+    zh-HK: 密碼
+  field_private_key:
+    en: private key
+    zh-CN: 私钥
+    zh-HK: 私鑰
+  field_passphrase:
+    en: key passphrase
+    zh-CN: 私钥口令
+    zh-HK: 私鑰口令
+  field_secret:
+    en: password or private key
+    zh-CN: 密码或私钥
+    zh-HK: 密碼或私鑰
+
 Home:
   open_connection:
     en: Open Connection
