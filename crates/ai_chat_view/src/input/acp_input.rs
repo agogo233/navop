@@ -52,8 +52,8 @@ use crate::input::composer_chrome::{
     CHIP_HEIGHT, CHIP_MAX_WIDTH, CHIP_MIN_WIDTH, CHIP_RADIUS, action_button_radius,
     action_button_size, capability_chip, composer_capability_row, composer_capability_slot,
     composer_card, composer_chip_label, composer_context_row, composer_editor_frame,
-    composer_model_chip, composer_root, composer_toolbar, estimated_label_width, ghost_chip,
-    ghost_chip_muted, model_menu_width,
+    composer_model_chip, composer_popover_surface, composer_root, composer_toolbar,
+    estimated_label_width, ghost_chip, ghost_chip_muted, model_menu_width,
 };
 use crate::input::context::{
     AgentComposerContext, ComposerBranchOption, ComposerMenuOption, ComposerModelOption,
@@ -1683,6 +1683,7 @@ impl AcpAgentInput {
                                 .glyph_size(px(16.0))
                                 .size(action_size)
                                 .rounded(action_button_radius())
+                                .cursor_pointer()
                                 .tooltip(t!("AgentUi.queue_for_next_turn").to_string())
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.submit(window, cx)),
@@ -1704,6 +1705,7 @@ impl AcpAgentInput {
                                 .glyph_size(px(16.0))
                                 .size(action_size)
                                 .rounded(action_button_radius())
+                                .cursor_pointer()
                                 .tooltip(t!("AgentUi.stop").to_string())
                                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                         ),
@@ -1724,6 +1726,7 @@ impl AcpAgentInput {
                             .glyph_size(px(16.0))
                             .size(action_size)
                             .rounded(action_button_radius())
+                            .cursor_pointer()
                             .tooltip(t!("AgentUi.send").to_string())
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -2093,12 +2096,7 @@ fn render_mode_content(
     cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
     let theme = active_agent_chat_theme(cx);
-    let mut col = v_flex()
-        .p_1()
-        .gap(sp(2.0))
-        .min_w(sp(200.0))
-        .bg(theme.background)
-        .text_color(theme.foreground);
+    let mut col = composer_popover_surface(&theme).min_w(sp(200.0));
 
     col = col.child(context_group_label(t!("AgentUi.mode").to_string(), &theme));
 
@@ -2182,12 +2180,7 @@ fn render_workspace_content(
     theme: &AgentChatTheme,
     cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
-    let mut col = v_flex()
-        .p_1()
-        .gap(sp(2.0))
-        .min_w(sp(260.0))
-        .bg(theme.background)
-        .text_color(theme.foreground);
+    let mut col = composer_popover_surface(theme).min_w(sp(260.0));
 
     col = col.child(context_group_label(
         t!("AgentUi.workspace").to_string(),
@@ -2449,7 +2442,7 @@ fn render_acp_plan_content(
 ) -> gpui::AnyElement {
     let theme = active_agent_chat_theme(cx);
     let muted = theme.muted_foreground;
-    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(320.0));
+    let mut col = composer_popover_surface(&theme).min_w(sp(320.0));
 
     col = col.child(context_group_label(
         t!("AgentUi.plan_todo").to_string(),
@@ -2469,7 +2462,7 @@ fn render_acp_plan_content(
     }
 
     for (index, item) in items.into_iter().enumerate() {
-        col = col.child(acp_plan_item_row(index, item, &theme, cx));
+        col = col.child(acp_plan_item_row(index, item, &theme));
     }
     col.into_any_element()
 }
@@ -2478,11 +2471,10 @@ fn acp_plan_item_row(
     index: usize,
     item: ComposerPlanItem,
     theme: &AgentChatTheme,
-    cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
     let muted = theme.muted_foreground;
-    let success = cx.theme().success;
-    let warning = cx.theme().warning;
+    let success = theme.success;
+    let warning = theme.warning;
     let (icon, icon_color) = match item.status.as_ref() {
         "completed" => (IconName::CircleCheck, success),
         "running" | "in_progress" => (IconName::LoaderCircle, warning),
@@ -2532,7 +2524,7 @@ fn render_acp_subagent_content(
 ) -> gpui::AnyElement {
     let theme = active_agent_chat_theme(cx);
     let muted = theme.muted_foreground;
-    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(300.0));
+    let mut col = composer_popover_surface(&theme).min_w(sp(300.0));
 
     col = col.child(context_group_label(
         t!("AgentUi.subagents").to_string(),
@@ -2647,6 +2639,11 @@ fn render_usage_detail(
         .w(sp(220.0))
         .gap_2()
         .p_3()
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.surface_radius)
+        .shadow_md()
         .child(
             div()
                 .text_xs()

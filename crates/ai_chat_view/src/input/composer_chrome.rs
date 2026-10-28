@@ -217,6 +217,24 @@ pub(crate) fn composer_context_row(theme: &AgentChatTheme) -> Div {
         .text_color(theme.muted_foreground)
 }
 
+/// 下拉菜单的表面：浮在卡片上的一块浮层，不是一块「隐形」的列表。
+///
+/// gpui 的 `Popover` 只负责定位，内容容器不画底色；调用方若只写文字与行 hover，
+/// 菜单就会直接叠在面板上（深色侧栏里尤其像没画完）。表面色取调色板里的
+/// `raised`，跟着面板配色走，而不是应用主题的 `popover`。
+pub(crate) fn composer_popover_surface(theme: &AgentChatTheme) -> Div {
+    v_flex()
+        .debug_selector(|| "agent-input-popover-surface".to_string())
+        .p_1()
+        .gap(sp(2.0))
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.surface_radius)
+        .shadow_md()
+        .text_color(theme.foreground)
+}
+
 /// chip 的内容：`[图标] [可截断标签]`。
 ///
 /// 不带 `⌄`：整块卡片原来有六条小箭头，一起消失是减线里最见效的一步。
@@ -272,12 +290,18 @@ pub(crate) fn ghost_chip_with(
     theme: &AgentChatTheme,
     cx: &App,
 ) -> Button {
-    button.h(sp(CHIP_HEIGHT)).rounded(px(CHIP_RADIUS)).custom(
-        ButtonCustomVariant::new(cx)
-            .foreground(foreground)
-            .hover(theme.overlay)
-            .active(theme.overlay),
-    )
+    button
+        .h(sp(CHIP_HEIGHT))
+        .rounded(px(CHIP_RADIUS))
+        // 组件库的按钮默认是箭头光标（桌面惯例），但参数行这些 chip 在鼠标悬停时
+        // 什么反馈都给不出「能点」的暗示，手指光标是这里唯一的提示。
+        .cursor_pointer()
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(foreground)
+                .hover(theme.overlay)
+                .active(theme.overlay),
+        )
 }
 
 /// 发送 / 排队 / 停止键的边长（与 chip 同高）。
@@ -375,6 +399,7 @@ pub(crate) fn composer_model_chip(
         .h(sp(CHIP_HEIGHT))
         .rounded(px(CHIP_RADIUS))
         .overflow_hidden()
+        .cursor_pointer()
         .hover(|this| this.bg(theme.overlay))
         .text_color(theme.foreground)
         .tooltip({

@@ -42,7 +42,8 @@ use crate::input::completion::ComposerCompletionProvider;
 use crate::input::composer_chrome::{
     action_button_radius, action_button_size, capability_chip, composer_capability_row,
     composer_capability_slot, composer_card, composer_editor_frame, composer_model_chip,
-    composer_permission_slot, composer_root, composer_toolbar, ghost_chip, model_menu_width,
+    composer_permission_slot, composer_popover_surface, composer_root, composer_toolbar,
+    ghost_chip, model_menu_width,
 };
 use crate::input::context::{
     AgentComposerContext, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
@@ -1280,6 +1281,7 @@ impl AgentInput {
                                 .small()
                                 .size(action_size)
                                 .rounded(action_radius)
+                                .cursor_pointer()
                                 .tooltip(t!("AgentUi.queue_for_next_turn").to_string())
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.submit(window, cx)),
@@ -1300,6 +1302,7 @@ impl AgentInput {
                                 .small()
                                 .size(action_size)
                                 .rounded(action_radius)
+                                .cursor_pointer()
                                 .tooltip(t!("AgentUi.stop").to_string())
                                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                         ),
@@ -1319,6 +1322,7 @@ impl AgentInput {
                             .small()
                             .size(action_size)
                             .rounded(action_radius)
+                            .cursor_pointer()
                             .tooltip(t!("AgentUi.send").to_string())
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -1447,12 +1451,7 @@ fn render_mode_content(
     theme: &AgentChatTheme,
     cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
-    let mut col = v_flex()
-        .p_1()
-        .gap(sp(2.0))
-        .min_w(sp(320.0))
-        .bg(theme.background)
-        .text_color(theme.foreground);
+    let mut col = composer_popover_surface(theme).min_w(sp(320.0));
 
     col = col.child(context_group_label(t!("AgentUi.mode").to_string(), theme));
     for option in data.options {
@@ -1529,7 +1528,7 @@ fn render_plan_mode_content(
     let theme = active_agent_chat_theme(cx);
     let muted = theme.muted_foreground;
     let border = theme.border;
-    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(320.0));
+    let mut col = composer_popover_surface(&theme).min_w(sp(320.0));
 
     col = col.child(context_group_label(
         t!("AgentUi.plan_todo").to_string(),
@@ -1748,7 +1747,7 @@ fn render_subagent_mode_content(
 ) -> gpui::AnyElement {
     let theme = active_agent_chat_theme(cx);
     let muted = theme.muted_foreground;
-    let mut col = v_flex().p_1().gap(sp(2.0)).min_w(sp(300.0));
+    let mut col = composer_popover_surface(&theme).min_w(sp(300.0));
 
     col = col.child(context_group_label(
         t!("AgentUi.subagents").to_string(),
@@ -1873,6 +1872,12 @@ fn render_context_mode_content(
         .debug_selector(|| "agent-context-popover-content".to_string())
         .w(sp(CONTEXT_POPOVER_WIDTH))
         .min_w(sp(CONTEXT_POPOVER_WIDTH))
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.surface_radius)
+        .shadow_md()
+        .text_color(theme.foreground)
         .overflow_x_hidden();
 
     if let Some(target) = current {
@@ -3162,6 +3167,31 @@ mod tests {
         assert!(
             cx.debug_bounds("agent-tool-mode").is_none(),
             "tool mode should not render as a separate legacy toolbar control"
+        );
+    }
+
+    /// 计划弹层必须自己画一块表面：`Popover` 的内容容器默认没有底色，
+    /// 少了这层 `bg`，菜单就会直接叠在面板上（深色侧栏里像没画完）。
+    #[gpui::test]
+    fn plan_popover_paints_its_own_surface(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(AgentInputLayoutRoot::new);
+        let cx: &mut VisualTestContext = cx;
+
+        let trigger = cx
+            .debug_bounds("agent-plan-trigger")
+            .expect("plan trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+
+        let surface = cx
+            .debug_bounds("agent-input-popover-surface")
+            .expect("plan popover must paint its own surface");
+        assert!(
+            surface.size.width >= px(300.0),
+            "popover surface should be wide enough for the plan content: {surface:?}"
         );
     }
 
