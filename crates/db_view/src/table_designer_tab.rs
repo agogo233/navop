@@ -52,7 +52,7 @@ use rust_i18n::t;
 const COLUMN_EDITOR_RESIZE_GRAB_PADDING: Pixels = px(4.0);
 /// 分隔线本身的宽度。
 const COLUMN_EDITOR_RESIZE_LINE_WIDTH: Pixels = px(1.0);
-const COLUMN_EDITOR_COLUMN_COUNT: usize = 7;
+const COLUMN_EDITOR_COLUMN_COUNT: usize = 8;
 const COLUMN_NAME_COL: usize = 0;
 const COLUMN_TYPE_COL: usize = 1;
 const COLUMN_LENGTH_COL: usize = 2;
@@ -60,6 +60,8 @@ const COLUMN_SCALE_COL: usize = 3;
 const COLUMN_NULLABLE_COL: usize = 4;
 const COLUMN_PRIMARY_KEY_COL: usize = 5;
 const COLUMN_AUTO_INCREMENT_COL: usize = 6;
+/// 默认值列紧跟在自增之后、注释之前，与各家设计器的习惯顺序一致。
+const COLUMN_DEFAULT_COL: usize = 7;
 const COLUMN_DRAG_HANDLE_WIDTH: Pixels = px(24.0);
 const COLUMN_EDITOR_DEFAULT_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(160.0),
@@ -69,6 +71,7 @@ const COLUMN_EDITOR_DEFAULT_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(50.0),
     px(50.0),
     px(50.0),
+    px(120.0),
 ];
 const COLUMN_EDITOR_MIN_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(96.0),
@@ -78,6 +81,7 @@ const COLUMN_EDITOR_MIN_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(42.0),
     px(42.0),
     px(42.0),
+    px(80.0),
 ];
 const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(360.0),
@@ -87,6 +91,7 @@ const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(120.0),
     px(120.0),
     px(140.0),
+    px(260.0),
 ];
 
 /// 列/索引行的选中底色透明度。
@@ -2970,6 +2975,12 @@ impl ColumnsEditor {
                 true,
                 cx,
             ))
+            .child(self.render_header_cell(
+                COLUMN_DEFAULT_COL,
+                t!("Table.default_value").to_string(),
+                false,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -3174,13 +3185,28 @@ impl ColumnsEditor {
             )
             .child(
                 div()
+                    .w(self.column_width(COLUMN_DEFAULT_COL))
+                    .child(Input::new(&row.default_input).w_full()),
+            )
+            .child(
+                div()
                     .flex_1()
                     .child(Input::new(&row.comment_input).w_full()),
             )
             .into_any_element()
     }
 
+    /// 详情面板只剩「列表行放不下」的字段：默认值已经在列表列里直接编辑，
+    /// 这里只留字符集、排序规则和枚举可选值。某个库三者都没有时（SQL Server、
+    /// Oracle 等）整个面板不渲染，避免底部留下一条空白带子挤压列表。
     fn render_detail_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let has_detail_fields = self.column_editor_capabilities.show_charset_in_detail
+            || self.column_editor_capabilities.show_collation_in_detail
+            || self.column_editor_capabilities.supports_enum_values;
+        if !has_detail_fields {
+            return div().into_any_element();
+        }
+
         let Some(idx) = self.selected_index else {
             return v_flex()
                 .items_center()
@@ -3215,6 +3241,10 @@ impl ColumnsEditor {
             && self.is_enum_type(&selected_type, cx);
         let show_charset = self.column_editor_capabilities.show_charset_in_detail;
         let show_collation = self.column_editor_capabilities.show_collation_in_detail;
+        // 支持枚举值但当前类型不是 enum/set 时也没有可填的字段。
+        if !show_charset && !show_collation && !is_enum_or_set {
+            return div().into_any_element();
+        }
 
         v_flex()
             .w_full()
@@ -3226,19 +3256,6 @@ impl ColumnsEditor {
             .bg(cx.theme().background)
             .p_3()
             .gap_3()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(70.))
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}:", t!("Table.default_value"))),
-                    )
-                    .child(Input::new(&row.default_input).w(px(200.))),
-            )
             .when(show_charset, |this| {
                 this.child(
                     h_flex()
@@ -5996,6 +6013,46 @@ mod tests {
                 "{name} 的编辑器不能是禁用态，否则选区都拿不到"
             );
         }
+    }
+
+    /// 列列表要能直接看到并改默认值（issue #477）：
+    /// 表头有默认值列、行里是可编辑输入框、详情面板不再重复渲染同一个输入。
+    #[test]
+    fn the_columns_list_shows_the_default_value_column() {
+        let source = include_str!("table_designer_tab.rs");
+
+        let header = function_body(source, "render_table_header");
+        let default_header = header
+            .find("COLUMN_DEFAULT_COL")
+            .expect("列列表表头要显示默认值列");
+        let comment_header = header.find("Table.comment").expect("表头要有注释列");
+        assert!(
+            default_header < comment_header,
+            "默认值列要排在注释列之前，和各家设计器的习惯顺序一致"
+        );
+
+        let row = function_body(source, "render_row");
+        assert!(
+            row.contains("column_width(COLUMN_DEFAULT_COL)"),
+            "列列表行要按默认值列的宽度渲染单元格"
+        );
+        assert!(
+            row.contains("Input::new(&row.default_input)"),
+            "默认值要在列列表里直接编辑"
+        );
+
+        // 同一个 InputState 渲染两处，两处都会画出焦点框和光标。
+        let detail = function_body(source, "render_detail_panel");
+        assert!(
+            !detail.contains("row.default_input"),
+            "详情面板不能再渲染默认值输入框，否则和列表行抢同一份输入状态"
+        );
+        assert!(
+            detail.contains("show_charset")
+                && detail.contains("show_collation")
+                && detail.contains("is_enum_or_set"),
+            "详情面板只保留字符集 / 排序规则 / 枚举可选值"
+        );
     }
 
     /// 工具栏里复制按钮摆在「保存」左边，而不是预览区里单独占一行。
