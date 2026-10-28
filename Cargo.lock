@@ -316,6 +316,7 @@ dependencies = [
  "one-core",
  "one-ui",
  "palette",
+ "process-util",
  "rust-i18n",
  "serde",
  "serde_json",
@@ -5977,6 +5978,7 @@ version = "0.15.2"
 dependencies = [
  "dirs 6.0.0",
  "futures",
+ "process-util",
  "serde",
  "tempfile",
 ]
@@ -10216,6 +10218,7 @@ version = "0.15.2"
 dependencies = [
  "dirs 6.0.0",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
