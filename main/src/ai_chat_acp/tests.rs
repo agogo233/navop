@@ -71,7 +71,19 @@ fn overridden_path_keeps_program_dir_and_toolchain_dirs() {
         .expect("PATH is injected for npm-backed presets");
     assert!(path.starts_with("/opt/acp/bin"), "{path}");
     assert!(path.contains("/custom/toolchain/bin"), "{path}");
+    // 兜底目录随平台不同（见 `process_util` 的 fallback_program_dirs）：Unix 会额外补
+    // `/usr/bin` 这一层基础系统目录，Windows 补的是 nodejs / npm / Volta 之类的工具链
+    // 目录、没有 `/usr/bin`，所以断言必须按平台分开，否则 Windows CI 必红。
+    #[cfg(not(windows))]
     assert!(path.contains("/usr/bin"), "{path}");
+    #[cfg(windows)]
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let nodejs = PathBuf::from(program_files).join("nodejs");
+        assert!(
+            path.contains(&*nodejs.to_string_lossy()),
+            "缺少 Windows 工具链兜底目录 {nodejs:?}: {path}"
+        );
+    }
 }
 
 #[test]
