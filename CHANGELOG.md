@@ -4,6 +4,70 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [v0.22.0] - 2026-10-28
+
+#### 更新内容
+
+- 团队管理全部迁入桌面端原生「团队」页：建团队、改资料、邀请成员、改角色、移除成员与团队密钥都在应用内完成，不再把 access_token / refresh_token 拼进 URL 打开浏览器（网站 dashboard 可以下线了）；权限严格对齐线上 RPC，owner 不可被直接移除。
+- 侧边栏 AI 每轮都重新读一次终端现场：当前目录、是否在 vim 这类全屏程序里、选中了什么、窗口尺寸和前台进程都会随消息带过去，不用再让模型先调 `terminal.read` 才知道你在哪。SSH 终端保持「连接」为默认目标，连接级工具的行为不变。
+- 终端里选中一段内容后直接提问，选中的正文会随消息一起送进侧边栏 AI（超过 8000 字截断并标注），发送前就能在转录里看到自己送出了什么。
+- 读终端时可以省略 target：会话里只有一个终端时自动补上，返回结果新增全屏程序、滚动位置、光标行与选中区间。
+- 侧栏分组右键新增「移动到」：子分组可以换父级，也可以移回顶层；目标里会剔掉自己和自己的后代，不会移成环。
+- AI 输入框重新排版：能力入口（计划 / 子代理 / 上下文 / 技能）回到卡片顶部一行，底栏只留「怎么发出去」（模型、模式 / 权限、附件、发送），窄侧栏下标签不再被挤成省略号；ACP 与内置 Agent 两套输入框共用同一套尺寸。
+- ACP 客户端目录收全官方 registry：内置 27 个预设，默认只启用 Claude Code、Codex、OpenCode、DeepSeek Harness 与 Pi，其余在「设置 > ACP 客户端」里按需打开；新装机器不会因为探活把十几个 CLI 一起拉起来。
+
+#### 修复与优化
+
+- 修复侧栏 ACP 底栏缺分支与 Worktree 的问题：终端侧边栏现在和工作台一样注入工作区、分支与 Worktree，切换分支、勾选 Worktree 都可用，chip 与实际工作目录始终一致。
+- ACP 切换器选完立即关闭，不再盖住新视图；agent 变多时列表固定高度并可滚动，不会顶到窗口边缘点不到靠下的项。
+- 修掉执行过程每来一次工具调用就收起、再撑开的闪烁：过程按「段」折叠，当前段默认展开；正文写完后的新一段思考单独成段，不再挂到上一段正文上方。
+- 修掉深色侧栏里的白块与串色：输入区底色跟卡片形态走（卡片有框时不填色、无框的侧栏才用内嵌底色），弹层自己画浮层表面，按钮恢复手指光标。
+- 同一份待审批不再出现两处入口：去掉输入框上方的重复决策栏，审批只在时间线卡片里做，卡片里的入参与上下文更完整。
+- 首页与侧栏不再「丢连接」：未分组连接在分组过滤下也照常显示，分组被删除或尚未同步落地的连接会收进「未分组」，不会再两个视图都找不到。
+- 分组右键「新建连接」默认落在该分组；此前向导总是默认「未分组」，保存后连接跑到根目录。
+- 云同步不再清空或改回连接的分组归属：分组还没上传时宁可不传，也不会把「无分组」写进云端；云端没有分组引用时保留本地分组，收尾阶段按云端明确给出的引用对齐，不再来回覆盖。
+- 团队页补回滚动条并修掉左栏头部溢出：264px 窄栏下刷新按钮不再被右侧详情面板盖掉，成员行在窄窗口不再挤压角色徽标。
+- SFTP 上传文件夹冲突选「覆盖」前增加二次确认：明确说明这是整目录替换（只存在于远端的文件会被删掉），只需替换同名文件时应改用「合并」。
+- 数据库表格右键「删除记录」按选区批量删除：多选后右键删除不再只删掉第一行；右键落在选区外时仍只删那一行。
+- SQL Server 低兼容级别的库恢复分页能力：兼容级别低于 110 时回退 `ROW_NUMBER()` 分页，双击表预览不再整页空白。
+- 修复启动期两处运行态 panic：`secondary-s` 快捷键改为按宿主系统解析，ACP 就绪等待不再跨 await 持有 runtime guard。
+- 升级到 gpui-fast v0.1.12、gpui-kit v0.8.1 与 russh 0.65.0，并适配一批 API 变更（滚动事件、动态快捷键、键盘布局识别等）。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.22.0) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- Team management now lives in a native desktop "Team" page: create teams, edit profiles, invite members, change roles, remove members and manage team keys inside the app instead of opening the browser with access_token / refresh_token in the URL (the website dashboard can be retired). Permissions mirror the online RPC layer, and an owner can no longer be removed directly.
+- The sidebar AI re-reads the terminal on every turn: current directory, whether a full-screen program like vim is running, the current selection, window size and foreground process all travel with the message, so the model no longer has to call `terminal.read` first. SSH terminals keep the connection as their default target, so connection-scoped tools behave as before.
+- Select text in the terminal and ask a question: the selected body is attached to the message (truncated with a note above 8000 characters) and shows up in the transcript, so you can see what you sent.
+- `terminal.read` can omit its target: with a single terminal in the session it is filled in automatically, and results now include the alternate-screen state, display offset, cursor row and selection.
+- Sidebar groups gained a "Move to" action in the context menu: subgroups can change parents or move back to the top level, and the target list excludes the group itself and its descendants so no cycle can be created.
+- The AI composer was re-laid out: capability entries (plan / subagents / context / skills) sit on a row at the top of the card, the bottom row is only about sending (model, mode / permission, attachment, send), labels no longer collapse into ellipses in narrow sidebars, and the ACP and built-in agent composers share one set of measurements.
+- The ACP client catalog now covers the official registry: 27 built-in presets with only Claude Code, Codex, OpenCode, DeepSeek Harness and Pi enabled by default; the rest can be turned on in Settings > ACP clients, so a fresh machine no longer spawns a dozen CLIs just to probe them.
+
+#### Fixes and Improvements
+
+- Fixed the missing branch and Worktree controls in the sidebar ACP footer: the terminal sidebar now injects workspace, branches and Worktree just like the workbench, so switching branches and enabling Worktree work there, and the chip always matches the real working directory.
+- The ACP switcher closes as soon as a client is picked instead of covering the new view, and its list scrolls inside a fixed height so entries near the bottom stay reachable.
+- Fixed the flicker where the process block collapsed on every tool call and expanded again: the process collapses by segment with the current segment staying open, and a new reasoning segment after written text now starts its own block instead of appearing above the previous answer.
+- Fixed white patches and wrong colors in dark sidebars: the editor fill follows the card shape (no fill when the card has a border, an inset fill only in borderless sidebars), popovers paint their own surface, and buttons use the pointing-hand cursor again.
+- A pending approval no longer appears twice: the duplicate decision bar above the composer is gone, and approvals happen on the timeline card, which carries the full arguments and context.
+- The home page and sidebar no longer lose connections: ungrouped connections show up even while groups are filtered, and connections whose group was deleted or has not synced yet are collected under "Ungrouped" instead of disappearing from both views.
+- "New connection" from a group's context menu now lands in that group; the wizard used to default to "Ungrouped" and save the connection at the root.
+- Cloud sync no longer clears or reverts a connection's group: uploads wait until the group has a cloud ID instead of writing "no group", downloads keep the local group when the cloud record has no reference, and a final alignment pass applies the references the cloud does provide.
+- The team page scrolls again and no longer overflows its header: at 264px the refresh button is no longer hidden behind the detail panel, and member rows stop squeezing the role badge in narrow windows.
+- Overwriting an SFTP folder conflict now asks for confirmation first, spelling out that it replaces the whole directory (deleting files that only exist remotely) and pointing to "Merge" when only same-named files should be replaced.
+- "Delete record" in the database grid now deletes the whole selection: right-clicking inside a multi-row selection no longer removes only the first row, while right-clicking outside the selection still deletes a single row.
+- SQL Server databases at a lower compatibility level paginate again: below level 110 the grid falls back to `ROW_NUMBER()` paging, so previewing a table no longer shows a blank page.
+- Fixed two startup panics: the `secondary-s` shortcut is resolved against the host OS, and the ACP readiness wait no longer holds a runtime guard across an await.
+- Upgraded to gpui-fast v0.1.12, gpui-kit v0.8.1 and russh 0.65.0, adapting to a batch of API changes (scroll events, dynamic key bindings, keyboard layout detection).
+
+---
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.21.2...v0.22.0
+
 ## [v0.21.2] - 2026-10-26
 
 #### 修复与优化
