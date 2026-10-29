@@ -43,11 +43,13 @@ impl MongoSidebar {
         let active_connection = active_conn_id
             .and_then(|id| connections.iter().find(|conn| conn.id == Some(id)))
             .or_else(|| connections.first());
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
         let ai_chat_panel = if let Some(connection) = active_connection {
             let (scope, catalog, mentions) = build_sidebar_resource_state(
                 connection,
                 &connections,
                 DefaultTargetReason::CurrentConnection,
+                &ai_access_levels,
             );
             cx.new(|cx| {
                 DefaultAgentChatPanel::new_sidebar_with_scope_and_catalog(

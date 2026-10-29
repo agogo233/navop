@@ -5,9 +5,15 @@ use std::sync::OnceLock;
 
 pub const PORTABLE_MARKER_FILE: &str = "navop.portable";
 
+/// debug 构建的默认数据目录名。开发态必须与已安装版本完全隔离，
+/// 否则 `cargo run` 会直接写生产配置（连接库、设置、登录态）。
+/// 与 `.env.local` 中常用的 `NAVOP_DATA_DIR=~/.navop-dev` 保持一致。
+pub const DEVELOPMENT_DATA_DIR_NAME: &str = ".navop-dev";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppRunMode {
     Installed,
+    Development { root: PathBuf },
     Portable { root: PathBuf },
 }
 
@@ -40,6 +46,16 @@ impl AppPaths {
         matches!(self.mode, AppRunMode::Portable { .. })
     }
 
+    /// debug 构建使用独立的开发数据目录。
+    pub fn is_development(&self) -> bool {
+        matches!(self.mode, AppRunMode::Development { .. })
+    }
+
+    /// 只有正式安装态才允许迁移生产目录、注册文件关联等宿主级副作用。
+    pub fn uses_installed_directories(&self) -> bool {
+        matches!(self.mode, AppRunMode::Installed)
+    }
+
     pub fn allows_persistent_master_key(&self) -> bool {
         true
     }
@@ -63,6 +79,20 @@ pub struct AppPathOverrides {
     data_dir: Option<PathBuf>,
 }
 
+impl AppPathOverrides {
+    /// 把配置/数据根目录挪到指定位置（等同 `--data-dir`）。
+    ///
+    /// 测试用它把写入引到临时目录：配置写入路径默认指向用户真实配置目录，
+    /// 而测试里的设置起步是默认值，一次保存就会把用户真实 `settings.json`
+    /// 覆盖成默认值。
+    pub fn with_data_dir(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            portable: false,
+            data_dir: Some(data_dir.into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedStartupArguments {
     pub path_overrides: AppPathOverrides,
@@ -75,6 +105,8 @@ pub struct AppPathResolutionContext {
     pub current_dir: PathBuf,
     pub portable_environment: Option<OsString>,
     pub data_dir_environment: Option<OsString>,
+    /// debug 构建的默认隔离目录；release 构建恒为 `None`。
+    pub development_data_dir: Option<PathBuf>,
 }
 
 static APP_PATHS: OnceLock<AppPaths> = OnceLock::new();
@@ -129,31 +161,43 @@ pub fn resolve_app_paths(
     context: &AppPathResolutionContext,
 ) -> Result<AppPaths> {
     let executable_root = executable_root(&context.executable_path)?;
-    let marker_portable = executable_root.join(PORTABLE_MARKER_FILE).is_file();
+    if let Some(data_root) = requested_data_root(overrides, context, &executable_root) {
+        return Ok(portable_paths(executable_root, data_root));
+    }
+    if let Some(development_root) = context.development_data_dir.as_ref() {
+        return Ok(development_paths(development_root.clone()));
+    }
+
+    Ok(installed_paths()?)
+}
+
+/// 用户显式声明的便携数据根。显式参数与便携环境变量优先于 debug 隔离目录。
+fn requested_data_root(
+    overrides: &AppPathOverrides,
+    context: &AppPathResolutionContext,
+    executable_root: &Path,
+) -> Option<PathBuf> {
+    if let Some(path) = overrides.data_dir.as_ref() {
+        return Some(make_absolute(path, &context.current_dir));
+    }
+    if overrides.portable {
+        return Some(executable_root.join("data"));
+    }
     let environment_data_dir = context
         .data_dir_environment
         .as_deref()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
+    if let Some(path) = environment_data_dir.as_ref() {
+        return Some(make_absolute(path, &context.current_dir));
+    }
     let portable_environment = context
         .portable_environment
         .as_deref()
         .is_some_and(is_truthy);
-    let data_root = if let Some(path) = overrides.data_dir.as_ref() {
-        Some(make_absolute(path, &context.current_dir))
-    } else if overrides.portable {
-        Some(executable_root.join("data"))
-    } else if let Some(path) = environment_data_dir.as_ref() {
-        Some(make_absolute(path, &context.current_dir))
-    } else {
-        (portable_environment || marker_portable).then(|| executable_root.join("data"))
-    };
+    let marker_portable = executable_root.join(PORTABLE_MARKER_FILE).is_file();
 
-    if let Some(data_root) = data_root {
-        return Ok(portable_paths(executable_root, data_root));
-    }
-
-    Ok(installed_paths()?)
+    (portable_environment || marker_portable).then(|| executable_root.join("data"))
 }
 
 pub fn initialize_app_paths(
@@ -176,6 +220,11 @@ pub fn is_portable() -> bool {
     initialized_paths().is_some_and(AppPaths::is_portable)
 }
 
+/// 当前进程是否运行在正式安装态。未初始化时按安装态处理，保持旧行为。
+pub fn is_installed() -> bool {
+    initialized_paths().is_none_or(AppPaths::uses_installed_directories)
+}
+
 pub fn master_key_on_startup_required(
     configured: bool,
     portable_remember_master_key: bool,
@@ -191,7 +240,27 @@ pub fn process_context() -> Result<AppPathResolutionContext> {
         current_dir: std::env::current_dir().context("resolve current directory")?,
         portable_environment: std::env::var_os("NAVOP_PORTABLE"),
         data_dir_environment: std::env::var_os("NAVOP_DATA_DIR"),
+        development_data_dir: development_data_dir(),
     })
+}
+
+/// debug 构建默认写入独立的开发目录，避免 `cargo run` 覆盖已安装版本的配置（issue: 开发态配置污染生产）。
+/// release 构建恒返回 `None`，保持安装态路径不变。
+fn development_data_dir() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+
+    dirs::home_dir().map(|home| home.join(DEVELOPMENT_DATA_DIR_NAME))
+}
+
+fn development_paths(root: PathBuf) -> AppPaths {
+    AppPaths {
+        mode: AppRunMode::Development { root: root.clone() },
+        config_dir: root.join("config"),
+        data_dir: Some(root.join("state")),
+        cache_dir: Some(root.join("cache")),
+    }
 }
 
 fn portable_paths(root: PathBuf, data_root: PathBuf) -> AppPaths {
@@ -213,7 +282,7 @@ fn installed_paths() -> Result<AppPaths> {
 }
 
 fn prepare_paths(paths: &AppPaths) -> Result<()> {
-    if !paths.is_portable() {
+    if paths.uses_installed_directories() {
         return Ok(());
     }
 
@@ -232,9 +301,9 @@ fn prepare_directory(directory: &Path) -> Result<()> {
         .with_context(|| format!("create {}", directory.display()))?;
     let probe = directory.join(format!(".write-test-{}", std::process::id()));
     std::fs::write(&probe, b"navop")
-        .with_context(|| format!("portable directory is not writable: {}", probe.display()))?;
+        .with_context(|| format!("application directory is not writable: {}", probe.display()))?;
     std::fs::remove_file(&probe)
-        .with_context(|| format!("remove portable write probe: {}", probe.display()))?;
+        .with_context(|| format!("remove write probe: {}", probe.display()))?;
     Ok(())
 }
 

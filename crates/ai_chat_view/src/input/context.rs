@@ -14,6 +14,7 @@ use gpui::SharedString;
 use rust_i18n::t;
 
 use super::skill::{ComposerSkillItem, ComposerSkillSummary};
+use crate::usage::ContextUsage;
 
 /// 顶部主「目标」chip 的展示数据。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -225,6 +226,9 @@ impl ComposerScope {
 pub struct ComposerModel {
     pub provider: SharedString,
     pub model: SharedString,
+    /// true 时标签只显示模型名，隐藏 provider 前缀（ACP 的 provider 是 agent 名，
+    /// 工具栏已单独展示 agent，再拼一遍是重复）。
+    pub model_only: bool,
 }
 
 impl ComposerModel {
@@ -232,7 +236,13 @@ impl ComposerModel {
         Self {
             provider: provider.into(),
             model: model.into(),
+            model_only: false,
         }
+    }
+
+    pub fn with_model_only(mut self) -> Self {
+        self.model_only = true;
+        self
     }
 }
 
@@ -249,6 +259,8 @@ pub struct ComposerModelOption {
     pub model: SharedString,
     /// 次要说明(可选,显示在标签下方)。
     pub hint: Option<SharedString>,
+    /// true 时标签只显示模型名，不拼 provider 前缀（ACP 模型用）。
+    pub model_only: bool,
 }
 
 impl ComposerModelOption {
@@ -264,6 +276,7 @@ impl ComposerModelOption {
             provider_label: provider_label.into(),
             model: model.into(),
             hint: None,
+            model_only: false,
         }
     }
 
@@ -272,12 +285,26 @@ impl ComposerModelOption {
         self
     }
 
+    pub fn with_model_only(mut self) -> Self {
+        self.model_only = true;
+        self
+    }
+
     pub fn display_label(&self) -> SharedString {
-        SharedString::from(format!("{} / {}", self.provider_label, self.model))
+        if self.model_only {
+            self.model.clone()
+        } else {
+            SharedString::from(format!("{} / {}", self.provider_label, self.model))
+        }
     }
 
     pub fn to_composer_model(&self) -> ComposerModel {
-        ComposerModel::new(self.provider_label.clone(), self.model.clone())
+        let model = ComposerModel::new(self.provider_label.clone(), self.model.clone());
+        if self.model_only {
+            model.with_model_only()
+        } else {
+            model
+        }
     }
 }
 
@@ -440,6 +467,126 @@ impl ComposerAgentOption {
     }
 }
 
+/// 底部上下文栏的「工作区」信息。
+///
+/// 只承载展示所需的文本；真实路径与切换动作由上层持有。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComposerWorkspaceInfo {
+    /// 显示名(通常是目录名)；空串表示尚无工作区。
+    pub label: SharedString,
+    /// 完整路径，用于下拉项副标题与 tooltip。
+    pub path: Option<SharedString>,
+    /// 是否为 Git 仓库；决定分支 / Worktree 两个入口是否可用。
+    pub is_git_repo: bool,
+}
+
+impl ComposerWorkspaceInfo {
+    pub fn new(label: impl Into<SharedString>, path: Option<impl Into<SharedString>>) -> Self {
+        Self {
+            label: label.into(),
+            path: path.map(Into::into),
+            is_git_repo: false,
+        }
+    }
+
+    pub fn with_git_repo(mut self, is_git_repo: bool) -> Self {
+        self.is_git_repo = is_git_repo;
+        self
+    }
+}
+
+/// 底部上下文栏「工作区」下拉的一项。
+///
+/// 候选来自宿主已经打开过的工作区集合；与左侧会话导航里的那个下拉同源。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerWorkspaceOption {
+    pub label: SharedString,
+    /// 工作区根目录(绝对路径)，选中后回传给宿主。
+    pub path: SharedString,
+    pub current: bool,
+}
+
+impl ComposerWorkspaceOption {
+    pub fn new(
+        label: impl Into<SharedString>,
+        path: impl Into<SharedString>,
+        current: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            path: path.into(),
+            current,
+        }
+    }
+
+    /// 下拉菜单项的稳定标识。
+    pub fn element_id(&self) -> SharedString {
+        SharedString::from(format!("composer-workspace-{}", self.path))
+    }
+}
+
+/// 底部上下文栏「分支」下拉的一项。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerBranchOption {
+    pub name: SharedString,
+    pub current: bool,
+    /// 远程分支(`origin/xxx`)。选中远程分支由上层决定是否切成本地跟踪分支。
+    pub remote: bool,
+}
+
+impl ComposerBranchOption {
+    pub fn new(name: impl Into<SharedString>, current: bool, remote: bool) -> Self {
+        Self {
+            name: name.into(),
+            current,
+            remote,
+        }
+    }
+
+    /// 下拉菜单项的稳定标识。
+    pub fn element_id(&self) -> SharedString {
+        SharedString::from(format!(
+            "composer-branch-{}{}",
+            if self.remote { "remote-" } else { "" },
+            self.name
+        ))
+    }
+}
+
+/// 底部上下文栏的「Worktree」状态。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComposerWorktreeState {
+    /// 当前会话是否跑在独立 worktree 上(复选框勾选态)。
+    pub enabled: bool,
+    /// 当前 worktree 名；`enabled` 时用于 chip 文案。
+    pub label: Option<SharedString>,
+    /// 已勾选但**尚未创建** —— 真正的创建推迟到本会话第一次发送
+    /// (见 [`AgentChatView::submit_with_window`](super::AgentChatView))，
+    /// 免得只是勾一下就在磁盘上留下 worktree、还把工作区根切走。
+    ///
+    /// `pending` 时没有 `label`(名字要等创建时才知道)，chip 显示通用文案。
+    pub pending: bool,
+}
+
+impl ComposerWorktreeState {
+    pub fn new(enabled: bool, label: Option<impl Into<SharedString>>) -> Self {
+        Self {
+            enabled,
+            label: label.map(Into::into),
+            pending: false,
+        }
+    }
+
+    /// 已勾选、等首次对话时创建。
+    pub fn pending() -> Self {
+        Self {
+            enabled: true,
+            label: None,
+            pending: true,
+        }
+    }
+}
+
 /// 注入给输入框的整体上下文(只读展示)。
 ///
 /// 由上层构造并通过 [`AgentInput::set_context`](super::AgentInput::set_context) 注入。
@@ -473,6 +620,16 @@ pub struct AgentComposerContext {
     pub model: Option<ComposerModel>,
     /// 工具执行模式当前文案(如 `自动`)。
     pub execution_mode_label: SharedString,
+    /// 底部上下文栏：当前工作区。
+    pub workspace: ComposerWorkspaceInfo,
+    /// 底部上下文栏：工作区下拉的候选(空表示宿主尚未注入)。
+    pub workspace_options: Vec<ComposerWorkspaceOption>,
+    /// 底部上下文栏：可切换的分支列表(空表示非 Git 仓库或数据未就绪)。
+    pub branch_options: Vec<ComposerBranchOption>,
+    /// 底部上下文栏：Worktree 状态。
+    pub worktree: ComposerWorktreeState,
+    /// 上下文用量读数(本地/ACP 同源);`None` 时不画圆环。
+    pub context_usage: Option<ContextUsage>,
 }
 
 #[cfg(test)]
@@ -609,5 +766,23 @@ mod tests {
             option.to_composer_model(),
             ComposerModel::new("OpenAI", "gpt-4.1")
         );
+    }
+
+    #[test]
+    fn model_only_option_hides_the_provider_prefix() {
+        // ACP：provider 是 agent 名，标签只用模型名。
+        let option = ComposerModelOption::new(
+            "acp:opencode-acp:model:9router/deepseek-v4-flash",
+            "opencode-acp",
+            "opencode-acp.opencode-acp",
+            "9router/deepseek-v4-flash",
+        )
+        .with_model_only();
+
+        assert_eq!(option.display_label().as_ref(), "9router/deepseek-v4-flash");
+        let model = option.to_composer_model();
+        assert!(model.model_only);
+        assert_eq!(model.provider.as_ref(), "opencode-acp.opencode-acp");
+        assert_eq!(model.model.as_ref(), "9router/deepseek-v4-flash");
     }
 }

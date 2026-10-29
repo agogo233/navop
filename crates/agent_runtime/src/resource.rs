@@ -240,6 +240,25 @@ impl ResourceContext {
         self.current.as_ref().and_then(|id| self.get(id))
     }
 
+    /// 为「需要某类资源」的工具挑选默认目标。
+    ///
+    /// 当前聚焦资源类型匹配时直接用它；否则仅当同类资源唯一时才用它。
+    /// 同类资源多于一个时返回 `None`，让调用方要求模型显式指定 target。
+    pub fn default_target_of_kind(&self, kind: &ResourceKind) -> Option<&ResourceRef> {
+        if let Some(current) = self.current().filter(|resource| &resource.kind == kind) {
+            return Some(current);
+        }
+        let mut candidates = self
+            .resources
+            .iter()
+            .filter(|resource| &resource.kind == kind);
+        let first = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     /// 按 ID 查找资源并返回可变引用。
     pub fn get_mut(&mut self, id: &ResourceId) -> Option<&mut ResourceRef> {
         self.resources.iter_mut().find(|r| &r.id == id)

@@ -65,6 +65,11 @@ fn private_key_content_takes_precedence_over_local_path() {
 
 #[test]
 fn strict_resolution_rejects_missing_or_empty_selected_fields() {
+    // `MissingCredential` 的文案走 t! 翻译，rust_i18n 的 locale 是进程级全局，
+    // 与其它翻转 locale 的测试并行会互相踩（本机全量跑必现）。这里按错误变体
+    // 断言，不依赖当前 locale。
+    use crate::storage::CredentialResolutionError;
+
     let reference = CredentialReference {
         credential_id: 42,
         credential_cloud_id: None,
@@ -76,12 +81,22 @@ fn strict_resolution_rejects_missing_or_empty_selected_fields() {
     let manual = ReferencedCredentialFields::default();
     let missing = resolve_credential_reference_strict(manual.clone(), &reference, None)
         .expect_err("missing credential must fail");
-    assert!(missing.to_string().contains("credential 42 was not found"));
+    assert!(matches!(
+        missing.downcast_ref::<CredentialResolutionError>(),
+        Some(CredentialResolutionError::MissingCredential(42))
+    ));
 
     let credential = CredentialEntry::new("Empty");
     let empty = resolve_credential_reference_strict(manual, &reference, Some(&credential))
         .expect_err("selected empty password must fail");
-    assert!(empty.to_string().contains("has no password"));
+    assert!(matches!(
+        empty.downcast_ref::<CredentialResolutionError>(),
+        Some(CredentialResolutionError::EmptyField {
+            credential_id: 42,
+            field: "password",
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -30,8 +30,7 @@ use terminal::{
     local_config_from_settings_with_profile,
 };
 use terminal_view::{
-    TerminalConnectionKind, TerminalWorkspace, TerminalWorkspaceEvent,
-    current_settings as current_terminal_settings,
+    TerminalWorkspace, TerminalWorkspaceEvent, current_settings as current_terminal_settings,
 };
 
 fn redis_tab_open_context(
@@ -488,7 +487,11 @@ mod tests {
         let pinned = opener.find("activate_pinned_tab_by_id").unwrap();
         let regular = opener.find("activate_or_add_tab_lazy").unwrap();
         assert!(pinned < regular);
-        assert!(opener.contains("with_tab_closeable(true)"));
+        // 「AI 工作台标签可关闭」这件事是在 `build_ai_workbench_shell` 里设置的
+        // （opener 只是 `TabItem::new(..)` 引用它），所以断言要分开落两处：
+        // 这里确认 opener 确实走那个构造函数，具体标志位去它自己的文件里查。
+        assert!(opener.contains("build_ai_workbench_shell"));
+        assert!(include_str!("ai_workbench.rs").contains(".with_tab_closeable(true)"));
     }
 
     #[test]
@@ -696,6 +699,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_hotkey_shares_the_tab_menu_duplicate_path() {
+        let source = include_str!("home_tabs.rs").replace("\r\n", "\n");
+        let method = source
+            .split("\n    pub(crate) fn duplicate_active_tab")
+            .nth(1)
+            .and_then(|source| source.split("\n    }\n").next())
+            .expect("duplicate_active_tab method");
+
+        assert!(method.contains("tc.duplicate_active_tab(window, cx)"));
+        assert!(!method.contains("add_terminal_tab"));
+        assert!(!method.contains("self.connections"));
+
+        let lifecycle = include_str!("../home_tab/lifecycle.rs");
+        assert!(lifecycle.contains("TabContainerEvent::TabDuplicated { id }"));
+        assert!(lifecycle.contains("this.subscribe_terminal_workspace_events(&terminal"));
+    }
+
+    #[test]
     fn ssh_terminal_workspace_can_request_an_sftp_tab() {
         let source = include_str!("home_tabs.rs").replace("\r\n", "\n");
         let method = source
@@ -749,15 +770,6 @@ impl HomePage {
         current_terminal_settings(cx).sync_path_with_terminal
     }
 
-    pub(crate) fn open_ssh_terminal(
-        &mut self,
-        conn: StoredConnection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_ssh_terminal_with_mode(conn, TabOpenMode::Activate, window, cx);
-    }
-
     pub(crate) fn open_ssh_terminal_with_mode(
         &mut self,
         conn: StoredConnection,
@@ -791,8 +803,24 @@ impl HomePage {
         let terminal_view = cx.new(|cx| {
             TerminalWorkspace::new_ssh_with_index(conn, tab_index, window, cx, None, sync_path)
         });
+        self.subscribe_terminal_workspace_events(&terminal_view, window, cx);
+        window.defer(cx, move |window, cx| {
+            tab_container.update(cx, |tc, cx| {
+                let tab = TabItem::new(tab_id, "ssh", terminal_view);
+                tc.add_tab_with_mode(tab, mode, window, cx);
+            });
+        });
+    }
+
+    /// SSH 终端标签（含复制出的标签）请求打开 SFTP / 另存连接时由主页响应。
+    pub(crate) fn subscribe_terminal_workspace_events(
+        &mut self,
+        terminal_view: &Entity<TerminalWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(
-            &terminal_view,
+            terminal_view,
             window,
             |this, _terminal, event: &TerminalWorkspaceEvent, window, cx| match event {
                 TerminalWorkspaceEvent::OpenSftp(connection) => {
@@ -804,21 +832,6 @@ impl HomePage {
             },
         );
         self._subscriptions.push(subscription);
-        window.defer(cx, move |window, cx| {
-            tab_container.update(cx, |tc, cx| {
-                let tab = TabItem::new(tab_id, "ssh", terminal_view);
-                tc.add_tab_with_mode(tab, mode, window, cx);
-            });
-        });
-    }
-
-    pub(crate) fn open_serial_terminal(
-        &mut self,
-        conn: StoredConnection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_serial_terminal_with_mode(conn, TabOpenMode::Activate, window, cx);
     }
 
     pub(crate) fn open_serial_terminal_with_mode(
@@ -856,15 +869,6 @@ impl HomePage {
                 tc.add_tab_with_mode(tab, mode, window, cx);
             });
         });
-    }
-
-    pub(crate) fn open_telnet_terminal(
-        &mut self,
-        conn: StoredConnection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_telnet_terminal_with_mode(conn, TabOpenMode::Activate, window, cx);
     }
 
     pub(crate) fn open_telnet_terminal_with_mode(
@@ -1249,11 +1253,11 @@ impl HomePage {
         });
     }
 
-    pub(crate) fn add_team_key_settings_tab(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 打开原生「团队」tab（团队资料 / 成员 / 团队密钥）。
+    ///
+    /// 过去这里跳浏览器 dashboard，URL 里还带着 access_token / refresh_token；
+    /// 现在全部走桌面端云端 API，网站 dashboard 可以下线。
+    pub(crate) fn add_team_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !is_feature_enabled(Feature::TeamManagement, cx) {
             return;
         }
@@ -1262,10 +1266,11 @@ impl HomePage {
         window.defer(cx, move |window, cx| {
             tab_container.update(cx, |tc, cx| {
                 tc.activate_or_add_tab_lazy(
-                    "settings-team-keys",
-                    |win, cx| {
-                        let settings = cx.new(|cx| SettingsPanel::new_team_keys(win, cx));
-                        TabItem::new("settings-team-keys", "home", settings)
+                    "team",
+                    |window, cx| {
+                        let team_tab = cx.new(|cx| crate::team_tab::TeamTab::new(window, cx));
+                        team_tab.update(cx, |team_tab, cx| team_tab.ensure_loaded(window, cx));
+                        TabItem::new("team", "home", team_tab)
                     },
                     window,
                     cx,
@@ -1399,24 +1404,20 @@ impl HomePage {
 
     pub(crate) fn add_ai_workbench_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tab_container = self.active_tab_container(cx);
+        let ai_access_levels = ai_chat_view::load_ai_access_levels(cx);
         let (scope, catalog, mentions) =
-            ai_chat_view::build_workbench_resource_state(&self.connections);
+            ai_chat_view::build_workbench_resource_state(&self.connections, &ai_access_levels);
         window.defer(cx, move |window, cx| {
             tab_container.update(cx, |tabs, cx| {
-                if tabs.activate_pinned_tab_by_id("ai-workbench", window, cx) { return; }
+                if tabs.activate_pinned_tab_by_id("ai-workbench", window, cx) {
+                    return;
+                }
                 tabs.activate_or_add_tab_lazy(
                     "ai-workbench",
                     |window, cx| {
-                        let workbench = cx.new(|cx| {
-                            ai_chat_view::DefaultAgentChatPanel::new_workbench_with_scope_and_catalog(
-                                scope,
-                                catalog,
-                                mentions,
-                                window,
-                                cx,
-                            )
-                            .with_tab_closeable(true)
-                        });
+                        let workbench = crate::home::ai_workbench::build_ai_workbench_shell(
+                            scope, catalog, mentions, window, cx,
+                        );
                         TabItem::new("ai-workbench", "home", workbench)
                     },
                     window,
@@ -1644,80 +1645,9 @@ impl HomePage {
 
     /// 复制当前活动标签并打开
     pub(crate) fn duplicate_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 与标签右键菜单「复制」共用 TabContainer::duplicate_active_tab，保证 CWD 等状态一致
         let tab_container = self.active_tab_container(cx);
-        let tc = tab_container.read(cx);
-
-        // pinned tab 不支持复制
-        if tc.is_pinned_tab_active() {
-            return;
-        }
-
-        let Some(active_tab) = tc.active_tab() else {
-            return;
-        };
-
-        let content_key = active_tab.content().content_key(cx);
-
-        match content_key {
-            "Terminal" => {
-                // 获取终端视图的连接信息
-                let view = active_tab.content().view();
-                let Ok(terminal_view) = view.downcast::<TerminalWorkspace>() else {
-                    return;
-                };
-
-                let kind = terminal_view.read(cx).connection_kind(cx);
-                match kind {
-                    TerminalConnectionKind::Ssh => {
-                        // SSH 终端：通过 connection_id 找到 StoredConnection 并打开新连接
-                        let conn_id = terminal_view.read(cx).connection_id(cx);
-                        if let Some(conn_id) = conn_id {
-                            if let Some(conn) = self
-                                .connections
-                                .iter()
-                                .find(|c| c.id == Some(conn_id))
-                                .cloned()
-                            {
-                                self.open_ssh_terminal(conn, window, cx);
-                            }
-                        }
-                    }
-                    TerminalConnectionKind::Serial => {
-                        let conn_id = terminal_view.read(cx).connection_id(cx);
-                        if let Some(conn_id) = conn_id {
-                            if let Some(conn) = self
-                                .connections
-                                .iter()
-                                .find(|c| c.id == Some(conn_id))
-                                .cloned()
-                            {
-                                self.open_serial_terminal(conn, window, cx);
-                            }
-                        }
-                    }
-                    TerminalConnectionKind::Telnet => {
-                        let conn_id = terminal_view.read(cx).connection_id(cx);
-                        if let Some(conn_id) = conn_id {
-                            if let Some(conn) = self
-                                .connections
-                                .iter()
-                                .find(|c| c.id == Some(conn_id))
-                                .cloned()
-                            {
-                                self.open_telnet_terminal(conn, window, cx);
-                            }
-                        }
-                    }
-                    TerminalConnectionKind::Local => {
-                        // 本地终端：直接新建
-                        self.add_terminal_tab(window, cx);
-                    }
-                }
-            }
-            _ => {
-                // 其他类型暂不支持复制
-            }
-        }
+        tab_container.update(cx, |tc, cx| tc.duplicate_active_tab(window, cx));
     }
 }
 

@@ -9,27 +9,31 @@
 //! emit 的选择事件(目标轮换、模型 / 模式切换)。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_client_protocol::schema::{ContentBlock, ImageContent, TextContent};
+use agent_client_protocol::schema::v1::{
+    AvailableCommandInput, ContentBlock, ImageContent, TextContent,
+};
 use agent_runtime::{
-    AgentResourceScope, ResourceCatalog, ResourceContext, ResourceId, ResourceKind, ResourceRef,
-    Runtime, RuntimeEvent, RuntimeEventReceiver, SessionId, TaskKind, ToolCallId,
+    AgentResourceScope, HistoryItem, ResourceCatalog, ResourceContext, ResourceId, ResourceKind,
+    ResourceRef, Runtime, RuntimeEvent, RuntimeEventReceiver, SessionId, TaskKind, ToolCallId,
     ToolExecutionMode, ToolRegistry, TurnId, UserInput,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Anchor, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, px,
+    Anchor, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    NavigationDirection, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     popover::Popover,
     spinner::Spinner,
@@ -39,49 +43,95 @@ use one_assets::IconName;
 #[cfg(not(test))]
 use one_core::gpui_tokio::Tokio;
 use one_core::llm::{GlobalProviderState, LlmConnector, LlmProvider, ProviderConfig};
-use one_core::settings::{AiChatToolExecutionMode, AppSettings};
+use one_core::settings::{AiChatBackendSelection, AiChatToolExecutionMode, AppSettings};
 use one_core::sidebar_contribution::SidebarPlacement;
 use one_ui::{IconButton, IconButtonRole, PanelHeader, PanelHeaderVariant};
 use rust_i18n::t;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
+/// 仅测试用例使用：给子代理详情回放造一个合成轮次 id。
+#[cfg(test)]
+use crate::acp::detail_turn_id_for;
+/// 仅后台探测路径使用（测试构建下探测被禁用以避免真实子进程）。
+#[cfg(not(test))]
+use crate::acp::{AcpAgentConfig, AcpProbeRecord, acp_probe_cache, probe_fingerprint};
 use crate::acp::{
-    AcpAgentEntry, AcpConnectOutcome, AcpConnection, AcpConnectionPhase, AcpError, AcpErrorKind,
-    AcpPendingConnection, AcpPermissionEnvelope, AcpPermissionMessage, AcpPermissionOutcome,
-    AcpPermissionProvider, AcpPromptStartError, AcpPublicMcpApprovalEnvelope,
+    AcpAgentEntry, AcpAgentProbe, AcpClientProviders, AcpConnectOutcome, AcpConnection,
+    AcpConnectionPhase, AcpElicitationEnvelope, AcpElicitationMessage, AcpElicitationOutcome,
+    AcpError, AcpErrorKind, AcpModelInfo, AcpPendingConnection, AcpPermissionEnvelope,
+    AcpPermissionMessage, AcpPermissionOutcome, AcpPromptStartError, AcpPublicMcpApprovalEnvelope,
     AcpPublicMcpApprovalMessage, AcpPublicMcpApprovalOutcome, AcpPublicMcpApprovalProvider,
-    AcpRecoveryAction, AcpSessionState, acp_permission_channel, acp_public_mcp_approval_channel,
-    acquire_acp_permission_grant, build_acp_agent_entries, current_acp_tool_mode,
+    AcpRecoveryAction, AcpSessionContinuity, AcpSessionState, AcpSessionSummary, AcpUsage,
+    acp_elicitation_channel, acp_permission_channel, acp_public_mcp_approval_channel,
+    acp_session_list_supported, acp_session_summaries, acquire_acp_permission_grant,
+    build_acp_agent_entries, current_acp_tool_mode, detail_session_id_for, is_detail_session_id,
     set_current_acp_tool_mode,
 };
+use crate::acp_agent_config::{AcpAgentConfigEvent, acp_agent_config_notifier};
 use crate::agent_cards::{
-    ApproveToolCall, PlanCardData, RejectToolCall, SelectAcpPermissionOption, SubAgentCardData,
+    ApproveToolCall, OpenFileInReview, OpenSubagentDetail, PlanCardData, RejectToolCall,
+    SelectAcpPermissionOption, SubAgentCardData,
 };
 use crate::agent_skills::AgentSkillState;
 use crate::agent_transcript::AgentTranscript;
 use crate::bridge::build_runtime_from_llm_provider;
 use crate::code_block::{CodeBlockAction, CodeBlockActionRegistry};
+use crate::command_palette::{
+    CloseCommandPalette, PALETTE_PAGE_STEP, PaletteSelectFirst, PaletteSelectLast,
+    PaletteSelectNext, PaletteSelectPageDown, PaletteSelectPageUp, PaletteSelectPrev,
+    ToggleCommandPalette,
+};
+use crate::expansion_state::ExpansionState;
+use crate::find_shortcut::{
+    AI_CHAT_SEARCH_CONTEXT, FindNextInTranscript, FindPreviousInTranscript, ToggleTranscriptFind,
+};
+use crate::input::composer_chrome::CONTAINER_PADDING_BOTTOM;
 use crate::input::{
-    AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption, ComposerMenuOption,
-    ComposerModelOption, ComposerPlanItem, ComposerResourcePoolItem, ComposerResourcePoolSummary,
-    ComposerResourceSourceOption, ComposerResourceTypeFilter, ComposerScope, ComposerSkillItem,
-    ComposerSkillSummary, ComposerSubAgentItem, ComposerTarget, MentionItem, QueuedPromptPreview,
+    AcpAgentInput, AgentComposerContext, AgentInput, AgentInputEvent, ComposerAgentOption,
+    ComposerBranchOption, ComposerMenuOption, ComposerModelOption, ComposerPlanItem,
+    ComposerResourcePoolItem, ComposerResourcePoolSummary, ComposerResourceSourceOption,
+    ComposerResourceTypeFilter, ComposerScope, ComposerSkillItem, ComposerSkillSummary,
+    ComposerSubAgentItem, ComposerTarget, ComposerWorkspaceInfo, ComposerWorkspaceOption,
+    ComposerWorktreeState, MentionItem, QueuedPromptPreview, SlashCommandItem,
 };
-use crate::message_view::{
-    render_messages_with_code_actions_and_activity, render_running_activity,
-    render_sidebar_messages_with_code_actions_and_activity,
+use crate::message::ChatMessageUI;
+use crate::message_turn_view::{
+    MessageListAction, MessageListActionHandler, MessageListContext, render_message_list,
 };
+use crate::message_view::{MessageListLayout, render_running_activity};
 use crate::pending_submission::{PendingSubmission, PendingSubmissions};
 use crate::persistence;
 use crate::resource_display::first_visible_alias;
+use crate::session_shortcut::{NavigateSessionBack, NavigateSessionForward, ToggleSessionSwitcher};
 use crate::session_sidebar::{self, SessionRowStyle, SessionSummary};
-use crate::theme::{AgentChatTheme, resolve_agent_chat_theme};
+use crate::theme::{AgentChatTheme, resolve_agent_chat_theme, sp};
+use crate::transcript_scroll::{FOLLOW_THRESHOLD, TranscriptScrollState};
+use crate::transcript_search::TranscriptSearch;
+use crate::transcript_selection::{
+    ClearTranscriptSelection, CopyTranscriptSelection, TranscriptSelectionHandle,
+};
+use crate::turn::{TurnOutcome, TurnTimings};
+use crate::usage::{ContextUsage, format_local_usage, model_context_window};
 
 mod acp_options;
+pub(crate) mod acp_sessions;
 mod acp_ui;
+mod attachment_preview;
+mod composer_slot;
+mod findbar;
+mod message_image_preview;
+mod selection;
+mod session_navigation;
+mod session_switcher;
 
-use acp_options::{agent_option_disabled, composer_agent_options, current_agent_label};
+use acp_options::{
+    agent_option_disabled, composer_agent_options, composer_agent_options_with_status,
+    current_agent_label,
+};
+use acp_sessions::{acp_session_placeholder, acp_session_row, acp_session_section_header};
 use acp_ui::AcpConnectOperation;
+use session_navigation::SessionNavigation;
+use session_switcher::SessionSwitcherUi;
 
 /// Agent 聊天视图事件。
 #[derive(Clone, Debug)]
@@ -90,42 +140,161 @@ pub enum AgentChatViewEvent {
     Close,
     /// 请求宿主把面板移动到指定位置。
     MoveTo(SidebarPlacement),
+    TurnStarted {
+        session_id: String,
+        turn_id: String,
+    },
+    TurnFinished {
+        session_id: String,
+        turn_id: String,
+        success: bool,
+    },
+    /// 用户点击某轮页脚的「回到这一轮」：请求宿主把工作区状态退回该轮结束时。
+    ///
+    /// 视图只转发请求——它不知道工作区有没有快照、也没有能力改文件；实际回滚由
+    /// 宿主的工作区浏览器执行。
+    RestoreTurn {
+        session_id: String,
+        turn_id: String,
+    },
+    /// 用户点了改动摘要里的某个文件：请求宿主在审阅面板里打开**该文件的改动**。
+    ///
+    /// 与 [`Self::RestoreTurn`] 同理,视图只转发定位信息 —— 打开文档需要窗口,
+    /// 面板在哪、这份 diff 从哪一轮的快照里裁,都由宿主决定。
+    ///
+    /// `turn_id` 就是「裁哪一轮」：点历史轮的改动文件时，要的是**那一刻**的 diff。
+    /// 给不出来（历史恢复的轮次没有 turn id）时为 `None`，宿主退到最近一轮。
+    OpenFileInReview {
+        session_id: String,
+        path: String,
+        turn_id: Option<String>,
+    },
+    /// 用户点了本轮改动摘要里的「查看改动」：把**这一轮所有文件**的 diff 摆到审阅面板。
+    ///
+    /// 与 [`Self::OpenFileInReview`] 分开：那个只要某一个文件那一段，这个要整轮。
+    /// 视图只转发轮次 id —— 快照在 Explorer 手里，裁哪一份由它决定。
+    OpenTurnReview {
+        session_id: String,
+        turn_id: String,
+    },
+    /// 用户点了子代理卡片上的「查看推理过程」：请求宿主把子代理详情面板切到前台。
+    ///
+    /// 视图只转发请求，面板建在哪、怎么开由宿主决定（与 [`Self::OpenFileInReview`] 同理）。
+    /// 数据本身不走这里——面板从面板层按 `detail_session_id` 现取，见
+    /// [`AgentChatView::subagent_detail_messages`]。
+    SubagentDetailRequested {
+        /// 子会话的**协议** id（`session/load` 的地址，也是面板的稳定标识）。
+        acp_session_id: String,
+        /// 卡片标题（工具调用标题），面板头部用它标明「看的是哪只子代理」。
+        title: String,
+    },
+    /// 子代理详情转录有了新内容：面板据此重绘。
+    ///
+    /// 单独一个事件而不是让面板 observe 整个聊天视图：主会话每个 token 都会
+    /// `cx.notify()`，observe 会把详情面板一起拖着重绘（一次 `render_messages`
+    /// 覆盖上千条消息），代价直接落在流式输出上。
+    SubagentDetailUpdated {
+        detail_session_id: String,
+    },
 }
 
 /// 根据模型选项构建对应运行时。
 pub type AgentRuntimeFactory =
     Arc<dyn Fn(&ComposerModelOption) -> anyhow::Result<Arc<Runtime>> + Send + Sync + 'static>;
 
+/// 每轮发送前重建资源上下文的回调。
+///
+/// 在 gpui 线程上调用，因此可以安全读取实体与全局的最新状态；返回 `None`
+/// 表示本轮沿用现有资源池。侧边栏用它把终端等资源的实时状态（当前目录、
+/// 是否运行全屏程序、选中内容）写进资源池，避免「资源快照只在面板创建时
+/// 构建一次」。
+pub type ResourceContextRefresher =
+    Arc<dyn Fn(&App) -> Option<agent_runtime::ResourceContext> + Send + Sync>;
+
+/// 宿主随本轮用户消息一并送出的正文（如终端选中内容）。
+///
+/// `label` 用于追溯与测试；`body` 会拼在用户输入前面一起发送，因此转录里
+/// 原样可见 —— 用户能回看自己究竟送出了什么，而不是只在后台悄悄附加。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextAttachment {
+    pub label: SharedString,
+    pub body: String,
+}
+
+impl ContextAttachment {
+    pub fn new(label: impl Into<SharedString>, body: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            body: body.into(),
+        }
+    }
+}
+
+/// 发送前抓取「随消息附加正文」的回调；返回 `None` 表示本轮没有附件。
+pub type ContextAttachmentProvider = Arc<dyn Fn(&App) -> Option<ContextAttachment> + Send + Sync>;
+
 const MAX_CACHED_SESSION_TRANSCRIPTS: usize = 32;
 const MAX_RUNTIME_EVENT_BATCH_SIZE: usize = 64;
 
 fn runtime_event_matches_session(event: &RuntimeEvent, session_filter: Option<&SessionId>) -> bool {
-    session_filter.is_none_or(|session_id| event.session_id() == session_id)
+    session_filter.is_none_or(|session_id| {
+        event.session_id() == session_id
+            // 子代理详情会话的事件也归这条连接的泵：它们同属一个 agent 进程，只是
+            // 另一条会话。挡在这里等于把整段子代理推理丢掉 —— 而且丢得无声无息。
+            || is_detail_session_id(&event.session_id().to_string())
+    })
+}
+
+/// 这条事件是不是子代理详情会话的？是就返回它的详情会话 id。
+fn subagent_detail_uid(event: &RuntimeEvent) -> Option<String> {
+    let session_id = event.session_id().to_string();
+    is_detail_session_id(&session_id).then_some(session_id)
+}
+
+/// 一批已就绪的事件，外加「取这批的过程中被通道挤掉了多少条」。
+#[derive(Default)]
+struct RuntimeEventBatch {
+    /// 本批实际拿到、且属于目标会话的事件。
+    events: Vec<RuntimeEvent>,
+    /// 广播通道挤掉的事件数。
+    ///
+    /// 必须往上报，不能吞掉：被挤掉的是**任意**事件，其中可能正好是某一轮的
+    /// 终态。终态是清「正在响应」和推进排队消息的唯一触发点，丢了就再没有任何
+    /// 后续事件会补上——界面会永久停在工作中，而且不留任何痕迹
+    /// （日志里只有驱动侧那行，无从判断事件到没到）。见
+    /// [`AgentChatView::on_runtime_events_dropped`]。
+    skipped: u64,
 }
 
 fn collect_ready_runtime_events(
     rx: &mut RuntimeEventReceiver,
     first: RuntimeEvent,
     session_filter: Option<&SessionId>,
-) -> Vec<RuntimeEvent> {
-    let mut events = Vec::new();
+) -> RuntimeEventBatch {
+    let mut batch = RuntimeEventBatch::default();
     if runtime_event_matches_session(&first, session_filter) {
-        events.push(first);
+        batch.events.push(first);
     }
 
-    for _ in events.len()..MAX_RUNTIME_EVENT_BATCH_SIZE {
+    for _ in batch.events.len()..MAX_RUNTIME_EVENT_BATCH_SIZE {
         match rx.try_recv() {
             Ok(event) if runtime_event_matches_session(&event, session_filter) => {
-                if events.len() == 1 {
-                    events.reserve(MAX_RUNTIME_EVENT_BATCH_SIZE - 1);
+                if batch.events.len() == 1 {
+                    batch.events.reserve(MAX_RUNTIME_EVENT_BATCH_SIZE - 1);
                 }
-                events.push(event);
+                batch.events.push(event);
             }
-            Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+            // 别的会话的事件：本泵不认，丢给对应会话的泵。不算 lag。
+            Ok(_) => {}
+            Err(TryRecvError::Lagged(skipped)) => {
+                // 游标已被挪到最旧的可读位置，继续取就是「还在的那批」里最旧的。
+                // 丢掉的条数单独记下来，由调用方决定怎么补。
+                batch.skipped = batch.skipped.saturating_add(skipped);
+            }
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
-    events
+    batch
 }
 
 /// 当前驱动后端:自研内核(One_Agent)或外部 ACP agent。
@@ -137,21 +306,95 @@ enum Backend {
     Acp,
 }
 
+/// composer「执行模式」下拉里的一项：任务类型 + 工具策略。
+///
+/// 早期任务类型与工具策略是两个独立下拉，后来合并成一个；这里把「问答」这个任务
+/// 类型选择保留下来，避免合并之后 `TaskKind::Ask` 彻底不可达。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct ExecutionSelection {
+    task: TaskKind,
+    tool: ToolExecutionMode,
+}
+
+impl ExecutionSelection {
+    fn new(task: TaskKind, tool: ToolExecutionMode) -> Self {
+        Self { task, tool }
+    }
+
+    /// 普通轮次：任务类型固定 Agent，只挑工具策略。
+    fn tool(tool: ToolExecutionMode) -> Self {
+        Self {
+            task: TaskKind::Agent,
+            tool,
+        }
+    }
+
+    /// 下拉里展示的文案。
+    fn label(self) -> String {
+        match self.task {
+            TaskKind::Ask => t!("AgentUi.ask_mode").to_string(),
+            TaskKind::Plan => t!("AgentUi.plan_mode").to_string(),
+            TaskKind::Agent => tool_execution_mode_label(self.tool),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AcpTurnOwner {
     event_session_id: SessionId,
     session_uid: String,
     turn_id: TurnId,
+    /// 这一轮是否已被转入后台：新建对话/切走会话时置位。
+    ///
+    /// 后台轮次的输出照常回流并落进对应会话的转录缓存，但不再驱动当前界面的
+    /// 「正在响应」状态；取消（停止按钮）也只作用于前台轮次。
+    backgrounded: bool,
     cancel_requested: bool,
 }
 
 impl AcpTurnOwner {
     fn mark_cancel_requested(&mut self, session_uid: &str, has_connection: bool) -> bool {
-        if !has_connection || self.session_uid != session_uid || self.cancel_requested {
+        if !has_connection
+            || self.session_uid != session_uid
+            || self.cancel_requested
+            || self.backgrounded
+        {
             return false;
         }
         self.cancel_requested = true;
         true
+    }
+}
+
+/// 正在放行的**历史回放**：`session/load` 把整段历史重放成一批 `session/update`。
+///
+/// 与 [`AcpTurnOwner`] 分开，是因为回放**不属于任何一轮**——它不是跑出来的输出，没有
+/// prompt、没有终态，`is_running` 那些「有一轮在跑」的判断也不该被它影响。它只需要
+/// 一道门：这批事件必须落进转录（否则用户点开一条历史会话什么都看不到），但又只能落
+/// 进**它自己那条会话**。
+///
+/// 所以窗口只认「哪条连接事件流 + 哪个合成轮次」，两者都对上才放行；其余一律丢弃——
+/// 迟到的输出绝不能算进别人的会话。
+///
+/// 窗口不需要精确关闭：连接那边（[`AcpConnection::end_history_replay`]）在 `load` 响应
+/// 回来时就把回放轮次从 `session/update` 上摘掉了，之后不会再有任何事件带这个 id。
+/// 所以这里留到下一次打开会话时被覆盖、或连接被收掉时清掉（[`Self::reset_acp_client_session`]）
+/// 都不会多放任何一个事件进来。
+///
+/// 反过来，**不能在 `finish_acp_session_open` 里关闭它**：那批事件此时已经发进事件通道，
+/// 事件泵未必已经把尾部几条交给转录，先关窗口就是白丢几条历史。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AcpHistoryReplay {
+    event_session_id: SessionId,
+    session_uid: String,
+    turn_id: TurnId,
+}
+
+impl AcpHistoryReplay {
+    /// 这条事件是不是这次回放的。
+    fn accepts(&self, event: &RuntimeEvent) -> bool {
+        event.session_id() == &self.event_session_id
+            && runtime_event_turn_id(event) == &self.turn_id
     }
 }
 
@@ -161,6 +404,12 @@ struct AcpOperationToken(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcpSessionTransitionPhase {
     Creating,
+    /// 正在拉历史会话列表。
+    ///
+    /// 复用同一个状态机而不是另起一个标志位：渲染层靠它在列表在飞的时候把提交
+    /// 排成 `RetryLater`（见 [`submission_start_for_acp_availability`]）——
+    /// 此时连接被 `take()` 走了，若不放行排队就会弹「未连接」误报。
+    Listing,
     Failed,
 }
 
@@ -188,21 +437,38 @@ enum PendingAdvance {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcpStopAction {
+    /// 发 `session/cancel`,等 agent 回终态。
     CancelActivePrompt,
+    /// 取消已发过、agent 仍不回终态：本地结账，不再等。
+    ForceLocalStop,
     ReturnToLocal,
     AbandonFailedTransition,
     ClearQueueOnly,
 }
 
+/// 发出取消后等 agent 回终态的上限。超时就本地结账。
+///
+/// `session/cancel` 只是一条通知，协议里 agent 可以不回终态：实测 OpenCode 在
+/// provider 卡死时 `session/prompt` 二十多分钟不返回，而它的 `stopReason` 又永远
+/// 是 `end_turn`（从不回 `cancelled`）。没有这个上限，界面就永远停在「正在响应」，
+/// 再点停止也毫无反应。
+const ACP_CANCEL_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 fn acp_stop_action(
     owns_current_turn: bool,
     has_connection: bool,
+    cancel_outstanding: bool,
     connecting: bool,
     authentication_pending: bool,
     session_transition: Option<AcpSessionTransitionPhase>,
 ) -> AcpStopAction {
     if owns_current_turn && has_connection {
-        return AcpStopAction::CancelActivePrompt;
+        // 已经发过一次取消、agent 还没回终态：用户再点就是「不等了」。
+        return if cancel_outstanding {
+            AcpStopAction::ForceLocalStop
+        } else {
+            AcpStopAction::CancelActivePrompt
+        };
     }
     if connecting
         || authentication_pending
@@ -222,9 +488,9 @@ fn acp_stop_action(
 
 fn submission_start_for_acp_error(error: AcpPromptStartError) -> SubmissionStart {
     match error {
-        AcpPromptStartError::AlreadyRunning | AcpPromptStartError::NotReady => {
-            SubmissionStart::RetryLater
-        }
+        // 同会话已有轮次在飞不再是错误（那是 steer 插话），能走到这里的只剩
+        // 「连接还没准备好」，退回队列等重连。
+        AcpPromptStartError::NotReady => SubmissionStart::RetryLater,
         AcpPromptStartError::ImageUnsupported => SubmissionStart::Rejected,
     }
 }
@@ -238,6 +504,91 @@ fn acp_connection_is_unavailable(phase: Option<&AcpConnectionPhase>) -> bool {
         phase,
         Some(AcpConnectionPhase::Failed { .. } | AcpConnectionPhase::Closed)
     )
+}
+
+/// 骨架屏画几组占位条。
+///
+/// 5 组足够铺满常见面板高度，又不会在矮窗口里被裁成半截——骨架屏被裁掉
+/// 一半会让人以为布局坏了。
+const SKELETON_ROWS: usize = 5;
+
+/// 该不该拿骨架屏顶替转录列表。
+///
+/// 五个条件缺一不可：
+/// - 非侧边栏紧凑渲染（那里是列表行，不是完整转录）；
+/// - 后端是 ACP（本地后端的历史是同步读盘的，没有空窗期）；
+/// - 连接停在 Ready 之前的相位（Failed/Closed 要走错误条，不是骨架屏）；
+/// - 没有在飞轮次（轮次页脚已经在说「进行中」）；
+/// - 转录为空（已有历史就不该拿占位条盖住它）。
+fn should_show_transcript_skeleton(
+    sidebar_mode: bool,
+    backend: Backend,
+    phase: Option<&AcpConnectionPhase>,
+    is_running: bool,
+    transcript_is_empty: bool,
+) -> bool {
+    !sidebar_mode
+        && backend == Backend::Acp
+        && !is_running
+        && transcript_is_empty
+        && matches!(
+            phase,
+            Some(
+                AcpConnectionPhase::Starting
+                    | AcpConnectionPhase::Initializing
+                    | AcpConnectionPhase::CreatingSession
+            )
+        )
+}
+
+/// 自动重连上限。超过后不再拉起子进程，改为把决定权交回用户。
+const ACP_RECONNECT_MAX_ATTEMPTS: u32 = 3;
+/// 首次重连延迟；之后按 2 倍退避，避免 agent 反复崩溃时打转。
+const ACP_RECONNECT_BASE_DELAY_MS: u64 = 600;
+/// 空闲连接的健康检查间隔。agent 进程空闲退出不会产生轮次事件，只能靠轮询发现。
+#[cfg_attr(test, allow(dead_code))]
+const ACP_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcpReconnectDecision {
+    Reconnect,
+    GiveUp,
+    Idle,
+}
+
+/// 是否应该自动重连。纯决策，便于单测；不触碰任何进程或 GPUI 状态。
+///
+/// 只有「ACP 后端 + 连接确实不可用 + 没有正在进行的连接动作 + 有明确目标」才重连，
+/// 且受尝试次数上限约束。用户主动切走（`has_target == false`）时永不重连。
+fn acp_reconnect_decision(
+    is_acp_backend: bool,
+    connection_unavailable: bool,
+    busy: bool,
+    has_target: bool,
+    attempts: u32,
+) -> AcpReconnectDecision {
+    if !is_acp_backend || !connection_unavailable || busy || !has_target {
+        return AcpReconnectDecision::Idle;
+    }
+    if attempts >= ACP_RECONNECT_MAX_ATTEMPTS {
+        AcpReconnectDecision::GiveUp
+    } else {
+        AcpReconnectDecision::Reconnect
+    }
+}
+
+/// 第 `attempts` 次（从 0 起）重连前的等待时长。
+fn acp_reconnect_delay(attempts: u32) -> std::time::Duration {
+    let shift = attempts.min(3);
+    std::time::Duration::from_millis(ACP_RECONNECT_BASE_DELAY_MS << shift)
+}
+
+/// 自动重连状态。`generation` 让被取代的定时器无法生效。
+#[derive(Default)]
+struct AcpReconnectState {
+    attempts: u32,
+    scheduled: bool,
+    generation: u64,
 }
 
 fn submission_start_for_acp_availability(
@@ -444,6 +795,21 @@ fn current_agent_task_title() -> String {
     t!("AgentUi.current_agent_task").to_string()
 }
 
+/// 把上下文附件拼到用户输入前面。
+///
+/// 附件正文为空（或只有空白）时原样返回用户输入，避免消息里出现空块；标题
+/// 由宿主写进 `body`，这里不额外加标记，好让发送后的转录与模型看到的完全一致。
+fn compose_prompt_with_attachment(text: &str, attachment: Option<&ContextAttachment>) -> String {
+    let Some(attachment) = attachment else {
+        return text.to_string();
+    };
+    let body = attachment.body.trim_end();
+    if body.is_empty() {
+        return text.to_string();
+    }
+    format!("{body}\n\n{text}")
+}
+
 fn persistence_title_from_input(text: &str) -> String {
     const MAX_TITLE_CHARS: usize = 40;
 
@@ -463,9 +829,61 @@ fn persistence_title_from_input(text: &str) -> String {
     }
 }
 
+/// 会话切换前是否要停掉在飞轮次。
+///
+/// 历史上 ACP 在这里返回 `true`（切走即取消）；后台轮次方案后 ACP 轮次改为
+/// 转入后台继续跑，本地运行时从不需要切换前强停——两侧都返回 `false`，
+/// 保留这个函数是为了让切换守卫语义集中在一处，也留着给未来需要强停的后端。
 fn should_stop_task_before_session_switch(backend: Backend) -> bool {
-    backend == Backend::Acp
+    let _ = backend;
+    false
 }
+
+/// 这次会话切换是怎么发起的——决定导航栈（后退/前进）怎么记账。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionSwitchOrigin {
+    /// 用户主动访问（侧栏点击 / 切换器提交 / 公共 API）：把来源压入 back 栈。
+    Visit,
+    /// 后退导航：栈已在调用前移动，切换本身不再记账。
+    Back,
+    /// 前进导航：同上。
+    Forward,
+}
+
+/// 输入框的一次性草稿载荷：文字 + 图片附件。
+///
+/// 文字来自 Runtime 会话的 `draft`（可落盘）；图片来自
+/// [`AgentChatView::session_draft_attachments`]（只在进程内，见字段注释）。
+/// 由 [`AgentChatView::stage_session_draft`] 组装、`render` 时
+/// [`AgentChatView::apply_pending_input_draft`] 写进输入框。
+#[derive(Default)]
+struct ComposerDraft {
+    text: String,
+    images: Vec<crate::ImageAttachment>,
+}
+
+/// 草稿防抖保存的等待时间。
+///
+/// 与 waku 的 `COMPOSER_DRAFT_SAVE_DELAY` 同量级：短到「手一停就存上了」，
+/// 长到连续打字时不会每敲一个字都写一次库。
+const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// 命令面板正文检索的防抖窗口。
+///
+/// 短到「打完停顿一下结果就在」，长到连续输入只查最后一次——正文检索要读快照
+/// JSON，比标题过滤贵得多。
+const PALETTE_BODY_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+/// 少于这个长度的查询不搜正文：一两个字符几乎命中所有会话，等于什么都没筛掉，
+/// 白搭一次全库扫。
+const PALETTE_BODY_MIN_QUERY: usize = 2;
+/// 正文命中最多列几条。
+const PALETTE_BODY_LIMIT: usize = 12;
+
+/// agent 切换弹层的最大高度：超出的部分滚动，弹层不跟着 agent 数量长胖。
+///
+/// 这个列表一行两行文字（名字 + 状态），六七个 agent 就会顶到窗口边缘；
+/// 顶部弹层一旦比窗口高，靠下的 agent 点不到，换成固定高度 + 滚动才可靠。
+const AGENT_SWITCHER_MAX_HEIGHT: f32 = 320.0;
 
 fn merge_live_session_summaries(
     persisted: Vec<SessionSummary>,
@@ -494,9 +912,21 @@ fn merge_live_session_summaries(
     }
 
     summaries.extend(persisted.into_iter().map(|summary| {
-        live_by_id
-            .get(summary.id.as_str())
-            .map_or(summary, |live| (*live).clone())
+        // 实时摘要只提供「还在内存里变」的字段：标题与活跃时间。
+        //
+        // 工作区归属与外部 agent 来源是**落盘快照**的事实，不能被内存副本冲掉：
+        // 内存那份归属来自 `session_roots`，而它可能压根没有这个会话的记录
+        // （例如进程启动时建的那个初始会话从没进过表）。整体 `clone()` 覆盖
+        // 会让侧栏那一行从它的工作区分组掉进「未分组」，用户点一下别的会话
+        // 它又跳回来——「点一下分组就变了 / 顺序就变了」。
+        match live_by_id.get(summary.id.as_str()) {
+            Some(live) => SessionSummary {
+                name: live.name.clone(),
+                updated_at: live.updated_at,
+                ..summary
+            },
+            None => summary,
+        }
     }));
     summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     summaries
@@ -540,6 +970,15 @@ impl RuntimeBinding {
         }
     }
 
+    /// 切换模型：换 Runtime，但**保留当前会话**。
+    ///
+    /// 本地会话的对话历史只活在 Runtime 内存里（落盘的是快照副本），直接
+    /// `create_session` 开一个空会话等于把上下文丢掉——用户看到的就是"切完
+    /// 模型它不记得刚才聊过什么"。这里先把当前会话冻结成快照，再在新 Runtime
+    /// 上用同一个 session id 恢复，历史 / 计划 / 系统指令 / 技能一起延续。
+    ///
+    /// 返回 `Ok(true)` 表示已切换（`session_id` 不变即历史已延续），`Ok(false)`
+    /// 表示没有可用的 Runtime 工厂、调用方应保持原状。
     fn switch_model(
         &mut self,
         option: &ComposerModelOption,
@@ -548,13 +987,86 @@ impl RuntimeBinding {
         let Some(factory) = &self.runtime_factory else {
             return Ok(false);
         };
+        // 先取快照再建 Runtime：工厂报错时 `self` 原封不动，旧 Runtime 仍可用。
+        let snapshot = self
+            .runtime
+            .session(&self.session_id)
+            .map(|session| session.snapshot());
         let runtime = factory(option)?;
-        let session = runtime.create_session(resources.clone());
+        let session = match snapshot {
+            Some(snapshot) => runtime.restore_session(snapshot),
+            None => runtime.create_session(resources.clone()),
+        };
         self.runtime = runtime;
         self.session_id = session.id().clone();
         self.selected_model = Some(option.clone());
         Ok(true)
     }
+}
+
+/// 工作台外壳注入工具条的侧栏开关：状态读取与切换动作都由外壳提供。
+///
+/// 图标状态在每次渲染时经 `nav_collapsed` / `right_open` 闭包实时求值，
+/// 动作闭包经外壳弱引用回调——外壳与面板互不强持有，销毁顺序无关。
+/// 面板会暂存注入值：内层视图是异步构建的，注入可能早于视图存在。
+#[derive(Clone)]
+pub struct WorkbenchSidebarToggles {
+    /// 会话导航栏是否处于收起态。
+    pub nav_collapsed: std::sync::Arc<dyn Fn(&gpui::App) -> bool + 'static>,
+    /// 切换会话导航栏。
+    pub toggle_nav: std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>,
+    /// 右侧标签组是否处于展开态（有标签且未被收起，放大视为展开）。
+    pub right_open: std::sync::Arc<dyn Fn(&gpui::App) -> bool + 'static>,
+    /// 切换右侧标签组。
+    pub toggle_right: std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>,
+}
+
+/// 输入框下方上下文栏的数据快照：工作区 / 分支 / Worktree。
+///
+/// 宿主每次推送前现算一次（分支要走 git），因此是一次性的值而不是 getter。
+#[derive(Clone, Debug, Default)]
+pub struct ComposerContextSnapshot {
+    pub workspace: ComposerWorkspaceInfo,
+    pub workspace_options: Vec<ComposerWorkspaceOption>,
+    pub branches: Vec<ComposerBranchOption>,
+    pub worktree: ComposerWorktreeState,
+}
+
+/// 宿主注入的上下文栏数据源与动作。
+///
+/// 与 [`WorkbenchSidebarToggles`] 同构：视图只负责展示与转发，真实语义
+/// （切工作区、切分支、建 worktree）全在宿主侧，视图不依赖任何业务 crate。
+#[derive(Clone)]
+pub struct ComposerContextSource {
+    /// 取当前快照。每次 [`AgentChatView::sync_composer`] 调用一次。
+    pub snapshot: std::sync::Arc<dyn Fn(&mut gpui::App) -> ComposerContextSnapshot + 'static>,
+    /// 选中工作区。宿主决定「会话已有消息则在目标工作区新建对话」。
+    pub select_workspace:
+        std::sync::Arc<dyn Fn(&std::path::Path, &mut gpui::Window, &mut gpui::App) + 'static>,
+    /// 「选择其它目录…」：宿主弹自己的目录选择器。
+    pub browse_workspace: std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>,
+    /// 切换分支（分支名，可能与远程分支同名）。
+    pub select_branch: std::sync::Arc<dyn Fn(&SharedString, &mut gpui::App) + 'static>,
+    /// 切换「本会话跑在独立 worktree 上」。
+    ///
+    /// 勾选只是记下意图（宿主在快照里回 `ComposerWorktreeState::pending`），
+    /// 真正的创建发生在第一次提交之前，见 [`Self::prepare_worktree`]。
+    pub toggle_worktree: std::sync::Arc<dyn Fn(bool, &mut gpui::App) + 'static>,
+    /// 创建待建的 worktree（首次提交前调用，见 [`AgentChatView::defer_submission_for_worktree`]）。
+    ///
+    /// 返回的 task 在**失败**时给出原因，视图据此中止这次发送并把内容还回输入框；
+    /// 成功时它只代表 `git worktree add` 跑完了 —— 换根要经过
+    /// `set_root_manually` → `RootChanged` 的**延后派发**，真正落地在
+    /// [`AgentChatView::set_workspace_root`]，视图在那里接着发这条被拦下的提交。
+    /// 若在这里就继续提交，ACP 会话仍绑在旧根上，等于没切。
+    pub prepare_worktree:
+        std::sync::Arc<dyn Fn(&mut gpui::App) -> Task<Result<(), SharedString>> + 'static>,
+    /// 告诉用户「worktree 没建起来、这条消息没发出去」。
+    ///
+    /// 由宿主弹，而不是视图自己调组件库的通知：通知需要组件库的窗口状态，
+    /// 视图只负责把话递出去（与 `browse_workspace` 弹宿主的目录选择器同一套路）。
+    pub report_worktree_failure:
+        std::sync::Arc<dyn Fn(&SharedString, &mut gpui::Window, &mut gpui::App) + 'static>,
 }
 
 /// 创建 [`AgentChatView`] 所需的配置。
@@ -581,6 +1093,8 @@ pub struct AgentChatViewConfig {
     pub acp_agents: Vec<AcpAgentEntry>,
     /// 可选的局部聊天主题。用于终端侧边栏等嵌入场景,普通 Agent tab 保持应用主题。
     pub theme: Option<AgentChatTheme>,
+    /// ACP、资源浏览和工作区工具共用根目录。
+    pub workspace_root: Option<std::path::PathBuf>,
 }
 
 impl AgentChatViewConfig {
@@ -605,6 +1119,7 @@ impl AgentChatViewConfig {
             sidebar_frame_placement: SidebarPlacement::Right,
             acp_agents: Vec::new(),
             theme: None,
+            workspace_root: None,
         }
     }
 
@@ -650,6 +1165,11 @@ impl AgentChatViewConfig {
     /// 注入局部聊天主题。
     pub fn with_theme(mut self, theme: AgentChatTheme) -> Self {
         self.theme = Some(theme);
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace_root = Some(root);
         self
     }
 
@@ -786,17 +1306,79 @@ impl AutoScrollState {
 pub struct AgentChatView {
     runtime: Arc<Runtime>,
     session_id: SessionId,
+    workspace_root: std::path::PathBuf,
     resources: ResourceContext,
+    /// 每轮发送前重建资源上下文的回调（侧边栏用它注入终端等实时状态）。
+    resource_context_refresher: Option<ResourceContextRefresher>,
+    context_attachment_provider: Option<ContextAttachmentProvider>,
     available_resources: Vec<ResourceRef>,
     transcript: AgentTranscript,
     input: Entity<AgentInput>,
+    /// ACP agent 那一份输入框（见 [`composer_slot`] 模块文档）。
+    ///
+    /// 与 [`Self::input`] 同时存在、各自持有编辑器与附件：输入区**按后端起手**
+    /// 挂其中一份，切后端只换挂载，不改组件内部的任何状态。
+    acp_input: Entity<AcpAgentInput>,
+    /// 上一次渲染时挂的是哪一份输入框。
+    ///
+    /// 用来发现"后端换了"这一次事实（切换后必然渲染一帧），好把输入内容从旧那份
+    /// 搬到新那份。放在渲染里而不是每个切换点上：赋值 `backend` 的地方以后还会
+    /// 增加，漏一处就会出现"切过去了但刚打的字留在另一份里"。
+    composer_backend: Backend,
+    /// 会话切换后待写入输入框的草稿；`Some` 才有动作，在下一次 `render` 应用。
+    ///
+    /// 之所以不直接写输入框：`InputState::set_value` 需要 `&mut Window`，
+    /// 而 `switch_session` / `start_fresh_session` 全链路都没有 window（改签名
+    /// 会波及十几处调用点与公共 API）。渲染恰好在切换后必然发生，把「换输入框
+    /// 内容」推迟到那一帧，语义等价且不动任何调用方。
+    pending_input_draft: Option<ComposerDraft>,
+    /// 每个会话自己的**图片**草稿（文字走 Runtime 会话的 `draft`，见
+    /// [`Self::capture_session_draft`]）。
+    ///
+    /// 图片不进会话快照——几 MB 的像素数据会让快照膨胀到不可接受——所以只在
+    /// 进程内有效：切换会话时图片跟着会话走、互不串台，重启后只恢复文字。
+    session_draft_attachments: HashMap<String, Vec<crate::ImageAttachment>>,
+    /// 上一次离开的「空白会话」，供「新建会话」复用（见 [`Self::new_session`]）。
+    ///
+    /// 只在**本地后端**记：ACP 的转录空白不代表 agent 那边没有上下文
+    /// （`session/resume` 就是不回放历史的，转录看着空、聊天记录在 agent 手里）。
+    /// 内存态，不持久化：重启后这些白纸本来就没了。
+    draft_session: Option<String>,
+    /// 会话后退/前进导航栈（见 [`session_navigation`] 模块文档）。
+    session_navigation: SessionNavigation,
+    /// 最近会话切换器的状态机（见 [`session_switcher`] 模块文档）。
+    session_switcher: SessionSwitcherUi,
+    /// 切换器 overlay 的焦点句柄：切换器打开时把焦点收进来，这样
+    /// `AgentSessionSwitcher` 上下文里的键（tab / enter / escape）才派发得到。
+    session_switcher_focus: FocusHandle,
     sessions: Vec<SessionSummary>,
+    /// 会话 id → 归属工作区。创建/载入时定格，落盘时随快照写出。
+    session_roots: HashMap<String, String>,
     /// 尚未完全由持久化历史覆盖的实时会话摘要（当前会话和后台运行会话）。
     live_sessions: Vec<SessionSummary>,
     /// 非当前会话的实时转录，切换回来时可继续看到流式进度。
     session_transcripts: HashMap<String, AgentTranscript>,
     /// 非当前会话转录的 LRU 顺序，队首为最久未访问项。
     session_transcript_order: VecDeque<String>,
+    /// [`Self::session_transcripts`] 里哪些 uid 存的是**外部 agent** 那侧的内容。
+    ///
+    /// 槽位按 uid 复用：同一条会话可能先把本地那段交给 agent（本地转录进缓存），
+    /// 之后屏上换成 agent 的内容。来源不记下来，切回本地时就会把 agent 的转录
+    /// 当成本地历史摆出来（`restore_local_transcript` 靠这张表避开这个坑）。
+    acp_cached_transcripts: HashSet<String>,
+    /// 子代理**详情会话**的转录，键是详情会话 id（`acp-sub:<子会话 id>`）。
+    ///
+    /// 与 [`Self::session_transcripts`] 分开存是有意的：那个 map 装的是「别的**真实**
+    /// 会话」，会进 LRU、会落盘、会出现在会话列表里；详情会话只是某张卡片的一次回放，
+    /// 既不落盘也不该被 LRU 挤掉——用户正看着它。
+    subagent_details: HashMap<String, AgentTranscript>,
+    /// 详情会话加载失败的文案，键同 [`Self::subagent_details`]。
+    subagent_detail_errors: HashMap<String, String>,
+    /// 已经发出过 `session/load` 的子会话协议 id。
+    ///
+    /// 用于防重复：每 load 一次，agent 就把整段子代理历史重放一遍；子代理动辄上千条
+    /// part，重复触发既浪费也会把转录灌花。
+    subagent_loads: HashSet<String>,
     /// 当前 Runtime 中仍在执行的会话集合。
     running_sessions: HashSet<String>,
     /// 本地 stop 后不再允许影响后续轮次状态的旧 turn。
@@ -809,6 +1391,94 @@ pub struct AgentChatView {
     pending_submissions: PendingSubmissions,
     current_session: String,
     sidebar_collapsed: bool,
+    /// 工作台外壳接管左侧会话栏时整块隐藏内建侧栏（不渲染折叠 rail）。
+    sidebar_suppressed: bool,
+    /// 工作台外壳注入的侧栏开关；`Some` 时工具条在 agent 切换器两侧渲染
+    /// 导航栏开关（左）与右侧标签组开关（右），替代外壳顶栏。
+    workbench_toggles: Option<WorkbenchSidebarToggles>,
+    /// 宿主注入的输入框下方上下文栏数据源（工作区 / 分支 / Worktree）。
+    /// `None` 时底栏只渲染「权限级别」一项，其余入口不出现。
+    composer_context_source: Option<ComposerContextSource>,
+    /// 被「worktree 待创建」拦下、等根切过去之后再发的提交（先来先发）。
+    ///
+    /// 用队列而不是单个槽位：创建要秒级（`git worktree add` 是子进程），这期间
+    /// 用户完全可能再发一条；单槽位会把上一条静默覆盖掉。
+    gated_submissions: VecDeque<PendingSubmission>,
+    /// 滚动三态（跟随尾巴 / 阅读历史 / 锚点跳转中）。
+    scroll: TranscriptScrollState,
+    /// 过程块展开态覆盖表；按稳定 id 记录用户的显式展开/收起。
+    expansion: ExpansionState,
+    /// 轮次起止时间；折叠头里的「用时 Ns」只来自这里，缺失就不显示。
+    turn_timings: TurnTimings,
+    /// 会话 id → 该会话里「已捕获快照、可以回滚」的轮次 id。
+    ///
+    /// 快照存在工作区浏览器的 git ref 里，视图拿不到也不该去查，所以这张表完全由
+    /// 宿主推送。按会话分桶是为了切换会话时不会把上一会话的轮次当成可回滚——那会渲染
+    /// 出一个点了没反应的按钮。
+    restorable_turns: HashMap<String, HashSet<String>>,
+    /// 每个会话留下了整轮 diff 的轮次（宿主注入，key = session id）。
+    ///
+    /// 与 `restorable_turns` 分开存：回滚入口只对锚定成功的轮次出现，审阅入口只要
+    /// diff 真算出来了就该在。两者依据不同，合成一份会互相带累。
+    reviewed_turns: HashMap<String, HashSet<String>>,
+    /// 决策栏里**显式展开详情**的那一项 id；`None` 表示全部收起。
+    ///
+    /// 详情展开是纯展示动作，不取键盘焦点——绝不让「用户正在打字」时 Enter 变成「允许」。
+    /// 会话内搜索状态（纯逻辑）；渲染层只读它。
+    search: TranscriptSearch,
+    /// 上次重算命中时的转录版本号；正文没变不重算。
+    search_revision: u64,
+    /// findbar 是否打开。
+    findbar_open: bool,
+    /// 用量历史浮层的数据；`None` = 浮层关着。
+    ///
+    /// 打开时取一次、关掉即清：这条视图读的是本地库（采样流水 + 会话摘要），
+    /// 不适合放在每帧 render 路径上重复查。`None` 与「空数据」区分开——
+    /// 空数据是「打开了但还没有采样」。
+    pub(super) usage_history: Option<crate::usage_history::UsageHistoryData>,
+    /// 正在放大的转录图片；`None` = 没开。
+    ///
+    /// 存图本身而不是「消息 id + 下标」：会话一切换、消息一被淘汰，
+    /// 反查就会落空，表现为「点了没反应」。`Arc<Image>` 的克隆只加一次
+    /// 引用计数。
+    pub(super) message_image_preview: Option<crate::message_image::MessageImage>,
+    /// findbar 的查询输入框。
+    findbar_input: Entity<InputState>,
+    /// 命令面板是否打开。
+    pub(super) palette_open: bool,
+    /// 面板里当前高亮的是第几条（按 `visible_items` 的下标）。
+    pub(super) palette_selection: usize,
+    /// 面板查询框里的文本；由 `InputEvent::Change` 同步，渲染只读它。
+    pub(super) palette_query: String,
+    /// 命令面板的查询输入框。
+    palette_input: Entity<InputState>,
+    /// 命令面板「正文命中」那一段的结果；随查询变化刷新。
+    ///
+    /// 存在视图里而不是每帧查库：正文检索要读快照 JSON，代价与库大小成正比，
+    /// 挂在 render 路径上会让每帧都被拖慢。
+    palette_body_hits: Vec<crate::command_palette::PaletteBodyHit>,
+    /// 排队中的正文检索防抖任务；再敲一个字会把它顶掉重排（旧任务随 drop 取消）。
+    palette_body_task: Option<Task<()>>,
+    /// 有未发送草稿的会话 uid（会话列表行上的标记用）。
+    ///
+    /// 缓存一份而不是每帧查库：列表每帧都要它，而草稿只在输入停下来时变一次。
+    drafted_sessions: HashSet<String>,
+    /// 排队中的草稿防抖保存；再输入一次会把它顶掉重排（旧任务随 drop 取消）。
+    draft_save_task: Option<Task<()>>,
+    /// 业务资源那一批 `@` 提及项（连接、SSH 主机…）。
+    ///
+    /// 工作区文件是**后到**的（目录遍历在后台跑），所以这一批要留一份：
+    /// 换根重新收集时要跟文件那份重新合并，而不是把业务资源丢在路上。
+    resource_mentions: Vec<MentionItem>,
+    /// 后台的工作区文件遍历任务；换根会把它顶掉（旧任务随 drop 取消）。
+    workspace_mentions_task: Option<Task<()>>,
+    /// 转录里的块级选中（见 `transcript_selection`）。
+    ///
+    /// 用 `Rc<RefCell<..>>` 而不是普通字段：渲染层（`message_turn_view`）要自己
+    /// 挂鼠标事件并读选区，那层不认识 `AgentChatView`，共享句柄是最小耦合。
+    transcript_selection: Rc<std::cell::RefCell<crate::transcript_selection::TranscriptSelection>>,
+    /// 转录容器的焦点句柄：按下消息时把焦点收过来，`Cmd+C` 才会落到转录而不是 composer。
+    transcript_focus: FocusHandle,
     /// 侧边栏是否显示「已归档」会话(否则显示活跃会话)。
     show_archived: bool,
     /// 侧边栏视图(窄面板)模式:头部走新建对话 / 历史记录紧凑布局,不常驻会话列表。
@@ -825,18 +1495,43 @@ pub struct AgentChatView {
     backend: Backend,
     /// 可接入的外部 ACP agent 列表。
     acp_agents: Vec<AcpAgentEntry>,
+    /// 每个 ACP agent 的一次性探测结果；缺失表示尚未探测。
+    acp_probes: HashMap<SharedString, AcpAgentProbe>,
+    /// 正在探测的 agent id；用于渲染「探测中」并防止重复启动。
+    acp_probe_inflight: HashSet<SharedString>,
     /// 本地 Codex-style Skill 管理状态。
     skills: AgentSkillState,
     /// 已建立的 ACP 连接(backend == Acp 时存在)。
     acp: Option<AcpConnection>,
-    /// 当前 ACP prompt 的 UI 会话、连接事件 token 与 turn 归属。
-    acp_turn_owner: Option<AcpTurnOwner>,
+    /// 在飞轮次的 UI 侧记账：哪个内置会话、哪条连接事件流、哪一轮。
+    ///
+    /// 后台轮次方案后同一时刻可以有多条（各会话各自一轮）：按 turn_id 路由，
+    /// 不再是单槽 `Option`。
+    acp_turn_owners: Vec<AcpTurnOwner>,
+    /// 正在放行的**历史回放**窗口（`session/load` 重放出来的那批 `session/update`）。
+    acp_history_replay: Option<AcpHistoryReplay>,
+    /// 历史回放期间事件流被挤掉（lagged）后的重载补全状态。
+    ///
+    /// `session/load` 的整段历史靠 broadcast 事件流回放，一旦订阅端 lagged，
+    /// 这段历史就永久缺一块（后续不会再有事件来补）。补法是再 `load` 一次
+    /// 同一条协议会话；只补一次，重放仍然 lagged 就认了（日志 warn），
+    /// 避免在慢 agent 上无限重载。
+    acp_replay_lagged: bool,
+    acp_replay_retries: u8,
     /// 等待用户选择鉴权方式的 ACP 连接。
     acp_pending: Option<AcpPendingConnection>,
     /// 当前 pending 连接公布的鉴权方式。
     acp_auth_methods: Vec<String>,
     /// 当前选中的 ACP agent id(用于头部切换控件高亮)。
     current_acp_id: Option<SharedString>,
+    /// 连接前选中的模型值；连接成功后自动补一次 `session/set_config_option`。
+    ///
+    /// 没有它，「先挑模型再连接」会变成点了没反应的假控件。
+    pending_acp_model: Option<String>,
+    /// 断线自动重连的尝试计数、待触发标记与代次。
+    acp_reconnect: AcpReconnectState,
+    /// 空闲 ACP 连接的健康检查任务；随连接建立与失效启停。
+    _acp_health_task: Option<Task<()>>,
     /// 正在连接 ACP agent(拉起子进程中)。
     acp_connecting: bool,
     /// 正在连接的 ACP agent id,用于忽略已取消连接的异步回调。
@@ -847,8 +1542,28 @@ pub struct AgentChatView {
     acp_operation_generation: u64,
     /// ACP 新会话创建中的操作，或创建失败后等待重试的操作。
     acp_session_transition: Option<AcpSessionTransition>,
+    /// 从零重开一条外部 agent 会话时，连接就绪后要 `load` 回来的协议会话 id。
+    ///
+    /// `resume` 只把上下文接上，不回放历史；agent 支持 `session/load` 时再主动
+    /// load 一次，用户点开侧栏那行才能看到原来那段对话。只在下一次连接就绪时消费，
+    /// 且 id 对得上才真去 load：用户中途改成连别的 agent 的话，这个值自然作废。
+    acp_reopen_pending: Option<String>,
+    /// 从 agent 拉到的历史会话列表（仅在 agent 声明支持 `session/list` 时有意义）。
+    acp_sessions: Vec<AcpSessionSummary>,
+    /// 拉列表/开会话失败的可见原因。清空表示上次是成功的——不拿空列表冒充失败。
+    acp_sessions_error: Option<String>,
+    /// 列表请求在飞。渲染层据此区分「还没拉」和「拉完了是空的」。
+    acp_sessions_loading: bool,
+    /// 列表请求的代次；迟到响应靠它判归属（不变量 5）。
+    acp_sessions_generation: u64,
+    /// 当前 agent 声明支持 `session/list`。连接被 take 走做请求时也保持稳定——
+    /// 否则列表会在刷新过程中整个闪掉（不变量 11 说的是「能力缺失就不显示」，
+    /// 不是「连接不在就不显示」）。
+    acp_sessions_supported: bool,
     /// 当前 ACP 连接尚未响应的权限请求。
     pending_acp_permissions: HashMap<String, AcpPermissionEnvelope>,
+    /// 当前 ACP 连接尚未回答的 agent 提问。同一时刻最多一条，新的会顶掉旧的。
+    pending_acp_elicitations: HashMap<String, AcpElicitationEnvelope>,
     /// 安全确认模式下，实际 Public MCP 调用尚未响应的二次审批。
     pending_public_mcp_approvals: HashMap<String, AcpPublicMcpApprovalEnvelope>,
     /// 把匹配的 Public MCP 审批请求路由回当前 ACP 消息流。
@@ -857,6 +1572,8 @@ pub struct AgentChatView {
     auto_scroll: AutoScrollState,
     /// 当前工具执行模式。由 AI Chat 设置恢复，并用于后续提交。
     tool_execution_mode: ToolExecutionMode,
+    /// 本轮的任务类型（问答 / 常规 / 计划）。与工具策略合成一个下拉。
+    task_kind: TaskKind,
     /// 当前模型。切换时通过 runtime_factory 重建 Runtime,影响后续提交。
     selected_model: Option<ComposerModelOption>,
     model_options: Vec<ComposerModelOption>,
@@ -882,6 +1599,7 @@ pub struct AgentChatView {
     _event_task: Task<()>,
     /// 当前 ACP 连接的权限请求泵；切换连接时丢弃以隔离旧连接请求。
     _acp_permission_task: Option<Task<()>>,
+    _acp_elicitation_task: Option<Task<()>>,
     /// 当前 ACP 连接的 Public MCP 二次审批泵。
     _acp_public_mcp_approval_task: Option<Task<()>>,
 }
@@ -909,8 +1627,11 @@ impl AgentChatView {
         self.runtime_factory = runtime_factory;
         let model_options = self.model_options.clone();
         let tool_options = self.tool_options.clone();
+        // 宿主刷新的是**本地**模型列表（连着 runtime factory 与工具注册表）：只喂本地
+        // 那份。走 `composer()` 的话，用户在 ACP 会话里改设置会顺手把 agent 声明的
+        // 模型列表顶掉。
         self.input.update(cx, |input, cx| {
-            input.set_menu_options(model_options, tool_options, cx);
+            input.set_menu_options(model_options, tool_options, cx)
         });
         if let Some(retained) = retained {
             self.selected_model = Some(retained);
@@ -964,9 +1685,12 @@ impl AgentChatView {
         let sidebar_frame_placement = config.sidebar_frame_placement;
         let theme = config.theme;
         let acp_agents = config.acp_agents;
+        let workspace_root = config.workspace_root.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        });
         let resources = config.resources;
         let available_resources = config.available_resources;
-        let mentions = config.mentions;
+        let base_mentions = config.mentions;
         let model_options = config.model_options;
         let binding = RuntimeBinding::new(
             config.runtime,
@@ -980,22 +1704,28 @@ impl AgentChatView {
         let runtime_factory = binding.runtime_factory;
         let input = cx.new(|cx| {
             AgentInput::with_mentions(
-                mentions,
+                base_mentions.clone(),
                 t!("AgentUi.input_placeholder").to_string(),
                 window,
                 cx,
             )
         });
+        // ACP 那一份输入框：不是 One agent 的裁剪版，只摆 agent 自己声明的东西
+        // （会话模式、模型、`/` 命令）与必需的工作区归属，别的面板一概没有。
+        let acp_input = cx.new(|cx| AcpAgentInput::new(window, cx));
         Self::register_approval_actions(cx);
         if let Some(theme) = theme.clone() {
-            input.update(cx, |input, cx| input.set_theme(Some(theme), cx));
+            input.update(cx, |input, cx| input.set_theme(Some(theme.clone()), cx));
+            acp_input.update(cx, |input, cx| input.set_theme(Some(theme), cx));
         }
         if sidebar_mode {
             input.update(cx, |input, cx| input.set_edge_to_edge(true, cx));
+            acp_input.update(cx, |input, cx| input.set_edge_to_edge(true, cx));
         }
 
-        let tool_execution_mode =
-            runtime_tool_execution_mode(AppSettings::current(cx).ai_chat.tool_execution_mode);
+        let stored_mode = AppSettings::current(cx).ai_chat.tool_execution_mode;
+        let tool_execution_mode = runtime_tool_execution_mode(stored_mode);
+        let task_kind = task_kind_from_settings(stored_mode);
         // 默认来源为全局设置：初始化时用当前设置作种子值，之后新会话/切换模型都会
         // 跟随设置刷新（包括配置被清空）。外部显式注入会通过 set_system_instruction
         // 覆盖来源并保持不变。
@@ -1003,12 +1733,12 @@ impl AgentChatView {
             .ai_chat
             .effective_custom_system_prompt();
         let system_instruction_from_settings = true;
-        let tool_options = default_tool_options();
+        let tool_options = default_execution_mode_options();
 
-        let skills = AgentSkillState::load_default();
+        let skills = AgentSkillState::load_for_workspace(&workspace_root);
         let init_ctx = build_composer_context(
             &resources,
-            tool_execution_mode,
+            ExecutionSelection::new(task_kind, tool_execution_mode),
             selected_model.as_ref(),
             None,
             &[],
@@ -1020,6 +1750,8 @@ impl AgentChatView {
             &available_resources,
             skills.summary(),
             skills.items(),
+            // 构造时还没有任何模型采样,计量自然为空;之后的 sync_composer 会带上。
+            None,
         );
         let target_options: Vec<ComposerTarget> = resources
             .resources
@@ -1029,10 +1761,61 @@ impl AgentChatView {
         input.update(cx, |inp, cx| {
             inp.set_target_options(target_options, cx);
             inp.set_menu_options(model_options.clone(), tool_options.clone(), cx);
+            inp.set_context(init_ctx.clone(), cx);
+        });
+        // ACP 那份只接视图上下文（工作区 / 分支 / Worktree / 会话标题这些归属信息）：
+        // 模型与执行模式是 **agent 自己声明的**，接进来之前一律留空——塞一份本地模型
+        // 列表进去，用户在 agent 还没报上模型时看到的会是本地那一串。
+        acp_input.update(cx, |inp, cx| {
             inp.set_context(init_ctx, cx);
         });
 
-        let subscriptions = vec![cx.subscribe_in(&input, window, Self::on_input_event)];
+        // 会话内搜索的查询框。
+        //
+        // **不**设 `clean_on_escape()`：那会让 `InputBaseState::escape` 走 `clean()` 分支
+        // 提前 `return`（不再 `cx.propagate()`），findbar 容器上的 `escape` 关闭动作就永远收不到。
+        // 保留查询、由 findbar 自己决定关闭后的语义。
+        let findbar_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("AgentUi.findbar_placeholder").to_string())
+        });
+
+        // 命令面板的查询框。与 findbar 同理**不**设 `clean_on_escape()`：
+        // 那会吞掉 escape 的冒泡，面板就收不到「关掉自己」这个动作。
+        let palette_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("AgentUi.palette_placeholder").to_string())
+        });
+
+        // 会话切换器 overlay 的焦点句柄（打开时收焦点，让 tab/enter/escape 到位）。
+        let session_switcher_focus = cx.focus_handle();
+
+        let mut subscriptions = vec![
+            cx.subscribe_in(&input, window, Self::on_input_event),
+            // 两份输入框发的是同一个事件枚举：处理逻辑只有一份，ACP 这份只是
+            // 另一个来源（见 `on_acp_input_event`）。
+            cx.subscribe_in(&acp_input, window, Self::on_acp_input_event),
+            cx.subscribe(
+                &findbar_input,
+                |this: &mut Self, _, event: &InputEvent, cx| {
+                    this.on_findbar_input_event(event, cx);
+                },
+            ),
+            cx.subscribe_in(
+                &palette_input,
+                window,
+                |this: &mut Self, _, event: &InputEvent, window, cx| {
+                    this.on_palette_input_event(event, window, cx);
+                },
+            ),
+        ];
+        // 设置页改完 ACP agent 列表/启用状态/当前选中项后，活着的聊天面板要跟着走。
+        if let Some(notifier) = acp_agent_config_notifier(cx) {
+            subscriptions.push(cx.subscribe(
+                &notifier,
+                |this: &mut Self, _, _: &AcpAgentConfigEvent, cx| {
+                    this.on_acp_agent_config_changed(cx);
+                },
+            ));
+        }
         let event_task = Self::spawn_event_pump(runtime.subscribe(), None, cx);
         let current_session = session_id.to_string();
         let mut transcript = AgentTranscript::new();
@@ -1053,17 +1836,39 @@ impl AgentChatView {
             false,
         );
 
-        let new_view = Self {
+        // 初始会话在构造时就归属当前工作区（与 `start_fresh_session` 同一约定）。
+        // 漏了它，这条会话在第一次落盘之前没有任何归属可查，侧栏会先把它摆进
+        // 「未分组」，落盘后才跳回分组——看起来就像「点一下分组自己变了」。
+        let initial_session_roots = HashMap::from([(
+            current_session.clone(),
+            workspace_root.to_string_lossy().into_owned(),
+        )]);
+
+        let mut new_view = Self {
             runtime,
             session_id,
             resources,
+            resource_context_refresher: None,
+            context_attachment_provider: None,
             available_resources,
             transcript,
             input,
+            acp_input,
+            composer_backend: Backend::Local,
+            pending_input_draft: None,
+            session_draft_attachments: HashMap::new(),
+            draft_session: None,
+            session_navigation: SessionNavigation::default(),
+            session_switcher: SessionSwitcherUi::new(),
+            session_switcher_focus,
             sessions,
             live_sessions,
             session_transcripts: HashMap::new(),
+            acp_cached_transcripts: HashSet::new(),
             session_transcript_order: VecDeque::new(),
+            subagent_details: HashMap::new(),
+            subagent_detail_errors: HashMap::new(),
+            subagent_loads: HashSet::new(),
             running_sessions,
             ignored_local_turns: HashSet::new(),
             local_operation_generations: HashMap::new(),
@@ -1071,6 +1876,34 @@ impl AgentChatView {
             pending_submissions: PendingSubmissions::default(),
             current_session,
             sidebar_collapsed: false,
+            sidebar_suppressed: false,
+            workbench_toggles: None,
+            composer_context_source: None,
+            gated_submissions: VecDeque::new(),
+            scroll: TranscriptScrollState::default(),
+            expansion: ExpansionState::default(),
+            turn_timings: TurnTimings::new(),
+            restorable_turns: HashMap::new(),
+            reviewed_turns: HashMap::new(),
+            search: TranscriptSearch::new(),
+            search_revision: 0,
+            findbar_open: false,
+            usage_history: None,
+            message_image_preview: None,
+            findbar_input,
+            palette_open: false,
+            palette_selection: 0,
+            palette_query: String::new(),
+            palette_input,
+            palette_body_hits: Vec::new(),
+            palette_body_task: None,
+            // 启动时从库里取一次：上次没发出去的草稿要在列表上标出来。
+            drafted_sessions: persistence::drafted_session_uids(cx),
+            draft_save_task: None,
+            resource_mentions: base_mentions.clone(),
+            workspace_mentions_task: None,
+            transcript_selection: Rc::default(),
+            transcript_focus: cx.focus_handle(),
             show_archived: false,
             sidebar_mode,
             show_sidebar_header,
@@ -1079,28 +1912,45 @@ impl AgentChatView {
             history_popover_open: false,
             backend: Backend::Local,
             acp_agents,
+            acp_probes: HashMap::new(),
+            acp_probe_inflight: HashSet::new(),
             skills,
             acp: None,
-            acp_turn_owner: None,
+            acp_turn_owners: Vec::new(),
+            acp_history_replay: None,
+            acp_replay_lagged: false,
+            acp_replay_retries: 0,
             acp_pending: None,
             acp_auth_methods: Vec::new(),
             current_acp_id: None,
+            pending_acp_model: None,
+            acp_reconnect: AcpReconnectState::default(),
+            _acp_health_task: None,
             acp_connecting: false,
             acp_connecting_id: None,
             acp_connect_origin_session: None,
             acp_operation_generation: 0,
             acp_session_transition: None,
+            acp_reopen_pending: None,
+            acp_sessions: Vec::new(),
+            acp_sessions_error: None,
+            acp_sessions_loading: false,
+            acp_sessions_generation: 0,
+            acp_sessions_supported: false,
             pending_acp_permissions: HashMap::new(),
+            pending_acp_elicitations: HashMap::new(),
             pending_public_mcp_approvals: HashMap::new(),
             acp_public_mcp_approval_provider: None,
             scroll_handle: ScrollHandle::new(),
             auto_scroll: AutoScrollState::default(),
             tool_execution_mode,
+            task_kind,
             selected_model,
             model_options,
             tool_options,
             runtime_factory,
             is_running: false,
+            session_roots: initial_session_roots,
             system_instruction: seed_system_instruction,
             system_instruction_from_settings,
             theme,
@@ -1108,11 +1958,15 @@ impl AgentChatView {
             _subscriptions: subscriptions,
             _event_task: event_task,
             _acp_permission_task: None,
+            _acp_elicitation_task: None,
             _acp_public_mcp_approval_task: None,
+            workspace_root,
         };
         if new_view.system_instruction.is_some() {
             new_view.apply_system_instruction_to_current_session();
         }
+        // `@` 里的工作区文件：起手收集一次（后台跑，见方法说明）。
+        new_view.refresh_workspace_mentions(cx);
         new_view
     }
 
@@ -1159,6 +2013,37 @@ impl AgentChatView {
                 cx.propagate();
             }
         });
+
+        // 工具卡片里的 diff 文件头只有一个「打开」按钮,它不知道审阅面板在哪,
+        // 也不知道自己在哪一轮 —— 只把路径与自己的消息 id 发出来。这里用消息 id
+        // 反查轮次，再往上转一手,由宿主决定落位与裁哪一轮的快照。
+        let view = cx.weak_entity();
+        let app: &mut App = cx;
+        app.on_action(move |action: &OpenFileInReview, cx: &mut App| {
+            let path = action.path.clone();
+            let message_id = action.message_id.clone();
+            let _ = view.update(cx, |this, cx| {
+                let turn_id = this.turn_id_for_message(&message_id);
+                let session_id = this.current_session.clone();
+                cx.emit(AgentChatViewEvent::OpenFileInReview {
+                    session_id,
+                    path,
+                    turn_id,
+                });
+            });
+        });
+
+        // 子代理卡片上的「查看推理过程」：卡片只知道子会话的协议 id 与标题，
+        // 拉历史、开面板都由视图与宿主分别接手。
+        let view = cx.weak_entity();
+        let app: &mut App = cx;
+        app.on_action(move |action: &OpenSubagentDetail, cx: &mut App| {
+            let acp_session_id = action.acp_session_id.clone();
+            let title = action.title.clone();
+            let _ = view.update(cx, |this, cx| {
+                this.open_subagent_detail(acp_session_id, title, cx);
+            });
+        });
     }
 
     fn resolve_pending_tool_action(
@@ -1178,17 +2063,106 @@ impl AgentChatView {
         true
     }
 
-    fn start_acp_permission_session(&mut self, cx: &mut Context<Self>) -> AcpPermissionProvider {
-        self.reset_acp_permission_session(cx);
+    /// 为这一次连接建好「agent 反问用户」的两条回程：权限确认与提问。
+    fn start_acp_client_session(&mut self, cx: &mut Context<Self>) -> AcpClientProviders {
+        self.reset_acp_client_session(cx);
         let (provider, receiver) = acp_permission_channel();
+        let (elicitation_provider, elicitation_receiver) = acp_elicitation_channel();
         let (public_mcp_provider, public_mcp_receiver) = acp_public_mcp_approval_channel();
         self.acp_public_mcp_approval_provider = Some(public_mcp_provider);
         self._acp_permission_task = Some(Self::spawn_acp_permission_pump(receiver, cx));
+        self._acp_elicitation_task =
+            Some(Self::spawn_acp_elicitation_pump(elicitation_receiver, cx));
         self._acp_public_mcp_approval_task = Some(Self::spawn_public_mcp_approval_pump(
             public_mcp_receiver,
             cx,
         ));
-        provider
+        AcpClientProviders::new(provider, elicitation_provider)
+    }
+
+    fn spawn_acp_elicitation_pump(
+        mut receiver: tokio::sync::mpsc::UnboundedReceiver<AcpElicitationMessage>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            while let Some(message) = receiver.recv().await {
+                let updated = this.update(cx, |this, cx| match message {
+                    AcpElicitationMessage::Requested(envelope) => {
+                        this.receive_acp_elicitation(envelope, cx)
+                    }
+                    AcpElicitationMessage::Expired { request_id } => {
+                        this.expire_acp_elicitation(&request_id, cx)
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn receive_acp_elicitation(
+        &mut self,
+        envelope: AcpElicitationEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        let request = envelope.request().clone();
+        // 同一时刻只留一个问题：新的顶掉旧的（旧的按取消回给它的 agent）。
+        self.cancel_pending_acp_elicitations(cx);
+        // 「agent 提问」是 ACP 独有的东西：只往 ACP 那份输入框送。按后端走的话，
+        // 这份表单就会长在本地输入框里，而本地输入框根本不认识它。
+        self.acp_input.update(cx, |input, cx| {
+            input.set_pending_elicitation(Some(&request), cx)
+        });
+        self.pending_acp_elicitations
+            .insert(request.request_id.clone(), envelope);
+        self.request_scroll_to_bottom();
+        self.auto_scroll.request_settle();
+        cx.notify();
+    }
+
+    fn expire_acp_elicitation(&mut self, request_id: &str, cx: &mut Context<Self>) {
+        if self.pending_acp_elicitations.remove(request_id).is_none() {
+            return;
+        }
+        // 超时是 agent 侧先放弃的：这里只把面板收起来，不必再回一次结果。
+        self.clear_elicitation_panel(cx);
+        cx.notify();
+    }
+
+    fn cancel_pending_acp_elicitations(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_acp_elicitations);
+        if pending.is_empty() {
+            return;
+        }
+        for (_request_id, envelope) in pending {
+            envelope.resolve(AcpElicitationOutcome::Cancel);
+        }
+        self.clear_elicitation_panel(cx);
+        cx.notify();
+    }
+
+    /// 把用户在 composer 面板里给出的答案送回 agent。
+    fn resolve_pending_acp_elicitation(
+        &mut self,
+        outcome: AcpElicitationOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request_id) = self.pending_acp_elicitations.keys().next().cloned() else {
+            return;
+        };
+        let Some(envelope) = self.pending_acp_elicitations.remove(&request_id) else {
+            return;
+        };
+        // 送不回去说明通道已经关了（多半是超时）：结果丢弃即可，agent 那边不再等。
+        let _ = envelope.resolve(outcome);
+        self.clear_elicitation_panel(cx);
+        cx.notify();
+    }
+
+    fn clear_elicitation_panel(&mut self, cx: &mut Context<Self>) {
+        self.acp_input
+            .update(cx, |input, cx| input.set_pending_elicitation(None, cx));
     }
 
     fn spawn_public_mcp_approval_pump(
@@ -1368,11 +2342,16 @@ impl AgentChatView {
         cx.notify();
     }
 
-    fn reset_acp_permission_session(&mut self, cx: &mut Context<Self>) {
+    /// 收掉这一次连接留下的全部交互回程（权限 / 提问 / 二次审批）。
+    fn reset_acp_client_session(&mut self, cx: &mut Context<Self>) {
         self.cancel_pending_acp_permissions(cx);
         self.cancel_pending_public_mcp_approvals(cx);
+        self.cancel_pending_acp_elicitations(cx);
+        // 连接已经收掉，回放窗口也没有意义了：留着它只会让人以为还有一批历史要落进来。
+        self.acp_history_replay = None;
         self.acp_public_mcp_approval_provider = None;
         self._acp_permission_task = None;
+        self._acp_elicitation_task = None;
         self._acp_public_mcp_approval_task = None;
     }
 
@@ -1392,22 +2371,36 @@ impl AgentChatView {
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                match rx.recv().await {
+                // 先收事件，再把「丢过事件」这件事补掉。
+                // 顺序不能反：本批里可能就带着某个会话的终态，先落地它，
+                // 重同步就少一次误判。
+                let batch = match rx.recv().await {
                     Ok(event) => {
-                        let events =
-                            collect_ready_runtime_events(&mut rx, event, session_filter.as_ref());
-                        if events.is_empty() {
-                            continue;
-                        }
-                        if this
-                            .update(cx, |this, cx| this.apply_runtime_events(events, cx))
-                            .is_err()
-                        {
-                            break;
-                        }
+                        collect_ready_runtime_events(&mut rx, event, session_filter.as_ref())
                     }
-                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Lagged(skipped)) => RuntimeEventBatch {
+                        events: Vec::new(),
+                        skipped,
+                    },
                     Err(RecvError::Closed) => break,
+                };
+                if !batch.events.is_empty()
+                    && this
+                        .update(cx, |this, cx| this.apply_runtime_events(batch.events, cx))
+                        .is_err()
+                {
+                    break;
+                }
+                // 丢过事件就必须重同步：被挤掉的可能是某一轮的终态，
+                // 迟到的补救没有任何其他触发点。见 `on_runtime_events_dropped`。
+                if batch.skipped > 0
+                    && this
+                        .update(cx, |this, cx| {
+                            this.on_runtime_events_dropped(batch.skipped, cx)
+                        })
+                        .is_err()
+                {
+                    break;
                 }
             }
         })
@@ -1417,17 +2410,457 @@ impl AgentChatView {
         for event in events {
             self.apply_runtime_event_with_deferred_budget(event, cx);
         }
+        if self.backend == Backend::Acp {
+            self.refresh_acp_model_options(cx);
+        }
         self.transcript.flush_deferred_budget();
         for transcript in self.session_transcripts.values_mut() {
             transcript.flush_deferred_budget();
         }
     }
 
+    /// 事件流被广播通道挤掉之后的补救。
+    ///
+    /// 为什么不能只记一条日志：丢的是**任意**事件，而清「正在响应」、推进排队
+    /// 消息、落盘这一整串收尾动作，唯一的触发点就是终态事件
+    /// （`TurnCompleted` / `TurnFailed` / `TurnCancelled`）。终态一旦被挤掉，
+    /// 后面不会再有第二个事件来补齐——界面永久停在「正在响应」，排队的那条消息
+    /// 永远发不出去，而且日志里看不出任何异常。所以丢过事件就必须重算一次。
+    ///
+    /// 判据取自**驱动侧**而不是视图侧：视图的 `running_sessions` 本来就是事件
+    /// 推出来的，丢了事件它自己就是错的；本地看 runtime 会话的 `is_busy`，
+    /// ACP 看连接自己的 `active_turn`，这两个都在产生事件的那一侧。
+    fn on_runtime_events_dropped(&mut self, skipped: u64, cx: &mut Context<Self>) {
+        tracing::warn!(
+            skipped,
+            backend = ?self.backend,
+            running = self.running_sessions.len(),
+            "runtime event stream lagged: dropped events cannot be replayed; \
+             reconciling running state against the driver"
+        );
+        // 历史回放窗口开着时被挤掉，丢的就是回放本体：再 load 一次补全
+        // （是否补、补几次由 `finish_acp_session_open` 判定）。
+        if self.acp_history_replay.is_some() {
+            self.acp_replay_lagged = true;
+        }
+        let stale: Vec<String> = self
+            .running_sessions
+            .iter()
+            .filter(|session_uid| self.driver_reports_idle(session_uid))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let backend = self.backend;
+        let acp_phase = self.acp.as_ref().map(AcpConnection::phase);
+        for session_uid in stale {
+            tracing::warn!(
+                %session_uid,
+                ?backend,
+                "terminating a turn whose terminal event was dropped"
+            );
+            if self
+                .acp_turn_owners
+                .iter()
+                .any(|owner| owner.session_uid == session_uid)
+            {
+                self.cancel_pending_acp_permissions(cx);
+                self.clear_acp_turn_owners_for_session(&session_uid);
+            }
+            if session_uid == self.current_session {
+                self.auto_scroll.request_settle();
+            }
+            self.set_session_running(&session_uid, false, cx);
+            // 终态该做的收尾一件都不能少：漏了落盘会丢历史，漏了推进排队会让
+            // 用户排在下一条的消息永远发不出去——两个都是静默的。
+            match backend {
+                Backend::Local => {
+                    self.persist_session(&session_uid, cx);
+                    self.start_next_pending(&session_uid, cx);
+                }
+                Backend::Acp if acp_terminal_allows_queue_advance(acp_phase.as_ref()) => {
+                    self.persist_acp_session(&session_uid, true, cx);
+                    self.advance_acp_pending_after_terminal(&session_uid, cx);
+                }
+                Backend::Acp => {}
+            }
+        }
+        self.trim_session_transcripts();
+        cx.notify();
+    }
+
+    /// 驱动侧是否**确证**这个会话已经不在跑了。
+    ///
+    /// 只回答「确证空闲」：问不出来、或者轮次对不上，一律返回 `false`。
+    /// 这里宁可漏收（界面上多转一会儿），也不能误清——误清会让真正还在跑的
+    /// 那一轮凭空失去「正在响应」，用户会以为它结束了。
+    fn driver_reports_idle(&self, session_uid: &str) -> bool {
+        match self.backend {
+            Backend::Local => {
+                let session_id = SessionId::from_string(session_uid.to_string());
+                // 会话不在 runtime 里就不下结论（可能是历史条目，也可能是别的
+                // runtime 的会话）。在，就信它自己的 `is_busy`：runtime 是先登记
+                // 活动轮次再发 `TurnStarted`、先清登记再发终态的，所以这个值在
+                // 有事件可看的时候始终是准的。
+                self.runtime
+                    .session(&session_id)
+                    .is_some_and(|session| !session.is_busy())
+            }
+            Backend::Acp => {
+                let Some(acp) = self.acp.as_ref() else {
+                    // 连接已经收掉：没有可问的对象，不猜。
+                    return false;
+                };
+                // 按这个会话记在账上的轮次问连接：`try_prompt` 是先装 tracker 再发
+                // `TurnStarted` 的，所以视图这边一看到轮次，连接那边就一定有对应的
+                // tracker；查不到就是终态被丢了。
+                let owned: Vec<&TurnId> = self
+                    .acp_turn_owners
+                    .iter()
+                    .filter(|owner| owner.session_uid == session_uid)
+                    .map(|owner| &owner.turn_id)
+                    .collect();
+                if owned.is_empty() {
+                    // 账上没轮次、视图却还标着在跑：只认当前连接自己那条会话。
+                    return acp.session_id().to_string() == session_uid;
+                }
+                owned.iter().all(|turn_id| !acp.turn_is_active(turn_id))
+            }
+        }
+    }
+
+    fn refresh_acp_model_options(&mut self, cx: &mut Context<Self>) {
+        let Some(acp) = self.acp.as_ref() else {
+            return;
+        };
+        let options = acp_model_options(&acp.state(), self.current_acp_id.as_ref());
+        if options == self.model_options {
+            return;
+        }
+        self.model_options = options.clone();
+        // agent 声明的模型只属于 ACP 那份输入框。
+        self.acp_input.update(cx, |input, cx| {
+            input.set_menu_options(options, self.tool_options.clone(), cx)
+        });
+    }
+
+    /// findbar 查询框的事件。
+    ///
+    /// `Enter` / `Shift+Enter` 走 `InputEvent::PressEnter`，不额外绑键——
+    /// 输入组件已经替我们区分了「有/无修饰键」两种回车。
+    fn on_findbar_input_event(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
+        match event {
+            InputEvent::Change => {
+                self.refresh_search_from_findbar(cx);
+            }
+            InputEvent::PressEnter { shift, .. } => {
+                self.step_search(!shift, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// 按查询框当前内容重算命中。
+    ///
+    /// 打字走 `InputEvent::Change`，但程序化写入（命令面板跳过来时把查询词灌进
+    /// 输入框）**不发** `Change`，所以两条路径共用这个方法，别指望事件会来。
+    fn refresh_search_from_findbar(&mut self, cx: &mut Context<Self>) {
+        let query = self.findbar_input.read(cx).value().to_string();
+        self.search.set_query(query, &self.transcript.messages);
+        self.search_revision = self.transcript.revision();
+        // 查询变化把游标复位到第一个命中：顺手把视图也拉过去。
+        self.jump_to_current_search_hit();
+        cx.notify();
+    }
+
+    /// 命令面板查询框的事件。
+    ///
+    /// `Enter` 执行当前高亮；上下键不在输入框这层处理——它们由绑定层转发成
+    /// `PaletteSelectPrev/Next`（见 `command_palette` 模块的说明）。
+    fn on_palette_input_event(
+        &mut self,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Change => {
+                self.palette_query = self.palette_input.read(cx).value().to_string();
+                // 查询变了就把高亮拉回第一条：留着旧下标的话，高亮会落在
+                // 一个跟刚才不同的条目上。
+                self.palette_selection = 0;
+                self.schedule_palette_body_search(cx);
+                cx.notify();
+            }
+            InputEvent::PressEnter { .. } => {
+                self.run_palette_selection(window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// 打开命令面板：清掉上一次的查询，把焦点交给查询框。
+    pub(super) fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = true;
+        self.palette_selection = 0;
+        self.palette_query.clear();
+        self.palette_body_hits.clear();
+        self.palette_body_task = None;
+        self.palette_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        let focus_handle = self.palette_input.read(cx).focus_handle(cx);
+        focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 关面板并把焦点还给 composer。
+    ///
+    /// 浮层一消失，焦点就落在一个已经出树的输入框上（等价于没有焦点），
+    /// 键盘事件再没人接——连下一次 `cmd-k` 都会静默失效。
+    pub(super) fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return;
+        }
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_selection = 0;
+        self.palette_body_hits.clear();
+        self.palette_body_task = None;
+        self.composer().focus_input(window, cx);
+        cx.notify();
+    }
+
+    /// 快捷键入口：开着就关，关着就开。
+    pub(super) fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.close_command_palette(window, cx);
+        } else {
+            self.open_command_palette(window, cx);
+        }
+    }
+
+    /// 排一次正文检索（防抖）。
+    ///
+    /// 查询太短就把上一轮结果清掉：留着的话，删到一个字时列表里还挂着上一次
+    /// 更长查询的命中——那些行点进去跟当前查询对不上。
+    fn schedule_palette_body_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.palette_query.trim().to_string();
+        if query.chars().count() < PALETTE_BODY_MIN_QUERY {
+            self.palette_body_hits.clear();
+            self.palette_body_task = None;
+            return;
+        }
+        self.palette_body_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(PALETTE_BODY_SEARCH_DEBOUNCE)
+                .await;
+            let _ = this.update(cx, |this, cx| this.flush_palette_body_search(query, cx));
+        }));
+    }
+
+    /// 防抖到点：真去查一次正文。
+    fn flush_palette_body_search(&mut self, query: String, cx: &mut Context<Self>) {
+        // 这期间查询又被改过（或面板关了）：这一轮结果已经过期，丢掉——
+        // 直接把过期结果写进列表，用户会看到跟输入框对不上的命中。
+        if !self.palette_open || self.palette_query.trim() != query {
+            return;
+        }
+        self.palette_body_hits =
+            crate::persistence::search_session_bodies(cx, &query, PALETTE_BODY_LIMIT)
+                .into_iter()
+                .map(|hit| crate::command_palette::PaletteBodyHit {
+                    uid: hit.uid,
+                    title: hit.title,
+                    snippet: hit.snippet,
+                    query: query.clone(),
+                })
+                .collect();
+        cx.notify();
+    }
+
+    fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return;
+        }
+        let len = self.palette_items().len();
+        self.palette_selection =
+            crate::command_palette::move_selection(self.palette_selection, len, delta);
+        cx.notify();
+    }
+
+    /// 直接跳到首项 / 末项（`home` / `end`）。
+    fn select_palette_edge(&mut self, last: bool, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return;
+        }
+        let len = self.palette_items().len();
+        self.palette_selection = crate::command_palette::edge_selection(len, last);
+        cx.notify();
+    }
+
+    /// 面板里的候选：固定命令在前，会话（最近更新在前）在后。
+    ///
+    /// 当前会话不列：跳到自己等于什么都没发生，占一行还被高亮到最前面。
+    fn palette_items(&self) -> Vec<crate::command_palette::PaletteItem> {
+        let mut summaries: Vec<&SessionSummary> = self
+            .sessions
+            .iter()
+            .filter(|session| session.id != self.current_session)
+            .collect();
+        summaries.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+        let sessions: Vec<crate::command_palette::PaletteSession> = summaries
+            .into_iter()
+            .take(crate::command_palette::PALETTE_MAX_SESSIONS)
+            .map(|session| crate::command_palette::PaletteSession {
+                uid: session.id.clone(),
+                title: session.name.to_string(),
+                detail: session
+                    .external_agent
+                    .as_deref()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        session
+                            .workspace_root
+                            .as_deref()
+                            .and_then(crate::command_palette::workspace_label)
+                    }),
+            })
+            .collect();
+
+        let mut items = crate::command_palette::command_items(self.show_archived);
+        // 正文命中排在会话前面：它是「搜正文搜出来的」，比「标题里恰好有这个字」
+        // 更接近用户想要的东西，而 `visible_items` 只留 7 行——排后面就等于
+        // 永远看不见。
+        items.extend(crate::command_palette::body_match_items(
+            &self.palette_body_hits,
+        ));
+        items.extend(crate::command_palette::session_items(&sessions));
+        items
+    }
+
+    /// 执行面板里的一条。
+    fn run_palette_item(
+        &mut self,
+        item: &crate::command_palette::PaletteItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::command_palette::PaletteAction;
+
+        // 先关面板：关的动作会把焦点还给 composer，之后要抢焦点的入口
+        // （会话内搜索）再自己抢。
+        self.close_command_palette(window, cx);
+        match &item.action {
+            PaletteAction::NewSession => self.new_session(cx),
+            PaletteAction::OpenSession(uid) => self.switch_session(uid, cx),
+            PaletteAction::OpenSessionAtMatch { uid, query } => {
+                // 先切会话再开搜索：findbar 搜的是**当前**转录，顺序反了就会
+                // 拿旧会话的正文去找，然后在刚打开的会话里显示一堆对不上的命中。
+                self.switch_session(uid, cx);
+                self.open_findbar(window, cx);
+                self.findbar_input
+                    .update(cx, |state, cx| state.set_value(query.clone(), window, cx));
+                self.refresh_search_from_findbar(cx);
+            }
+            PaletteAction::OpenUsageHistory => {
+                self.usage_history = Some(crate::usage_history::collect_usage_history(cx));
+            }
+            PaletteAction::ToggleFindInSession => self.open_findbar(window, cx),
+            PaletteAction::ToggleArchivedSessions => self.toggle_archived(cx),
+        }
+        cx.notify();
+    }
+
+    /// 执行当前高亮那条（回车 / 点击）。
+    fn run_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible =
+            crate::command_palette::visible_items(&self.palette_items(), &self.palette_query);
+        let index = self.palette_selection.min(visible.len().saturating_sub(1));
+        let Some(item) = visible.get(index).cloned() else {
+            return;
+        };
+        self.run_palette_item(&item, window, cx);
+    }
+
+    /// 命令面板浮层；没打开时返回 `None`。
+    fn render_command_palette_overlay(
+        &self,
+        theme: &AgentChatTheme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.palette_open {
+            return None;
+        }
+
+        // `Input` 自身不吃 `debug_selector`，包一层拿测试锚点。
+        let query_input = div()
+            .debug_selector(|| "ai-chat-palette-input".to_string())
+            .w_full()
+            .min_w_0()
+            .px(sp(6.0))
+            .py(sp(4.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Input::new(&self.palette_input)
+                    .small()
+                    .w_full()
+                    .focus_bordered(false),
+            )
+            .into_any_element();
+
+        let items =
+            crate::command_palette::visible_items(&self.palette_items(), &self.palette_query);
+        let run = cx.listener(
+            |this, item: &crate::command_palette::PaletteItem, window, cx| {
+                this.run_palette_item(item, window, cx);
+            },
+        );
+        let on_run: Rc<dyn Fn(&crate::command_palette::PaletteItem, &mut Window, &mut App)> =
+            Rc::new(move |item, window, cx| run(item, window, cx));
+        let close = cx.listener(|this, _: &MouseDownEvent, window, cx| {
+            this.close_command_palette(window, cx);
+        });
+
+        Some(crate::command_palette::render_command_palette(
+            theme,
+            &items,
+            self.palette_selection,
+            query_input,
+            move |event, window, cx| close(event, window, cx),
+            on_run,
+        ))
+    }
+
     fn on_input_event(
         &mut self,
         _input: &Entity<AgentInput>,
         event: &AgentInputEvent,
-        _window: &mut Window,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_input_event(event, window, cx);
+    }
+
+    /// ACP 那份输入框的事件入口。
+    ///
+    /// 两份组件发同一个枚举（[`AgentInputEvent`]），所以处理逻辑共用一份：
+    /// 面板不懂"这个事件是哪个组件发的"，只认事件本身与当前后端。
+    fn on_acp_input_event(
+        &mut self,
+        _input: &Entity<AcpAgentInput>,
+        event: &AgentInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_input_event(event, window, cx);
+    }
+
+    fn handle_input_event(
+        &mut self,
+        event: &AgentInputEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event.clone() {
@@ -1436,7 +2869,7 @@ impl AgentChatView {
                 mentions,
                 images,
             } => {
-                self.submit(text, mentions, images, cx);
+                self.submit_with_window(text, mentions, images, window, cx);
             }
             AgentInputEvent::Stop => self.stop(cx),
             AgentInputEvent::SelectTarget { id } => {
@@ -1476,15 +2909,235 @@ impl AgentChatView {
                 model,
             } => {
                 if !self.is_running {
-                    self.select_model(&id, &provider_id, &model, cx);
+                    if self.backend == Backend::Acp {
+                        self.select_acp_model(&id, &provider_id, &model, cx);
+                    } else {
+                        self.select_model(&id, &provider_id, &model, cx);
+                    }
                 }
             }
             AgentInputEvent::SelectExecutionMode { id } => self.select_execution_mode(&id, cx),
-            AgentInputEvent::SelectAgentBackend { id } => {
+            AgentInputEvent::SelectWorkspace { path } => {
                 if !self.is_running {
-                    self.select_backend(id, cx);
+                    self.run_composer_action(window, cx, move |source, window, cx| {
+                        (source.select_workspace)(std::path::Path::new(path.as_ref()), window, cx);
+                    });
                 }
             }
+            AgentInputEvent::BrowseWorkspace => {
+                if !self.is_running {
+                    self.run_composer_action(window, cx, move |source, window, cx| {
+                        (source.browse_workspace)(window, cx);
+                    });
+                }
+            }
+            AgentInputEvent::SelectBranch { name } => {
+                if !self.is_running {
+                    self.run_composer_action(window, cx, move |source, _window, cx| {
+                        (source.select_branch)(&name, cx);
+                    });
+                }
+            }
+            AgentInputEvent::ToggleWorktree { enabled } => {
+                if !self.is_running {
+                    self.run_composer_action(window, cx, move |source, _window, cx| {
+                        (source.toggle_worktree)(enabled, cx);
+                    });
+                }
+            }
+            AgentInputEvent::SubmitElicitation { content } => {
+                self.resolve_pending_acp_elicitation(AcpElicitationOutcome::Accept(content), cx)
+            }
+            AgentInputEvent::DeclineElicitation => {
+                self.resolve_pending_acp_elicitation(AcpElicitationOutcome::Decline, cx)
+            }
+            AgentInputEvent::CancelElicitation => {
+                self.resolve_pending_acp_elicitation(AcpElicitationOutcome::Cancel, cx)
+            }
+            AgentInputEvent::RemoveQueued { index } => {
+                let session_uid = self.current_session.clone();
+                if self
+                    .pending_submissions
+                    .remove_at(&session_uid, index)
+                    .is_some()
+                {
+                    self.sync_pending_preview(cx);
+                    cx.notify();
+                }
+            }
+            AgentInputEvent::DraftChanged => {
+                self.schedule_draft_save(cx);
+            }
+            AgentInputEvent::OpenUsageHistory => {
+                self.usage_history = Some(crate::usage_history::collect_usage_history(cx));
+                cx.notify();
+            }
+            AgentInputEvent::EditQueued { index } => {
+                let session_uid = self.current_session.clone();
+                if let Some(submission) = self.pending_submissions.remove_at(&session_uid, index) {
+                    self.sync_pending_preview(cx);
+                    self.composer().restore_to_composer(
+                        &submission.text,
+                        submission.images,
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// 把底栏动作转发给宿主注入的数据源。
+    ///
+    /// 先把 `Arc` 克隆出来再调用：宿主回调里会 `update` 本视图（重新取快照），
+    /// 若直接借用 `self` 的字段就会自借用冲突。
+    ///
+    /// **必须延迟到本轮 `update` 收尾再执行**，不能原地调用。本函数处在
+    /// `on_input_event` 里，而那是本视图订阅 `AgentInput` 的回调：GPUI 的
+    /// `Context::subscribe_in` 会经 `invoke_subscriber_in` 先
+    /// `subscriber.update(...)`，也就是说回调运行期间 `AgentChatView` 已被租借。
+    /// 宿主动作末了会走 `shell.refresh_composer_context()`
+    /// → `DefaultAgentChatPanel::refresh_composer_context` → `AgentChatView::update`，
+    /// 同步调用就是 GPUI 的双重租借 panic：
+    /// `cannot update ai_chat_view::agent_view::AgentChatView while it is already
+    /// being updated`。而 macOS 的事件回调 `handle_view_event` 是 `extern "C"`，
+    /// panic 无法 unwind，会升级成 `fatal runtime error: failed to initiate panic`
+    /// 直接 abort 整个进程 —— 点一下底栏的分支 / Worktree / 工作区就是一次崩溃。
+    ///
+    /// `Window::defer` 把回调挂到 `Effect::Defer`，由最外层 `finish_update`
+    /// 的 `flush_effects` 执行，那时所有租借都已释放，且仍在同一帧内。
+    fn run_composer_action(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(&ComposerContextSource, &mut Window, &mut gpui::App) + 'static,
+    ) {
+        let Some(source) = self.composer_context_source.clone() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| action(&source, window, cx));
+    }
+
+    /// 用户从输入框提交 —— 先过一道「worktree 待创建」的闸。
+    ///
+    /// 与 [`Self::submit`] 分开是因为闸门要 [`Window`]：worktree 创建失败时得把
+    /// 文字与附件**还回**输入框并弹提示。而 `submit` 还被
+    /// [`Self::send_external_message`]（侧栏 ask_ai，手上没有窗口）复用，不能
+    /// 给它的签名加窗口。
+    fn submit_with_window(
+        &mut self,
+        text: String,
+        mentions: Vec<MentionItem>,
+        images: Vec<crate::ImageAttachment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.defer_submission_for_worktree(&text, &mentions, &images, window, cx) {
+            return;
+        }
+        self.submit(text, mentions, images, cx);
+    }
+
+    /// 这次提交是不是要先建 worktree；是则拦下并返回 `true`。
+    ///
+    /// 勾选 Worktree 只记意图，磁盘上还什么都没有（快照里的
+    /// [`ComposerWorktreeState::pending`]）。到第一次发送才真正创建 ——
+    /// 否则「只是勾一下」就会在磁盘上留一个 worktree、还把工作区根切走。
+    ///
+    /// 创建期间这条提交挂在 [`Self::gated_submissions`] 上等根落地：ACP 会话绑的是
+    /// 工作区根，根没换过去就发等于跑在旧工作区上。成功由
+    /// [`Self::set_workspace_root`] 接着发，失败走 [`Self::abort_gated_submission`]。
+    fn defer_submission_for_worktree(
+        &mut self,
+        text: &str,
+        mentions: &[MentionItem],
+        images: &[crate::ImageAttachment],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(source) = self.composer_context_source.clone() else {
+            return false;
+        };
+        // 只有第一条要开工：创建是实打实的 `git worktree add`，多调一次就多建一个
+        // worktree。创建期间后来的提交只排队，等根切过去一起按序发。
+        let preparing = !self.gated_submissions.is_empty();
+        if !preparing && !(source.snapshot)(cx).worktree.pending {
+            return false;
+        }
+        self.gated_submissions.push_back(PendingSubmission {
+            text: text.to_string(),
+            mentions: mentions.to_vec(),
+            images: images.to_vec(),
+        });
+        if preparing {
+            cx.notify();
+            return true;
+        }
+        // 创建是后台 git 子进程（大仓库要数秒），等它跑完再发，别冻结输入框。
+        let task = (source.prepare_worktree)(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            // 成功不在这里做什么：换根是延后派发的，等 `set_workspace_root` 落地后
+            // 由它接着发（在这儿发会用旧根）。
+            if let Err(message) = task.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.abort_gated_submission(message, window, cx);
+                });
+            }
+        })
+        .detach();
+        true
+    }
+
+    /// worktree 创建失败：中止这次发送，把内容还回输入框，并把原因交给宿主展示。
+    ///
+    /// 「中止」而不是「降级到主工作区继续发」：静默换个地方跑，用户会以为自己在
+    /// 隔离的 worktree 里，实际改动落在主工作区上。勾选态**保留**，用户可以直接
+    /// 再点一次发送重试，或取消勾选改用主工作区。
+    fn abort_gated_submission(
+        &mut self,
+        message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gated_submissions.is_empty() {
+            return;
+        }
+        // 排队期间攒下的几条一起还回去：输入框只有一个，按发送顺序用换行拼起来，
+        // 附件合到一起。丢消息比这难看多了。
+        let gated: Vec<PendingSubmission> = self.gated_submissions.drain(..).collect();
+        let text = gated
+            .iter()
+            .map(|submission| submission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let images = gated
+            .into_iter()
+            .flat_map(|submission| submission.images)
+            .collect::<Vec<_>>();
+        self.composer()
+            .restore_to_composer(&text, images, window, cx);
+        if let Some(source) = self.composer_context_source.clone() {
+            (source.report_worktree_failure)(&message, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 根已经切到新 worktree：把被拦下的提交按顺序发出去。
+    ///
+    /// 手上只有 [`Self::apply_workspace_root`] 一个调用点（它由
+    /// [`Self::set_workspace_root`] 在「根落地」那一步调到）而不是 worktree 创建
+    /// 完成的时刻 —— 创建完成时 `RootChanged` 还只是入队（`Effect::Emit` 延后派发），
+    /// 视图这边的根、skills、ACP 连接都还是旧的。
+    fn resume_gated_submission(&mut self, cx: &mut Context<Self>) {
+        if self.gated_submissions.is_empty() {
+            return;
+        }
+        // 先取干净再逐条发：第一条会正常启动，后面的在 `submit` 里看到本会话已在
+        // 运行就自己排队 —— 复用既有队列，顺序不会乱。
+        let gated: Vec<PendingSubmission> = self.gated_submissions.drain(..).collect();
+        for submission in gated {
+            self.submit(submission.text, submission.mentions, submission.images, cx);
         }
     }
 
@@ -1495,13 +3148,85 @@ impl AgentChatView {
         images: Vec<crate::ImageAttachment>,
         cx: &mut Context<Self>,
     ) {
+        // 新提交：跨轮的展开态与滚动跟随都要重置。
+        self.expansion.clear();
+        self.scroll.jump_to_tail();
         let session_uid = self.current_session.clone();
+        // 文字与附件已从输入框消费（AgentInput::submit 里清空 / take），草稿同步
+        // 作废——否则切走再切回，已发送的半句话和图片会「复活」回输入框。
+        if let Some(session) = self
+            .runtime
+            .session(&SessionId::from_string(session_uid.clone()))
+        {
+            session.set_draft(None);
+        }
+        self.session_draft_attachments.remove(&session_uid);
         let submission = PendingSubmission {
             text,
             mentions,
             images,
         };
-        if self.running_sessions.contains(&session_uid) {
+        // steer：会话正在跑一轮、队列为空时，新提交**并发注入**而不是排队。
+        // ACP：并发 prompt 直接发；本地：入 runtime 队列，由当前轮在下一轮采样前
+        // 注入历史（见 `run_agent_loop` 开头的 take_pending_inputs）。
+        // 有排队时仍走 FIFO——插队会破坏已排消息的顺序。
+        let steer_in_flight_turn = self.backend == Backend::Acp
+            && self.running_sessions.contains(&session_uid)
+            && self.acp_session_has_foreground_turn(&session_uid)
+            && self.pending_submissions.len(&session_uid) == 0
+            && !self.acp_connecting
+            && self.acp_pending.is_none()
+            && self.acp_session_transition_phase(&session_uid).is_none();
+        let steer_local_turn = self.backend == Backend::Local
+            && self.running_sessions.contains(&session_uid)
+            && self.pending_submissions.len(&session_uid) == 0;
+        if self.running_sessions.contains(&session_uid)
+            && !steer_in_flight_turn
+            && !steer_local_turn
+        {
+            self.enqueue_submission(&session_uid, submission, cx);
+            return;
+        }
+        if steer_in_flight_turn {
+            self.push_user_to_session(
+                &session_uid,
+                &submission.text,
+                &submission.images,
+                &self.resources.clone(),
+            );
+            self.push_system_to_session(&session_uid, t!("AgentUi.acp_steer_sent").to_string());
+            self.request_scroll_to_bottom();
+            // 直接发；发不出去（连接问题等）就退回排队语义。
+            if self.start_submission(&session_uid, &submission, cx) == SubmissionStart::RetryLater {
+                self.enqueue_submission(&session_uid, submission, cx);
+            }
+            return;
+        }
+        if steer_local_turn {
+            // 本地 steer：入 runtime 输入队列即可，当前轮自己会在下一轮采样前取走。
+            // 含图片时退回排队——同轮多批图片会叠加 token / 请求体，留到轮次结束后重开。
+            let session_id = SessionId::from_string(session_uid.clone());
+            let steered = submission.images.is_empty()
+                && self
+                    .runtime
+                    .session(&session_id)
+                    .is_some_and(|session| session.steer(UserInput::new(submission.text.clone())));
+            if steered {
+                self.push_user_to_session(
+                    &session_uid,
+                    &submission.text,
+                    &submission.images,
+                    &self.resources.clone(),
+                );
+                self.push_system_to_session(
+                    &session_uid,
+                    t!("AgentUi.local_steer_sent").to_string(),
+                );
+                self.request_scroll_to_bottom();
+                cx.notify();
+                return;
+            }
+            // 会话已不在运行中（轮次刚好结束）或带图片：退回排队语义，轮次收尾时自然发走。
             self.enqueue_submission(&session_uid, submission, cx);
             return;
         }
@@ -1554,10 +3279,12 @@ impl AgentChatView {
             .collect::<Vec<_>>();
         let queue_blocked =
             !previews.is_empty() && !self.running_sessions.contains(&self.current_session);
-        self.input.update(cx, |input, cx| {
-            input.set_queued_submissions(previews, cx);
-            input.set_pending_queue_blocked(queue_blocked, cx);
-        });
+        // 队列同样是**面板**状态：两份输入框都摆上（与运行旗标同一个道理），
+        // 否则切后端后新挂的那份显示的是"没有排队"，而队列其实还在。
+        for composer in [self.composer(), self.other_composer()] {
+            composer.set_queued_submissions(previews.clone(), cx);
+            composer.set_pending_queue_blocked(queue_blocked, cx);
+        }
     }
 
     fn start_next_pending(&mut self, session_uid: &str, cx: &mut Context<Self>) -> PendingAdvance {
@@ -1603,8 +3330,8 @@ impl AgentChatView {
         if self.pending_submissions.len(&session_uid) == 0 {
             return PendingAdvance::Idle;
         }
-        if let Some((operation, permission_provider)) = self.prepare_current_pending_reconnect(cx) {
-            self.spawn_acp_connect(operation, permission_provider, cx);
+        if let Some((operation, providers)) = self.prepare_current_pending_reconnect(cx) {
+            self.spawn_acp_connect(operation, providers, cx);
             return PendingAdvance::Blocked;
         }
         self.start_next_pending(&session_uid, cx)
@@ -1613,7 +3340,7 @@ impl AgentChatView {
     fn prepare_current_pending_reconnect(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(AcpConnectOperation, AcpPermissionProvider)> {
+    ) -> Option<(AcpConnectOperation, AcpClientProviders)> {
         let session_uid = self.current_session.clone();
         if self.pending_submissions.len(&session_uid) == 0 || self.backend != Backend::Acp {
             return None;
@@ -1639,7 +3366,7 @@ impl AgentChatView {
         cx: &mut Context<Self>,
     ) {
         for session_uid in self.acp_pending_schedule_candidates(origin_session_uid) {
-            if self.acp_turn_owner.is_some() {
+            if self.acp_session_has_foreground_turn(&session_uid) {
                 break;
             }
             let advance = if session_uid == self.current_session {
@@ -1746,18 +3473,19 @@ impl AgentChatView {
 
         self.push_user_to_session(
             session_uid,
-            &submission.text,
-            submission.images.len(),
+            submission.text.as_str(),
+            &submission.images,
             &self.resources.clone(),
         );
         if session_uid == self.current_session.as_str() {
             self.request_scroll_to_bottom();
         }
         self.set_session_running(session_uid, true, cx);
-        self.acp_turn_owner = Some(AcpTurnOwner {
+        self.acp_turn_owners.push(AcpTurnOwner {
             event_session_id,
             session_uid: session_uid.to_string(),
             turn_id,
+            backgrounded: false,
             cancel_requested: false,
         });
         cx.notify();
@@ -1791,6 +3519,9 @@ impl AgentChatView {
                 return SubmissionStart::Rejected;
             }
         };
+        self.refresh_resources_before_turn(&session, cx);
+        let attachment = self.context_attachment(cx);
+        let prompt = compose_prompt_with_attachment(&submission.text, attachment.as_ref());
         let mut resources = session.resources();
         if apply_mentioned_resources(
             &mut resources,
@@ -1803,12 +3534,7 @@ impl AgentChatView {
                 self.sync_resource_targets(cx);
             }
         }
-        self.push_user_to_session(
-            session_uid,
-            &submission.text,
-            submission.images.len(),
-            &resources,
-        );
+        self.push_user_to_session(session_uid, prompt.as_str(), &submission.images, &resources);
         self.upsert_live_summary(
             session_uid.to_string(),
             persistence_title_from_input(&submission.text),
@@ -1818,7 +3544,7 @@ impl AgentChatView {
         if session_uid == self.current_session.as_str() {
             self.request_scroll_to_bottom();
         }
-        let input = UserInput::new(submission.text.clone()).with_images(input_images);
+        let input = UserInput::new(prompt.clone()).with_images(input_images);
         let operation_generation = self.next_local_operation_generation(session_uid);
         self.set_session_running(session_uid, true, cx);
         self.runtime
@@ -1827,23 +3553,20 @@ impl AgentChatView {
 
         let runtime = self.runtime.clone();
         let tool_mode = self.tool_execution_mode;
+        // 「问答」模式下不向模型暴露工具，因此任务类型要跟着下拉一起下发。
+        let task_kind = self.task_kind;
         let session_uid = session_uid.to_string();
         cx.spawn(async move |this, cx| {
             #[cfg(test)]
             let result = runtime
-                .run_turn_blocking_with_tool_mode(&session_id, input, TaskKind::Agent, tool_mode)
+                .run_turn_blocking_with_tool_mode(&session_id, input, task_kind, tool_mode)
                 .await;
 
             #[cfg(not(test))]
             let result = {
                 let task = Tokio::spawn(cx, async move {
                     runtime
-                        .run_turn_blocking_with_tool_mode(
-                            &session_id,
-                            input,
-                            TaskKind::Agent,
-                            tool_mode,
-                        )
+                        .run_turn_blocking_with_tool_mode(&session_id, input, task_kind, tool_mode)
                         .await
                 });
                 match task.await {
@@ -1919,15 +3642,16 @@ impl AgentChatView {
         &mut self,
         session_uid: &str,
         text: &str,
-        image_count: usize,
+        attachments: &[crate::ImageAttachment],
         resources: &ResourceContext,
     ) {
         if self.closed_sessions.contains(session_uid) {
             return;
         }
+        let images = crate::message_image::images_from_attachments(attachments);
         if session_uid == self.current_session {
             self.transcript.set_resource_context(resources);
-            self.transcript.push_user(text, image_count);
+            self.transcript.push_user(text, images);
             return;
         }
         {
@@ -1940,7 +3664,7 @@ impl AgentChatView {
                     transcript
                 });
             transcript.set_resource_context(resources);
-            transcript.push_user(text, image_count);
+            transcript.push_user(text, images);
         }
         self.touch_session_transcript(session_uid);
         self.trim_session_transcripts();
@@ -1948,10 +3672,10 @@ impl AgentChatView {
 
     fn request_acp_cancel_for_session(&mut self, session_uid: &str) -> bool {
         let has_connection = self.acp.is_some();
-        let should_cancel = self
-            .acp_turn_owner
-            .as_mut()
-            .is_some_and(|owner| owner.mark_cancel_requested(session_uid, has_connection));
+        let mut should_cancel = false;
+        for owner in self.acp_turn_owners.iter_mut() {
+            should_cancel |= owner.mark_cancel_requested(session_uid, has_connection);
+        }
         if should_cancel {
             self.acp
                 .as_ref()
@@ -1961,17 +3685,114 @@ impl AgentChatView {
         should_cancel
     }
 
+    /// 当前 owner 的轮次 id（只在这个 owner 就属于 `session_uid` 时给）。
+    fn acp_turn_owner_turn_id(&self, session_uid: &str) -> Option<TurnId> {
+        self.acp_turn_owners
+            .iter()
+            .find(|owner| owner.session_uid == session_uid && !owner.backgrounded)
+            .map(|owner| owner.turn_id.clone())
+    }
+
+    /// 这个会话是否有**前台**在飞轮次。
+    fn acp_session_has_foreground_turn(&self, session_uid: &str) -> bool {
+        self.acp_turn_owners
+            .iter()
+            .any(|owner| owner.session_uid == session_uid && !owner.backgrounded)
+    }
+
+    /// 收掉属于这个会话的全部 owner 记账（前台 + 后台）。
+    fn clear_acp_turn_owners_for_session(&mut self, session_uid: &str) {
+        self.acp_turn_owners
+            .retain(|owner| owner.session_uid != session_uid);
+    }
+
+    /// 测试构建下不排取消兜底定时器，这个判归属的辅助函数只有生产路径在用。
+    #[cfg_attr(test, allow(dead_code))]
+    fn acp_turn_owner_matches(&self, session_uid: &str, turn_id: &TurnId) -> bool {
+        self.acp_turn_owners.iter().any(|owner| {
+            owner.session_uid == session_uid && &owner.turn_id == turn_id && !owner.backgrounded
+        })
+    }
+
+    /// 本地把这一轮结掉：agent 没有回终态，界面不能一直转。
+    ///
+    /// 三件事必须一起做，少一件都还是「卡住」：
+    /// - 清 owner —— 迟到的输出靠它被丢弃，不会算进下一轮；
+    /// - 让连接层也放手 —— 否则它仍记着这一轮在跑，用户下一条消息会被拒成
+    ///   「等这一轮结束」，而那一轮永远不结束；
+    /// - 写一条说明 —— 用户点的是「停止」，得知道这一轮是按本地停止收的尾。
+    fn settle_acp_turn_locally(&mut self, session_uid: &str, cx: &mut Context<Self>) {
+        // 只动本会话的 owner:别的会话正在跑的轮次不归这次停止管。
+        let owned_turns: Vec<TurnId> = self
+            .acp_turn_owners
+            .iter()
+            .filter(|owner| owner.session_uid == session_uid)
+            .map(|owner| owner.turn_id.clone())
+            .collect();
+        if !owned_turns.is_empty() {
+            self.clear_acp_turn_owners_for_session(session_uid);
+        }
+        if let Some(acp) = self.acp.as_ref() {
+            for turn_id in &owned_turns {
+                acp.abandon_active_turn(turn_id);
+            }
+        }
+        self.set_session_running(session_uid, false, cx);
+        self.sync_pending_preview(cx);
+        self.sync_composer(cx);
+        self.push_system_to_session(
+            session_uid,
+            t!("AgentUi.acp_stop_settled_locally").to_string(),
+        );
+        cx.notify();
+    }
+
+    #[cfg(not(test))]
+    fn spawn_acp_cancel_settle_after(
+        &mut self,
+        delay: std::time::Duration,
+        session_uid: String,
+        turn_id: TurnId,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                // 轮次还在跑才结账：能对上终态事件的话(owner 已被清)这里什么都不做。
+                if !this.acp_turn_owner_matches(&session_uid, &turn_id) {
+                    return;
+                }
+                this.settle_acp_turn_locally(&session_uid, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 测试构建下不排定时器：到期后的行为由 [`Self::settle_acp_turn_locally`] 的
+    /// 单测直接覆盖，不必真的等 8 秒。
+    #[cfg(test)]
+    fn spawn_acp_cancel_settle_after(
+        &mut self,
+        _delay: std::time::Duration,
+        _session_uid: String,
+        _turn_id: TurnId,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     fn stop(&mut self, cx: &mut Context<Self>) {
         let session_uid = self.current_session.clone();
         if self.backend == Backend::Acp {
-            let owns_current_turn = self
-                .acp_turn_owner
-                .as_ref()
-                .is_some_and(|owner| owner.session_uid == session_uid);
+            let owns_current_turn = self.acp_session_has_foreground_turn(&session_uid);
+            let cancel_outstanding = self
+                .acp_turn_owners
+                .iter()
+                .any(|owner| owner.cancel_requested && !owner.backgrounded);
             let transition_phase = self.acp_session_transition_phase(&session_uid);
             let action = acp_stop_action(
                 owns_current_turn,
                 self.acp.is_some(),
+                cancel_outstanding,
                 self.acp_connecting,
                 self.acp_pending.is_some(),
                 transition_phase,
@@ -1987,11 +3808,25 @@ impl AgentChatView {
             self.sync_pending_preview(cx);
             match action {
                 AcpStopAction::CancelActivePrompt => {
-                    self.request_acp_cancel_for_session(&session_uid);
+                    let requested = self.request_acp_cancel_for_session(&session_uid);
                     // ACP cancellation is only a protocol notification. Keep the owner and
                     // running state until the matching prompt produces a real terminal event,
                     // otherwise late output can be attributed to a newer turn.
+                    if requested && let Some(turn_id) = self.acp_turn_owner_turn_id(&session_uid) {
+                        // 但等的上限必须有:agent 可以不回终态(provider 卡死时实测如此),
+                        // 到时本地结账,界面不会永远停在「正在响应」。
+                        self.spawn_acp_cancel_settle_after(
+                            ACP_CANCEL_SETTLE_TIMEOUT,
+                            session_uid.clone(),
+                            turn_id,
+                            cx,
+                        );
+                    }
                     cx.notify();
+                    return;
+                }
+                AcpStopAction::ForceLocalStop => {
+                    self.settle_acp_turn_locally(&session_uid, cx);
                     return;
                 }
                 AcpStopAction::ReturnToLocal => {
@@ -2000,7 +3835,7 @@ impl AgentChatView {
                 }
                 AcpStopAction::AbandonFailedTransition => {
                     self.invalidate_acp_operation();
-                    self.acp_turn_owner = None;
+                    self.clear_acp_turn_owners_for_session(&session_uid);
                     self.set_session_running(&session_uid, false, cx);
                     self.sync_pending_preview(cx);
                     self.sync_composer(cx);
@@ -2010,7 +3845,7 @@ impl AgentChatView {
                 AcpStopAction::ClearQueueOnly => {}
             }
             if owns_current_turn {
-                self.acp_turn_owner = None;
+                self.clear_acp_turn_owners_for_session(&session_uid);
             }
             self.set_session_running(&session_uid, false, cx);
             cx.notify();
@@ -2138,6 +3973,16 @@ impl AgentChatView {
         defer_budget: bool,
         cx: &mut Context<Self>,
     ) {
+        // 子代理详情会话：与当前对话无关的一段回放，走自己的通路。
+        //
+        // 必须在这里就分流，不能等到下面按会话归属：详情会话既不是 `current_session`，
+        // 也不属于任何一轮，落进 `session_transcripts` 就会被当成「另一条真实会话」——
+        // 于是进 LRU、被 `trim_session_transcripts` 挤掉，还可能被误当成一条要落盘的
+        // 会话。它只是某张卡片的一次回放。
+        if let Some(detail_uid) = subagent_detail_uid(&event) {
+            self.apply_subagent_detail_event(&detail_uid, &event, defer_budget, cx);
+            return;
+        }
         let backend = self.backend;
         if backend == Backend::Local {
             let turn_id = runtime_event_turn_id(&event).clone();
@@ -2156,15 +4001,29 @@ impl AgentChatView {
         let session_uid = match backend {
             Backend::Local => event.session_id().to_string(),
             Backend::Acp => {
-                let Some(owner) = self.acp_turn_owner.as_ref() else {
-                    return;
-                };
-                if event.session_id() != &owner.event_session_id
-                    || runtime_event_turn_id(&event) != &owner.turn_id
+                // 按 turn id 在在飞表里找 owner；找不到再看是不是历史回放。
+                // 多会话并发（后台轮次）时各轮的事件凭 turn id 各归各的会话。
+                let event_turn = runtime_event_turn_id(&event);
+                if let Some(owner) = self
+                    .acp_turn_owners
+                    .iter()
+                    .find(|owner| &owner.turn_id == event_turn)
                 {
-                    return;
+                    if event.session_id() != &owner.event_session_id {
+                        return;
+                    }
+                    owner.session_uid.clone()
+                } else {
+                    // 没有活动轮次：唯一合法的来源是 `session/load` 的历史回放。它没有轮次
+                    // 可归，认不出回放就只能丢弃 —— 点开一条 ACP 历史会话会因此全屏空白。
+                    let Some(replay) = self.acp_history_replay.as_ref() else {
+                        return;
+                    };
+                    if !replay.accepts(&event) {
+                        return;
+                    }
+                    replay.session_uid.clone()
                 }
-                owner.session_uid.clone()
             }
         };
         let is_need_user_input = matches!(&event, RuntimeEvent::NeedUserInput { .. });
@@ -2181,6 +4040,25 @@ impl AgentChatView {
             RuntimeEvent::TurnCompleted { .. } | RuntimeEvent::TurnFailed { .. }
         );
         let is_real_terminal = is_cancelled || is_completed_or_failed;
+        self.record_turn_timing(&event);
+        match &event {
+            RuntimeEvent::TurnStarted { turn_id, .. } => {
+                cx.emit(AgentChatViewEvent::TurnStarted {
+                    session_id: session_uid.clone(),
+                    turn_id: turn_id.to_string(),
+                });
+            }
+            RuntimeEvent::TurnCompleted { turn_id, .. }
+            | RuntimeEvent::TurnCancelled { turn_id, .. }
+            | RuntimeEvent::TurnFailed { turn_id, .. } => {
+                cx.emit(AgentChatViewEvent::TurnFinished {
+                    session_id: session_uid.clone(),
+                    turn_id: turn_id.to_string(),
+                    success: matches!(&event, RuntimeEvent::TurnCompleted { .. }),
+                });
+            }
+            _ => {}
+        }
         let acp_terminal_phase = if backend == Backend::Acp && is_real_terminal {
             self.acp.as_ref().map(AcpConnection::phase)
         } else {
@@ -2190,7 +4068,7 @@ impl AgentChatView {
             if backend == Backend::Acp && is_real_terminal {
                 self.cancel_pending_acp_permissions(cx);
                 self.set_session_running(&session_uid, false, cx);
-                self.acp_turn_owner = None;
+                self.clear_acp_turn_owners_for_session(&session_uid);
                 self.trim_session_transcripts();
                 if acp_connection_is_unavailable(acp_terminal_phase.as_ref()) {
                     self.invalidate_unavailable_acp_connection(cx);
@@ -2202,7 +4080,11 @@ impl AgentChatView {
             }
             return;
         }
-        let is_current_session = session_uid == self.current_session;
+        let is_current_session = session_uid == self.current_session
+            && !self
+                .acp_turn_owners
+                .iter()
+                .any(|owner| owner.turn_id == *runtime_event_turn_id(&event) && owner.backgrounded);
         let clears_running = is_real_terminal
             || (backend == Backend::Local && is_need_user_input && !is_pending_tool_approval);
         let advances_queue = match backend {
@@ -2246,26 +4128,44 @@ impl AgentChatView {
             self.trim_session_transcripts();
             applied
         };
+        // 终态收尾放在转录去重**之前**。
+        //
+        // `applied` 说的是「这条事件的内容是重复的」，不是「这一轮不用收尾」。
+        // 曾经的位置在 `if !applied { return; }` 之后，于是一条被判重的终态会把
+        // 清 running / 清 owner 一起带走——界面就永久停在「正在响应」，而且因为
+        // 转录里确实有内容，看起来完全不像卡住。收尾只依赖 `clears_running`。
+        if clears_running {
+            if backend == Backend::Acp && is_real_terminal {
+                self.cancel_pending_acp_permissions(cx);
+            }
+            if is_current_session && self.scroll.is_following() {
+                self.auto_scroll.request_settle();
+            }
+            let turn_finished = runtime_event_turn_id(&event).clone();
+            if backend == Backend::Acp && is_real_terminal {
+                // 后台轮次与当前轮共享同一个内置 uid：后台轮次终态不能把新会话的
+                // running 一起清掉——只有这条 uid 名下不再有任何在飞轮次时才清。
+                let session_still_running = self.acp_turn_owners.iter().any(|owner| {
+                    owner.session_uid == session_uid && owner.turn_id != turn_finished
+                });
+                if !session_still_running {
+                    self.set_session_running(&session_uid, false, cx);
+                }
+                self.acp_turn_owners
+                    .retain(|owner| owner.turn_id != turn_finished);
+                self.trim_session_transcripts();
+            } else {
+                self.set_session_running(&session_uid, false, cx);
+            }
+        }
         if !applied {
             return;
         }
         if is_current_session {
             self.sync_composer(cx);
-            // 跟随当前会话的流式输出 / 新卡片自动滚到底。
-            self.request_scroll_to_bottom();
-        }
-        if clears_running {
-            if backend == Backend::Acp && is_real_terminal {
-                self.cancel_pending_acp_permissions(cx);
-            }
-            if is_current_session {
-                self.auto_scroll.request_settle();
-            }
-            self.set_session_running(&session_uid, false, cx);
-            if backend == Backend::Acp && is_real_terminal {
-                self.acp_turn_owner = None;
-                self.trim_session_transcripts();
-            }
+            // 跟随当前会话的流式输出 / 新卡片自动滚到底；
+            // 用户正在上翻读历史时不抢滚动位置。
+            self.follow_streaming_scroll();
         }
         if backend == Backend::Acp
             && is_real_terminal
@@ -2278,6 +4178,11 @@ impl AgentChatView {
             self.persist_session(&session_uid, cx);
             self.reload_sessions(cx);
         }
+        // ACP 会话的历史仍然归外部 agent，但侧栏得留着这一行，而且每轮结束
+        // 都算一次「有过动静」，不然这段对话会永远沉在列表底部。
+        if backend == Backend::Acp && is_real_terminal {
+            self.persist_acp_session(&session_uid, true, cx);
+        }
         if advances_queue {
             match backend {
                 Backend::Local => {
@@ -2289,17 +4194,362 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// 把一条子代理详情事件落进它自己的转录。
+    ///
+    /// 详情转录是**独立**的一份 [`AgentTranscript`]：它不参与当前会话判定、不碰
+    /// running 状态、不落盘、也不进会话列表。唯一的外向动作是通知面板重绘。
+    fn apply_subagent_detail_event(
+        &mut self,
+        detail_uid: &str,
+        event: &RuntimeEvent,
+        defer_budget: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // 加载成功就别再挂着上一次的失败文案。
+        self.subagent_detail_errors.remove(detail_uid);
+        let resources = self.resources.clone();
+        let changed = {
+            let transcript = self
+                .subagent_details
+                .entry(detail_uid.to_string())
+                .or_insert_with(|| {
+                    let mut transcript = AgentTranscript::new();
+                    transcript.set_resource_context(&resources);
+                    transcript
+                });
+            transcript.set_budget_deferred(defer_budget);
+            let changed = transcript.apply(event);
+            transcript.flush_deferred_budget();
+            changed
+        };
+        if !changed {
+            return;
+        }
+        cx.emit(AgentChatViewEvent::SubagentDetailUpdated {
+            detail_session_id: detail_uid.to_string(),
+        });
+        cx.notify();
+    }
+
+    /// 用户点了子代理卡片上的「查看推理过程」。
+    ///
+    /// 交互是**懒加载**的：每 `session/load` 一次，agent 就把整段子代理历史重放一遍。
+    /// 子代理动辄上千条 part，为每张卡片都在结束时自动拉一遍，代价和噪声都不划算；
+    /// 用户点了才拉，才符合「我想看看这只子代理干了什么」的意图。
+    pub(crate) fn open_subagent_detail(
+        &mut self,
+        acp_session_id: String,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(AgentChatViewEvent::SubagentDetailRequested {
+            acp_session_id: acp_session_id.clone(),
+            title,
+        });
+        self.ensure_subagent_detail_loaded(acp_session_id, cx);
+        cx.notify();
+    }
+
+    /// 拉取（且只拉一次）某条子会话的完整推理。
+    fn ensure_subagent_detail_loaded(&mut self, acp_session_id: String, cx: &mut Context<Self>) {
+        if self.backend != Backend::Acp {
+            return;
+        }
+        // 插进去失败说明已经在拉、或已经拉过。状态会一直留着：转录本来就缓存着，
+        // 再点一次只是切回那份缓存。
+        if !self.subagent_loads.insert(acp_session_id.clone()) {
+            return;
+        }
+        let Some(loader) = self.acp.as_ref().map(AcpConnection::detail_loader) else {
+            // 连接已经不在（断线 / 刚切走）：把标记撤回，等重连后再点还有机会。
+            self.subagent_loads.remove(&acp_session_id);
+            return;
+        };
+        // 已经登记过的子会话不需要再 load：转录还在缓存里，重复 load 只会重放一遍。
+        if self
+            .acp
+            .as_ref()
+            .is_some_and(|acp| acp.is_detail_session_registered(&acp_session_id))
+        {
+            return;
+        }
+        let detail_uid = detail_session_id_for(&acp_session_id);
+        let cwd = self.acp_detail_cwd();
+        cx.spawn(async move |this, cx| {
+            let result = loader
+                .load(
+                    agent_client_protocol::schema::v1::SessionId::new(acp_session_id),
+                    cwd,
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_subagent_detail_load(&detail_uid, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_subagent_detail_load(
+        &mut self,
+        detail_uid: &str,
+        result: anyhow::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.subagent_detail_errors.remove(detail_uid);
+            }
+            Err(error) => {
+                // 失败要让用户看见：卡片点得动、点完却一片空白，是最难排查的那种静默失败。
+                let message =
+                    t!("AgentUi.subagent_detail_failed", error = error.to_string()).to_string();
+                tracing::warn!(%error, detail = %detail_uid, "failed to load subagent detail");
+                self.subagent_detail_errors
+                    .insert(detail_uid.to_string(), message);
+            }
+        }
+        cx.emit(AgentChatViewEvent::SubagentDetailUpdated {
+            detail_session_id: detail_uid.to_string(),
+        });
+        cx.notify();
+    }
+
+    /// 详情会话的转录消息；面板渲染用。
+    pub(crate) fn subagent_detail_messages(
+        &self,
+        detail_session_id: &str,
+    ) -> Option<&[ChatMessageUI]> {
+        self.subagent_details
+            .get(detail_session_id)
+            .map(|transcript| transcript.messages.as_slice())
+    }
+
+    /// 详情会话加载失败的文案；`None` 表示没失败（或还没结果）。
+    pub(crate) fn subagent_detail_error(&self, detail_session_id: &str) -> Option<&str> {
+        self.subagent_detail_errors
+            .get(detail_session_id)
+            .map(String::as_str)
+    }
+
+    /// 详情会话的状态令牌：`(转录修订号, 是否有失败文案)`。
+    ///
+    /// 详情面板靠它判断「要不要重新取一份快照」。直接把消息克隆过去虽然简单，但面板
+    /// 每次重绘都会克隆一遍整段转录（工具卡片里躺着几十 KB 的 JSON），光是鼠标划过
+    /// 就够呛。
+    pub(crate) fn subagent_detail_token(&self, detail_session_id: &str) -> (u64, bool) {
+        (
+            self.subagent_details
+                .get(detail_session_id)
+                .map(AgentTranscript::revision)
+                .unwrap_or(0),
+            self.subagent_detail_errors.contains_key(detail_session_id),
+        )
+    }
+
+    /// `session/load` 详情会话要用的工作目录。
+    ///
+    /// agent 按 cwd 定位会话（OpenCode 的 `session.get` 带 `directory` 参数），拿一个
+    /// 不相干的目录去 load 会直接查不到。所以优先用**当前 ACP 会话自己的** cwd；
+    /// 拿不到（当前会话不在已拉取的列表里）才退回工作区根目录——那是新建会话时用的
+    /// 目录，也是绝大多数情况下的正确答案。
+    fn acp_detail_cwd(&self) -> std::path::PathBuf {
+        self.acp
+            .as_ref()
+            .map(AcpConnection::protocol_session_id)
+            .and_then(|protocol_id| {
+                self.acp_sessions
+                    .iter()
+                    .find(|session| session.id == protocol_id)
+                    .map(|session| session.cwd.clone())
+            })
+            .unwrap_or_else(|| self.workspace_root.clone())
+    }
+
     fn invalidate_unavailable_acp_connection(&mut self, cx: &mut Context<Self>) -> bool {
         let phase = self.acp.as_ref().map(AcpConnection::phase);
         if !acp_connection_is_unavailable(phase.as_ref()) {
             return false;
         }
-        self.reset_acp_permission_session(cx);
+        self.reset_acp_client_session(cx);
         self.acp = None;
         self.sync_pending_preview(cx);
         self.sync_composer(cx);
         cx.notify();
         true
+    }
+
+    /// 连接不可用时先丢弃旧连接，再按有界退避尝试自动重连。
+    ///
+    /// 测试构建下健康检查不启动，因此这里可能未被调用；决策本身由纯函数覆盖。
+    #[cfg_attr(test, allow(dead_code))]
+    fn handle_acp_unavailable(&mut self, cx: &mut Context<Self>) {
+        if self.invalidate_unavailable_acp_connection(cx) {
+            self.schedule_acp_auto_reconnect(cx);
+        }
+    }
+
+    /// 当前连接是否已进入不可恢复的终态。
+    #[cfg_attr(test, allow(dead_code))]
+    fn acp_connection_unavailable(&self) -> bool {
+        match self.acp.as_ref() {
+            Some(connection) => acp_connection_is_unavailable(Some(&connection.phase())),
+            None => false,
+        }
+    }
+
+    /// 自动重连的目标 agent；用户主动切走（换后端 / 关闭会话）时为 `None`。
+    #[cfg_attr(test, allow(dead_code))]
+    fn acp_reconnect_target(&self) -> Option<SharedString> {
+        if self.backend != Backend::Acp || self.closed_sessions.contains(&self.current_session) {
+            return None;
+        }
+        self.current_acp_id.clone()
+    }
+
+    /// 取消待触发的自动重连，但不改尝试计数（新连接在飞时使用）。
+    fn invalidate_acp_reconnect_schedule(&mut self) {
+        self.acp_reconnect.scheduled = false;
+        self.acp_reconnect.generation = self.acp_reconnect.generation.wrapping_add(1);
+    }
+
+    /// 用户主动离开 ACP：清空重连预算并停止健康检查。
+    fn cancel_acp_auto_reconnect(&mut self) {
+        self.invalidate_acp_reconnect_schedule();
+        self.acp_reconnect.attempts = 0;
+        self._acp_health_task = None;
+    }
+
+    /// 按尝试次数决定自动重连、放弃还是不动。
+    #[cfg_attr(test, allow(dead_code))]
+    fn schedule_acp_auto_reconnect(&mut self, cx: &mut Context<Self>) {
+        let busy = self.acp_connecting
+            || self.acp_pending.is_some()
+            || self.acp_session_transition.is_some()
+            || !self.acp_turn_owners.is_empty();
+        let decision = acp_reconnect_decision(
+            self.backend == Backend::Acp,
+            true,
+            busy,
+            self.acp_reconnect_target().is_some(),
+            self.acp_reconnect.attempts,
+        );
+        match decision {
+            AcpReconnectDecision::Idle => {}
+            AcpReconnectDecision::GiveUp => {
+                self.acp_reconnect.scheduled = false;
+                let agent_id = self
+                    .current_acp_id
+                    .clone()
+                    .unwrap_or_else(|| SharedString::from("acp"));
+                let agent_name = self.acp_agent_name(&agent_id);
+                let error = AcpError::new(
+                    AcpErrorKind::ConnectionClosed,
+                    agent_id.to_string(),
+                    agent_name.to_string(),
+                    t!("AgentUi.acp_reconnect_exhausted").to_string(),
+                )
+                .with_recovery(AcpRecoveryAction::Retry);
+                self.transcript.set_acp_error(&error);
+                self.sync_composer(cx);
+                cx.notify();
+            }
+            AcpReconnectDecision::Reconnect => {
+                if self.acp_reconnect.scheduled {
+                    return;
+                }
+                self.acp_reconnect.scheduled = true;
+                let attempt = self.acp_reconnect.attempts;
+                self.acp_reconnect.attempts = self.acp_reconnect.attempts.saturating_add(1);
+                let generation = self.acp_reconnect.generation.wrapping_add(1);
+                self.acp_reconnect.generation = generation;
+                self.transcript.set_acp_status(
+                    t!(
+                        "AgentUi.acp_reconnecting",
+                        attempt = attempt + 1,
+                        max = ACP_RECONNECT_MAX_ATTEMPTS
+                    )
+                    .to_string(),
+                );
+                self.sync_composer(cx);
+                cx.notify();
+                self.spawn_acp_reconnect_after(acp_reconnect_delay(attempt), generation, cx);
+            }
+        }
+    }
+
+    /// 延迟后重试连接；代次不匹配说明已被更新的操作取代。
+    #[cfg(not(test))]
+    fn spawn_acp_reconnect_after(
+        &mut self,
+        delay: std::time::Duration,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.acp_reconnect.generation != generation {
+                    return;
+                }
+                this.acp_reconnect.scheduled = false;
+                if this.acp_connection_unavailable() {
+                    this.invalidate_unavailable_acp_connection(cx);
+                }
+                if this.acp.is_some() || this.acp_connecting || this.acp_pending.is_some() {
+                    return;
+                }
+                let Some(agent_id) = this.acp_reconnect_target() else {
+                    return;
+                };
+                // 不重置尝试计数：本次重试本身就是预算的一次消耗。
+                if let Some((operation, permission_provider)) =
+                    this.prepare_acp_connect(agent_id, cx)
+                {
+                    this.spawn_acp_connect(operation, permission_provider, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 测试构建下不拉子进程：自动重连只走纯决策，不产生真实连接。
+    #[cfg(test)]
+    fn spawn_acp_reconnect_after(
+        &mut self,
+        _delay: std::time::Duration,
+        _generation: u64,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// 空闲连接的健康检查。agent 进程空闲退出不会产生轮次事件，只能靠轮询发现。
+    #[cfg(not(test))]
+    fn spawn_acp_health(&mut self, agent_id: SharedString, cx: &mut Context<Self>) {
+        self._acp_health_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(ACP_HEALTH_INTERVAL).await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.backend != Backend::Acp
+                            || this.current_acp_id.as_ref() != Some(&agent_id)
+                        {
+                            return false;
+                        }
+                        if this.acp_connection_unavailable() {
+                            this.handle_acp_unavailable(cx);
+                        }
+                        // 连接已丢弃且没有在飞动作时收工；重连成功会再起一个新任务。
+                        this.acp.is_some()
+                            || this.acp_connecting
+                            || this.acp_pending.is_some()
+                            || this.acp_session_transition.is_some()
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 
     fn acp_turn_error(&self, reason: &str) -> AcpError {
@@ -2321,12 +4571,115 @@ impl AgentChatView {
         .with_recovery(AcpRecoveryAction::Retry)
     }
 
+    /// 记录轮次起止时间，以及真实收尾结果。
+    ///
+    /// 只认真实事件时刻；折叠头里的「用时 Ns」不足以凭猜显示。收尾结果同理：
+    /// 只有终态事件能判定失败/取消，绝不从系统提示文本推断。
+    fn record_turn_timing(&mut self, event: &RuntimeEvent) {
+        let now = unix_now_secs();
+        match event {
+            RuntimeEvent::TurnStarted { turn_id, .. } => {
+                self.turn_timings.note_started(turn_id.as_str(), now);
+            }
+            RuntimeEvent::TurnCompleted { turn_id, .. } => {
+                self.turn_timings.note_finished(turn_id.as_str(), now);
+                self.turn_timings
+                    .note_outcome(turn_id.as_str(), TurnOutcome::Completed);
+            }
+            RuntimeEvent::TurnCancelled { turn_id, .. } => {
+                self.turn_timings.note_finished(turn_id.as_str(), now);
+                self.turn_timings
+                    .note_outcome(turn_id.as_str(), TurnOutcome::Cancelled);
+            }
+            RuntimeEvent::TurnFailed { turn_id, .. } => {
+                self.turn_timings.note_finished(turn_id.as_str(), now);
+                self.turn_timings
+                    .note_outcome(turn_id.as_str(), TurnOutcome::Failed);
+            }
+            _ => {}
+        }
+    }
+
+    /// 某条消息属于哪一轮。
+    ///
+    /// 工具卡片的「在 Review 中打开」手里只有路径和自己的消息 id —— `ChatCard::render`
+    /// 拿到的 `CardMessage` 里没有轮次视图。这里用消息 id 反查它落在哪一轮，
+    /// 好过给 `render_one` / `render_card` 这条共用渲染路径再塞一个只为这一处
+    /// 服务的参数（那要牵动七处调用点）。
+    ///
+    /// 消息自身的 `turn_id` 就是权威值（见 `ChatMessageUIGeneric::turn_id` 的注释：
+    /// 不得用数组下标或渲染顺序推断）；历史恢复出来的消息没有它，返回 `None`。
+    fn turn_id_for_message(&self, message_id: &str) -> Option<String> {
+        self.transcript
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .and_then(|message| message.turn_id.clone())
+    }
+
+    /// 处理轮次视图抛出的交互请求。
+    fn apply_message_list_action(&mut self, action: MessageListAction, cx: &mut Context<Self>) {
+        match action {
+            MessageListAction::SetProcessExpanded { key, expanded } => {
+                self.expansion.set(key, expanded);
+            }
+            MessageListAction::ScrollToLatest => {
+                self.request_scroll_to_bottom();
+            }
+            MessageListAction::PreviewImage { image } => {
+                self.message_image_preview = Some(image);
+            }
+            MessageListAction::RestoreTurn { turn_id } => {
+                cx.emit(AgentChatViewEvent::RestoreTurn {
+                    session_id: self.current_session.clone(),
+                    turn_id,
+                });
+            }
+            MessageListAction::OpenFileInReview { path, turn_id } => {
+                cx.emit(AgentChatViewEvent::OpenFileInReview {
+                    session_id: self.current_session.clone(),
+                    path,
+                    turn_id,
+                });
+            }
+            MessageListAction::OpenTurnReview { turn_id } => {
+                cx.emit(AgentChatViewEvent::OpenTurnReview {
+                    session_id: self.current_session.clone(),
+                    turn_id,
+                });
+            }
+        }
+        cx.notify();
+    }
+
     fn request_scroll_to_bottom(&mut self) {
+        self.scroll.jump_to_tail();
         self.auto_scroll.request();
         self.scroll_handle.scroll_to_bottom();
     }
 
+    /// 距底还剩多少。gpui 的 `offset` 是负的滚动位移（顶部 0、底部 `-max`），
+    /// 两者相加才是「还差多少滚到底」。
+    fn distance_from_bottom(&self) -> gpui::Pixels {
+        (self.scroll_handle.max_offset().y + self.scroll_handle.offset().y).max(gpui::px(0.0))
+    }
+
+    /// 流式输出 / 新卡片进场时的跟随滚动。
+    ///
+    /// 只有仍贴着底部（`FOLLOW_THRESHOLD` 以内）才抢滚动位置：用户上滚去读
+    /// 历史时，每一帧 token 都把他拽回底部等于没法看；等他滚回底部，下一帧
+    /// 输出自动接上跟随，不需要额外点「回到最新」。
+    fn follow_streaming_scroll(&mut self) {
+        let distance = self.distance_from_bottom();
+        if distance <= FOLLOW_THRESHOLD {
+            self.request_scroll_to_bottom();
+        } else {
+            self.scroll.on_scroll(distance);
+        }
+    }
+
     fn request_scroll_to_bottom_until_layout_settles(&mut self) {
+        self.scroll.jump_to_tail();
         self.auto_scroll.request_settle();
         self.scroll_handle.scroll_to_bottom();
     }
@@ -2415,12 +4768,26 @@ impl AgentChatView {
         agent_id: SharedString,
         session_uid: String,
     ) -> AcpOperationToken {
+        self.begin_acp_session_transition_with_phase(
+            agent_id,
+            session_uid,
+            AcpSessionTransitionPhase::Creating,
+        )
+    }
+
+    /// 带阶段参数的版本。`Listing` 走这条:它同属「连接被 take 走了」的窗口。
+    fn begin_acp_session_transition_with_phase(
+        &mut self,
+        agent_id: SharedString,
+        session_uid: String,
+        phase: AcpSessionTransitionPhase,
+    ) -> AcpOperationToken {
         let operation = self.next_acp_operation();
         self.acp_session_transition = Some(AcpSessionTransition {
             operation,
             agent_id,
             session_uid,
-            phase: AcpSessionTransitionPhase::Creating,
+            phase,
         });
         operation
     }
@@ -2487,8 +4854,7 @@ impl AgentChatView {
         }
         if session_uid == self.current_session {
             self.is_running = running;
-            self.input
-                .update(cx, |input, cx| input.set_running(running, cx));
+            self.set_composers_running(running, cx);
             self.sync_pending_preview(cx);
         }
         self.reload_sessions(cx);
@@ -2540,11 +4906,17 @@ impl AgentChatView {
     }
 
     /// 重建并把展示上下文推给输入框。
-    fn sync_composer(&self, cx: &mut Context<Self>) {
-        let ctx = build_composer_context(
+    fn sync_composer(&mut self, cx: &mut Context<Self>) {
+        self.refresh_execution_mode_options();
+        let model = self
+            .acp
+            .as_ref()
+            .and_then(|acp| acp_model_option(&acp.state(), self.current_acp_id.as_ref()))
+            .or_else(|| self.selected_model.clone());
+        let mut ctx = build_composer_context(
             &self.resources,
-            self.tool_execution_mode,
-            self.selected_model.as_ref(),
+            self.execution_selection(),
+            model.as_ref(),
             self.transcript.latest_plan(),
             self.transcript.active_subagents(),
             self.backend,
@@ -2555,8 +4927,198 @@ impl AgentChatView {
             &self.available_resources,
             self.skills.summary(),
             self.skills.items(),
+            self.local_context_tokens(),
         );
-        self.input.update(cx, |inp, cx| inp.set_context(ctx, cx));
+        apply_composer_snapshot(&mut ctx, self.composer_snapshot(cx));
+        // `/` 命令只有 ACP agent 声明得出来：与提问面板一样，只喂 ACP 那份。
+        let commands = self.composer_slash_commands();
+        self.acp_input
+            .update(cx, |input, cx| input.set_slash_commands(commands, cx));
+        self.composer().set_context(ctx, cx);
+        if self.backend == Backend::Acp {
+            // 模式与模型也都是 agent 声明的：在这里一次推齐。散在各条连接路径上推的话，
+            // 总有一条路径只更新了面板字段（`self.tool_options`）而没推给输入框，
+            // 结果下拉里留着的还是上一份列表——比如本地那套「任务类型 / 工具策略」。
+            let modes = self.tool_options.clone();
+            let models = self.model_options.clone();
+            self.acp_input.update(cx, |input, cx| {
+                input.set_menu_options(models, modes, cx);
+            });
+        }
+    }
+
+    /// 向宿主取一次上下文栏快照；未注入数据源时给默认值（底栏只有权限级别）。
+    ///
+    /// 宿主快照闭包拿的是 `&mut App`：它可能要读设置、走 git，允许内部缓存，
+    /// 但绝不能反过来更新本视图（会在渲染路径里形成 `Entity::update` 重入）。
+    fn composer_snapshot(&self, cx: &mut Context<Self>) -> ComposerContextSnapshot {
+        match self.composer_context_source.as_ref() {
+            Some(source) => (source.snapshot)(cx),
+            None => ComposerContextSnapshot::default(),
+        }
+    }
+
+    /// 当前本地会话的上下文占用(模型报告过计量才有;ACP 会话由 agent 上报,
+    /// 走 [`AcpUsage`] 那条路,不经过这里)。
+    fn local_context_tokens(&self) -> Option<u64> {
+        if self.backend != Backend::Local {
+            return None;
+        }
+        self.runtime
+            .session(&SessionId::from_string(self.current_session.clone()))
+            .and_then(|session| session.context_tokens())
+    }
+
+    pub fn set_workspace_root(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.workspace_root == root {
+            return;
+        }
+        self.apply_workspace_root(root.clone(), cx);
+        AppSettings::update_and_save(cx, |settings| {
+            settings.ai_chat.last_workspace_root = Some(root);
+        });
+    }
+
+    /// 换根的后半程，也是被拦提交真正落地的地方：技能重载、ACP 连接作废、
+    /// 底栏重算，最后把「等这次换根」的提交接着发出去。
+    ///
+    /// 与 [`Self::set_workspace_root`] 分开，是为了让它能在单测里被直接驱动 ——
+    /// 后者会写用户真实的 `settings.json`，测试不能碰。**不要**为了省一次调用
+    /// 把它合回去：合回去就等于这条路径没有测试覆盖（`RootChanged` 那条链上的
+    /// 「提交接手」会静默失效，而测试照样全绿）。
+    ///
+    /// 用「根落地」而不是「worktree 创建完成」当触发点：创建完成时 `RootChanged`
+    /// 才刚入队（`Effect::Emit` 延后派发），技能与 ACP 连接都还是旧根的。
+    fn apply_workspace_root(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.workspace_root = root.clone();
+        // 项目级 skills 跟随工作区；选择集合只保留仍然存在的路径。
+        self.skills.reload_for_workspace(&root);
+        // `@` 里的文件也要换：引用的是**当前**工作区里的东西。
+        self.refresh_workspace_mentions(cx);
+        self.sync_session_skills();
+        // 换工作区会丢弃旧连接；连接前的模型选择也不再适用于新 agent 会话。
+        self.pending_acp_model = None;
+        self.cancel_acp_auto_reconnect();
+        self.acp = None;
+        self.acp_pending = None;
+        self.acp_connecting = false;
+        self.clear_acp_sessions();
+        self.sync_composer(cx);
+        cx.notify();
+        // 副作用：若用户在等待那一两秒里手动切了工作区，这条提交会落在新根上 ——
+        // 概率极低，且用户本来就切到了那里，比把内容憋在 `gated_submissions` 里强。
+        self.resume_gated_submission(cx);
+    }
+
+    pub fn restore_persisted_acp(&mut self, cx: &mut Context<Self>) {
+        let persisted_agent: Option<SharedString> =
+            match AppSettings::current(cx).ai_chat.last_backend.clone() {
+                // 用户上次明确选了内置 One Agent：保持本地后端，别再去连 ACP。
+                Some(AiChatBackendSelection::Builtin) => return,
+                Some(AiChatBackendSelection::Acp { id }) => Some(SharedString::from(id)),
+                // 旧配置没有 last_backend：沿用 last_acp_agent_id 的旧恢复路径。
+                None => AppSettings::current(cx)
+                    .ai_chat
+                    .last_acp_agent_id
+                    .map(SharedString::from),
+            };
+        let Some(agent_id) = persisted_agent else {
+            return;
+        };
+        if self
+            .acp_agents
+            .iter()
+            .any(|entry| entry.id == agent_id && entry.selectable())
+        {
+            self.select_acp_backend(agent_id, cx);
+        }
+    }
+
+    pub(crate) fn restore_persisted_acp_model(&mut self, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.current_acp_id.clone() else {
+            return;
+        };
+        self.apply_initial_acp_model(&agent_id, cx);
+    }
+
+    /// 连接建立后决定首个模型：优先连接前的选择，其次上次为该 agent 保存的模型。
+    fn apply_initial_acp_model(&mut self, agent_id: &SharedString, cx: &mut Context<Self>) {
+        let desired = self.pending_acp_model.take().or_else(|| {
+            AppSettings::current(cx)
+                .ai_chat
+                .acp_models
+                .get(agent_id.as_ref())
+                .cloned()
+        });
+        let Some(model) = desired else {
+            return;
+        };
+        let Some(option) = self
+            .model_options
+            .iter()
+            .find(|option| option.model.as_ref() == model)
+            .cloned()
+        else {
+            return;
+        };
+        self.select_acp_model(
+            option.id.as_ref(),
+            option.provider_id.as_ref(),
+            option.model.as_ref(),
+            cx,
+        );
+    }
+
+    /// 连接建立前，用探测到的模型填充选择器。
+    ///
+    /// 仅在「当前就是该 ACP agent 且尚未连接」时生效；真正连接后由
+    /// [`acp_model_options`] 覆盖成带配置项 id 的权威列表。
+    fn apply_probe_model_options(&mut self, agent_id: &SharedString, cx: &mut Context<Self>) {
+        if self.acp.is_some() {
+            return;
+        }
+        let Some(probe) = self.acp_probes.get(agent_id) else {
+            return;
+        };
+        if probe.models.is_empty() {
+            return;
+        }
+        let options = acp_model_options_from_probe(agent_id, &probe.models);
+        self.selected_model = self
+            .pending_acp_model
+            .as_deref()
+            .and_then(|model| {
+                options
+                    .iter()
+                    .find(|option| option.model.as_ref() == model)
+                    .cloned()
+            })
+            .or_else(|| {
+                self.selected_model
+                    .clone()
+                    .filter(|selected| options.iter().any(|option| option.id == selected.id))
+            })
+            .or_else(|| options.first().cloned());
+        self.model_options = options.clone();
+        // 探测到的模型也是 agent 声明的：只喂 ACP 那份。
+        self.acp_input.update(cx, |input, cx| {
+            input.set_menu_options(options, self.tool_options.clone(), cx)
+        });
+        self.sync_composer(cx);
+    }
+
+    /// 当前会话可补全的 `/` 命令。
+    ///
+    /// 命令只来自 Acp agent 的 `available_commands`：内置 agent 没有这套协议，返回空向量，
+    /// 输入框里打 `/` 就不弹菜单（不造假的命令表）。
+    fn composer_slash_commands(&self) -> Vec<SlashCommandItem> {
+        self.acp
+            .as_ref()
+            .map(|acp| {
+                let state = acp.state();
+                slash_commands_from_acp_state(&state)
+            })
+            .unwrap_or_default()
     }
 
     fn refresh_acp_agents(&mut self, cx: &mut Context<Self>) {
@@ -2570,16 +5132,148 @@ impl AgentChatView {
 
     fn refresh_acp_agents_from(&mut self, agents: Vec<AcpAgentEntry>, cx: &mut Context<Self>) {
         self.acp_agents = agents;
+        #[cfg(not(test))]
+        self.spawn_acp_probes(cx);
         self.sync_composer(cx);
         cx.notify();
     }
 
+    /// 设置页改了 ACP agent 配置（列表/启用状态/当前选中项）后的对齐动作。
+    fn on_acp_agent_config_changed(&mut self, cx: &mut Context<Self>) {
+        self.refresh_acp_agents(cx);
+        self.sync_active_acp_agent_from_settings(cx);
+    }
+
+    /// 把当前后端对齐到设置页选中的 agent。
+    ///
+    /// 正在跑一轮或正在连接时不动连接：切后端会掐掉当前回合，等这一轮结束或面板
+    /// 重新挂载时再对齐。
+    fn sync_active_acp_agent_from_settings(&mut self, cx: &mut Context<Self>) {
+        if self.is_running || self.acp_connecting {
+            return;
+        }
+        let Some(target) = AppSettings::current(cx)
+            .ai_chat
+            .last_acp_agent_id
+            .map(SharedString::from)
+        else {
+            return;
+        };
+        if self.backend == Backend::Acp && self.current_acp_id.as_ref() == Some(&target) {
+            return;
+        }
+        if !self
+            .acp_agents
+            .iter()
+            .any(|entry| entry.id == target && entry.selectable())
+        {
+            return;
+        }
+        self.select_acp_backend(target, cx);
+    }
+
+    /// 为尚未探测的 ACP agent 各起一次后台探测。
+    ///
+    /// 探测会真的拉起子进程，因此：
+    /// - 只处理**已启用**的 agent（停用的不启动任何进程）；
+    /// - 先查落盘缓存：启动指纹一致就直接复用上次结论；
+    /// - 剩下没缓存的才真正后台探测，结果写回缓存供下次复用。
+    #[cfg(not(test))]
+    fn spawn_acp_probes(&mut self, cx: &mut Context<Self>) {
+        let mut targets: Vec<(SharedString, AcpAgentConfig, String)> = Vec::new();
+        {
+            let cache = acp_probe_cache(cx);
+            for entry in self.acp_agents.iter().filter(|entry| entry.enabled) {
+                let Some(config) = entry.config.clone() else {
+                    continue;
+                };
+                if self.acp_probes.contains_key(&entry.id)
+                    || self.acp_probe_inflight.contains(&entry.id)
+                {
+                    continue;
+                }
+                let fingerprint = probe_fingerprint(&config);
+                if let Some(record) = cache.get(entry.id.as_ref(), &fingerprint) {
+                    self.acp_probes.insert(entry.id.clone(), record.probe);
+                    continue;
+                }
+                targets.push((entry.id.clone(), config, fingerprint));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let handle = Tokio::handle(cx);
+        for (id, _, _) in &targets {
+            self.acp_probe_inflight.insert(id.clone());
+        }
+        // 串行探测，且每个探测在 GPUI 后台线程上用 `Handle::block_on` 跑：
+        // 一次只拉起一个 CLI，`EnterGuard` 也不会落到 GPUI 主线程上交错。
+        let probe_task = cx.background_spawn(async move {
+            let mut results = Vec::with_capacity(targets.len());
+            for (id, config, fingerprint) in targets {
+                let probe = crate::acp::probe_agent_blocking(&config, handle.clone());
+                results.push((id, probe, fingerprint));
+            }
+            results
+        });
+        cx.spawn(async move |this, cx| {
+            for (id, probe, fingerprint) in probe_task.await {
+                if !probe.identified() {
+                    tracing::warn!(
+                        agent = %id,
+                        error = probe.error.as_deref().unwrap_or("unknown"),
+                        "ACP agent probe failed"
+                    );
+                }
+                let alive = this
+                    .update(cx, |this, cx| {
+                        this.acp_probe_inflight.remove(&id);
+                        acp_probe_cache(cx).store(
+                            id.as_ref(),
+                            AcpProbeRecord::new(fingerprint.clone(), probe.clone()),
+                        );
+                        this.acp_probes.insert(id.clone(), probe);
+                        if this.backend == Backend::Acp && this.current_acp_id.as_ref() == Some(&id)
+                        {
+                            this.apply_probe_model_options(&id, cx);
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 当前 agent 列表对应的探测状态文案，供切换器直接展示。
+    fn agent_probe_statuses(&self) -> HashMap<SharedString, SharedString> {
+        self.acp_agents
+            .iter()
+            .filter_map(|entry| {
+                let status = self.acp_probe_status(&entry.id)?;
+                Some((entry.id.clone(), status))
+            })
+            .collect()
+    }
+
+    fn acp_probe_status(&self, id: &SharedString) -> Option<SharedString> {
+        if self.acp_probe_inflight.contains(id) {
+            return Some(SharedString::from(t!("AgentUi.agent_probing").to_string()));
+        }
+        Some(probe_status_label(self.acp_probes.get(id)?))
+    }
+
     fn agent_switcher_options(&self) -> Vec<ComposerAgentOption> {
-        composer_agent_options(
+        composer_agent_options_with_status(
             self.backend,
             &self.acp_agents,
             self.current_acp_id.as_ref(),
             self.acp_connecting,
+            &self.agent_probe_statuses(),
         )
     }
 
@@ -2660,6 +5354,7 @@ impl AgentChatView {
             return;
         };
         let opt = opt.clone();
+        let previous_session = self.session_id.clone();
         let mut binding = RuntimeBinding {
             runtime: self.runtime.clone(),
             session_id: self.session_id.clone(),
@@ -2668,6 +5363,9 @@ impl AgentChatView {
         };
         match binding.switch_model(&opt, &self.resources) {
             Ok(true) => {
+                // session id 与切换前一致 ⇒ 历史已随会话搬进新 Runtime：这仍是
+                // 同一个会话，转录、侧栏摘要、会话缓存都不能重置，只换了模型。
+                let carried_session = binding.session_id == previous_session;
                 // Runtime 与新会话已成功构造；提交切换前先保存旧会话。
                 self.persist_current(cx);
                 self.runtime = binding.runtime;
@@ -2679,21 +5377,26 @@ impl AgentChatView {
                 }
                 self.apply_system_instruction_to_current_session();
                 self.sync_session_skills();
+                self.sync_session_resources();
                 self.selected_model = binding.selected_model;
                 self.current_session = self.session_id.to_string();
-                self.clear_cached_session_transcripts();
-                self.live_sessions.clear();
-                self.ignored_local_turns.clear();
-                self.closed_sessions.clear();
                 self.pending_submissions = PendingSubmissions::default();
-                self.acp_turn_owner = None;
-                self.upsert_live_summary(
-                    self.current_session.clone(),
-                    format!("{} / {}", opt.provider_label, opt.model),
-                    now_secs(),
-                );
-                self.transcript.clear();
-                self.transcript.set_resource_context(&self.resources);
+                self.acp_turn_owners.clear();
+                if !carried_session {
+                    // 没有可延续的会话（当前会话已不在 Runtime 中），只能按新会话
+                    // 处理：清转录与缓存，并在侧栏用「provider / model」占位。
+                    self.clear_cached_session_transcripts();
+                    self.live_sessions.clear();
+                    self.ignored_local_turns.clear();
+                    self.closed_sessions.clear();
+                    self.upsert_live_summary(
+                        self.current_session.clone(),
+                        format!("{} / {}", opt.provider_label, opt.model),
+                        now_secs(),
+                    );
+                    self.transcript.clear();
+                    self.transcript.set_resource_context(&self.resources);
+                }
                 self._event_task = Self::spawn_event_pump(self.runtime.subscribe(), None, cx);
                 self.reload_sessions(cx);
                 self.sync_pending_preview(cx);
@@ -2721,42 +5424,185 @@ impl AgentChatView {
         cx.notify();
     }
 
+    fn select_acp_model(
+        &mut self,
+        id: &str,
+        provider_id: &str,
+        model: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(option) = self.model_options.iter().find(|option| {
+            option.id.as_ref() == id
+                && option.provider_id.as_ref() == provider_id
+                && option.model.as_ref() == model
+        }) else {
+            return;
+        };
+        let option = option.clone();
+        // 尚未连接：先记住选择，等 `activate_acp` 拿到真实配置项后再下发。
+        let Some(acp) = self.acp.take() else {
+            self.pending_acp_model = Some(option.model.to_string());
+            self.selected_model = Some(option);
+            self.sync_composer(cx);
+            cx.notify();
+            return;
+        };
+        let Some(config) = acp.state().current_model_config().cloned() else {
+            self.acp = Some(acp);
+            return;
+        };
+        let value = agent_client_protocol::schema::v1::SessionConfigValueId::new(model);
+        let config_id = config.id.clone();
+        let provider_id = provider_id.to_string();
+        let model = model.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = acp.set_model(config_id, value).await;
+            let _ = this.update(cx, |this, cx| {
+                this.acp = Some(acp);
+                match result {
+                    Ok(()) => {
+                        this.selected_model = Some(option);
+                        AppSettings::update_and_save(cx, |settings| {
+                            settings
+                                .ai_chat
+                                .acp_models
+                                .insert(provider_id.to_string(), model.to_string());
+                        });
+                        this.sync_composer(cx);
+                    }
+                    Err(error) => this
+                        .transcript
+                        .push_system(format!("ACP model switch failed: {error}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// composer 的执行模式选择：任务类型 + 工具策略。
+    fn execution_selection(&self) -> ExecutionSelection {
+        ExecutionSelection::new(self.task_kind, self.tool_execution_mode)
+    }
+
+    /// 按当前后端刷新执行模式下拉项。
+    ///
+    /// ACP 已连接且 agent 声明了会话模式时用 agent 的模式（那是它真正支持的执行档位），
+    /// 其余情况用本地的任务类型/工具策略列表。
+    fn refresh_execution_mode_options(&mut self) {
+        self.tool_options = self
+            .acp
+            .as_ref()
+            .map(|acp| acp_execution_mode_options(&acp.state()))
+            .filter(|options| !options.is_empty())
+            .unwrap_or_else(default_execution_mode_options);
+    }
+
     fn select_execution_mode(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.is_running {
             return;
         }
-        if let Some(opt) = self.tool_options.iter().find(|o| o.id.as_ref() == id) {
-            let mode = tool_execution_mode_from_id(opt.id.as_ref());
-            if self.backend == Backend::Acp
-                && let Err(error) = set_current_acp_tool_mode(cx, mode)
-            {
-                let message = t!(
-                    "AgentChat.acp_tool_mode_update_failed",
-                    error = error.to_string()
-                )
-                .to_string();
-                tracing::warn!(%error, "Failed to update ACP Public MCP permission mode");
-                self.transcript.push_system(message);
-                self.request_scroll_to_bottom();
-                cx.notify();
-                return;
-            }
-            AppSettings::update_and_save(cx, |settings| {
-                settings.ai_chat.tool_execution_mode = settings_tool_execution_mode(mode);
-            });
-            self.tool_execution_mode = mode;
-            self.sync_composer(cx);
-            cx.notify();
+        // ACP 后端下拉里是 agent 自己声明的会话模式，选中后走 `session/set_mode`。
+        if let Some(mode_id) = id.strip_prefix(ACP_MODE_OPTION_PREFIX) {
+            self.select_acp_mode(mode_id.to_string(), cx);
+            return;
         }
+        // 新式 agent（opencode 等）把模式放在 configOptions，选中后走 `session/setConfigOption`。
+        if let Some(value) = id.strip_prefix(ACP_CONFIG_MODE_OPTION_PREFIX) {
+            self.select_acp_config_mode(value.to_string(), cx);
+            return;
+        }
+        if self.tool_options.iter().all(|o| o.id.as_ref() != id) {
+            return;
+        }
+        // 「问答」只改任务类型（它本身不下发工具），其余 id 只改工具策略、任务类型回到常规。
+        let selection = match task_kind_from_id(id) {
+            TaskKind::Agent => ExecutionSelection::tool(tool_execution_mode_from_id(id)),
+            task => ExecutionSelection::new(task, self.tool_execution_mode),
+        };
+        if self.backend == Backend::Acp
+            && let Err(error) = set_current_acp_tool_mode(cx, selection.tool)
+        {
+            let message = t!(
+                "AgentChat.acp_tool_mode_update_failed",
+                error = error.to_string()
+            )
+            .to_string();
+            tracing::warn!(%error, "Failed to update ACP Public MCP permission mode");
+            self.transcript.push_system(message);
+            self.request_scroll_to_bottom();
+            cx.notify();
+            return;
+        }
+        AppSettings::update_and_save(cx, |settings| {
+            settings.ai_chat.tool_execution_mode = settings_execution_mode(selection);
+        });
+        self.tool_execution_mode = selection.tool;
+        self.task_kind = selection.task;
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
+    /// 切换 ACP agent 自己声明的会话模式。
+    fn select_acp_mode(&mut self, mode_id: String, cx: &mut Context<Self>) {
+        let Some(acp) = self.acp.take() else {
+            return;
+        };
+        let mode = agent_client_protocol::schema::v1::SessionModeId::new(mode_id);
+        cx.spawn(async move |this, cx| {
+            let result = acp.set_mode(mode).await;
+            let _ = this.update(cx, |this, cx| {
+                this.acp = Some(acp);
+                if let Err(error) = result {
+                    this.transcript
+                        .push_system(format!("ACP mode switch failed: {error}"));
+                }
+                this.sync_composer(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 切换新式 agent（`SessionConfigOption{category=mode}`）的会话模式。
+    fn select_acp_config_mode(&mut self, value: String, cx: &mut Context<Self>) {
+        let Some(acp) = self.acp.take() else {
+            return;
+        };
+        let Some(config_id) = acp
+            .state()
+            .current_mode_config()
+            .map(|option| option.id.clone())
+        else {
+            self.acp = Some(acp);
+            return;
+        };
+        let value = agent_client_protocol::schema::v1::SessionConfigValueId::new(value);
+        cx.spawn(async move |this, cx| {
+            let result = acp.set_config_option(config_id, value).await;
+            let _ = this.update(cx, |this, cx| {
+                this.acp = Some(acp);
+                if let Err(error) = result {
+                    this.transcript
+                        .push_system(format!("ACP mode switch failed: {error}"));
+                }
+                this.sync_composer(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn new_session(&mut self, cx: &mut Context<Self>) {
         self.history_popover_open = false;
         // ACP 后端:会话由外部 agent 管理,这里仅做视觉重置(清空转录)。
         if self.backend == Backend::Acp {
-            if self.is_running {
-                self.stop(cx);
-                return;
+            // 正在跑的轮次不取消：转入后台继续跑，输出继续落进这个会话的转录缓存。
+            // 用户点「新建对话」意图是开新话题，不是杀掉正在生成的回答。
+            for owner in self.acp_turn_owners.iter_mut() {
+                if owner.session_uid == self.current_session {
+                    owner.backgrounded = true;
+                }
             }
             let session_uid = self.current_session.clone();
             let Some(agent_id) = self.current_acp_id.clone() else {
@@ -2782,7 +5628,15 @@ impl AgentChatView {
             if !retrying_failed_transition {
                 self.pending_submissions.clear_session(&session_uid);
             }
-            self.acp_turn_owner = None;
+            // 屏上转录交给缓存：后台轮次的后续输出靠它接住，不能随 visual reset 丢掉。
+            // 来源记成 agent 那侧：同一条 uid 接下来是**新**协议会话的内容，这份旧转录
+            // 不能被当成「本地历史」摆出来（见 `acp_cached_transcripts`）。
+            let mut stashed = AgentTranscript::new();
+            stashed.set_resource_context(&self.resources);
+            let transcript = std::mem::replace(&mut self.transcript, stashed);
+            self.cache_agent_session_transcript(session_uid.clone(), transcript);
+            self.set_session_running(&session_uid, false, cx);
+            self.set_composers_running(false, cx);
             self.trim_session_transcripts();
             self.sync_pending_preview(cx);
             let operation =
@@ -2790,25 +5644,41 @@ impl AgentChatView {
             self.transcript.clear();
             self.transcript
                 .push_system(t!("AgentUi.creating_acp_session").to_string());
-            self.input
-                .update(cx, |input, cx| input.set_running(true, cx));
+            self.set_composers_running(true, cx);
             self.sync_pending_preview(cx);
             self.request_scroll_to_bottom();
             cx.notify();
+            let workspace_root = self.workspace_root.clone();
             cx.spawn(async move |this, cx| {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-                let result = acp.create_session(cwd).await;
+                let result = acp.create_session(workspace_root).await;
                 let _ = this.update(cx, |this, cx| {
                     if !this.is_current_acp_session_transition(operation, &agent_id, &session_uid) {
                         return;
                     }
-                    this.input
-                        .update(cx, |input, cx| input.set_running(false, cx));
+                    this.set_composers_running(false, cx);
                     this.acp = Some(acp);
                     this.transcript.clear();
+                    let protocol_session_id =
+                        this.acp.as_ref().map(|acp| acp.protocol_session_id());
                     match result {
                         Ok(_) => {
                             this.clear_acp_session_transition(operation);
+                            // 新建出来的会话也是这个内置会话「当前指向」的那条，
+                            // 下次重连要回到它，而不是再开一条空的。
+                            if let Some(protocol_session_id) = protocol_session_id.as_deref() {
+                                this.remember_acp_protocol_session(
+                                    &session_uid,
+                                    &agent_id,
+                                    protocol_session_id,
+                                    cx,
+                                );
+                            }
+                            // 刚建好的会话要立刻出现在会话列表里：以前只有手动点刷新
+                            // 或重连才会拉列表，用户会以为压根没建成。
+                            this.reload_acp_sessions(cx);
+                            // 后台轮次还在飞时不推进队列：`start_next_pending` 先看
+                            // running_sessions，还在跑就直接 Blocked；终态后
+                            // `advance_acp_pending_after_terminal` 会补发。
                             this.start_next_pending(&session_uid, cx);
                         }
                         Err(err) => {
@@ -2831,7 +5701,40 @@ impl AgentChatView {
             .detach();
             return;
         }
+        // 已经站在**当前工作区的一张白纸**上：「新建会话」不该再 produce 第二张
+        // 白纸。（本地后端才有的判断，理由见 `current_session_is_blank`；
+        // 白纸本身归属别的工作区时要照常新建——侧栏不按工作区过滤，用户完全
+        // 可能站在别的工作区的白纸上。）
+        if self.current_session_is_blank(cx)
+            && self.session_belongs_to_current_workspace(&self.current_session)
+        {
+            self.show_archived = false;
+            self.reload_sessions(cx);
+            cx.notify();
+            return;
+        }
+        // 上一张被留在身后的白纸还在的话，回到它——比再造一张更贴近用户预期
+        // （他上一次「新建」得到的那张纸还在，没必要给两张）。
+        let reusable_draft = self
+            .draft_session
+            .clone()
+            .filter(|uid| self.reusable_blank_session(uid));
+        if let Some(draft) = reusable_draft {
+            self.draft_session = None;
+            self.show_archived = false;
+            self.switch_session(&draft, cx);
+            return;
+        }
+        // 指针在本工作区用不上就清掉——**除了**别的工作区的白纸：那张纸在它
+        // 自己的工作区里仍然有效，用户切回去时应当还能复用（每次复用前都会
+        // 经 `reusable_blank_session` 重新校验，指针留着是安全的）。
+        self.draft_session = self
+            .draft_session
+            .take()
+            .filter(|uid| !self.session_belongs_to_current_workspace(uid));
         // 新建前先保存当前会话,避免内容丢失。
+        // 草稿同理：先捕获再落盘，半句话跟着旧会话走。
+        self.capture_session_draft(cx);
         self.persist_current(cx);
         self.show_archived = false;
         self.start_fresh_session(cx);
@@ -2840,14 +5743,41 @@ impl AgentChatView {
     }
 
     /// 切换驱动后端:`None` = One_Agent(自研);`Some(id)` = 对应 ACP agent。
+    ///
+    /// 这是「用户在 agent 菜单里主动挑了一个后端」的唯一入口（设置页对齐、
+    /// 启动恢复都直接调 `select_*_backend`），所以选择在这里落进设置——
+    /// 选完 ACP agent 再选回 One Agent 也记得住，下次启动直接用它。
     fn select_backend(&mut self, agent_id: Option<SharedString>, cx: &mut Context<Self>) {
         if !self.can_select_backend(agent_id.as_ref()) {
             return;
         }
+        self.persist_backend_selection(agent_id.as_ref(), cx);
         match agent_id {
             None => self.select_local_backend(cx),
             Some(id) => self.select_acp_backend(id, cx),
         }
+    }
+
+    /// 把用户挑的后端写进设置，供下次启动恢复。
+    ///
+    /// 选内置时把 `last_acp_agent_id` 一并清掉：设置页的「使用中」标记和
+    /// 旧的恢复路径都以它为事实源，留着会让界面显示「还是那个 ACP agent」。
+    fn persist_backend_selection(
+        &mut self,
+        agent_id: Option<&SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        AppSettings::update_and_save(cx, |settings| {
+            let (selection, last_acp_agent_id) = match agent_id {
+                Some(id) => (
+                    AiChatBackendSelection::Acp { id: id.to_string() },
+                    Some(id.to_string()),
+                ),
+                None => (AiChatBackendSelection::Builtin, None),
+            };
+            settings.ai_chat.last_backend = Some(selection);
+            settings.ai_chat.last_acp_agent_id = last_acp_agent_id;
+        });
     }
 
     fn can_select_backend(&self, agent_id: Option<&SharedString>) -> bool {
@@ -2864,7 +5794,7 @@ impl AgentChatView {
             && self.acp.is_none()
             && !self.acp_connecting
             && self.acp_pending.is_none()
-            && self.acp_turn_owner.is_none()
+            && self.acp_turn_owners.is_empty()
             && self.acp_session_transition.is_none()
             && !self.closed_sessions.contains(&self.current_session)
     }
@@ -2875,8 +5805,14 @@ impl AgentChatView {
             self.stop(cx);
         }
         self.stash_current_transcript();
+        let previous_session = self.current_session.clone();
         let session = self.runtime.create_session(self.resources.clone());
         self.session_id = session.id().clone();
+        // 归属定格：新会话记住创建时的工作区，之后不随外壳切换而漂移。
+        self.session_roots.insert(
+            self.session_id.to_string(),
+            self.workspace_root.to_string_lossy().into_owned(),
+        );
         if self.system_instruction_from_settings {
             // 新会话跟随设置的最新值（含清空）；外部显式指令保持不变。
             self.system_instruction = AppSettings::current(cx)
@@ -2886,13 +5822,20 @@ impl AgentChatView {
         self.apply_system_instruction_to_current_session();
         self.sync_session_skills();
         self.current_session = self.session_id.to_string();
+        // 新建会话也是一次「主动访问」，旧会话留在后退栈里。
+        self.session_navigation
+            .visit(Some(previous_session), self.current_session.as_str());
+        self.session_switcher
+            .record_access(self.current_session.as_str());
         self.closed_sessions.remove(&self.current_session);
         self.trim_session_transcripts();
         self.transcript = AgentTranscript::new();
         self.transcript.set_resource_context(&self.resources);
         self.is_running = false;
-        self.input
-            .update(cx, |input, cx| input.set_running(false, cx));
+        // 新会话从空输入框开始（渲染时应用；文字与附件都换空的——
+        // 上一会话挂在输入框里的图片不许跟过来）。
+        self.pending_input_draft = Some(ComposerDraft::default());
+        self.set_composers_running(false, cx);
         self.sync_pending_preview(cx);
         self.upsert_live_summary(
             self.current_session.clone(),
@@ -2917,15 +5860,19 @@ impl AgentChatView {
         );
     }
 
+    pub(crate) fn showing_archived_sessions(&self) -> bool {
+        self.show_archived
+    }
+
     /// 切换「活跃 / 已归档」视图。
-    fn toggle_archived(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_archived(&mut self, cx: &mut Context<Self>) {
         self.show_archived = !self.show_archived;
         self.reload_sessions(cx);
         cx.notify();
     }
 
     /// 归档(软删除)一个会话;归档当前会话时自动新建空会话顶上。
-    fn apply_archive(&mut self, uid: &str, cx: &mut Context<Self>) {
+    pub(crate) fn apply_archive(&mut self, uid: &str, cx: &mut Context<Self>) {
         if !persistence::set_archived(cx, uid, true) {
             return;
         }
@@ -2945,6 +5892,20 @@ impl AgentChatView {
         }
     }
 
+    /// 关掉用量历史浮层，顺手把数据丢掉——下次打开重新查。
+    /// 关掉转录图片预览。没开着就是空操作。
+    pub(super) fn close_message_image_preview(&mut self, cx: &mut Context<Self>) {
+        if self.message_image_preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn close_usage_history(&mut self, cx: &mut Context<Self>) {
+        if self.usage_history.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// 把当前会话快照写入持久化存储,并刷新其侧边栏摘要(空会话不落库)。
     fn persist_current(&mut self, cx: &mut Context<Self>) {
         let uid = self.current_session.clone();
@@ -2959,15 +5920,53 @@ impl AgentChatView {
         let Some(session) = self.runtime.session(&session_id) else {
             return;
         };
-        if let Some((title, updated_at)) = persistence::save_session(cx, &session) {
+        // 归属定格：优先创建/载入时记录的工作区；缺失（旧数据在本次升级后
+        // 首次落盘）才用当前工作区补。
+        let workspace_root = self
+            .session_roots
+            .get(uid)
+            .cloned()
+            .unwrap_or_else(|| self.workspace_root.to_string_lossy().into_owned());
+        if let Some((title, updated_at)) =
+            persistence::save_session_with_workspace(cx, &session, Some(&workspace_root))
+        {
             self.upsert_live_summary(uid.to_string(), title, updated_at);
         }
+        self.record_local_usage_sample(uid, &session, cx);
+    }
+
+    /// 本地会话落盘顺手记一条用量采样（ACP 会话由 agent 上报那条路径记）。
+    ///
+    /// 没报过计量（`context_tokens` 为 `None`）就不记——宁缺勿造假数据。
+    fn record_local_usage_sample(
+        &self,
+        uid: &str,
+        session: &std::sync::Arc<agent_runtime::Session>,
+        cx: &App,
+    ) {
+        if self.backend != Backend::Local {
+            return;
+        }
+        let Some(used) = session.context_tokens() else {
+            return;
+        };
+        let model = self
+            .selected_model
+            .as_ref()
+            .map(|option| option.model.to_string());
+        let window = model
+            .as_deref()
+            .and_then(crate::usage::model_context_window);
+        persistence::record_usage_sample(cx, uid, used, window, model.as_deref());
     }
 
     fn upsert_live_summary(&mut self, uid: String, title: String, updated_at: i64) {
         self.live_sessions.retain(|summary| summary.id != uid);
-        self.live_sessions
-            .insert(0, SessionSummary::new(uid, title, updated_at));
+        let workspace_root = self.session_roots.get(&uid).cloned();
+        self.live_sessions.insert(
+            0,
+            SessionSummary::new(uid, title, updated_at).with_workspace_root(workspace_root),
+        );
     }
 
     fn touch_session_transcript(&mut self, uid: &str) {
@@ -2979,6 +5978,25 @@ impl AgentChatView {
     }
 
     fn cache_session_transcript(&mut self, uid: String, transcript: AgentTranscript) {
+        self.cache_session_transcript_with_origin(uid, transcript, false);
+    }
+
+    /// 收下一段**外部 agent** 的转录（来源标记见 [`Self::acp_cached_transcripts`]）。
+    fn cache_agent_session_transcript(&mut self, uid: String, transcript: AgentTranscript) {
+        self.cache_session_transcript_with_origin(uid, transcript, true);
+    }
+
+    fn cache_session_transcript_with_origin(
+        &mut self,
+        uid: String,
+        transcript: AgentTranscript,
+        from_agent: bool,
+    ) {
+        if from_agent {
+            self.acp_cached_transcripts.insert(uid.clone());
+        } else {
+            self.acp_cached_transcripts.remove(&uid);
+        }
         self.session_transcripts.insert(uid.clone(), transcript);
         self.touch_session_transcript(&uid);
         self.trim_session_transcripts();
@@ -2986,12 +6004,14 @@ impl AgentChatView {
 
     fn remove_cached_session_transcript(&mut self, uid: &str) -> Option<AgentTranscript> {
         self.session_transcript_order.retain(|item| item != uid);
+        self.acp_cached_transcripts.remove(uid);
         self.session_transcripts.remove(uid)
     }
 
     fn clear_cached_session_transcripts(&mut self) {
         self.session_transcripts.clear();
         self.session_transcript_order.clear();
+        self.acp_cached_transcripts.clear();
     }
 
     fn session_transcript_is_protected(&self, uid: &str) -> bool {
@@ -2999,9 +6019,9 @@ impl AgentChatView {
             || self.running_sessions.contains(uid)
             || self.pending_submissions.len(uid) > 0
             || self
-                .acp_turn_owner
-                .as_ref()
-                .is_some_and(|owner| owner.session_uid == uid)
+                .acp_turn_owners
+                .iter()
+                .any(|owner| owner.session_uid == uid)
             || self
                 .acp_session_transition
                 .as_ref()
@@ -3034,17 +6054,288 @@ impl AgentChatView {
                 .remove(index)
                 .expect("session transcript LRU index must remain valid");
             self.session_transcripts.remove(&uid);
+            self.acp_cached_transcripts.remove(&uid);
         }
     }
 
-    fn stash_current_transcript(&mut self) {
-        if self.backend != Backend::Local {
-            return;
-        }
+    /// 把屏幕上的转录收进会话缓存。返回**是否真的收下了一段非空转录**。
+    ///
+    /// 返回值给调用方判断要不要提示用户「本地这段不会带到 agent 那边」：空转录没什么可失的，
+    /// 提示只会变成噪音。
+    ///
+    /// 空转录**不入缓存**：缓存里留一个空壳会遮蔽 Runtime 快照重建
+    /// （见 [`Self::restore_local_transcript`]），让「切回本地」看起来像历史丢了。
+    ///
+    /// 外部 agent 会话的转录**也要留住**：那条会话的轮次不会因为切走而取消，
+    /// 而 agent 侧的 `load` 在轮次在飞时是被挡住的（要保住前台轮次的所有权，见
+    /// [`Self::open_protocol_session`]）。回来时唯一能把历史摆回屏幕的途径就是
+    /// 这块缓存——不留在本地，屏上就只剩一个「执行中」。
+    fn stash_current_transcript(&mut self) -> bool {
+        let from_agent = self.backend != Backend::Local;
         let mut replacement = AgentTranscript::new();
         replacement.set_resource_context(&self.resources);
         let transcript = std::mem::replace(&mut self.transcript, replacement);
-        self.cache_session_transcript(self.current_session.clone(), transcript);
+        if transcript.is_empty() {
+            return false;
+        }
+        if from_agent {
+            self.cache_agent_session_transcript(self.current_session.clone(), transcript);
+        } else {
+            self.cache_session_transcript(self.current_session.clone(), transcript);
+        }
+        true
+    }
+
+    /// 把输入框里尚未发送的文字记到当前会话上（会话草稿）。
+    ///
+    /// 调用时机：**离开当前会话之前**（切换 / 新建），且必须在 `persist_current`
+    /// 之前——落盘走 `session.snapshot()`，草稿要先写进 Runtime 会话才会被带上。
+    /// 草稿是每个会话独立的：切走再切回，输入框显示的是**那个会话自己**的
+    /// 未发送内容，而不是全局共享一块输入。
+    ///
+    /// 附件是**只读捕获**（`ImageAttachment` 内是 `Arc`，克隆廉价）：不把图片从
+    /// 输入框里拿走，留给 `apply_pending_input_draft` 在切换成立后整体替换——
+    /// 这样切换中途失败（目标快照加载不到）时输入框原样未动，不会出现
+    /// 「图没了、字还在」的中间态。
+    fn capture_session_draft(&mut self, cx: &App) {
+        // 上一次切换排队的草稿还没落进输入框：此刻输入框里显示的是**再上一个**
+        // 会话的内容，当成当前会话的草稿捕获就串台了。当前会话的正确草稿
+        // 仍在 Runtime 会话上（staging 只读不写），跳过即可。两次切换之间
+        // 必然没有用户输入（中间隔着一帧渲染），不会漏掉真实的编辑。
+        if self.pending_input_draft.is_some() {
+            return;
+        }
+        if self.closed_sessions.contains(&self.current_session) {
+            return;
+        }
+        let text = self.composer_text(cx);
+        let images = self.composer_attachments(cx);
+        let has_draft = !text.trim().is_empty() || !images.is_empty();
+        if let Some(session) = self
+            .runtime
+            .session(&SessionId::from_string(self.current_session.clone()))
+        {
+            session.set_draft(has_draft.then(|| text.clone()));
+        }
+        if images.is_empty() {
+            self.session_draft_attachments.remove(&self.current_session);
+        } else {
+            self.session_draft_attachments
+                .insert(self.current_session.clone(), images.clone());
+        }
+        // 落库。库里那行是**权威草稿**（文字 + 附件一起），快照里那份只是随消息
+        // 顺带写下的副本——空会话没有快照，那份副本根本不存在。
+        persistence::save_composer_draft(cx, &self.current_session, &text, &images);
+        if has_draft {
+            self.drafted_sessions.insert(self.current_session.clone());
+        } else {
+            self.drafted_sessions.remove(&self.current_session);
+        }
+    }
+
+    /// 排一次草稿保存；250ms 内再次输入会把上一次顶掉重排。
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        let session = self.current_session.clone();
+        self.draft_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DRAFT_SAVE_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.flush_draft_save(&session, cx));
+        }));
+    }
+
+    /// 防抖到点：把输入框里的内容写进草稿表。
+    ///
+    /// `uid` 与当前会话不一致就什么都不做——这期间用户已经切走了，输入框里
+    /// 现在是**另一个会话**的内容，照旧 uid 存下去就是串台。
+    fn flush_draft_save(&mut self, uid: &str, cx: &mut Context<Self>) {
+        if uid != self.current_session {
+            return;
+        }
+        self.capture_session_draft(cx);
+        cx.notify();
+    }
+
+    /// 这条会话有没有没发出去的草稿（会话列表行上的标记）。
+    pub(crate) fn session_has_draft(&self, uid: &str) -> bool {
+        self.drafted_sessions.contains(uid)
+    }
+
+    /// 目标会话的草稿送入输入框（经 [`Self::pending_input_draft`] 在渲染时应用）。
+    ///
+    /// 没有 `window` 时只排队不写——渲染帧必然到来，见字段注释。
+    fn stage_session_draft(&mut self, uid: &str, cx: &App) {
+        // 草稿表优先：文字与附件一起从库里取。附件过去只活在内存里，重启即丢；
+        // 库里没有记录（从没写过草稿 / 旧版本升级上来）才回落到运行时草稿。
+        if let Some(record) = persistence::load_composer_draft(cx, uid) {
+            self.pending_input_draft = Some(ComposerDraft {
+                text: record.text,
+                images: record.attachments,
+            });
+            return;
+        }
+        let text = self
+            .runtime
+            .session(&SessionId::from_string(uid.to_string()))
+            .and_then(|session| session.draft())
+            .unwrap_or_default();
+        let images = self
+            .session_draft_attachments
+            .get(uid)
+            .cloned()
+            .unwrap_or_default();
+        self.pending_input_draft = Some(ComposerDraft { text, images });
+    }
+
+    /// 渲染开头应用排队的草稿。只有切换会话/切换后端会排队，平时是 no-op。
+    ///
+    /// 文字与附件**一起**换：附件是整体替换——目标会话没有附件草稿时，
+    /// 上一会话挂在输入框里的图片必须被清掉，否则会跟着新会话一起发出去。
+    fn apply_pending_input_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(draft) = self.pending_input_draft.take() {
+            let composer = self.composer();
+            composer.set_composer_text(&draft.text, window, cx);
+            composer.set_composer_attachments(draft.images, cx);
+        }
+    }
+
+    /// 起手话按后端分口味：内置 One Agent 没有工作区读写工具，代码向的
+    /// 「讲讲这个项目」对它就是坏提示；外部 ACP agent 恰恰相反。
+    fn starter_flavor(&self) -> crate::empty_state::StarterFlavor {
+        match self.backend {
+            Backend::Local => crate::empty_state::StarterFlavor::Builtin,
+            Backend::Acp => crate::empty_state::StarterFlavor::Acp,
+        }
+    }
+
+    /// 点了空态里的起手话：填进输入框并把光标交回去，**不**直接发送。
+    ///
+    /// 直接发出去等于替用户按了发送键：起手话是给人改的草稿，不是命令。
+    fn apply_starter_prompt(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = crate::empty_state::starter_prompt(self.starter_flavor(), index);
+        let composer = self.composer();
+        composer.set_composer_text(&prompt, window, cx);
+        composer.focus_input(window, cx);
+        cx.notify();
+    }
+
+    /// `uid` 的 **Runtime 历史**是否还只有系统提示——即这个会话到底有没有被用过。
+    ///
+    /// 这是空白判定的**事实源**（不看屏幕转录）：转录可能只是留在缓存里的副本，
+    /// 或者在流式过程中短暂落后于历史。Runtime 不在这个会话时返回 `false`
+    /// （「不敢当白纸」比「误当白纸」安全得多）。
+    fn runtime_history_is_blank(&self, uid: &str) -> bool {
+        let session_id = SessionId::from_string(uid.to_string());
+        self.runtime.session(&session_id).is_some_and(|session| {
+            session
+                .snapshot()
+                .history
+                .iter()
+                .all(HistoryItem::is_system_note)
+        })
+    }
+
+    /// 当前会话是否还是一张白纸：**本地后端**、屏幕上没聊过、Runtime 历史也没聊过、
+    /// 没在跑、没有排队提交、输入框也空着（**文字与附件都空**）。
+    ///
+    /// 只看本地后端：ACP 的转录空白并不等于 agent 那边没有上下文——`session/resume`
+    /// 按设计不回放历史，转录正是空的，可 agent 手里握着整段对话（见
+    /// [`AcpSessionContinuity::ReusedWithoutHistory`]）。把「转录空」当「会话空」，
+    /// 会让用户点「新建会话」时被静默拦下，那才是真 bug。
+    ///
+    /// 输入框非空（文字**或**挂了图片）也算「不空」：用户已经开始准备内容了，
+    /// 他要的是一个干净输入框；这些半成品会跟着旧会话留在它的草稿里
+    /// （见 [`Self::stage_session_draft`]），不会被吞。
+    fn current_session_is_blank(&self, cx: &App) -> bool {
+        self.backend == Backend::Local
+            && !self.transcript.has_conversation()
+            && self.runtime_history_is_blank(&self.current_session)
+            && !self.is_running
+            && self
+                .pending_submissions
+                .items(self.current_session.as_str())
+                .is_empty()
+            && self.composer_text(cx).trim().is_empty()
+            && self.composer_attachments(cx).is_empty()
+    }
+
+    /// 离开当前会话时，若它还是白纸就记下来当「可复用的草稿会话」。
+    ///
+    /// 不记的话，用户每点一次「+」都在侧栏留一个空条目：
+    /// 空白会话增殖是「新建会话」最容易被抱怨的地方。
+    fn remember_blank_session_on_leave(&mut self, cx: &App) {
+        if !self.current_session_is_blank(cx) {
+            return;
+        }
+        let uid = self.current_session.clone();
+        if !self.closed_sessions.contains(&uid) {
+            self.draft_session = Some(uid);
+        }
+    }
+
+    /// `uid` 是否是一张仍在运行时里、还没被聊过的白纸。
+    ///
+    /// 判据取 Runtime 的**历史**而不是屏幕转录：转录可能是切换时留在缓存里的副本，
+    /// 历史才是「这个会话到底说过话没有」的事实源。
+    ///
+    /// 只复用**当前工作区**的白纸：工作区 B 里点「新建」不该把用户切到工作区 A
+    /// 留下的白纸上——那张纸的快照归属、落盘目录都是 A 的。这条约束按工作区生效，
+    /// 工作区不同的白纸一律不复用。
+    fn reusable_blank_session(&self, uid: &str) -> bool {
+        if uid == self.current_session
+            || self.closed_sessions.contains(uid)
+            || self.running_sessions.contains(uid)
+            || !self.pending_submissions.items(uid).is_empty()
+            || !self.session_belongs_to_current_workspace(uid)
+        {
+            return false;
+        }
+        self.runtime_history_is_blank(uid)
+    }
+
+    /// 会话是否归属于当前工作区。
+    ///
+    /// 没有记录归属（旧数据 / 测试里直接 restore 的会话）视为归属当前工作区 ——
+    /// 与落盘时的兜底同一约定（见 [`Self::persist_session`]）。注意这只是**判定**
+    /// 用的默认值：点开一条无归属旧会话不会给它定格归属，别拿这里的 `true`
+    /// 去反推「它就属于当前工作区」并回写。
+    fn session_belongs_to_current_workspace(&self, uid: &str) -> bool {
+        let Some(root) = self.session_roots.get(uid) else {
+            return true;
+        };
+        *root == self.workspace_root.to_string_lossy().into_owned()
+    }
+
+    /// 切回本地后端时把该会话的本地转录放回屏幕。
+    ///
+    /// 顺序：内存缓存（离开本地时 stash 的）→ Runtime 快照重建 → 清空。
+    /// 不能无条件清空：屏幕上此刻是 ACP agent 的内容，清掉就等于把本地那段对话抹了，
+    /// 这正是「会话记不住」的观感来源。
+    ///
+    /// 缓存命中也要看**是否非空**：可能有人往这个会话的缓存里塞过一个空壳转录
+    /// （例如连接失败时给非当前会话建过一块），空壳命中会让下面的 Runtime 重建被跳过，
+    /// 屏幕上就空了——而 Runtime 里历史还在。
+    ///
+    /// 缓存里装的是**外部 agent** 的内容时直接跳过（`acp_cached_transcripts`）：
+    /// 那段的归属在 agent 那边，拿来当本地历史就是串台。跳过时**不消费**这条缓存，
+    /// 它在 agent 那侧仍然有效（切回去还要靠它把历史摆上屏幕）。
+    fn restore_local_transcript(&mut self, session_uid: &str) {
+        if !self.acp_cached_transcripts.contains(session_uid)
+            && let Some(transcript) = self.remove_cached_session_transcript(session_uid)
+            && !transcript.is_empty()
+        {
+            self.transcript = transcript;
+            self.transcript.set_resource_context(&self.resources);
+            return;
+        }
+        self.transcript.clear();
+        let session_id = SessionId::from_string(session_uid.to_string());
+        let Some(session) = self.runtime.session(&session_id) else {
+            self.transcript.set_resource_context(&self.resources);
+            return;
+        };
+        let snapshot = session.snapshot();
+        self.transcript
+            .load_history(&snapshot.history, snapshot.plan.as_ref());
+        self.transcript.set_resource_context(&self.resources);
     }
 
     fn discard_live_session(&mut self, uid: &str) {
@@ -3071,11 +6362,109 @@ impl AgentChatView {
         self.runtime.close_session(&session_id);
         self.pending_submissions.remove_session(uid);
         self.remove_cached_session_transcript(uid);
+        // 会话没了，它的附件草稿（可能握着几 MB 的图片）也要一并放掉。
+        self.session_draft_attachments.remove(uid);
+        // 这张纸没了，别再拿它当「可复用的空白草稿」。
+        if self.draft_session.as_deref() == Some(uid) {
+            self.draft_session = None;
+        }
         self.live_sessions.retain(|summary| summary.id != uid);
+        // 会话没了：导航栈里也不能再有它，否则后退会落到一个不存在的会话。
+        self.session_navigation.remove(uid);
+        // 切换器的 recency / 列表同样要清。
+        self.session_switcher.remove(uid);
     }
 
     /// 切换到另一个(已持久化的)会话:保存当前 → 加载快照恢复 → 重建转录。
     fn switch_session(&mut self, uid: &str, cx: &mut Context<Self>) {
+        self.switch_session_with_origin(uid, SessionSwitchOrigin::Visit, cx);
+    }
+
+    /// 回到一条外部 agent 会话：把**这条 uid 现在指向的协议会话**上还在飞的轮次
+    /// 收回前台（撤掉 `backgrounded`）。
+    ///
+    /// 这个标记只表示「输出别上屏」。切走是临时的，人回来了就该撤：不撤，后续输出会
+    /// 继续落进缓存——屏上停在切回来那一刻，看着像卡住；停止按钮也不作用在它身上
+    /// （见 [`AcpTurnOwner::mark_cancel_requested`]）。
+    ///
+    /// 判据是**协议会话**而不是 uid：uid 被「新建对话」换过协议会话时，旧轮的输出
+    /// 属于上一段对话，不能因为 uid 相同就放它上屏。有连接时问连接要这条协议会话上
+    /// 在飞的轮次 id；没有连接就没有事件可路由，放开是安全的（重连会清空 owner）。
+    fn reclaim_foreground_turn(&mut self) {
+        let session_uid = self.current_session.clone();
+        let protocol_session_id = self
+            .runtime
+            .session(&SessionId::from_string(session_uid.clone()))
+            .and_then(|session| session.acp_ref())
+            .map(|reference| reference.session_id);
+        let Some(acp) = self.acp.as_ref() else {
+            for owner in self.acp_turn_owners.iter_mut() {
+                if owner.session_uid == session_uid {
+                    owner.backgrounded = false;
+                }
+            }
+            return;
+        };
+        let Some(protocol_session_id) = protocol_session_id else {
+            // 连接在、这条 uid 却没有协议会话地址：判不出那轮属于谁，保守不动。
+            return;
+        };
+        let active_turn = acp.active_turn_id_for(&protocol_session_id);
+        for owner in self.acp_turn_owners.iter_mut() {
+            if owner.session_uid == session_uid
+                && owner.backgrounded
+                && active_turn.as_ref() == Some(&owner.turn_id)
+            {
+                owner.backgrounded = false;
+            }
+        }
+    }
+
+    /// 后退/前进导航：切换到导航栈给出的目标。
+    ///
+    /// 栈的移动（go_back/go_forward）发生在调用**之前**，这里只负责切换本身，
+    /// 不再向 back 栈压入当前会话——否则后退会变成「来回横跳永不收敛」。
+    fn navigate_session(&mut self, uid: &str, cx: &mut Context<Self>, origin: SessionSwitchOrigin) {
+        debug_assert!(
+            origin != SessionSwitchOrigin::Visit,
+            "导航路径不该走 Visit 语义"
+        );
+        self.switch_session_with_origin(uid, origin, cx);
+    }
+
+    /// 会话后退；没有可退的目标时是 no-op（不是错误）。
+    fn navigate_session_back(&mut self, cx: &mut Context<Self>) {
+        let current = self.current_session.clone();
+        if self
+            .session_navigation
+            .back_target()
+            .is_some_and(|target| target != current)
+            && let Some(target) = self.session_navigation.go_back(&current)
+        {
+            self.navigate_session(&target, cx, SessionSwitchOrigin::Back);
+        }
+    }
+
+    /// 会话前进；没有可进的目标时是 no-op。
+    fn navigate_session_forward(&mut self, cx: &mut Context<Self>) {
+        let current = self.current_session.clone();
+        if self
+            .session_navigation
+            .forward_target()
+            .is_some_and(|target| target != current)
+            && let Some(target) = self.session_navigation.go_forward(&current)
+        {
+            self.navigate_session(&target, cx, SessionSwitchOrigin::Forward);
+        }
+    }
+
+    /// 切换会话的统一实现。`origin` 决定导航栈怎么记账（见 [`SessionSwitchOrigin`]）。
+    fn switch_session_with_origin(
+        &mut self,
+        uid: &str,
+        origin: SessionSwitchOrigin,
+        cx: &mut Context<Self>,
+    ) {
         // 侧边栏视图:从历史 Popover 选择后随即收起。
         self.history_popover_open = false;
         if uid == self.current_session {
@@ -3083,9 +6472,23 @@ impl AgentChatView {
             cx.notify();
             return;
         }
+        let previous_session = self.current_session.clone();
+        // 把「离开的是一张白纸」记下来（判定要在 `transcript` 被换掉之前做）。
+        self.remember_blank_session_on_leave(cx);
+        // ACP 的在飞轮次不取消：转入后台，输出继续回流到这个会话的转录缓存。
+        if self.backend == Backend::Acp {
+            for owner in self.acp_turn_owners.iter_mut() {
+                if owner.session_uid == previous_session {
+                    owner.backgrounded = true;
+                }
+            }
+        }
         if self.is_running && should_stop_task_before_session_switch(self.backend) {
             self.stop(cx);
         }
+        // 草稿必须先于落盘捕获：persist_current 走 session.snapshot()，
+        // 晚一步这次切换产生的草稿就不会进快照。
+        self.capture_session_draft(cx);
         self.persist_current(cx);
         self.stash_current_transcript();
 
@@ -3102,11 +6505,19 @@ impl AgentChatView {
                 cx.notify();
                 return;
             };
+            // 载入即定格：快照里**记过**归属就照它定格；没有归属的旧会话保持
+            // 「无归属」——点开看一眼不是归属变更（侧栏「未分组」就是它的语义），
+            // 真正的定格留到它下次落盘（见 [`Self::persist_session`] 的兜底）。
+            if let Some(root) = snapshot.workspace_root.clone() {
+                self.session_roots.insert(uid.to_string(), root);
+            }
             let restored = self.runtime.restore_session(snapshot);
             restored.set_resources(self.resources.clone());
             restored
         };
         self.closed_sessions.remove(uid);
+        // 这段对话是不是归外部 agent 管：运行时会话带着地址（从快照恢复的同样带）。
+        let external_agent = target.acp_ref();
         self.session_id = target.id().clone();
         // 快照自带指令的会话优先快照值（行为可复现）；没有指令的旧会话回落到
         // 当前全局设置（可能为空），并继续保持来源跟随设置。
@@ -3117,8 +6528,21 @@ impl AgentChatView {
         });
         self.system_instruction_from_settings = target.system_instruction().is_none();
         self.current_session = self.session_id.to_string();
+        // 只有「用户主动访问」才进导航历史；后退/前进本身不动栈（栈在调用前已移动）。
+        if origin == SessionSwitchOrigin::Visit {
+            self.session_navigation
+                .visit(Some(previous_session), self.current_session.as_str());
+            // 用户已经点了别的会话：切换器不再悬着（提交守卫之外的主动关闭）。
+            self.session_switcher.dismiss();
+        }
+        // recency：无论来源（点击 / 后退 / 前进 / 切换器），都是一次真实访问。
+        self.session_switcher.record_access(uid);
+        // 切换已成立：输入框换显示目标会话自己的草稿（渲染时应用）。
+        self.stage_session_draft(uid, cx);
         self.apply_system_instruction_to_current_session();
-        if let Some(transcript) = self.remove_cached_session_transcript(uid) {
+        if let Some(transcript) = self.remove_cached_session_transcript(uid)
+            && !transcript.is_empty()
+        {
             self.transcript = transcript;
         } else {
             let snapshot = target.snapshot();
@@ -3128,14 +6552,21 @@ impl AgentChatView {
         }
         self.trim_session_transcripts();
         self.is_running = self.running_sessions.contains(uid);
-        self.input
-            .update(cx, |input, cx| input.set_running(self.is_running, cx));
+        self.set_composers_running(self.is_running, cx);
+        // 人回到这条外部会话了：还在跑的那轮又回到眼前（输出上屏、停止可用）。
+        if external_agent.is_some() {
+            self.reclaim_foreground_turn();
+        }
         self.sync_pending_preview(cx);
         self.reload_sessions(cx);
         self.sync_composer(cx);
         self.request_scroll_to_bottom();
         if self.backend == Backend::Acp && !self.is_running {
             self.start_or_reconnect_current_pending(cx);
+        }
+        // 回到一条外部 agent 会话：把 agent 那边接回来（本地只有地址，历史在它手上）。
+        if let Some(reference) = external_agent {
+            self.reopen_acp_session(uid, reference, cx);
         }
         cx.notify();
     }
@@ -3250,6 +6681,11 @@ impl AgentChatView {
     /// 提交删除:从存储与列表移除;若删的是当前会话,自动新建一个空会话。
     fn apply_delete(&mut self, uid: &str, cx: &mut Context<Self>) {
         persistence::delete_session(cx, uid);
+        // 用量流水跟着会话一起收：“历史上那条已经不存在的会话用了多少”没意义。
+        persistence::clear_usage_samples(cx, uid);
+        // 草稿同理：会话都不在了，留一条草稿只会让列表标记凭空多出来一条。
+        persistence::clear_composer_draft(cx, uid);
+        self.drafted_sessions.remove(uid);
         if self.current_session == uid {
             self.start_fresh_session(cx);
         }
@@ -3296,7 +6732,7 @@ impl AgentChatView {
             .collect();
         let ctx = build_composer_context(
             &self.resources,
-            self.tool_execution_mode,
+            self.execution_selection(),
             self.selected_model.as_ref(),
             self.transcript.latest_plan(),
             self.transcript.active_subagents(),
@@ -3308,11 +6744,61 @@ impl AgentChatView {
             &self.available_resources,
             self.skills.summary(),
             self.skills.items(),
+            self.local_context_tokens(),
         );
+        // 目标选择器只有 One agent 那份有：这里照旧喂给 `input`，切到 ACP 时
+        // 它不挂载，喂了也无副作用；上下文则按后端起手送进当前那一份。
         self.input.update(cx, |input, cx| {
             input.set_target_options(target_options, cx);
-            input.set_context(ctx, cx);
         });
+        self.composer().set_context(ctx, cx);
+    }
+
+    /// 注册「每轮发送前重建资源上下文」的回调。
+    ///
+    /// 侧边栏用它把终端等资源的实时状态注入本轮资源池：回调在主线程执行，
+    /// 因此可以读取实体最新状态；返回 `None` 时本轮沿用现有资源池。
+    pub fn set_resource_context_refresher(
+        &mut self,
+        refresher: Option<ResourceContextRefresher>,
+        cx: &mut Context<Self>,
+    ) {
+        self.resource_context_refresher = refresher;
+        cx.notify();
+    }
+
+    /// 设置「随消息附加正文」的回调（回调返回 `Some` 时正文拼在本轮输入前面）。
+    pub fn set_context_attachment_provider(
+        &mut self,
+        provider: Option<ContextAttachmentProvider>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_attachment_provider = provider;
+        cx.notify();
+    }
+
+    /// 本轮要附加的正文；没有回调或回调返回空正文时为 `None`。
+    fn context_attachment(&self, cx: &App) -> Option<ContextAttachment> {
+        self.context_attachment_provider
+            .as_ref()
+            .and_then(|provider| provider(cx))
+    }
+
+    /// 发送前重建资源上下文，让本轮 prompt 带上资源的最新状态。
+    fn refresh_resources_before_turn(
+        &mut self,
+        session: &Arc<agent_runtime::Session>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(refresher) = self.resource_context_refresher.clone() else {
+            return;
+        };
+        let Some(resources) = refresher(cx) else {
+            return;
+        };
+        session.set_resources(resources.clone());
+        self.resources = resources;
+        self.sync_resource_targets(cx);
     }
 
     /// 更新可操作资源上下文与 `@` 提及项。
@@ -3365,7 +6851,7 @@ impl AgentChatView {
             .collect();
         let ctx = build_composer_context(
             &self.resources,
-            self.tool_execution_mode,
+            self.execution_selection(),
             self.selected_model.as_ref(),
             self.transcript.latest_plan(),
             self.transcript.active_subagents(),
@@ -3377,18 +6863,44 @@ impl AgentChatView {
             &self.available_resources,
             self.skills.summary(),
             self.skills.items(),
+            self.local_context_tokens(),
         );
+        // 业务资源换了：留一份给工作区文件重新合并用（文件那份不用重扫，根没动）。
+        self.resource_mentions = mentions;
+        self.refresh_workspace_mentions(cx);
+        // 同 `sync_resource_targets`：目标选择器只喂 One agent 那份，上下文按后端送。
         self.input.update(cx, |input, cx| {
-            input.set_mentions(mentions, cx);
             input.set_target_options(target_options, cx);
-            input.set_context(ctx, cx);
         });
+        self.composer().set_context(ctx, cx);
         if self.sidebar_mode {
             self.request_scroll_to_bottom_until_layout_settles();
         } else {
             self.request_scroll_to_bottom();
         }
         cx.notify();
+    }
+
+    /// 重新收集 `@` 里的工作区文件，并与业务资源合并推给输入框。
+    ///
+    /// 目录遍历放后台：工作区可能有几万个文件，把它压在首帧或换根那一帧里，
+    /// 用户会看到面板卡一下再出现。代价是补全菜单里文件**稍后**才出现——
+    /// 键入 `@` 花的几百毫秒通常足够遍历跑完。
+    pub(crate) fn refresh_workspace_mentions(&mut self, cx: &mut Context<Self>) {
+        let root = self.workspace_root.clone();
+        let base = self.resource_mentions.clone();
+        let input = self.input.clone();
+        self.workspace_mentions_task = Some(cx.spawn(async move |_this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(
+                    async move { crate::workspace_files::collect_workspace_files_default(&root) },
+                )
+                .await;
+            let mut all = base;
+            all.extend(files);
+            input.update(cx, |input, cx| input.set_mentions(all, cx));
+        }));
     }
 
     /// 注册代码块操作。
@@ -3398,7 +6910,11 @@ impl AgentChatView {
 
     pub fn set_theme(&mut self, theme: Option<AgentChatTheme>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
+        // 观感是**视图**的属性，不是某一份输入框的：两份都更新，之后无论挂哪一份
+        // 都不会退回默认配色。
         self.input
+            .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
+        self.acp_input
             .update(cx, |input, cx| input.set_theme(theme, cx));
         cx.notify();
     }
@@ -3422,29 +6938,29 @@ impl AgentChatView {
         let running_animation_id = running_session_animation_id(&uid);
 
         // 标题区:活跃视图可点击切换;归档视图只读。
-        let label = session_sidebar::session_row_with_style(session, selected, row_style).when(
-            running,
-            move |label| {
-                let debug_selector = running_indicator_id.clone();
-                label.child(
-                    h_flex()
-                        .id(SharedString::from(running_indicator_id))
-                        .debug_selector(move || debug_selector.clone())
-                        .items_center()
-                        .gap_0p5()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(running_color)
-                        .child(
-                            Spinner::new()
-                                .small()
-                                .color(running_color)
-                                .animation_id(running_animation_id),
-                        )
-                        .child(t!("AgentUi.running").to_string()),
-                )
-            },
-        );
+        let has_draft = self.session_has_draft(&session.id);
+        let label =
+            session_sidebar::session_row_with_style(session, selected, has_draft, row_style, cx)
+                .when(running, move |label| {
+                    let debug_selector = running_indicator_id.clone();
+                    label.child(
+                        h_flex()
+                            .id(SharedString::from(running_indicator_id))
+                            .debug_selector(move || debug_selector.clone())
+                            .items_center()
+                            .gap_0p5()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(running_color)
+                            .child(
+                                Spinner::new()
+                                    .small()
+                                    .color(running_color)
+                                    .animation_id(running_animation_id),
+                            )
+                            .child(t!("AgentUi.running").to_string()),
+                    )
+                });
         let label_area = if archived_view {
             div().flex_1().min_w_0().child(label).into_any_element()
         } else {
@@ -3550,34 +7066,7 @@ impl AgentChatView {
                 .into_any_element();
         }
 
-        let body = if self.backend == Backend::Acp {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .p_3()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t!("AgentUi.acp_external_managed").to_string()),
-                )
-                .into_any_element()
-        } else {
-            let sessions = self.sessions.clone();
-            let rows: Vec<gpui::AnyElement> = sessions
-                .iter()
-                .map(|session| self.render_session_row(session, cx))
-                .collect();
-            v_flex()
-                .id("agent-session-list")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .p_2()
-                .gap_1()
-                .children(rows)
-                .into_any_element()
-        };
+        let body = self.render_sidebar_body(cx);
 
         v_flex()
             .w(one_ui::theme_geometry().layout.context_sidebar_default)
@@ -3589,6 +7078,68 @@ impl AgentChatView {
             .bg(cx.theme().muted)
             .child(self.render_sidebar_header(cx))
             .child(body)
+            .into_any_element()
+    }
+
+    /// 侧栏主体：内置 agent 会话 ∪ ACP 历史会话。
+    ///
+    /// 方案 §7.1 要的「统一列表」：ACP 会话不再把整个侧栏换成一句「externally managed」，
+    /// 而是和内置会话并排，只是额外标出来源。ACP 能力不支持时才退回那句说明。
+    fn render_sidebar_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let sessions = self.sessions.clone();
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(sessions.len() + 4);
+        for session in &sessions {
+            rows.push(self.render_session_row(session, cx));
+        }
+
+        let theme = resolve_agent_chat_theme(self.theme.as_ref(), cx);
+        if self.acp_session_list_visible() {
+            rows.push(acp_session_section_header(
+                &theme,
+                SharedString::from("agent-acp-sessions-refresh"),
+                cx.listener(|this, _, _, cx| this.reload_acp_sessions(cx)),
+            ));
+            if let Some(model) = self.acp_session_list_model() {
+                let current = self.acp_session_id_snapshot();
+                for summary in &model.sessions {
+                    let id = summary.id.clone();
+                    rows.push(acp_session_row(
+                        &theme,
+                        summary,
+                        current.as_deref() == Some(summary.id.as_str()),
+                        SharedString::from(format!("agent-acp-session-{}", summary.id)),
+                        cx.listener(move |this, _, _, cx| this.open_acp_session(&id, cx)),
+                    ));
+                }
+                if let Some(placeholder) = acp_session_placeholder(
+                    &theme,
+                    cx.theme().danger,
+                    model.loading,
+                    model.error.as_deref(),
+                    !model.sessions.is_empty(),
+                ) {
+                    rows.push(placeholder);
+                }
+            }
+        } else if self.backend == Backend::Acp {
+            rows.push(
+                div()
+                    .p_2()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("AgentUi.acp_external_managed").to_string())
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .id("agent-session-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_2()
+            .gap_1()
+            .children(rows)
             .into_any_element()
     }
 
@@ -3719,6 +7270,85 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// 当前可见会话列表（已合并实时运行中的会话）。
+    pub fn session_summaries(&self) -> Vec<SessionSummary> {
+        self.sessions.clone()
+    }
+
+    /// 当前会话标识。
+    pub fn current_session_id(&self) -> &str {
+        &self.current_session
+    }
+
+    /// 当前会话是否已经产生对话内容。
+    ///
+    /// 用于决定工作区选择器是否允许切换当前会话的工作区：
+    /// 空会话可以随用户切工作区，已有消息后工作区被锁定。
+    pub fn current_session_has_messages(&self) -> bool {
+        !self.transcript.messages.is_empty()
+    }
+
+    /// 宿主同步「某会话里哪些轮次可以回滚」。
+    ///
+    /// 由工作区浏览器在快照锚定成功 / 回滚截断后推送**全量**列表。视图不自行推断：
+    /// 快照可能锚定失败，猜错就会渲染出一个点了没反应的按钮。
+    pub fn set_restorable_turns(
+        &mut self,
+        session_id: String,
+        turn_ids: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // 调用方是事件驱动的（轮次结束 / 回滚完成），不是逐帧渲染，直接重绘即可。
+        if turn_ids.is_empty() {
+            self.restorable_turns.remove(&session_id);
+        } else {
+            self.restorable_turns.insert(session_id, turn_ids);
+        }
+        cx.notify();
+    }
+
+    /// 宿主同步「某会话里哪些轮次留下了整轮 diff」。
+    ///
+    /// 与 [`Self::set_restorable_turns`] 同一套约定（宿主推全量，视图不自行推断），
+    /// 但判定依据不同：这里只算**有实质 diff** 的轮次——页脚据此决定要不要摆
+    /// 「查看改动」，摆了却点开一片空白等于没有入口。
+    pub fn set_reviewed_turns(
+        &mut self,
+        session_id: String,
+        turn_ids: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if turn_ids.is_empty() {
+            self.reviewed_turns.remove(&session_id);
+        } else {
+            self.reviewed_turns.insert(session_id, turn_ids);
+        }
+        cx.notify();
+    }
+    /// 内建侧栏是否已被工作台外壳接管。
+    pub fn sidebar_suppressed(&self) -> bool {
+        self.sidebar_suppressed
+    }
+
+    /// 工作台外壳接管左侧会话栏时调用；隐藏内建侧栏后由外壳渲染会话列表。
+    pub fn set_sidebar_suppressed(&mut self, suppressed: bool, cx: &mut Context<Self>) {
+        if self.sidebar_suppressed == suppressed {
+            return;
+        }
+        self.sidebar_suppressed = suppressed;
+        cx.notify();
+    }
+
+    /// 切换到指定会话；未知 id 由 [`Self::switch_session`] 自行兜底。
+    pub fn select_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.switch_session(id, cx);
+    }
+
+    /// 新建会话。
+    pub fn create_session(&mut self, cx: &mut Context<Self>) {
+        self.new_session(cx);
+    }
+
     /// 历史记录 Popover 内容:小标题 + 活跃/归档切换 + 会话行列表(复用行渲染)。
     fn render_history_list(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = resolve_agent_chat_theme(self.theme.as_ref(), cx);
@@ -3726,9 +7356,13 @@ impl AgentChatView {
         // ACP 模式:会话由外部 agent 管理,不展示本地列表。
         if self.backend == Backend::Acp {
             return v_flex()
-                .w(px(300.0))
+                .w(sp(300.0))
                 .p_3()
-                .bg(theme.background)
+                .bg(theme.raised)
+                .border_1()
+                .border_color(border)
+                .rounded(theme.surface_radius)
+                .shadow_md()
                 .child(
                     div()
                         .text_sm()
@@ -3746,8 +7380,13 @@ impl AgentChatView {
         let show_archived = self.show_archived;
 
         v_flex()
-            .w(px(300.0))
-            .bg(theme.background)
+            .w(sp(300.0))
+            // 弹层自己的表面，与其余 composer 弹层同一套：raised + border + 圆角。
+            .bg(theme.raised)
+            .border_1()
+            .border_color(border)
+            .rounded(theme.surface_radius)
+            .shadow_md()
             .text_color(theme.foreground)
             .child(
                 PanelHeader::new("agent-history-header")
@@ -3799,7 +7438,7 @@ impl AgentChatView {
             } else {
                 v_flex()
                     .id("agent-history-list")
-                    .max_h(px(360.0))
+                    .max_h(sp(360.0))
                     .overflow_y_scroll()
                     .p_1()
                     .gap_0p5()
@@ -3809,15 +7448,122 @@ impl AgentChatView {
             .into_any_element()
     }
 
+    /// 注入工作台外壳的侧栏开关；注入后工具条在 agent 切换器两侧渲染
+    /// 导航栏开关（leading）与右侧标签组开关（trailing）。
+    pub fn set_workbench_toggles(
+        &mut self,
+        toggles: WorkbenchSidebarToggles,
+        cx: &mut Context<Self>,
+    ) {
+        self.workbench_toggles = Some(toggles);
+        cx.notify();
+    }
+
+    /// 注入输入框下方上下文栏的数据源（工作区 / 分支 / Worktree）。
+    ///
+    /// 注入后底栏出现对应入口；`settle` 之前底栏只有「权限级别」一项。
+    pub fn set_composer_context_source(
+        &mut self,
+        source: ComposerContextSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_context_source = Some(source);
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
+    /// 重新向宿主取一次上下文栏快照（分支/worktree 变化后由宿主调用）。
+    pub fn refresh_composer_context(&mut self, cx: &mut Context<Self>) {
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = resolve_agent_chat_theme(self.theme.as_ref(), cx);
-        PanelHeader::new("agent-chat-toolbar")
+        // 会话内搜索入口。findbar 是浮层，打开状态本身已经很明显，
+        // 这里只用 outline 做一次状态复核（图标按钮没有 selected 语义）。
+        let mut search_button = IconButton::new("agent-chat-find", IconName::Search)
+            .role(IconButtonRole::Compact)
+            .custom(agent_header_icon_variant(&theme, cx))
+            .tooltip(t!("AgentUi.find_in_transcript").to_string())
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_findbar(window, cx)));
+        if self.findbar_open {
+            search_button = search_button.outline();
+        }
+        // `IconButton` 不接受 `debug_selector`，包一层拿测试锚点。
+        let search_entry = div()
+            .debug_selector(|| "agent-chat-find".to_string())
+            .flex_shrink_0()
+            .child(search_button);
+
+        // 工作台模式：导航栏开关在 agent 切换器左侧，右侧标签组开关与搜索
+        // 同在 trailing；非工作台模式保持原样。
+        let (leading, trailing) = match &self.workbench_toggles {
+            Some(toggles) => {
+                let nav_collapsed = (toggles.nav_collapsed)(cx);
+                let toggle_nav = toggles.toggle_nav.clone();
+                let toggle_right = toggles.toggle_right.clone();
+                let nav_toggle = IconButton::new(
+                    "workbench-toolbar-nav-toggle",
+                    if nav_collapsed {
+                        IconName::PanelLeftOpen
+                    } else {
+                        IconName::PanelLeftClose
+                    },
+                )
+                .role(IconButtonRole::Compact)
+                .tooltip(
+                    if nav_collapsed {
+                        t!("Workbench.expand_nav")
+                    } else {
+                        t!("Workbench.collapse_nav")
+                    }
+                    .to_string(),
+                )
+                .on_click(move |_, window, cx| (toggle_nav)(window, cx));
+                let right_open = (toggles.right_open)(cx);
+                let right_toggle = IconButton::new(
+                    "workbench-toolbar-right-toggle",
+                    if right_open {
+                        IconName::PanelRightClose
+                    } else {
+                        IconName::PanelRightOpen
+                    },
+                )
+                .role(IconButtonRole::Compact)
+                .tooltip(
+                    if right_open {
+                        t!("Workbench.collapse_right_sidebar")
+                    } else {
+                        t!("Workbench.expand_right_sidebar")
+                    }
+                    .to_string(),
+                )
+                .on_click(move |_, window, cx| (toggle_right)(window, cx));
+                (
+                    Some(nav_toggle.into_any_element()),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(search_entry)
+                        .child(right_toggle)
+                        .into_any_element(),
+                )
+            }
+            None => (None, search_entry.into_any_element()),
+        };
+
+        let mut header = PanelHeader::new("agent-chat-toolbar")
             .variant(PanelHeaderVariant::Toolbar)
             .horizontal_padding(one_ui::theme_geometry().spacing.space_4)
             .background(theme.background)
             .border_color(theme.border)
             .title(self.render_agent_switcher(cx))
-            .into_any_element()
+            .trailing(trailing);
+        if let Some(leading) = leading {
+            header = header.leading(leading);
+        }
+        header.into_any_element()
     }
 
     fn render_sidebar_frame_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3845,6 +7591,7 @@ impl AgentChatView {
             self.acp_connecting,
         );
         let trigger = Button::new("agent-header-switcher-btn")
+            .debug_selector(|| "agent-header-switcher-btn".to_string())
             .small()
             .icon(current_agent_icon(self.backend))
             .label(compact_agent_label(label.as_ref(), 24))
@@ -3879,34 +7626,262 @@ impl AgentChatView {
     }
 }
 
+fn acp_model_option(
+    state: &AcpSessionState,
+    agent_id: Option<&SharedString>,
+) -> Option<ComposerModelOption> {
+    let agent_id = agent_id?;
+    let option = state.current_model_config()?;
+    let agent_client_protocol::schema::v1::SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let value = &select.current_value;
+    let selected = select_config_value(&select.options, value)?;
+    Some(
+        ComposerModelOption::new(
+            format!("acp:{}:{}:{}", agent_id, option.id, value),
+            agent_id.clone(),
+            agent_id.clone(),
+            value.to_string(),
+        )
+        .with_model_only()
+        .with_hint(selected),
+    )
+}
+
+/// 由探测结果构造连接前可用的模型候选。
+///
+/// 探测拿不到配置项 id，这里用一个稳定的占位段；真正连接后
+/// [`acp_model_options`] 会用 agent 给出的配置项 id 覆盖这批选项。
+fn acp_model_options_from_probe(
+    agent_id: &SharedString,
+    models: &[AcpModelInfo],
+) -> Vec<ComposerModelOption> {
+    models
+        .iter()
+        .map(|model| {
+            ComposerModelOption::new(
+                format!("acp:{}:probe:{}", agent_id, model.id),
+                agent_id.clone(),
+                agent_id.clone(),
+                model.id.clone(),
+            )
+            .with_model_only()
+            .with_hint(model.label.clone())
+        })
+        .collect()
+}
+
+fn acp_model_options(
+    state: &AcpSessionState,
+    agent_id: Option<&SharedString>,
+) -> Vec<ComposerModelOption> {
+    let Some(agent_id) = agent_id else {
+        return Vec::new();
+    };
+    let Some(config) = state.current_model_config() else {
+        return Vec::new();
+    };
+    state
+        .model_options()
+        .into_iter()
+        .map(|(value, label)| {
+            ComposerModelOption::new(
+                format!("acp:{}:{}:{}", agent_id, config.id, value),
+                agent_id.clone(),
+                agent_id.clone(),
+                value,
+            )
+            .with_model_only()
+            .with_hint(label)
+        })
+        .collect()
+}
+
+fn select_config_value(
+    options: &agent_client_protocol::schema::v1::SessionConfigSelectOptions,
+    value: &agent_client_protocol::schema::v1::SessionConfigValueId,
+) -> Option<String> {
+    use agent_client_protocol::schema::v1::SessionConfigSelectOptions;
+    let values = match options {
+        SessionConfigSelectOptions::Ungrouped(values) => values,
+        SessionConfigSelectOptions::Grouped(groups) => {
+            return groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .find(|option| option.value == *value)
+                .map(|option| option.name.clone());
+        }
+        _ => return None,
+    };
+    values
+        .iter()
+        .find(|option| option.value == *value)
+        .map(|option| option.name.clone())
+}
+
+/// 把一次探测结论压成切换器副标题。
+///
+/// 已识别时优先「名称 版本 · N 个模型」；只有鉴权要求时退化为「需要登录」。
+/// 失败时只保留错误首行并截断，避免撑破菜单行。
+fn probe_status_label(probe: &AcpAgentProbe) -> SharedString {
+    if let Some(error) = probe.error.as_deref() {
+        return SharedString::from(
+            t!(
+                "AgentUi.agent_probe_failed",
+                error = truncate_probe_error(error)
+            )
+            .to_string(),
+        );
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = probe.name.as_deref().filter(|name| !name.trim().is_empty()) {
+        parts.push(
+            match probe
+                .version
+                .as_deref()
+                .filter(|version| !version.trim().is_empty())
+            {
+                Some(version) => format!("{name} {version}"),
+                None => name.to_string(),
+            },
+        );
+    }
+    if !probe.models.is_empty() {
+        parts.push(t!("AgentUi.agent_model_count", count = probe.models.len()).to_string());
+    } else if !probe.auth_methods.is_empty() {
+        parts.push(t!("AgentUi.agent_login_required").to_string());
+    }
+    if parts.is_empty() {
+        return SharedString::from("ACP Agent");
+    }
+    SharedString::from(parts.join(" · "))
+}
+
+/// 探测错误取首行并按字符上限截断。
+fn truncate_probe_error(error: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let first_line = error.lines().next().unwrap_or(error).trim();
+    if first_line.chars().count() <= MAX_CHARS {
+        return first_line.to_string();
+    }
+    first_line.chars().take(MAX_CHARS).collect::<String>() + "…"
+}
+
 impl EventEmitter<AgentChatViewEvent> for AgentChatView {}
+
+/// 当前 Unix 秒；时钟异常时退化为 0（时长会被判为未知而不是负值）。
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 换了后端（挂了另一份输入框）时先把内容搬过去，再应用排队的草稿：
+        // 顺序反了的话，"搬过去"会盖掉会话切换那份更权威的草稿。
+        self.sync_composer_handover(cx);
+        // 会话切换排队的草稿在第一帧应用（见 `pending_input_draft` 字段注释）。
+        self.apply_pending_input_draft(window, cx);
         if self.auto_scroll.take_pending_for_render() {
             self.scroll_handle.scroll_to_bottom();
         }
+        // 正文变化（含流式输出）后按当前查询重算命中。
+        // 这里刻意用无通知版本：渲染期间 notify 会把「重算 → 通知 → 再渲染」转起来。
+        self.refresh_search_if_stale();
         let chat_theme = resolve_agent_chat_theme(self.theme.as_ref(), cx);
-        let running_activity = self
-            .is_running
-            .then(|| render_running_activity(&chat_theme));
-        let messages = if self.sidebar_mode {
-            render_sidebar_messages_with_code_actions_and_activity(
-                &self.transcript.messages,
-                &self.scroll_handle,
-                Some(&self.code_block_actions),
-                Some(&chat_theme),
-                running_activity,
-                window,
-                cx,
+        // 「执行中…」只在**没有**进行中轮次时才挂：轮次页脚已经在显示「进行中」，
+        // 两者紧挨着出现就是同一句话说两遍（用户看到的「三个执行状态」）。
+        let has_live_turn = self
+            .transcript
+            .messages
+            .iter()
+            .any(crate::turn::is_live_message);
+        let running_activity =
+            (self.is_running && !has_live_turn).then(|| render_running_activity(&chat_theme));
+
+        // 滚动几何观测。「内容变长」不算用户移动阅读位置，否则流式输出会把
+        // 跟随态自己关掉（见 `TranscriptScrollState::observe`）。
+        let show_scroll_to_latest = self
+            .scroll
+            .observe(
+                // gpui 的 offset 是负的滚动位移，`observe` 要正数。
+                -self.scroll_handle.offset().y,
+                self.scroll_handle.max_offset().y,
             )
+            .unwrap_or(false)
+            && !self.sidebar_mode;
+
+        let list_layout = if self.sidebar_mode {
+            MessageListLayout::EdgeToEdge
         } else {
-            render_messages_with_code_actions_and_activity(
+            MessageListLayout::Centered
+        };
+        let action_listener = cx.listener(|this, action: &MessageListAction, _window, cx| {
+            this.apply_message_list_action(action.clone(), cx);
+        });
+        let on_action: MessageListActionHandler =
+            std::rc::Rc::new(move |action, window, cx| action_listener(&action, window, cx));
+
+        let findbar = self.render_findbar(&chat_theme, cx);
+        let selection = self.transcript_selection_handle(cx);
+        let selection_bar = self.render_selection_bar(&chat_theme, cx);
+        // ACP 连接还停在 Ready 之前的相位时，历史要靠 agent 回放，转录是空的。
+        // 空面板会被读成「坏了」；骨架屏则说明「在等数据」。
+        let acp_phase = self.acp.as_ref().map(AcpConnection::phase);
+        let show_skeleton = should_show_transcript_skeleton(
+            self.sidebar_mode,
+            self.backend,
+            acp_phase.as_ref(),
+            self.is_running,
+            self.transcript.messages.is_empty(),
+        );
+        // 起手态与骨架屏互斥（见 `empty_state::should_show_empty_state`）。
+        let show_empty_state = crate::empty_state::should_show_empty_state(
+            acp_phase.as_ref(),
+            self.is_running,
+            self.transcript.messages.is_empty(),
+        );
+        let empty_state = if show_empty_state {
+            let on_starter = cx.listener(|this, index: &usize, window, cx| {
+                this.apply_starter_prompt(*index, window, cx)
+            });
+            let on_starter: Rc<dyn Fn(usize, &mut Window, &mut App)> =
+                Rc::new(move |index, window, cx| on_starter(&index, window, cx));
+            Some(crate::empty_state::render_empty_state(
+                &chat_theme,
+                list_layout,
+                self.sidebar_mode,
+                self.starter_flavor(),
+                on_starter,
+            ))
+        } else {
+            None
+        };
+        let messages = if show_skeleton {
+            crate::skeleton::transcript_skeleton(&chat_theme, list_layout, SKELETON_ROWS)
+        } else {
+            render_message_list(
                 &self.transcript.messages,
                 &self.scroll_handle,
-                Some(&self.code_block_actions),
-                Some(&chat_theme),
-                running_activity,
+                MessageListContext::new(list_layout)
+                    .with_activity(running_activity)
+                    .with_code_actions(Some(&self.code_block_actions))
+                    .with_theme(Some(&chat_theme))
+                    .with_expansion(Some(&self.expansion))
+                    .with_timings(Some(&self.turn_timings))
+                    .with_action_handler(Some(on_action))
+                    .with_turn_chrome(!self.sidebar_mode)
+                    .with_search(Some(&self.search))
+                    .with_findbar(findbar)
+                    .with_selection(Some(&selection))
+                    .with_selection_bar(selection_bar)
+                    .with_empty_state(empty_state)
+                    .with_restorable_turns(self.restorable_turns.get(&self.current_session))
+                    .with_reviewed_turns(self.reviewed_turns.get(&self.current_session))
+                    .with_scroll_to_latest(show_scroll_to_latest),
                 window,
                 cx,
             )
@@ -3930,12 +7905,30 @@ impl Render for AgentChatView {
                     .w_full()
                     .min_w_0()
                     .when(self.sidebar_mode, |this| this.min_h_0().overflow_hidden())
-                    .when(!self.sidebar_mode, |this| this.p_3())
-                    .child(self.input.clone()),
+                    // 决策栏贴输入区顶部、通栏铺开（与内联卡片同一决策源）。
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .when(self.sidebar_mode, |this| {
+                                // 侧栏顶到窗口下沿：给输入区底部留一口气，最后一行
+                                // （ACP 的上下文行）不再被窗口边缘切掉。
+                                this.min_h_0()
+                                    .overflow_hidden()
+                                    .pb(sp(CONTAINER_PADDING_BOTTOM))
+                            })
+                            .when(!self.sidebar_mode, |this| this.p_3())
+                            .child(self.render_composer()),
+                    ),
             );
         let auth_actions = self.render_acp_auth_actions(cx);
 
         if self.sidebar_mode {
+            // 附件放大预览：挂在面板根部，才有覆盖整块面板的背板。
+            let attachment_preview = self.render_attachment_preview(&chat_theme, cx);
+            let message_image_preview = self.render_message_image_preview(&chat_theme, cx.entity());
+            let usage_history = self.render_usage_history(&chat_theme, cx.entity());
+            let command_palette = self.render_command_palette_overlay(&chat_theme, cx);
             // 侧边栏视图:紧凑头部(新建对话 / 历史记录) + 消息 + 输入。
             let header = self
                 .show_sidebar_header
@@ -3947,8 +7940,87 @@ impl Render for AgentChatView {
                 .overflow_hidden()
                 .text_color(chat_theme.foreground)
                 .bg(chat_theme.background)
+                .key_context(AI_CHAT_SEARCH_CONTEXT)
+                .track_focus(&self.transcript_focus)
+                .on_action(cx.listener(|this, _: &CopyTranscriptSelection, _, cx| {
+                    // 没有选区就交出去：同一条快捷键在别处（例如输入框内）还有别的语义。
+                    if !this.copy_transcript_selection(cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &ClearTranscriptSelection, _, cx| {
+                    if !this.clear_transcript_selection(cx) {
+                        cx.propagate();
+                    }
+                }))
                 .on_action(cx.listener(Self::approve_tool_call))
                 .on_action(cx.listener(Self::reject_tool_call))
+                .on_action(cx.listener(|this, _: &ToggleTranscriptFind, window, cx| {
+                    this.open_findbar(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FindNextInTranscript, _, cx| {
+                    this.step_search(true, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FindPreviousInTranscript, _, cx| {
+                    this.step_search(false, cx);
+                }))
+                // 命令面板：快捷开合 + 上下选择。动作处理挂在面板根上，
+                // 这样面板关着时按键也有地方接。
+                .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                    this.toggle_command_palette(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseCommandPalette, window, cx| {
+                    this.close_command_palette(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectPrev, _, cx| {
+                    this.move_palette_selection(-1, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectNext, _, cx| {
+                    this.move_palette_selection(1, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectFirst, _, cx| {
+                    this.select_palette_edge(false, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectLast, _, cx| {
+                    this.select_palette_edge(true, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectPageUp, _, cx| {
+                    this.move_palette_selection(-(PALETTE_PAGE_STEP as isize), cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectPageDown, _, cx| {
+                    this.move_palette_selection(PALETTE_PAGE_STEP as isize, cx);
+                }))
+                // 会话导航：cmd-[ / cmd-]（可自定义）与鼠标后退/前进键。
+                .on_action(cx.listener(|this, _: &NavigateSessionBack, _, cx| {
+                    this.navigate_session_back(cx);
+                }))
+                .on_action(cx.listener(|this, _: &NavigateSessionForward, _, cx| {
+                    this.navigate_session_forward(cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleSessionSwitcher, window, cx| {
+                    this.toggle_session_switcher(window, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Navigate(NavigationDirection::Back),
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate_session_back(cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Navigate(NavigationDirection::Forward),
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate_session_forward(cx);
+                    }),
+                )
+                // 最近会话切换器 overlay。
+                .when_some(
+                    self.render_session_switcher(&chat_theme, cx),
+                    |root, overlay| root.child(overlay),
+                )
+                .when_some(attachment_preview, |root, overlay| root.child(overlay))
+                .when_some(message_image_preview, |root, overlay| root.child(overlay))
+                .when_some(command_palette, |root, overlay| root.child(overlay))
+                .when_some(usage_history, |root, overlay| root.child(overlay))
                 .child(
                     v_flex()
                         .debug_selector(|| "agent-sidebar-stack".to_string())
@@ -3962,34 +8034,145 @@ impl Render for AgentChatView {
                         .child(input_area),
                 )
         } else {
+            // 附件放大预览：挂在面板根部，才有覆盖整块面板的背板。
+            let attachment_preview = self.render_attachment_preview(&chat_theme, cx);
+            let message_image_preview = self.render_message_image_preview(&chat_theme, cx.entity());
+            let usage_history = self.render_usage_history(&chat_theme, cx.entity());
+            let command_palette = self.render_command_palette_overlay(&chat_theme, cx);
             // 普通全宽视图:常驻左侧会话栏 + 主区(标题 / 消息 / 输入)。
-            let sidebar = self.render_sidebar(cx);
+            // 工作台外壳接管会话栏时整块隐藏（`sidebar_suppressed`）。
+            let sidebar = (!self.sidebar_suppressed).then(|| self.render_sidebar(cx));
             let toolbar = self.render_toolbar(cx);
+            let dropped = self.transcript.dropped_messages();
+            let truncation_hint = (dropped > 0).then(|| {
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(t!("AgentUi.history_truncated", count = dropped).to_string())
+                    .into_any_element()
+            });
             div()
                 .size_full()
                 .text_color(chat_theme.foreground)
                 .bg(chat_theme.background)
+                .key_context(AI_CHAT_SEARCH_CONTEXT)
+                .track_focus(&self.transcript_focus)
+                .on_action(cx.listener(|this, _: &CopyTranscriptSelection, _, cx| {
+                    // 没有选区就交出去：同一条快捷键在别处（例如输入框内）还有别的语义。
+                    if !this.copy_transcript_selection(cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &ClearTranscriptSelection, _, cx| {
+                    if !this.clear_transcript_selection(cx) {
+                        cx.propagate();
+                    }
+                }))
                 .on_action(cx.listener(Self::approve_tool_call))
                 .on_action(cx.listener(Self::reject_tool_call))
-                .child(
-                    h_flex().size_full().child(sidebar).child(
-                        div().flex_1().h_full().min_w_0().child(
-                            v_flex()
-                                .size_full()
-                                .child(toolbar)
-                                .child(messages)
-                                .when_some(auth_actions, |this, actions| this.child(actions))
-                                .child(input_area),
-                        ),
-                    ),
+                .on_action(cx.listener(|this, _: &ToggleTranscriptFind, window, cx| {
+                    this.open_findbar(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FindNextInTranscript, _, cx| {
+                    this.step_search(true, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FindPreviousInTranscript, _, cx| {
+                    this.step_search(false, cx);
+                }))
+                // 命令面板：快捷开合 + 上下选择。动作处理挂在面板根上，
+                // 这样面板关着时按键也有地方接。
+                .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                    this.toggle_command_palette(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseCommandPalette, window, cx| {
+                    this.close_command_palette(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectPrev, _, cx| {
+                    this.move_palette_selection(-1, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectNext, _, cx| {
+                    this.move_palette_selection(1, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectFirst, _, cx| {
+                    this.select_palette_edge(false, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectLast, _, cx| {
+                    this.select_palette_edge(true, cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectPageUp, _, cx| {
+                    this.move_palette_selection(-(PALETTE_PAGE_STEP as isize), cx);
+                }))
+                .on_action(cx.listener(|this, _: &PaletteSelectPageDown, _, cx| {
+                    this.move_palette_selection(PALETTE_PAGE_STEP as isize, cx);
+                }))
+                // 会话导航：cmd-[ / cmd-]（可自定义）与鼠标后退/前进键。
+                .on_action(cx.listener(|this, _: &NavigateSessionBack, _, cx| {
+                    this.navigate_session_back(cx);
+                }))
+                .on_action(cx.listener(|this, _: &NavigateSessionForward, _, cx| {
+                    this.navigate_session_forward(cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleSessionSwitcher, window, cx| {
+                    this.toggle_session_switcher(window, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Navigate(NavigationDirection::Back),
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate_session_back(cx);
+                    }),
                 )
+                .on_mouse_down(
+                    MouseButton::Navigate(NavigationDirection::Forward),
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate_session_forward(cx);
+                    }),
+                )
+                // 最近会话切换器 overlay。
+                .when_some(
+                    self.render_session_switcher(&chat_theme, cx),
+                    |root, overlay| root.child(overlay),
+                )
+                .child(
+                    h_flex()
+                        .size_full()
+                        .when_some(sidebar, |this, sidebar| this.child(sidebar))
+                        .child(
+                            div().flex_1().h_full().min_w_0().child(
+                                v_flex()
+                                    .size_full()
+                                    .child(toolbar)
+                                    .when_some(truncation_hint, |this, hint| this.child(hint))
+                                    .child(messages)
+                                    .when_some(auth_actions, |this, actions| this.child(actions))
+                                    .child(input_area),
+                            ),
+                        ),
+                )
+                .when_some(attachment_preview, |root, overlay| root.child(overlay))
+                .when_some(message_image_preview, |root, overlay| root.child(overlay))
+                .when_some(command_palette, |root, overlay| root.child(overlay))
+                .when_some(usage_history, |root, overlay| root.child(overlay))
         }
     }
 }
 
+/// 把宿主快照里的底栏数据覆盖进已构建好的上下文。
+///
+/// 单独成函数而不是给 [`build_composer_context`] 加参数：那个函数在测试里
+/// 有十几处直接调用，多一个「几乎总是默认值」的参数只会污染所有调用点。
+fn apply_composer_snapshot(context: &mut AgentComposerContext, snapshot: ComposerContextSnapshot) {
+    context.workspace = snapshot.workspace;
+    context.workspace_options = snapshot.workspace_options;
+    context.branch_options = snapshot.branches;
+    context.worktree = snapshot.worktree;
+}
+
 fn build_composer_context(
     resources: &ResourceContext,
-    tool_execution_mode: ToolExecutionMode,
+    selection: ExecutionSelection,
     model: Option<&ComposerModelOption>,
     plan: Option<&PlanCardData>,
     subagents: &[SubAgentCardData],
@@ -4001,8 +8184,9 @@ fn build_composer_context(
     available_resources: &[ResourceRef],
     skill_summary: ComposerSkillSummary,
     skill_items: Vec<ComposerSkillItem>,
+    local_context_tokens: Option<u64>,
 ) -> AgentComposerContext {
-    let mut context = build_context(resources, tool_execution_mode, model);
+    let mut context = build_context(resources, selection, model);
     context.resource_source_options = resource_source_options(resources, available_resources);
     context.resource_pool_items = resource_pool_items(resources, available_resources);
     context.skill_summary = skill_summary;
@@ -4013,6 +8197,31 @@ fn build_composer_context(
         composer_agent_options(backend, acp_agents, current_acp_id, acp_connecting);
     if backend == Backend::Acp {
         apply_acp_state_to_context(&mut context, acp_state.as_ref());
+        // ACP 的「执行模式」是 agent 自己声明的会话模式（如 codex 的 read-only /
+        // agent / agent-full-access），比本地那套工具策略更贴近实际语义。
+        if let Some(label) = acp_state.as_ref().and_then(acp_mode_label) {
+            context.execution_mode_label = SharedString::from(label);
+        }
+        // 圆环 gauge 与 `acp-usage` scope 同源:scope 报精确读数,圆环给
+        // 一眼可见的占用比例。agent 没报窗口(`size == 0`)时给 `None`,
+        // 圆环退化成只显示 token 数。
+        if let Some(usage) = acp_state.as_ref().and_then(AcpSessionState::usage) {
+            let window = (usage.size > 0).then_some(usage.size);
+            context.context_usage = Some(
+                ContextUsage::new(usage.used, window)
+                    .with_cost(usage.cost.as_ref().map(format_acp_cost)),
+            );
+        }
+    } else if let Some(tokens) = local_context_tokens {
+        // 本地后端:模型报了计量才展示;窗口大小按模型名尽力解析,查不到就
+        // 只显示 token 数,不猜百分比。
+        let window = model.and_then(|option| model_context_window(&option.model));
+        context.scopes.push(ComposerScope::new(
+            "local-usage",
+            t!("AgentUi.usage").to_string(),
+            format_local_usage(tokens, window),
+        ));
+        context.context_usage = Some(ContextUsage::new(tokens, window));
     }
     context
 }
@@ -4060,10 +8269,50 @@ fn acp_scopes(state: &AcpSessionState) -> Vec<ComposerScope> {
         scopes.push(ComposerScope::new(
             "acp-usage",
             t!("AgentUi.usage").to_string(),
-            format!("{}/{} tokens", usage.used, usage.size),
+            format_acp_usage(usage),
         ));
     }
     scopes
+}
+
+/// 用量文案：`used/size tokens`，agent 报了费用就在后面追加。
+///
+/// 货币代码原样透传（协议给什么写什么，不自己拼符号）；小数位先按 4 位截掉尾随零，
+/// 免得到处是 `0.0120`。
+fn format_acp_usage(usage: &AcpUsage) -> String {
+    let mut text = format!("{}/{} tokens", usage.used, usage.size);
+    if let Some(cost) = usage.cost.as_ref() {
+        text.push_str(&format!(" · {}", format_acp_cost(cost)));
+    }
+    text
+}
+
+/// 费用文案:`0.0124 USD`。货币代码原样透传(协议给什么写什么,不自己拼
+/// 符号);小数位先按 4 位截掉尾随零,免得到处是 `0.0120`。
+fn format_acp_cost(cost: &agent_client_protocol::schema::v1::Cost) -> String {
+    let amount = format!("{:.4}", cost.amount);
+    let amount = amount.trim_end_matches('0').trim_end_matches('.');
+    format!("{} {}", amount, cost.currency)
+}
+
+/// 把 Acp agent 推送的 `available_commands` 转成 composer 的 `/` 补全项。
+///
+/// 命令名原样使用（补全插入的就是它）；`input` 只取非空提示，空的当成没有参数说明。
+fn slash_commands_from_acp_state(state: &AcpSessionState) -> Vec<SlashCommandItem> {
+    state
+        .available_commands()
+        .iter()
+        .map(|command| {
+            let item = SlashCommandItem::new(command.name.clone(), command.description.clone());
+            match command.input.as_ref() {
+                Some(AvailableCommandInput::Unstructured(input)) => {
+                    item.with_input_hint(input.hint.clone())
+                }
+                // 协议枚举标了 non_exhaustive：未来新增的输入形态先当无提示处理。
+                _ => item,
+            }
+        })
+        .collect()
 }
 
 fn acp_capabilities(state: &AcpSessionState) -> Vec<SharedString> {
@@ -4109,21 +8358,13 @@ fn acp_agent_capability_labels(state: &AcpSessionState) -> Vec<SharedString> {
 }
 
 fn acp_mode_label(state: &AcpSessionState) -> Option<String> {
-    let current = state.current_mode_id()?;
-    Some(
-        state
-            .available_modes()
-            .iter()
-            .find(|mode| mode.id == *current)
-            .map(|mode| mode.name.clone())
-            .unwrap_or_else(|| current.0.to_string()),
-    )
+    state.current_mode_label()
 }
 
 /// 由资源上下文构建输入框展示用上下文。
 fn build_context(
     resources: &ResourceContext,
-    tool_execution_mode: ToolExecutionMode,
+    selection: ExecutionSelection,
     model: Option<&ComposerModelOption>,
 ) -> AgentComposerContext {
     let current = resources.current();
@@ -4158,7 +8399,12 @@ fn build_context(
         subagent_items: Vec::new(),
         agent_options: Vec::new(),
         model: model.map(ComposerModelOption::to_composer_model),
-        execution_mode_label: SharedString::from(tool_execution_mode_label(tool_execution_mode)),
+        execution_mode_label: SharedString::from(selection.label()),
+        workspace: Default::default(),
+        workspace_options: Vec::new(),
+        branch_options: Vec::new(),
+        worktree: Default::default(),
+        context_usage: None,
     }
 }
 
@@ -4227,11 +8473,22 @@ fn render_agent_switcher_content(
     cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
     let muted = theme.muted_foreground;
+    // 选项的 `on_click` 只能拿到 `&mut App`，要关掉弹层就得先握住它的实体。
+    let popover = cx.entity();
     let mut col = v_flex()
+        .id("agent-header-switcher-list")
+        .debug_selector(|| "agent-header-switcher-content".to_string())
         .p_1()
-        .gap(px(2.0))
-        .min_w(px(300.0))
-        .bg(theme.background)
+        .gap(sp(2.0))
+        .min_w(sp(300.0))
+        .max_h(sp(AGENT_SWITCHER_MAX_HEIGHT))
+        .overflow_y_scroll()
+        // 弹层自己的表面：Popover 的内容容器不画底色，用面板底色会看不出是浮层。
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.surface_radius)
+        .shadow_md()
         .text_color(theme.foreground);
 
     col = col.child(header_switcher_group_label("Agent", theme));
@@ -4251,10 +8508,10 @@ fn render_agent_switcher_content(
     for agent in agents {
         col = col.child(header_agent_option_row(
             view.clone(),
+            popover.clone(),
             agent,
             muted,
             theme,
-            cx,
         ));
     }
     col.into_any_element()
@@ -4272,10 +8529,10 @@ fn header_switcher_group_label(label: &'static str, theme: &AgentChatTheme) -> g
 
 fn header_agent_option_row(
     view: Entity<AgentChatView>,
+    popover: Entity<gpui_component::popover::PopoverState>,
     agent: ComposerAgentOption,
     muted: gpui::Hsla,
     theme: &AgentChatTheme,
-    cx: &mut Context<gpui_component::popover::PopoverState>,
 ) -> gpui::AnyElement {
     let hover_bg = theme.hover_background();
     let selected_bg = theme.selection_background();
@@ -4283,26 +8540,32 @@ fn header_agent_option_row(
     let icon_fg = if agent.selected { theme.accent } else { muted };
     let target = agent.id.clone();
     let disabled = agent_option_disabled(&agent);
+    let element_id = SharedString::from(format!("agent-header-option-{}", agent.element_id()));
+    // 测试要点某一项：`id` 只给交互树用，`debug_bounds` 认的是 debug selector。
+    let debug_selector = element_id.clone();
 
     h_flex()
-        .id(SharedString::from(format!(
-            "agent-header-option-{}",
-            agent.element_id()
-        )))
+        .id(element_id)
+        .debug_selector(move || debug_selector.to_string())
         .w_full()
         .items_center()
         .gap_2()
         .px_2()
         .py_1p5()
-        .rounded(cx.theme().radius)
+        .rounded(theme.surface_radius)
         .when(agent.selected, |this| this.bg(selected_bg))
         .when(agent.selected, |this| this.text_color(selected_fg))
         .when(disabled, |this| this.opacity(0.5))
         .when(!disabled, |this| {
             this.cursor_pointer()
                 .hover(move |this| this.bg(hover_bg))
-                .on_click(move |_, _window, cx| {
+                .on_click(move |_, window, cx| {
                     let target = target.clone();
+                    let view = view.clone();
+                    let popover = popover.clone();
+                    // 先收弹层再换后端：换后端会重建 header 与内容区，弹层留在
+                    // 最上层就会盖着新视图不走（用户点了却像没反应）。
+                    popover.update(cx, |state, cx| state.dismiss(window, cx));
                     view.update(cx, |this, cx| {
                         if !this.is_running {
                             this.select_backend(target, cx);
@@ -4680,6 +8943,22 @@ fn kind_icon(kind: &ResourceKind) -> &'static str {
     }
 }
 
+/// 「问答」是一个任务类型而不是工具策略，两者共用同一个下拉 id 空间。
+fn task_kind_from_id(id: &str) -> TaskKind {
+    match id {
+        "ask" => TaskKind::Ask,
+        "plan" => TaskKind::Plan,
+        _ => TaskKind::Agent,
+    }
+}
+
+fn task_kind_from_settings(mode: AiChatToolExecutionMode) -> TaskKind {
+    match mode {
+        AiChatToolExecutionMode::Ask => TaskKind::Ask,
+        _ => TaskKind::Agent,
+    }
+}
+
 fn tool_execution_mode_from_id(id: &str) -> ToolExecutionMode {
     match id {
         "auto" => ToolExecutionMode::Auto,
@@ -4693,6 +8972,18 @@ fn runtime_tool_execution_mode(mode: AiChatToolExecutionMode) -> ToolExecutionMo
         AiChatToolExecutionMode::Auto => ToolExecutionMode::Auto,
         AiChatToolExecutionMode::ReadOnly => ToolExecutionMode::ReadOnly,
         AiChatToolExecutionMode::Manual => ToolExecutionMode::Manual,
+        // 「问答」不下发工具，工具策略用不上；取最保守的一档，避免任何意外暴露。
+        AiChatToolExecutionMode::Ask => ToolExecutionMode::Manual,
+    }
+}
+
+/// 把执行模式下拉选中的项落盘到设置。
+///
+/// 任务类型优先：「问答」有独立的设置档位；其余情况按工具策略存。
+fn settings_execution_mode(selection: ExecutionSelection) -> AiChatToolExecutionMode {
+    match selection.task {
+        TaskKind::Ask => AiChatToolExecutionMode::Ask,
+        _ => settings_tool_execution_mode(selection.tool),
     }
 }
 
@@ -4849,12 +9140,74 @@ fn selected_provider_model_id(specs: &[RuntimeBuildSpec]) -> Option<SharedString
         .map(|spec| spec.option.id.clone())
 }
 
-fn default_tool_options() -> Vec<ComposerMenuOption> {
+/// 本地后端的执行模式选项。
+///
+/// 「问答」是任务类型（不向模型暴露工具），其余三项是工具策略——两者共用一个下拉，
+/// 与合并后的单一执行模式控件保持一致。
+fn default_execution_mode_options() -> Vec<ComposerMenuOption> {
     vec![
+        ComposerMenuOption::new("ask", t!("AgentUi.ask_mode").to_string())
+            .with_hint(t!("AgentUi.ask_mode_hint").to_string()),
         ComposerMenuOption::new("auto", t!("AgentUi.auto").to_string()),
         ComposerMenuOption::new("readonly", t!("AgentUi.readonly").to_string()),
         ComposerMenuOption::new("manual", t!("AgentUi.manual_confirmation").to_string()),
     ]
+}
+
+/// ACP 后端的执行模式选项。
+///
+/// 两套来源：传统 `SessionModeState.available_modes`（waku/codex 等），以及
+/// `SessionConfigOption{category=mode}`（opencode 等新式 agent）。两者只会有一套非空，
+/// 优先传统那套以保持既有行为。
+fn acp_execution_mode_options(state: &AcpSessionState) -> Vec<ComposerMenuOption> {
+    let legacy = legacy_acp_mode_options(state);
+    if !legacy.is_empty() {
+        return legacy;
+    }
+    acp_config_mode_options(state)
+}
+
+/// 传统 `available_modes` 的下拉项。
+fn legacy_acp_mode_options(state: &AcpSessionState) -> Vec<ComposerMenuOption> {
+    state
+        .available_modes()
+        .iter()
+        .map(|mode| {
+            let option =
+                ComposerMenuOption::new(acp_mode_option_id(mode.id.0.as_ref()), mode.name.clone());
+            match mode.description.as_deref() {
+                Some(description) => option.with_hint(description.to_string()),
+                None => option,
+            }
+        })
+        .collect()
+}
+
+/// `SessionConfigOption{category=mode}` 的下拉项。
+fn acp_config_mode_options(state: &AcpSessionState) -> Vec<ComposerMenuOption> {
+    state
+        .mode_options()
+        .into_iter()
+        .map(|(value, name, description)| {
+            let option = ComposerMenuOption::new(acp_config_mode_option_id(&value), name);
+            match description {
+                Some(description) => option.with_hint(description),
+                None => option,
+            }
+        })
+        .collect()
+}
+
+const ACP_MODE_OPTION_PREFIX: &str = "acp-mode:";
+
+fn acp_mode_option_id(mode_id: &str) -> String {
+    format!("{ACP_MODE_OPTION_PREFIX}{mode_id}")
+}
+
+const ACP_CONFIG_MODE_OPTION_PREFIX: &str = "acp-config-mode:";
+
+fn acp_config_mode_option_id(value: &str) -> String {
+    format!("{ACP_CONFIG_MODE_OPTION_PREFIX}{value}")
 }
 
 fn now_secs() -> i64 {
@@ -4867,12 +9220,17 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use one_core::llm::usage_history::AgentUsageSample;
+
     use crate::agent_cards::{
         ACP_PERMISSION_CARD, AcpPermissionCardData, AcpPermissionOptionData, TOOL_CARD,
         TOOL_CONFIRM_CARD, ToolCardData, ToolConfirmCardData,
     };
+    use crate::find_shortcut::CloseTranscriptFind;
     use crate::{
-        AcpAgentConfig, AcpConfigDiagnostic, AcpPermissionOption, AcpPermissionRequest,
+        AcpAgentConfig, AcpAgentEntry, AcpConfigDiagnostic, AcpElicitationField,
+        AcpElicitationFieldKind, AcpElicitationForm, AcpElicitationMode, AcpElicitationOption,
+        AcpElicitationOutcome, AcpElicitationRequest, AcpPermissionOption, AcpPermissionRequest,
         AcpPublicMcpApprovalRequest,
     };
     use agent_runtime::RuntimeServices;
@@ -4887,12 +9245,12 @@ mod tests {
     };
     use async_trait::async_trait;
     use gpui::{
-        Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, ScrollDelta,
-        ScrollWheelEvent, Styled, TestAppContext, TouchPhase, VisualTestContext, Window, div,
-        point, px,
+        Entity, IntoElement, Modifiers, ParentElement, Pixels, Render, ScrollDelta, ScrollEvent,
+        Styled, TestAppContext, TouchPhase, VisualTestContext, Window, div, point, px,
     };
     use one_core::llm::{ProviderConfig, ProviderType};
     use serde_json::json;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct WriteTool;
@@ -4925,6 +9283,47 @@ mod tests {
         }
     }
 
+    fn test_acp_elicitation_request() -> AcpElicitationRequest {
+        AcpElicitationRequest {
+            request_id: "elicitation-test".into(),
+            session_id: "session".into(),
+            message: "要部署到哪个环境？".into(),
+            mode: AcpElicitationMode::Form(AcpElicitationForm {
+                title: Some("部署目标".into()),
+                description: None,
+                fields: vec![
+                    AcpElicitationField {
+                        name: "env".into(),
+                        title: "环境".into(),
+                        description: None,
+                        required: true,
+                        default: None,
+                        kind: AcpElicitationFieldKind::SingleSelect {
+                            options: vec![
+                                AcpElicitationOption {
+                                    value: "prod".into(),
+                                    title: "生产".into(),
+                                },
+                                AcpElicitationOption {
+                                    value: "staging".into(),
+                                    title: "预发".into(),
+                                },
+                            ],
+                        },
+                    },
+                    AcpElicitationField {
+                        name: "confirm".into(),
+                        title: "同时刷新缓存".into(),
+                        description: None,
+                        required: false,
+                        default: None,
+                        kind: AcpElicitationFieldKind::Boolean,
+                    },
+                ],
+            }),
+        }
+    }
+
     fn pending_submission(text: &str) -> crate::pending_submission::PendingSubmission {
         crate::pending_submission::PendingSubmission {
             text: text.to_string(),
@@ -4950,13 +9349,234 @@ mod tests {
         }
 
         let first = rx.try_recv().unwrap();
-        let events = collect_ready_runtime_events(&mut rx, first, None);
+        let batch = collect_ready_runtime_events(&mut rx, first, None);
 
-        assert_eq!(MAX_RUNTIME_EVENT_BATCH_SIZE, events.len());
+        assert_eq!(MAX_RUNTIME_EVENT_BATCH_SIZE, batch.events.len());
+        assert_eq!(0, batch.skipped, "没丢事件时不该报 lag");
         assert!(
             rx.try_recv().is_ok(),
             "batch must leave the overflow queued"
         );
+    }
+
+    /// 通道挤掉事件时必须把条数报上来。
+    ///
+    /// 这是丢终态能不能被补救的**唯一**入口：条数没报出来，上层就以为一切正常，
+    /// 界面会停在「正在响应」而日志里一句都没有。
+    #[test]
+    fn runtime_event_batch_reports_the_events_the_channel_dropped() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+        let session_id = SessionId::from_string("lag-session");
+        let turn_id = TurnId::from_string("lag-turn");
+
+        // 容量 2，先塞满再把接收端甩开 3 条，接收端必然 lag。
+        for index in 0..5 {
+            tx.send(RuntimeEvent::AssistantMessageDelta {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                delta: index.to_string(),
+            })
+            .unwrap();
+        }
+
+        // 第一条 `recv` 就会撞上 lag：丢的是最旧的那批。
+        let Err(TryRecvError::Lagged(skipped)) = rx.try_recv() else {
+            panic!("expected the receiver to lag behind a full channel");
+        };
+        assert!(skipped > 0, "lag 必须报出被挤掉的条数");
+
+        let next = rx.try_recv().expect("lag 之后仍应能取到还留着的事件");
+        let batch = collect_ready_runtime_events(&mut rx, next, Some(&session_id));
+        assert!(
+            !batch.events.is_empty(),
+            "lag 之后游标会挪到最旧的可读位置，接着取仍是本会话的事件"
+        );
+    }
+
+    /// 终态被通道挤掉之后，「正在响应」必须能被收回来。
+    ///
+    /// 复现形状：视图相信会话在跑（`running_sessions` 里有它），但 runtime 那边
+    /// 这一轮早就结束了——区别只在于清 running 的那个终态事件被挤掉了。没有重同步
+    /// 的话界面就永久停在「正在响应」，而日志里只有驱动侧那行，看不出事件没到。
+    #[gpui::test]
+    fn dropped_terminal_event_releases_a_session_the_driver_already_finished(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            view.set_session_running(&session_uid, true, cx);
+            assert!(view.running_sessions.contains(&session_uid));
+
+            // 前置条件：runtime 里这个会话确实在，而且没有在跑的轮次。
+            // 也就是说视图的 running 是**残留**，而不是 runtime 还在忙。
+            assert!(
+                !view
+                    .runtime
+                    .session(&view.session_id)
+                    .expect("view's session must be registered with the runtime")
+                    .is_busy()
+            );
+
+            view.on_runtime_events_dropped(7, cx);
+
+            assert!(
+                !view.running_sessions.contains(&session_uid),
+                "runtime 侧已经没有在跑的轮次：running 是终态被丢掉的残留，必须收回"
+            );
+            assert!(!view.is_running, "当前会话的输入框也要跟着退出运行态");
+        });
+    }
+
+    /// 问不出结论时**不许**猜：不在 runtime 里的会话不能被误清。
+    ///
+    /// 误清的代价比多转一会儿大得多——用户会以为那一轮结束了，对着一个其实还在
+    /// 跑的会话继续追问。
+    #[gpui::test]
+    fn dropped_terminal_event_keeps_a_session_the_driver_cannot_be_asked_about(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let session_uid = "history-only-session".to_string();
+            view.set_session_running(&session_uid, true, cx);
+
+            view.on_runtime_events_dropped(3, cx);
+
+            assert!(
+                view.running_sessions.contains(&session_uid),
+                "runtime 里没有这个会话、问不出结论：宁可多转一会儿，也不能误清"
+            );
+        });
+    }
+
+    /// ACP 侧同理：连接已经收掉时没有可问的对象，不能凭「没有连接」就断定它跑完了。
+    #[gpui::test]
+    fn dropped_terminal_event_keeps_an_acp_turn_without_a_connection(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            let session_uid = "acp-owner-session".to_string();
+            view.acp_turn_owners = vec![AcpTurnOwner {
+                event_session_id: SessionId::from_string("acp:owner"),
+                session_uid: session_uid.clone(),
+                turn_id: TurnId::from_string("turn-owner"),
+                backgrounded: false,
+                cancel_requested: false,
+            }];
+            view.set_session_running(&session_uid, true, cx);
+
+            view.on_runtime_events_dropped(2, cx);
+
+            assert!(view.running_sessions.contains(&session_uid));
+            assert!(
+                !view.acp_turn_owners.is_empty(),
+                "没确证结束就不该动 owner —— 动了等于把这一轮白送给下一条消息"
+            );
+        });
+    }
+
+    /// steer：ACP 前台轮次在飞时提交新消息，不排队、直接插入在飞轮次。
+    /// 连接不在时退回排队语义（RetryLater），消息不丢。
+    #[gpui::test]
+    fn steering_submission_while_acp_turn_in_flight(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            let session_uid = view.current_session.clone();
+            view.acp_turn_owners = vec![AcpTurnOwner {
+                event_session_id: SessionId::from_string("acp:steer"),
+                session_uid: session_uid.clone(),
+                turn_id: TurnId::from_string("turn-steer"),
+                backgrounded: false,
+                cancel_requested: false,
+            }];
+            view.set_session_running(&session_uid, true, cx);
+
+            // 无连接：steer 发送会失败退回排队，但用户消息与插话提示都已落转录。
+            view.submit(
+                "插一句：别忘了看并发测试".to_string(),
+                Vec::new(),
+                Vec::new(),
+                cx,
+            );
+
+            assert!(
+                view.acp_turn_owners
+                    .iter()
+                    .any(|owner| owner.turn_id.as_str() == "turn-steer"),
+                "原在飞轮次的 owner 不受插话影响"
+            );
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("插一句")),
+                "插话消息应落进当前转录"
+            );
+        });
+    }
+
+    /// 终态收尾不能被转录去重挡掉。
+    ///
+    /// 复现形状：同一个终态来了两次（直播一次、迟到的重放再来一次）。第二次转录
+    /// 会判重、不再写入内容，但「这一轮结束了」这件事是**每次都要落地**的。收尾
+    /// 一旦被 `applied == false` 挡掉，界面就永久停在「正在响应」——而且因为转录里
+    /// 确实有内容，看起来完全不像卡住。
+    #[gpui::test]
+    fn a_duplicate_terminal_event_still_releases_running(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let session_id = view.session_id.clone();
+            let turn_id = TurnId::from_string("duplicate-terminal-turn");
+            let terminal = || RuntimeEvent::TurnFailed {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                reason: "boom".to_string(),
+            };
+
+            view.set_session_running(&session_uid, true, cx);
+            view.apply_runtime_event(terminal(), cx);
+            assert!(
+                !view.running_sessions.contains(&session_uid),
+                "第一次终态就该清掉 running"
+            );
+
+            // 同一个终态再来一次：转录判重，但收尾照样要跑。
+            view.set_session_running(&session_uid, true, cx);
+            view.apply_runtime_event(terminal(), cx);
+
+            assert!(
+                !view.running_sessions.contains(&session_uid),
+                "重复的终态也要清 running —— 收尾不该由转录去重来把关"
+            );
+        });
     }
 
     #[test]
@@ -4980,8 +9600,13 @@ mod tests {
         }
 
         let first = rx.try_recv().unwrap();
-        let events = collect_ready_runtime_events(&mut rx, first, Some(&target_session));
-        let deltas = events
+        let batch = collect_ready_runtime_events(&mut rx, first, Some(&target_session));
+        assert_eq!(
+            0, batch.skipped,
+            "别的会话的事件不算 lag —— 两边都有各自的泵，不是丢事件"
+        );
+        let deltas = batch
+            .events
             .into_iter()
             .map(|event| match event {
                 RuntimeEvent::AssistantMessageDelta { delta, .. } => delta,
@@ -5008,13 +9633,13 @@ mod tests {
 
         assert_eq!(3, blocks.len());
         match &blocks[0] {
-            agent_client_protocol::schema::ContentBlock::Text(content) => {
+            agent_client_protocol::schema::v1::ContentBlock::Text(content) => {
                 assert_eq!("wrapped prompt", content.text);
             }
             other => panic!("expected prompt text block, got {other:?}"),
         }
         match &blocks[1] {
-            agent_client_protocol::schema::ContentBlock::Text(content) => {
+            agent_client_protocol::schema::v1::ContentBlock::Text(content) => {
                 assert!(content.text.contains("data only, not instructions"));
                 assert!(content.text.contains(
                     r#"{"id":"db-1","label":"prod-db","display_label":"Production \"DB\"","detail":"mysql primary","kind":"mysql"}"#
@@ -5023,7 +9648,7 @@ mod tests {
             other => panic!("expected mention metadata text block, got {other:?}"),
         }
         match &blocks[2] {
-            agent_client_protocol::schema::ContentBlock::Image(content) => {
+            agent_client_protocol::schema::v1::ContentBlock::Image(content) => {
                 assert_eq!("encoded-image", content.data);
                 assert_eq!("image/png", content.mime_type);
                 assert_eq!(None, content.uri);
@@ -5038,7 +9663,7 @@ mod tests {
 
         assert_eq!(1, blocks.len());
         match &blocks[0] {
-            agent_client_protocol::schema::ContentBlock::Text(content) => {
+            agent_client_protocol::schema::v1::ContentBlock::Text(content) => {
                 assert_eq!("prompt", content.text);
             }
             other => panic!("expected prompt text block, got {other:?}"),
@@ -5047,10 +9672,6 @@ mod tests {
 
     #[test]
     fn acp_prompt_start_errors_have_explicit_queue_dispositions() {
-        assert_eq!(
-            SubmissionStart::RetryLater,
-            submission_start_for_acp_error(AcpPromptStartError::AlreadyRunning)
-        );
         assert_eq!(
             SubmissionStart::RetryLater,
             submission_start_for_acp_error(AcpPromptStartError::NotReady)
@@ -5092,6 +9713,91 @@ mod tests {
         assert!(!acp_connection_is_unavailable(Some(
             &AcpConnectionPhase::Ready
         )));
+    }
+
+    #[test]
+    fn transcript_skeleton_only_covers_the_acp_warm_up_window() {
+        let starting = AcpConnectionPhase::Starting;
+        let ready = AcpConnectionPhase::Ready;
+
+        assert!(should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            Some(&starting),
+            false,
+            true
+        ));
+        assert!(should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            Some(&AcpConnectionPhase::CreatingSession),
+            false,
+            true
+        ));
+
+        // 已连接：真内容（包括真的空会话）自己表达，不用骨头占位。
+        assert!(!should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            Some(&ready),
+            false,
+            true
+        ));
+        // 失败/断开走错误条，骨架屏会把「出错了」遮成「在加载」。
+        let failed = AcpConnectionPhase::Failed {
+            error: AcpError::new(
+                AcpErrorKind::ConnectionClosed,
+                "agent",
+                "Agent",
+                "connection failed",
+            ),
+        };
+        assert!(!should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            Some(&failed),
+            false,
+            true
+        ));
+        assert!(!should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            None,
+            false,
+            true
+        ));
+        // 已经有历史：不能拿占位条盖住它。
+        assert!(!should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            Some(&starting),
+            false,
+            false
+        ));
+        // 在飞轮次：轮次页脚已经在说「进行中」。
+        assert!(!should_show_transcript_skeleton(
+            false,
+            Backend::Acp,
+            Some(&starting),
+            true,
+            true
+        ));
+        // 本地后端的历史是同步读盘的，没有空窗期。
+        assert!(!should_show_transcript_skeleton(
+            false,
+            Backend::Local,
+            Some(&starting),
+            false,
+            true
+        ));
+        // 侧边栏紧凑渲染里是列表行，不是完整转录。
+        assert!(!should_show_transcript_skeleton(
+            true,
+            Backend::Acp,
+            Some(&starting),
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -5138,19 +9844,20 @@ mod tests {
     fn acp_stop_action_distinguishes_prompt_control_and_failed_transition_states() {
         assert_eq!(
             AcpStopAction::CancelActivePrompt,
-            acp_stop_action(true, true, false, false, None)
+            acp_stop_action(true, true, false, false, false, None)
         );
         assert_eq!(
             AcpStopAction::ReturnToLocal,
-            acp_stop_action(false, false, true, false, None)
+            acp_stop_action(false, false, false, true, false, None)
         );
         assert_eq!(
             AcpStopAction::ReturnToLocal,
-            acp_stop_action(false, false, false, true, None)
+            acp_stop_action(false, false, false, false, true, None)
         );
         assert_eq!(
             AcpStopAction::ReturnToLocal,
             acp_stop_action(
+                false,
                 false,
                 false,
                 false,
@@ -5165,6 +9872,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 Some(AcpSessionTransitionPhase::Failed),
             )
         );
@@ -5175,12 +9883,27 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 Some(AcpSessionTransitionPhase::Failed),
             )
         );
         assert_eq!(
             AcpStopAction::ClearQueueOnly,
-            acp_stop_action(false, false, false, false, None)
+            acp_stop_action(false, false, false, false, false, None)
+        );
+    }
+
+    #[test]
+    fn a_second_stop_settles_the_turn_instead_of_repeating_the_cancel() {
+        // 取消已经发过、agent 就是不回终态:再点停止必须做点别的,否则按钮等于坏的。
+        assert_eq!(
+            AcpStopAction::ForceLocalStop,
+            acp_stop_action(true, true, true, false, false, None)
+        );
+        // 连接已经没了,就没什么可结的账了,照旧走原有分支。
+        assert_eq!(
+            AcpStopAction::ClearQueueOnly,
+            acp_stop_action(true, false, true, false, false, None)
         );
     }
 
@@ -5190,6 +9913,7 @@ mod tests {
             event_session_id: SessionId::from_string("acp:cancel-once"),
             session_uid: "session-a".into(),
             turn_id: TurnId::from_string("turn-a"),
+            backgrounded: false,
             cancel_requested: false,
         };
 
@@ -5197,6 +9921,97 @@ mod tests {
         assert!(!owner.mark_cancel_requested("session-a", false));
         assert!(owner.mark_cancel_requested("session-a", true));
         assert!(!owner.mark_cancel_requested("session-a", true));
+    }
+
+    fn acp_session_summary(id: &str, title: Option<&str>) -> AcpSessionSummary {
+        AcpSessionSummary {
+            id: id.to_string(),
+            title: title.map(str::to_string),
+            updated_at: None,
+            cwd: std::path::PathBuf::from("/work"),
+        }
+    }
+
+    /// 列表只在「ACP 后端 + agent 声明支持 session/list」时出现；两个条件任一不满足就不显示。
+    #[gpui::test]
+    fn acp_session_list_model_needs_backend_and_capability(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, _| {
+            view.acp_sessions = vec![acp_session_summary("s-1", Some("Plan review"))];
+
+            // 后端不是 ACP:能力有了也不显示,否则本地会话侧栏会冒出别的 agent 的历史。
+            view.acp_sessions_supported = true;
+            assert!(view.acp_session_list_model().is_none());
+
+            view.backend = Backend::Acp;
+            let model = view
+                .acp_session_list_model()
+                .expect("visible on acp backend");
+            assert_eq!(1, model.sessions.len());
+            assert_eq!("Plan review", model.sessions[0].label());
+
+            // 能力缺失就不显示(不变量 11)。
+            view.acp_sessions_supported = false;
+            assert!(view.acp_session_list_model().is_none());
+        });
+    }
+
+    /// 切后端 / 换 agent 时抹状态必须顺带推进世代，否则在飞的旧响应还能把列表写回来。
+    #[gpui::test]
+    fn clearing_acp_sessions_drops_rows_and_in_flight_generation(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, _| {
+            view.backend = Backend::Acp;
+            view.acp_sessions_supported = true;
+            view.acp_sessions = vec![acp_session_summary("s-1", None)];
+            view.acp_sessions_error = Some("boom".to_string());
+            view.acp_sessions_loading = true;
+            let generation = view.acp_sessions_generation;
+
+            view.clear_acp_sessions();
+
+            assert!(view.acp_sessions.is_empty());
+            assert!(view.acp_sessions_error.is_none());
+            assert!(!view.acp_sessions_loading);
+            assert!(!view.acp_sessions_supported);
+            assert_ne!(
+                generation, view.acp_sessions_generation,
+                "in-flight list responses must be invalidated"
+            );
+            assert!(view.acp_session_list_model().is_none());
+        });
+    }
+
+    /// 拿不到打开方式(既不能 load 也不能 resume)时点击必须是哑的：
+    /// 留下半截 transition 会把后续提交全卡在排队里。
+    #[gpui::test]
+    fn open_acp_session_is_inert_without_a_supported_open_kind(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.acp_sessions_supported = true;
+
+            view.open_acp_session("s-1", cx);
+
+            assert!(view.acp_session_transition.is_none());
+            assert!(view.acp.is_none());
+            assert!(view.acp_session_id_snapshot().is_none());
+        });
     }
 
     #[gpui::test]
@@ -5255,12 +10070,13 @@ mod tests {
             view.running_sessions.insert(running_uid.clone());
             view.pending_submissions
                 .enqueue(&pending_uid, pending_submission("queued"));
-            view.acp_turn_owner = Some(AcpTurnOwner {
+            view.acp_turn_owners = vec![AcpTurnOwner {
                 event_session_id: SessionId::from_string("acp:cached-owner"),
                 session_uid: owner_uid.clone(),
                 turn_id: TurnId::from_string("turn-cached-owner"),
+                backgrounded: false,
                 cancel_requested: false,
-            });
+            }];
             view.acp_session_transition = Some(AcpSessionTransition {
                 operation: AcpOperationToken(1),
                 agent_id: "cached-agent".into(),
@@ -5279,7 +10095,7 @@ mod tests {
 
             view.running_sessions.remove(&running_uid);
             view.pending_submissions.remove_session(&pending_uid);
-            view.acp_turn_owner = None;
+            view.acp_turn_owners.clear();
             view.acp_session_transition = None;
             view.trim_session_transcripts_to(1);
 
@@ -5306,6 +10122,92 @@ mod tests {
             assert!(view.session_transcripts.contains_key("cached-a"));
             assert!(!view.session_transcripts.contains_key("cached-b"));
             assert!(view.session_transcripts.contains_key("cached-c"));
+        });
+    }
+
+    #[gpui::test]
+    fn removing_a_queued_item_drops_only_that_entry(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            let session_uid = view.current_session.clone();
+            let queue = |view: &AgentChatView| {
+                view.pending_submissions
+                    .items(&session_uid)
+                    .into_iter()
+                    .map(|item| item.text.clone())
+                    .collect::<Vec<_>>()
+            };
+            view.pending_submissions
+                .enqueue(&session_uid, pending_submission("第一条"));
+            view.pending_submissions
+                .enqueue(&session_uid, pending_submission("第二条"));
+            view.pending_submissions
+                .enqueue(&session_uid, pending_submission("第三条"));
+            let input = view.input.clone();
+
+            view.on_input_event(
+                &input,
+                &AgentInputEvent::RemoveQueued { index: 1 },
+                window,
+                cx,
+            );
+
+            assert_eq!(vec!["第一条", "第三条"], queue(view));
+
+            // 越界删除必须是 no-op，不能把队首误删。
+            view.on_input_event(
+                &input,
+                &AgentInputEvent::RemoveQueued { index: 9 },
+                window,
+                cx,
+            );
+            assert_eq!(vec!["第一条", "第三条"], queue(view));
+        });
+    }
+
+    #[gpui::test]
+    fn editing_a_queued_item_pulls_it_back_into_the_composer_and_dequeues_it(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            let session_uid = view.current_session.clone();
+            view.pending_submissions
+                .enqueue(&session_uid, pending_submission("要改的这条"));
+            view.pending_submissions
+                .enqueue(&session_uid, pending_submission("留在队列里"));
+            view.sync_pending_preview(cx);
+            let input = view.input.clone();
+
+            view.on_input_event(
+                &input,
+                &AgentInputEvent::EditQueued { index: 0 },
+                window,
+                cx,
+            );
+
+            // 队列里只剩没被编辑的那条，且编辑项已从队列移除而不是复制一份。
+            let remaining: Vec<String> = view
+                .pending_submissions
+                .items(&session_uid)
+                .into_iter()
+                .map(|item| item.text.clone())
+                .collect();
+            assert_eq!(vec!["留在队列里"], remaining);
+
+            // 文本回到输入框，用户可以改完再发。
+            let restored = view.input.read(cx).composer_text(cx);
+            assert_eq!("要改的这条", restored);
         });
     }
 
@@ -5515,9 +10417,102 @@ mod tests {
         });
     }
 
+    /// 流式输出跟随滚动：用户上翻读历史时，新到达的内容不抢滚动位置；
+    /// 滚回底部后，下一帧输出自动恢复跟随（不需要点「回到最新」）。
+    #[gpui::test]
+    fn streaming_follow_respects_reading_history_and_resumes_at_bottom(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .sidebar_mode(true);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            for index in 0..40 {
+                view.transcript.push_system(format!(
+                    "第 {index} 行：用于把消息列表撑到可滚动的长度。这是一段更长的内容，好让每条消息占多行高度，从而产生足够大的滚动空间。内容内容内容内容内容内容内容内容内容内容内容。"
+                ));
+            }
+            view.request_scroll_to_bottom();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (bottom, max) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_handle.offset().y,
+                view.scroll_handle.max_offset().y,
+            )
+        });
+        assert_eq!(-max, bottom, "起手应贴着底部");
+        assert!(view.read_with(cx, |view, _| view.scroll.is_following()));
+
+        let position = cx
+            .debug_bounds("ai-chat-messages")
+            .expect("消息区应已渲染")
+            .center();
+        // 手势要 Started 再 Moved：单独一条 Moved 会被当作续接而忽略。
+        for phase in [TouchPhase::Started, TouchPhase::Moved] {
+            cx.simulate_event(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(600.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: phase,
+                source: gpui::ScrollSource::default(),
+            });
+            cx.run_until_parked();
+        }
+        let reading = view.read_with(cx, |view, _| view.scroll_handle.offset().y);
+        assert!(
+            reading > bottom,
+            "上滚后位置应回退：{reading:?} vs {bottom:?}"
+        );
+        assert!(!view.read_with(cx, |view, _| view.scroll.is_following()));
+
+        // 读历史时来新内容：不许把用户拽回底部。
+        view.update(cx, |view, cx| {
+            view.transcript
+                .push_system("读历史时到达的新内容。".repeat(8));
+            view.follow_streaming_scroll();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let still_reading = view.read_with(cx, |view, _| view.scroll_handle.offset().y);
+        assert_eq!(reading, still_reading, "读历史时新内容不得抢滚动位置");
+
+        // 滚回底部后：自动恢复跟随。
+        for phase in [TouchPhase::Started, TouchPhase::Moved] {
+            cx.simulate_event(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-5000.0))),
+                modifiers: Modifiers::default(),
+                touch_phase: phase,
+                source: gpui::ScrollSource::default(),
+            });
+            cx.run_until_parked();
+        }
+        view.update(cx, |view, cx| {
+            view.transcript
+                .push_system("回到底部后的新内容。".repeat(8));
+            view.follow_streaming_scroll();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (offset, max) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_handle.offset().y,
+                view.scroll_handle.max_offset().y,
+            )
+        });
+        assert_eq!(-max, offset, "回到底部后应重新跟随末尾");
+        assert!(view.read_with(cx, |view, _| view.scroll.is_following()));
+    }
+
     #[test]
     fn build_context_without_target_is_empty() {
-        let ctx = build_context(&ResourceContext::new(), ToolExecutionMode::Auto, None);
+        let ctx = build_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+        );
         assert!(ctx.target.is_none());
         assert!(ctx.scopes.is_empty());
         assert!(ctx.capabilities.is_empty());
@@ -5540,7 +10535,7 @@ mod tests {
         );
         let ctx = build_context(
             &resources,
-            ToolExecutionMode::ReadOnly,
+            ExecutionSelection::tool(ToolExecutionMode::ReadOnly),
             Some(&ComposerModelOption::new(
                 "openai:gpt-4.1",
                 "openai",
@@ -5564,7 +10559,11 @@ mod tests {
             .with_resource(ResourceRef::new("ssh-a", ResourceKind::Ssh, "prod-a"))
             .with_resource(ResourceRef::new("ssh-b", ResourceKind::Ssh, "prod-b"));
 
-        let context = build_context(&resources, ToolExecutionMode::Auto, None);
+        let context = build_context(
+            &resources,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+        );
 
         assert_eq!(context.resource_pool.total_resources, 2);
         assert_eq!(
@@ -5585,7 +10584,11 @@ mod tests {
             .with_resource(ResourceRef::new("db-a", ResourceKind::Postgres, "prod-db"))
             .with_resource(ResourceRef::new("redis-a", ResourceKind::Redis, "cache"));
 
-        let context = build_context(&resources, ToolExecutionMode::Auto, None);
+        let context = build_context(
+            &resources,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            None,
+        );
 
         let filters = context
             .resource_type_filters
@@ -5858,6 +10861,416 @@ mod tests {
                 .len(&view.current_session))
         );
         assert!(!view.read_with(cx, |view, _| view.is_running));
+    }
+
+    #[gpui::test]
+    fn turn_boundaries_emit_host_events_for_workspace_checkpoints(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_subscribe = seen.clone();
+        cx.update(|_window: &mut gpui::Window, cx: &mut gpui::App| {
+            cx.subscribe(
+                &view,
+                move |_, event: &AgentChatViewEvent, _cx| match event {
+                    AgentChatViewEvent::TurnStarted { .. } => {
+                        seen_for_subscribe.lock().unwrap().push("started");
+                    }
+                    AgentChatViewEvent::TurnFinished { success, .. } => {
+                        seen_for_subscribe.lock().unwrap().push(if *success {
+                            "finished:ok"
+                        } else {
+                            "finished:fail"
+                        });
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        });
+
+        view.update(cx, |view, cx| {
+            let session_id = view.session_id.clone();
+            view.apply_runtime_event(
+                RuntimeEvent::TurnStarted {
+                    session_id: session_id.clone(),
+                    turn_id: agent_runtime::TurnId::from_string("turn-checkpoint"),
+                },
+                cx,
+            );
+            view.apply_runtime_event(
+                RuntimeEvent::TurnCompleted {
+                    session_id,
+                    turn_id: agent_runtime::TurnId::from_string("turn-checkpoint"),
+                    answer: None,
+                },
+                cx,
+            );
+        });
+
+        cx.run_until_parked();
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(
+            vec!["started", "finished:ok"],
+            events,
+            "宿主依赖这些事件捕获 worktree checkpoint"
+        );
+    }
+
+    #[gpui::test]
+    fn restoring_a_turn_emits_a_host_request_for_that_session(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_subscribe = seen.clone();
+        cx.update(|_window: &mut gpui::Window, cx: &mut gpui::App| {
+            cx.subscribe(&view, move |_, event: &AgentChatViewEvent, _cx| {
+                if let AgentChatViewEvent::RestoreTurn {
+                    session_id,
+                    turn_id,
+                } = event
+                {
+                    seen_for_subscribe
+                        .lock()
+                        .unwrap()
+                        .push((session_id.clone(), turn_id.clone()));
+                }
+            })
+            .detach();
+        });
+
+        let session_id = view.read_with(cx, |view, _| view.current_session.clone());
+        view.update(cx, |view, cx| {
+            view.apply_message_list_action(
+                MessageListAction::RestoreTurn {
+                    turn_id: "turn-2".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            vec![(session_id, "turn-2".to_string())],
+            seen.lock().unwrap().clone(),
+            "宿主靠这个事件知道该回滚哪个会话的哪一轮"
+        );
+    }
+
+    #[gpui::test]
+    fn opening_a_changed_file_emits_a_host_request(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_subscribe = seen.clone();
+        cx.update(|_window: &mut gpui::Window, cx: &mut gpui::App| {
+            cx.subscribe(&view, move |_, event: &AgentChatViewEvent, _cx| {
+                if let AgentChatViewEvent::OpenFileInReview { path, turn_id, .. } = event {
+                    seen_for_subscribe
+                        .lock()
+                        .unwrap()
+                        .push((path.clone(), turn_id.clone()));
+                }
+            })
+            .detach();
+        });
+
+        view.update(cx, |view, cx| {
+            view.apply_message_list_action(
+                MessageListAction::OpenFileInReview {
+                    path: "src/lib.rs".into(),
+                    turn_id: Some("turn-3".into()),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            vec![("src/lib.rs".to_string(), Some("turn-3".to_string()))],
+            seen.lock().unwrap().clone(),
+            "视图只发路径与轮次，落到哪个面板、裁哪一份快照由宿主决定"
+        );
+    }
+
+    /// 造一轮「改了这几个文件」的对话。
+    ///
+    /// 走 `TurnStarted` 开轮而不是直接给消息打标：`push_message` 会用 transcript
+    /// 当前轮覆盖消息自带的轮次，只按消息打标会得到一轮没有身份的对话。
+    fn push_turn_with_edits(
+        view: &mut AgentChatView,
+        session_id: &str,
+        turn_id: &str,
+        files: &[(&str, u32, u32)],
+    ) {
+        view.transcript.apply(&RuntimeEvent::TurnStarted {
+            session_id: agent_runtime::SessionId::from(session_id),
+            turn_id: agent_runtime::TurnId::from_string(turn_id),
+        });
+        view.transcript
+            .push_message(crate::ChatMessageUI::user("改一下"));
+        for (index, (path, added, removed)) in files.iter().enumerate() {
+            view.transcript.push_message(crate::ChatMessageUI::card(
+                TOOL_CARD,
+                ToolCardData {
+                    call_id: format!("call-{index}"),
+                    tool_name: "Edit".to_string(),
+                    action: agent_runtime::ToolAction::Edit,
+                    target_id: None,
+                    target_label: None,
+                    input_summary: String::new(),
+                    input_json: String::new(),
+                    running: false,
+                    success: Some(true),
+                    summary: String::new(),
+                    data_text: String::new(),
+                    file_changes: vec![crate::agent_diff::FileChangeSummary {
+                        path: (*path).to_string(),
+                        added: *added,
+                        removed: *removed,
+                        created: false,
+                        rows: Vec::new(),
+                        hidden: 0,
+                    }],
+                    duration_ms: None,
+                }
+                .to_json(),
+            ));
+        }
+        view.transcript
+            .push_message(crate::ChatMessageUI::assistant("改完了"));
+    }
+
+    /// 「查看改动」入口只在**确有整轮 diff** 的轮次出现，点它发的是整轮请求。
+    #[gpui::test]
+    fn the_turn_review_entry_appears_only_for_turns_with_a_diff(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_subscribe = seen.clone();
+        cx.update(|_window: &mut gpui::Window, cx: &mut gpui::App| {
+            cx.subscribe(&view, move |_, event: &AgentChatViewEvent, _cx| {
+                if let AgentChatViewEvent::OpenTurnReview {
+                    session_id,
+                    turn_id,
+                } = event
+                {
+                    seen_for_subscribe
+                        .lock()
+                        .unwrap()
+                        .push((session_id.clone(), turn_id.clone()));
+                }
+            })
+            .detach();
+        });
+
+        view.update(cx, |view, cx| {
+            let session_id = view.current_session.clone();
+            push_turn_with_edits(
+                view,
+                &session_id,
+                "turn-edit",
+                &[("src/a.rs", 12, 3), ("src/b.rs", 4, 0)],
+            );
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ai-chat-turn-changes").is_some(),
+            "这一轮改了文件就该有摘要"
+        );
+        assert!(
+            cx.debug_bounds("ai-chat-turn-review").is_none(),
+            "还没捕获到快照的轮次不给入口：点了只会开出一片空白"
+        );
+
+        let session_id = view.read_with(cx, |view, _| view.current_session.clone());
+        view.update(cx, |view, cx| {
+            view.set_reviewed_turns(
+                session_id.clone(),
+                std::iter::once("turn-edit".to_string()).collect(),
+                cx,
+            );
+        });
+        refresh_frame(cx);
+
+        let review = cx
+            .debug_bounds("ai-chat-turn-review")
+            .expect("真有 diff 的轮次要给入口");
+        assert!(seen.lock().unwrap().is_empty(), "只是出现，还没点过");
+        cx.simulate_click(review.center(), Modifiers::default());
+        refresh_frame(cx);
+
+        assert_eq!(
+            vec![(session_id, "turn-edit".to_string())],
+            seen.lock().unwrap().clone(),
+            "整轮审阅只认用户点的那一轮，且宿主靠会话 + 轮次定位"
+        );
+    }
+
+    /// 文件多了就在原地展开，不弹窗、不跳页。
+    #[gpui::test]
+    fn the_turn_changes_list_expands_in_place(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let session_id = view.current_session.clone();
+            push_turn_with_edits(
+                view,
+                &session_id,
+                "turn-many",
+                &[
+                    ("src/a.rs", 1, 0),
+                    ("src/b.rs", 2, 1),
+                    ("src/c.rs", 3, 2),
+                    ("src/d.rs", 4, 3),
+                    ("src/e.rs", 5, 4),
+                ],
+            );
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ai-chat-turn-change-overflow").is_none(),
+            "默认只列前几个：页脚是导航不是清单"
+        );
+        let toggle = cx
+            .debug_bounds("ai-chat-turn-changes-toggle")
+            .expect("多出来的文件要有展开入口");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-turn-change-overflow").is_some(),
+            "展开后剩下的文件就在原地长出来"
+        );
+
+        let toggle = cx
+            .debug_bounds("ai-chat-turn-changes-toggle")
+            .expect("展开后仍能收起");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-turn-change-overflow").is_none(),
+            "收起后回到只列前几个"
+        );
+    }
+
+    #[gpui::test]
+    fn a_message_resolves_to_the_turn_it_belongs_to(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let session_id = view.session_id.clone();
+            view.apply_runtime_event(
+                RuntimeEvent::AssistantMessage {
+                    session_id,
+                    turn_id: agent_runtime::TurnId::from_string("turn-card"),
+                    text: "改完了".into(),
+                    reasoning: None,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let message_id = view.read_with(cx, |view, _| {
+            view.transcript
+                .messages
+                .last()
+                .map(|message| message.id.clone())
+                .expect("一条助手消息")
+        });
+
+        assert_eq!(
+            Some("turn-card".to_string()),
+            view.read_with(cx, |view, _| view.turn_id_for_message(&message_id)),
+            "工具卡片拿自己的消息 id 反查轮次，反查结果决定审阅面板裁哪一轮的快照"
+        );
+        assert_eq!(
+            None,
+            view.read_with(cx, |view, _| view.turn_id_for_message("no-such-message")),
+            "查不到的消息不能猜一个轮次出来 —— 猜错就是拿别人的 diff 冒充"
+        );
+    }
+
+    #[gpui::test]
+    fn restorable_turns_are_bucketed_by_session(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        let current = view.read_with(cx, |view, _| view.current_session.clone());
+        view.update(cx, |view, cx| {
+            view.set_restorable_turns(current.clone(), HashSet::from(["turn-a".to_string()]), cx);
+            view.set_restorable_turns(
+                "another-session".to_string(),
+                HashSet::from(["turn-b".to_string()]),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                Some(&HashSet::from(["turn-a".to_string()])),
+                view.restorable_turns.get(&current),
+                "切回本会话时只有本会话的轮次算可回滚"
+            );
+            assert_eq!(
+                Some(&HashSet::from(["turn-b".to_string()])),
+                view.restorable_turns.get("another-session")
+            );
+            assert!(
+                !view
+                    .restorable_turns
+                    .get(&current)
+                    .is_some_and(|turns| turns.contains("turn-b")),
+                "另一会话的轮次绝不能漏进本会话——那会渲染出点了没反应的入口"
+            );
+        });
+
+        // 宿主发空列表 = 该会话已无可回滚轮次，桶要整个消失。
+        view.update(cx, |view, cx| {
+            view.set_restorable_turns(current.clone(), HashSet::new(), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.restorable_turns.contains_key(&current));
+        });
     }
 
     #[gpui::test]
@@ -6177,6 +11590,543 @@ mod tests {
         assert!(
             cx.debug_bounds("agent-input-send-control").is_none(),
             "a blocked FIFO must not fall back to the ordinary send control"
+        );
+    }
+
+    #[gpui::test]
+    fn backend_switches_which_composer_is_mounted(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        // 本地：挂 One agent 那份（它有权限档位芯片，ACP 那份没有）。
+        view.update(cx, |_, cx| cx.notify());
+        let cx: &mut VisualTestContext = cx;
+        assert!(
+            cx.debug_bounds("agent-input-permission").is_some(),
+            "本地后端应当挂载 One agent 那份输入框"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-acp-root").is_none(),
+            "本地后端不该出现 ACP 那份输入框"
+        );
+
+        // 切到 ACP：同一个位置换成 ACP 那份——One agent 的能力区整块消失。
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            cx.notify();
+        });
+        assert!(
+            cx.debug_bounds("agent-input-acp-root").is_some(),
+            "ACP 后端应当挂载 ACP 那份输入框"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-permission").is_none(),
+            "切到 ACP 后不该再出现 One agent 的能力 chip"
+        );
+    }
+
+    /// ACP 的"怎么跑"跟底栏走：模式与模型都在工具栏那一行，抬头只剩下身份与能力。
+    #[gpui::test]
+    fn acp_composer_keeps_mode_and_model_on_the_bottom_row(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let toolbar = cx
+            .debug_bounds("agent-input-toolbar")
+            .expect("底栏应当渲染");
+        let mode = cx
+            .debug_bounds("agent-input-acp-mode")
+            .expect("模式 chip 应当渲染");
+        let model = cx
+            .debug_bounds("agent-input-acp-model-control")
+            .expect("模型下拉应当渲染");
+
+        let toolbar_bottom = toolbar.origin.y + toolbar.size.height;
+        for control in [mode, model] {
+            assert!(
+                control.origin.y >= toolbar.origin.y
+                    && control.origin.y + control.size.height <= toolbar_bottom,
+                "模式与模型必须落在底栏那一行：control={control:?}, toolbar={toolbar:?}"
+            );
+        }
+
+        // 计划 / 子代理搬到了卡片顶部的能力行：它们不该再出现在底栏里，
+        // 底栏只回答「怎么发出去」；能力行在编辑器之上，标签有整行宽度。
+        let editor = cx
+            .debug_bounds("agent-input-editor")
+            .expect("编辑区应当渲染");
+        let capability_row = cx
+            .debug_bounds("agent-input-capability-row")
+            .expect("能力行应当渲染");
+        assert!(
+            capability_row.origin.y + capability_row.size.height <= editor.origin.y,
+            "能力行必须在编辑区之上：row={capability_row:?}, editor={editor:?}"
+        );
+        for selector in ["acp-plan-trigger", "acp-subagents-trigger"] {
+            let chip = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} 应当渲染"));
+            assert!(
+                chip.origin.y >= capability_row.origin.y
+                    && chip.origin.y + chip.size.height
+                        <= capability_row.origin.y + capability_row.size.height,
+                "{selector} 必须落在能力行里：chip={chip:?}, row={capability_row:?}"
+            );
+            assert!(
+                chip.origin.y + chip.size.height <= editor.origin.y,
+                "{selector} 不该再挤在底栏：chip={chip:?}, editor={editor:?}"
+            );
+        }
+
+        // 身份行已去掉：底栏之上不该再有第二行 chrome。
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("agent-input-acp-header").is_none(),
+            "身份行不应再渲染"
+        );
+    }
+
+    /// 上下文栏放不下三颗 chip 时要换行，不能把它们挤到 `min_w` 下限、
+    /// 只剩省略号——那是"显示不全"的根源。
+    #[gpui::test]
+    fn acp_context_row_wraps_instead_of_squeezing(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+        let source = ComposerContextSource {
+            snapshot: Arc::new(move |_: &mut gpui::App| ComposerContextSnapshot {
+                workspace: ComposerWorkspaceInfo {
+                    label: SharedString::from("navop-wt-ai-workbench"),
+                    path: Some(SharedString::from("/tmp/navop-wt-ai-workbench")),
+                    is_git_repo: true,
+                },
+                workspace_options: vec![ComposerWorkspaceOption::new(
+                    "navop-wt-ai-workbench",
+                    "/tmp/navop-wt-ai-workbench",
+                    true,
+                )],
+                branches: vec![ComposerBranchOption::new("impl/ai-workbench", true, false)],
+                worktree: ComposerWorktreeState {
+                    enabled: false,
+                    label: Some(SharedString::from("navop-wt-ai-workbench")),
+                    pending: false,
+                },
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+        refresh_frame(cx);
+
+        let chips = |cx: &mut VisualTestContext| {
+            [
+                "agent-input-workspace",
+                "agent-input-branch",
+                "agent-input-worktree",
+            ]
+            .map(|selector| cx.debug_bounds(selector).expect("三颗 chip 都应当渲染"))
+        };
+        // 宽窗：一行放得下，三颗同一中线。
+        let wide = chips(cx);
+        let center = wide[0].origin.y + wide[0].size.height / 2.0;
+        for bounds in wide {
+            assert!(
+                (bounds.origin.y + bounds.size.height / 2.0 - center).abs() <= px(2.0),
+                "宽窗下三颗应当在同一行：{bounds:?}"
+            );
+        }
+        let wide_widths: Vec<Pixels> = wide.iter().map(|bounds| bounds.size.width).collect();
+
+        // 收窄到放不下三颗：换成两行，而不是把每颗压到 `min_w`。
+        cx.simulate_resize(gpui::Size {
+            width: px(604.0),
+            height: px(900.0),
+        });
+        refresh_frame(cx);
+        let narrow = chips(cx);
+        for (index, bounds) in narrow.iter().enumerate() {
+            assert!(
+                bounds.size.width >= wide_widths[index] - px(0.5),
+                "窄窗下不该把 chip 压窄（第 {index} 颗）：wide={wide_widths:?}, narrow={bounds:?}"
+            );
+        }
+        let narrow_centers: Vec<Pixels> = narrow
+            .iter()
+            .map(|bounds| bounds.origin.y + bounds.size.height / 2.0)
+            .collect();
+        assert!(
+            narrow_centers
+                .windows(2)
+                .any(|pair| (pair[0] - pair[1]).abs() > px(2.0)),
+            "窄窗下应当换行，实际三颗仍在同一行：{narrow:?}"
+        );
+    }
+
+    /// Worktree 从组件库 `Checkbox` 换成 chip 之后，点一下仍然要把**翻转后**的值
+    /// 交给宿主：开关的语义搬到了 `☑/☐` 图标上，回路不变。
+    #[gpui::test]
+    fn acp_worktree_chip_reports_the_flipped_state(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let enabled = Arc::new(Mutex::new(true));
+        let enabled_for_snapshot = enabled.clone();
+        let toggled = Arc::new(Mutex::new(Vec::new()));
+        let toggled_for_source = toggled.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let source = ComposerContextSource {
+            snapshot: Arc::new(move |_: &mut gpui::App| ComposerContextSnapshot {
+                branches: vec![ComposerBranchOption::new("main", true, false)],
+                worktree: ComposerWorktreeState {
+                    enabled: *enabled_for_snapshot.lock().unwrap(),
+                    label: Some(SharedString::from("navop-wt-chip")),
+                    pending: false,
+                },
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(move |next: bool, _: &mut gpui::App| {
+                *enabled.lock().unwrap() = next;
+                toggled_for_source.lock().unwrap().push(next);
+            }),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+
+        let chip = cx
+            .debug_bounds("agent-input-worktree")
+            .expect("Worktree chip 应当渲染");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert_eq!(
+            toggled.lock().unwrap().as_slice(),
+            [false],
+            "勾选态为开时点一下，应当报「关」"
+        );
+
+        // 宿主把新状态灌回快照后再点一次：这一回报的应当是「开」。
+        view.update(cx, |view, cx| view.sync_composer(cx));
+        refresh_frame(cx);
+        let chip = cx
+            .debug_bounds("agent-input-worktree")
+            .expect("Worktree chip 应当仍在");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert_eq!(
+            toggled.lock().unwrap().as_slice(),
+            [false, true],
+            "关着的时候点一下，应当报「开」"
+        );
+    }
+
+    /// ACP 的能力行：计划与子代理是卡片顶部一排的两颗 chip，模式仍留在底栏。
+    ///
+    /// 侧栏一窄，一行里挤四类控件会把两边都挤成省略号；计划 / 子代理搬到编辑区
+    /// 上方之后，能力行有整行宽度，底栏只留「怎么发出去」。
+    #[gpui::test]
+    fn acp_composer_keeps_plan_and_subagent_tabs(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let plan = cx
+            .debug_bounds("acp-plan-trigger")
+            .expect("计划 chip 应当渲染");
+        let subagents = cx
+            .debug_bounds("acp-subagents-trigger")
+            .expect("子代理 chip 应当渲染");
+        let mode = cx
+            .debug_bounds("agent-input-acp-mode")
+            .expect("模式 chip 应当渲染");
+        let editor = cx
+            .debug_bounds("agent-input-editor")
+            .expect("编辑区应当渲染");
+
+        // 能力行：计划 → 子代理，横向排列。
+        assert!(
+            plan.origin.x < subagents.origin.x,
+            "顺序应为 计划 → 子代理：plan={plan:?}, subagents={subagents:?}"
+        );
+        // 两颗都是 26 高的 chip，真的同高，所以比中线就够。
+        let row_center = plan.origin.y + plan.size.height / 2.0;
+        for bounds in [plan, subagents] {
+            let center = bounds.origin.y + bounds.size.height / 2.0;
+            assert!(
+                (center - row_center).abs() <= px(2.0),
+                "计划与子代理必须居在同一条中线上：{bounds:?}（row_center={row_center:?}）"
+            );
+        }
+        // 能力行在编辑区之上；模式在编辑区之下（底栏）。
+        for bounds in [plan, subagents] {
+            assert!(
+                bounds.origin.y + bounds.size.height <= editor.origin.y,
+                "能力 chip 必须落在编辑区之上：{bounds:?}, editor={editor:?}"
+            );
+        }
+        assert!(
+            mode.origin.y >= editor.origin.y + editor.size.height,
+            "模式应留在底栏（编辑区之下）：mode={mode:?}, editor={editor:?}"
+        );
+
+        // 身份行与折叠开关一起没了：这两栏不再有收起状态，任何时刻都在。
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("agent-input-acp-header").is_none(),
+            "身份行不应再渲染"
+        );
+        assert!(
+            cx.debug_bounds("agent-input-acp-header-toggle").is_none(),
+            "折叠开关不应再渲染"
+        );
+        assert!(
+            cx.debug_bounds("acp-plan-trigger").is_some(),
+            "计划 chip 应当始终在"
+        );
+        assert!(
+            cx.debug_bounds("acp-subagents-trigger").is_some(),
+            "子代理 chip 应当始终在"
+        );
+    }
+
+    /// ACP 的分支选择与模型同一套控件（组件库 `Select`）：点开列出候选，
+    /// 选中一条走原有的 `SelectBranch` 事件交给宿主（与旧的自绘列表同一条回路）。
+    ///
+    /// 搜索框是组件自带的，能搜的前提在 `BranchChoice::matches` 那侧（含单测）；
+    /// 这里盯的是「换成组件下拉之后，开关与选中都还能跑通」。
+    #[gpui::test]
+    fn acp_branch_select_lists_options_and_reports_the_pick(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let picked = Arc::new(Mutex::new(Vec::new()));
+        let picked_for_source = picked.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let source = ComposerContextSource {
+            snapshot: Arc::new(|_: &mut gpui::App| ComposerContextSnapshot {
+                branches: vec![ComposerBranchOption::new("main", true, false)],
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(move |name: &SharedString, _: &mut gpui::App| {
+                picked_for_source.lock().unwrap().push(name.clone());
+            }),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+
+        let branch = cx
+            .debug_bounds("agent-input-branch")
+            .expect("分支选择应当渲染");
+        assert!(
+            branch.size.width > px(0.0),
+            "分支选择不能被挤成零宽：{branch:?}"
+        );
+        assert!(
+            cx.debug_bounds("agent-branch-option").is_none(),
+            "没点开之前不该有候选"
+        );
+
+        cx.simulate_click(branch.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("agent-branch-option").is_some(),
+            "点开应当出现组件下拉的候选行"
+        );
+
+        let option = cx
+            .debug_bounds("agent-branch-option")
+            .expect("候选行应当在");
+        cx.simulate_click(option.center(), Modifiers::default());
+        refresh_frame(cx);
+        assert_eq!(
+            picked.lock().unwrap().as_slice(),
+            [SharedString::from("main")],
+            "选中必须原样报给宿主"
+        );
+        assert!(
+            cx.debug_bounds("agent-branch-option").is_none(),
+            "选完应当收起"
+        );
+    }
+
+    /// 分支下拉的行必须一样高。
+    ///
+    /// 列表是按**第一行**量一次高度、全体共用的（`List::prepare_items_if_needed`），
+    /// 谁比这个高度多出一行，就会压到下一行上 —— 远端分支原先就是这么叠起来的。
+    /// 所以断言的不是「长得好看」，而是两种行的高度必须一致。
+    #[gpui::test]
+    fn acp_branch_dropdown_rows_share_one_height(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        // 第一条是本地分支（列表就量它）：它后面的远端行才看得出撑没撑破。
+        let source = ComposerContextSource {
+            snapshot: Arc::new(|_: &mut gpui::App| ComposerContextSnapshot {
+                branches: vec![
+                    ComposerBranchOption::new("main", true, false),
+                    ComposerBranchOption::new("origin/feature/x", false, true),
+                ],
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("agent"));
+            view.set_composer_context_source(source, cx);
+            cx.notify();
+        });
+
+        let branch = cx
+            .debug_bounds("agent-input-branch")
+            .expect("分支选择应当渲染");
+        cx.simulate_click(branch.center(), Modifiers::default());
+        refresh_frame(cx);
+
+        let local = cx
+            .debug_bounds("agent-branch-option-local")
+            .expect("本地分支应当有一行");
+        let remote = cx
+            .debug_bounds("agent-branch-option-remote")
+            .expect("远端分支应当有一行");
+        assert!(
+            (local.size.height - remote.size.height).abs() <= px(1.0),
+            "本地与远端的分支行必须一样高（多的那一行会压到下一行上）：local={local:?}, remote={remote:?}"
+        );
+        assert!(
+            remote.origin.y >= local.origin.y,
+            "远端行排在本地行之后：local={local:?}, remote={remote:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn switching_backend_carries_the_draft_between_composers(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        // 本地那份里留半句话 + 一张附件。
+        view.update_in(cx, |view, window, cx| {
+            view.composer()
+                .set_composer_text("切过去也不该丢的半句话", window, cx);
+            view.composer()
+                .set_composer_attachments(vec![crate::ImageAttachment::for_test("carry.png")], cx);
+        });
+
+        // 切到 ACP：两份组件各有自己的编辑器，内容靠面板在渲染时搬一次。
+        view.update_in(cx, |view, window, cx| {
+            view.backend = Backend::Acp;
+            cx.notify();
+            view.render(window, cx);
+        });
+        assert_eq!(
+            "切过去也不该丢的半句话",
+            view.read_with(cx, |view, cx| view.acp_input.read(cx).composer_text(cx)),
+            "切到 ACP 后刚打的字要跟过去"
+        );
+        assert_eq!(
+            1,
+            view.read_with(cx, |view, cx| view
+                .acp_input
+                .read(cx)
+                .composer_attachments()
+                .len()),
+            "附件也要跟着搬"
+        );
+
+        // 在 ACP 那份里改一行再切回本地：搬的是**最新**的内容，不是旧那份里的残留。
+        view.update_in(cx, |view, window, cx| {
+            view.composer()
+                .set_composer_text("在 ACP 里改过的一句", window, cx);
+            view.backend = Backend::Local;
+            cx.notify();
+            view.render(window, cx);
+        });
+        assert_eq!(
+            "在 ACP 里改过的一句",
+            view.read_with(cx, |view, cx| view.input.read(cx).composer_text(cx)),
+            "切回本地要搬 ACP 那份里的最新内容"
         );
     }
 
@@ -6569,8 +12519,7 @@ mod tests {
             view.backend = Backend::Acp;
             view.current_acp_id = Some(agent_id.clone());
             let operation = view.begin_acp_session_transition(agent_id, session_uid.clone());
-            view.input
-                .update(cx, |input, cx| input.set_running(true, cx));
+            view.set_composers_running(true, cx);
             view.pending_submissions
                 .enqueue(&session_uid, pending_submission("cancel with new session"));
 
@@ -6671,6 +12620,1307 @@ mod tests {
             assert_eq!(Backend::Local, view.backend);
             assert!(!view.is_current_acp_operation(stale_operation));
             assert_eq!(None, view.acp_session_transition_phase(&session_uid));
+        });
+    }
+
+    /// 用户从 agent 菜单里选一次后端，就要记住这次选择。
+    ///
+    /// 以前只有 ACP 鉴权失败那条路径会写设置：选 Codex 连上了、重启却回到
+    /// One Agent。现在选择本身即持久化，选回内置也会把 ACP 选中项清掉。
+    #[gpui::test]
+    fn selecting_backend_persists_the_choice(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agent_id = SharedString::from("codex");
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_acp_agents(vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+                    agent_id.clone(),
+                    "Codex",
+                    "definitely-missing-acp-binary",
+                ))]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            AppSettings::update(cx, |settings| {
+                settings.ai_chat.last_acp_agent_id = Some(agent_id.to_string());
+                settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+                    id: agent_id.to_string(),
+                });
+            });
+
+            view.select_backend(None, cx);
+
+            assert_eq!(Backend::Local, view.backend);
+            let settings = AppSettings::current(cx);
+            assert_eq!(
+                Some(AiChatBackendSelection::Builtin),
+                settings.ai_chat.last_backend,
+                "选内置要记住"
+            );
+            assert_eq!(
+                None, settings.ai_chat.last_acp_agent_id,
+                "选内置时要清掉 ACP 选中项，否则设置页还标着旧 agent"
+            );
+        });
+    }
+
+    /// 上次选了内置 One Agent：启动恢复时留在本地后端，不去连 ACP。
+    #[gpui::test]
+    fn restoring_builtin_choice_keeps_local_backend(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agent_id = SharedString::from("codex");
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_acp_agents(vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+                    agent_id.clone(),
+                    "Codex",
+                    "definitely-missing-acp-binary",
+                ))]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            AppSettings::update(cx, |settings| {
+                settings.ai_chat.last_acp_agent_id = Some(agent_id.to_string());
+                settings.ai_chat.last_backend = Some(AiChatBackendSelection::Builtin);
+            });
+
+            view.restore_persisted_acp(cx);
+
+            assert_eq!(Backend::Local, view.backend);
+            assert_eq!(None, view.current_acp_id);
+            assert!(!view.acp_connecting);
+        });
+    }
+
+    /// 上次选的 ACP agent 已被删掉/禁用：安静地留在本地，不尝试连接。
+    #[gpui::test]
+    fn restoring_missing_acp_choice_leaves_local_backend(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            AppSettings::update(cx, |settings| {
+                settings.ai_chat.last_acp_agent_id = Some("removed-agent".to_string());
+                settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+                    id: "removed-agent".to_string(),
+                });
+            });
+
+            view.restore_persisted_acp(cx);
+
+            assert_eq!(Backend::Local, view.backend);
+            assert_eq!(None, view.current_acp_id);
+            assert!(!view.acp_connecting);
+        });
+    }
+
+    /// 切到 ACP 后端前，必须把本地那段对话落进会话缓存。
+    ///
+    /// 本地转录归 navop 所有，ACP 会话历史归 agent（靠 load/resume 取回），
+    /// 两者不能共用同一个 `clear`：否则「本地 → ACP → 切回本地」之后本地内容凭空消失。
+    #[gpui::test]
+    fn leaving_local_backend_stashes_the_local_transcript(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            view.transcript.push_system(LOCAL_TRANSCRIPT_MARK);
+
+            view.begin_acp_connect(&agent, &session_uid, cx);
+
+            assert!(
+                view.session_transcripts.contains_key(&session_uid),
+                "切到 ACP 前本地转录必须落进会话缓存"
+            );
+            assert!(
+                !view
+                    .transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == LOCAL_TRANSCRIPT_MARK),
+                "ACP 会话内容未知，屏幕不该继续显示上一段本地对话"
+            );
+        });
+    }
+
+    /// 从 ACP 切回本地时，屏幕上要能把本地那段对话还回来。
+    #[gpui::test]
+    fn returning_to_local_restores_the_stashed_transcript(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            view.transcript.push_system(LOCAL_TRANSCRIPT_MARK);
+            view.begin_acp_connect(&agent, &session_uid, cx);
+
+            view.select_local_backend_for_session(&session_uid, cx);
+
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == LOCAL_TRANSCRIPT_MARK),
+                "切回本地必须恢复该会话的本地转录"
+            );
+        });
+    }
+
+    /// 缓存被淘汰也不能让本地会话在切回时变成空白：能从 Runtime 快照重建。
+    #[gpui::test]
+    fn returning_to_local_rebuilds_from_runtime_when_cache_is_gone(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let session_id = view.session_id.clone();
+            view.runtime
+                .session(&session_id)
+                .expect("current session is live")
+                .record_user_input("本地快照里的话");
+            view.transcript.push_system(LOCAL_TRANSCRIPT_MARK);
+            view.begin_acp_connect(&agent, &session_uid, cx);
+            // 模拟缓存被 LRU 淘汰 / 从未落缓存。
+            view.remove_cached_session_transcript(&session_uid);
+
+            view.select_local_backend_for_session(&session_uid, cx);
+
+            assert!(
+                view.transcript.messages.iter().any(|message| {
+                    matches!(&message.content, content if content.contains("本地快照里的话"))
+                }),
+                "缓存缺失时应从 Runtime 快照重建本地转录"
+            );
+        });
+    }
+
+    /// 本地这段对话不会进入 agent 的上下文，切过去时必须说在明处。
+    #[gpui::test]
+    fn switching_to_acp_tells_the_user_where_the_local_context_goes(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            view.refresh_acp_agents_from(vec![AcpAgentEntry::ready(agent.clone())], cx);
+            let session_uid = view.current_session.clone();
+            view.transcript.push_system(LOCAL_TRANSCRIPT_MARK);
+
+            view.begin_acp_connect(&agent, &session_uid, cx);
+
+            assert!(
+                view.transcript.messages.iter().any(|message| {
+                    message.content == t!("AgentUi.context_boundary_to_acp", name = "Agent")
+                }),
+                "切到 ACP 必须提示本地上下文不会带过去，实际内容：{:?}",
+                view.transcript
+                    .messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// 本地会话本来就是空的，切到 ACP 不必提示「本地那段不会带过去」——没有可失的东西。
+    ///
+    /// 顺带钉住空转录**不进缓存**：缓存里留一个空壳会遮蔽 Runtime 快照重建，
+    /// 让「切回本地」看起来像历史丢了。
+    #[gpui::test]
+    fn switching_to_acp_stays_quiet_when_the_local_session_is_empty(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            view.refresh_acp_agents_from(vec![AcpAgentEntry::ready(agent.clone())], cx);
+            let session_uid = view.current_session.clone();
+
+            view.begin_acp_connect(&agent, &session_uid, cx);
+
+            let boundary_notice = t!("AgentUi.context_boundary_to_acp", name = "Agent").to_string();
+            assert!(
+                !view
+                    .transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == boundary_notice),
+                "本地没有内容时不该提示上下文边界"
+            );
+            assert!(
+                !view.session_transcripts.contains_key(&session_uid),
+                "空转录不该进会话缓存"
+            );
+        });
+    }
+
+    /// 切回本地时要说清 agent 那段对话去哪了：它在 agent 一侧，不进入本地模型的上下文。
+    #[gpui::test]
+    fn switching_back_to_local_explains_where_the_agent_conversation_went(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            view.refresh_acp_agents_from(vec![AcpAgentEntry::ready(agent.clone())], cx);
+            let session_uid = view.current_session.clone();
+            view.transcript.push_system(LOCAL_TRANSCRIPT_MARK);
+            view.begin_acp_connect(&agent, &session_uid, cx);
+            // 屏幕上此刻是 agent 的内容。
+            view.transcript.push_system(ACP_TRANSCRIPT_MARK);
+
+            view.select_local_backend_for_session(&session_uid, cx);
+
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == LOCAL_TRANSCRIPT_MARK),
+                "切回本地要恢复本地那段对话"
+            );
+            assert!(
+                view.transcript.messages.iter().any(|message| {
+                    message.content == t!("AgentUi.context_boundary_to_local", name = "Agent")
+                }),
+                "切回本地必须说明 agent 那段对话留在哪一侧"
+            );
+        });
+    }
+
+    /// 缓存里留一个空壳不能让切回本地变空白：Runtime 里的历史还在，必须重建出来。
+    ///
+    /// 空壳是真实会出现的：连接失败 / 状态推送会给非当前会话建一块空白转录。
+    #[gpui::test]
+    fn an_empty_session_cache_does_not_shadow_the_runtime_history(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let session_id = view.session_id.clone();
+            view.runtime
+                .session(&session_id)
+                .expect("current session is live")
+                .record_user_input("本地快照里的话");
+            view.begin_acp_connect(&agent, &session_uid, cx);
+            // 缓存没了，只剩一个空壳。
+            view.remove_cached_session_transcript(&session_uid);
+            view.cache_session_transcript(session_uid.clone(), AgentTranscript::new());
+
+            view.select_local_backend_for_session(&session_uid, cx);
+
+            assert!(
+                view.transcript.messages.iter().any(|message| {
+                    matches!(&message.content, content if content.contains("本地快照里的话"))
+                }),
+                "空缓存不能遮蔽 Runtime 快照重建"
+            );
+        });
+    }
+
+    /// 切会话时，缓存里一块空壳转录同样不能遮蔽 Runtime 里的历史。
+    #[gpui::test]
+    fn switching_sessions_rebuilds_when_the_cached_transcript_is_empty(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let first = view.current_session.clone();
+            let first_id = view.session_id.clone();
+            view.runtime
+                .session(&first_id)
+                .expect("current session is live")
+                .record_user_input("第一段会话的话");
+
+            // 换到另一个会话，并把第一个会话的缓存换成一块空壳。
+            view.start_fresh_session(cx);
+            assert_ne!(first, view.current_session);
+            view.cache_session_transcript(first.clone(), AgentTranscript::new());
+
+            view.switch_session(&first, cx);
+
+            assert!(
+                view.transcript.messages.iter().any(|message| {
+                    matches!(&message.content, content if content.contains("第一段会话的话"))
+                }),
+                "空壳缓存不能遮蔽 Runtime 快照"
+            );
+        });
+    }
+
+    /// 会话草稿跟随会话：切走时捕获到 Runtime 会话，切回来时回到输入框。
+    /// 每个会话各存各的，互不串台。
+    #[gpui::test]
+    fn switching_sessions_carries_the_composer_draft_per_session(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            let first = view.current_session.clone();
+            let first_id = view.session_id.clone();
+            view.input.update(cx, |input, cx| {
+                input.set_composer_text("第一个会话的半句话", window, cx)
+            });
+            // 第一个会话有了历史（否则不会被持久化），草稿才有落盘意义。
+            view.runtime
+                .session(&first_id)
+                .expect("first session is live")
+                .record_user_input("第一段会话的话");
+
+            // 新建会话：输入框应清空（新会话没有草稿）。
+            view.new_session(cx);
+            let second = view.current_session.clone();
+            assert_ne!(first, second);
+            view.apply_pending_input_draft(window, cx);
+            assert_eq!(
+                view.input.read(cx).composer_text(cx),
+                "",
+                "新会话必须从空输入框开始"
+            );
+
+            // 在第二个会话里留半句，再切回第一个。
+            view.input.update(cx, |input, cx| {
+                input.set_composer_text("第二个会话的半句话", window, cx)
+            });
+            view.switch_session(&first, cx);
+            view.apply_pending_input_draft(window, cx);
+            assert_eq!(
+                view.input.read(cx).composer_text(cx),
+                "第一个会话的半句话",
+                "切回来必须恢复该会话自己的草稿"
+            );
+
+            // 两个会话的 Runtime 草稿互不覆盖。
+            assert_eq!(
+                view.runtime
+                    .session(&SessionId::from_string(first.clone()))
+                    .expect("first still live")
+                    .draft()
+                    .as_deref(),
+                Some("第一个会话的半句话")
+            );
+            assert_eq!(
+                view.runtime
+                    .session(&SessionId::from_string(second.clone()))
+                    .expect("second still live")
+                    .draft()
+                    .as_deref(),
+                Some("第二个会话的半句话")
+            );
+        });
+    }
+
+    /// 测试用的图片附件：内容字节不重要（这些用例不渲染缩略图），重要的是
+    /// 它是一份**跟着会话走的用户内容**。
+    fn test_image_attachment(name: &str) -> crate::ImageAttachment {
+        crate::ImageAttachment {
+            id: format!("img-{name}"),
+            name: format!("{name}.png"),
+            image: std::sync::Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                vec![0x89, 0x50, 0x4E, 0x47],
+            )),
+        }
+    }
+
+    /// 附件也跟着会话走：切走时捕获、
+    /// 切回来时恢复；目标会话没有附件草稿时，输入框里**不许残留**上一会话的
+    /// 图片——否则它会跟着新会话一起发出去。
+    #[gpui::test]
+    fn switching_sessions_carries_the_composer_attachments_per_session(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            let first = view.current_session.clone();
+            let first_id = view.session_id.clone();
+            view.input.update(cx, |input, cx| {
+                input.set_composer_text("第一个会话的半句话", window, cx);
+                input.set_composer_attachments(vec![test_image_attachment("a")], cx);
+            });
+            // 第一个会话有了历史（否则不会被持久化），草稿才有落盘意义。
+            view.runtime
+                .session(&first_id)
+                .expect("first session is live")
+                .record_user_input("第一段会话的话");
+
+            // 新会话：输入框要**连图片一起**清空（新会话没有附件草稿）。
+            view.new_session(cx);
+            let second = view.current_session.clone();
+            assert_ne!(first, second);
+            view.apply_pending_input_draft(window, cx);
+            assert_eq!(view.input.read(cx).composer_text(cx), "");
+            assert!(
+                view.input.read(cx).composer_attachments().is_empty(),
+                "切到没有附件草稿的会话，上一会话的图片不能留在输入框里"
+            );
+
+            // 切回第一个会话：文字与图片都要回来。
+            view.switch_session(&first, cx);
+            view.apply_pending_input_draft(window, cx);
+            assert_eq!(
+                view.input.read(cx).composer_text(cx),
+                "第一个会话的半句话",
+                "切回来必须恢复该会话自己的文字草稿"
+            );
+            let attachments = view.input.read(cx).composer_attachments();
+            assert_eq!(1, attachments.len(), "切回来必须恢复该会话自己的附件");
+            assert_eq!("img-a", attachments[0].id, "恢复的是同一张图");
+        });
+    }
+
+    /// 输入框只挂了图片、没有文字时，这个会话也**不算白纸**：
+    /// 用户已经开始准备内容了。
+    #[gpui::test]
+    fn a_session_with_only_composer_attachments_is_not_blank(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, cx| {
+            assert!(
+                view.current_session_is_blank(cx),
+                "刚打开、什么都没挂的会话才是白纸"
+            );
+            view.input.update(cx, |input, cx| {
+                input.set_composer_attachments(vec![test_image_attachment("x")], cx);
+            });
+            assert!(
+                !view.current_session_is_blank(cx),
+                "只挂了图片（没有文字）也不是白纸"
+            );
+        });
+    }
+
+    /// 发送后附件草稿作废：切走再切回，已发送的图片不能「复活」回输入框
+    /// （文字已有同款保护，这条补齐附件侧）。
+    #[gpui::test]
+    fn submit_consumes_the_attachment_draft(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            let first = view.current_session.clone();
+            view.input.update(cx, |input, cx| {
+                input.set_composer_text("带图的这句话", window, cx);
+                input.set_composer_attachments(vec![test_image_attachment("s")], cx);
+            });
+            // 先把附件捕获进这个会话的草稿位（否则 map 里本来就没有它，
+            // 下面的「作废」断言就成了无中生有的空转绿）。
+            view.capture_session_draft(cx);
+            assert!(
+                view.session_draft_attachments.contains_key(&first),
+                "前置：附件草稿已进入该会话的草稿位"
+            );
+            // 排队一个提交并标记运行中：submit 走入队路径，不触发模型调用。
+            view.pending_submissions
+                .enqueue(&first, pending_submission("already queued"));
+            view.set_running(true, cx);
+
+            view.submit(
+                "带图的这句话".into(),
+                Vec::new(),
+                vec![test_image_attachment("s")],
+                cx,
+            );
+
+            assert!(
+                !view.session_draft_attachments.contains_key(&first),
+                "发送后该会话的附件草稿必须作废"
+            );
+            // 排队路径没有丢内容：图片跟着提交进了队列。
+            assert_eq!(
+                1,
+                view.pending_submissions
+                    .items(&first)
+                    .last()
+                    .expect("submitted item is queued")
+                    .images
+                    .len()
+            );
+        });
+    }
+
+    /// 空白草稿只在**同一个工作区**内复用：工作区 B 里点「新建」，不能把用户
+    /// 切到工作区 A 留下的白纸上（那张纸的快照归属、技能上下文都是 A 的）。
+    #[gpui::test]
+    fn a_blank_session_from_another_workspace_is_not_reused(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_workspace_root(std::path::PathBuf::from("/tmp/navop-test-ws-a"));
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, cx| {
+            let first = view.current_session.clone();
+            let first_id = view.session_id.clone();
+            view.runtime
+                .session(&first_id)
+                .expect("first session is live")
+                .record_user_input("第一段会话的话");
+
+            // 在 ws-a 里留下一张白纸。
+            view.new_session(cx);
+            let blank = view.current_session.clone();
+            view.switch_session(&first, cx);
+            assert_eq!(Some(blank.clone()), view.draft_session, "前置：白纸被记下");
+
+            // 壳层切到工作区 B（直接改字段：绕开 set_workspace_root 的设置落盘）。
+            view.workspace_root = std::path::PathBuf::from("/tmp/navop-test-ws-b");
+
+            // B 里点「新建」：不能切回 A 的白纸，要给 B 造一张新纸。
+            view.new_session(cx);
+            assert_ne!(
+                blank, view.current_session,
+                "别的工作区留下的白纸不能被复用"
+            );
+            assert_eq!(
+                Some(blank.clone()),
+                view.draft_session,
+                "指针要留着：那张纸在它自己的工作区里仍然有效"
+            );
+            assert!(
+                view.session_roots
+                    .get(&view.current_session)
+                    .is_some_and(|root| root == "/tmp/navop-test-ws-b"),
+                "新纸必须归属当前工作区"
+            );
+
+            // 切回工作区 A：那张白纸又能被复用了。
+            view.workspace_root = std::path::PathBuf::from("/tmp/navop-test-ws-a");
+            view.new_session(cx);
+            assert_eq!(
+                blank, view.current_session,
+                "回到原工作区后，自己的白纸照常复用"
+            );
+        });
+    }
+
+    /// 只有系统提示的转录不算「聊过」：否则「正在创建 ACP 会话」这类提示
+    /// 会让空白会话看起来像有内容，空白复用与切后端提示都会跟着错。
+    #[test]
+    fn a_transcript_with_only_system_notes_has_no_conversation() {
+        let mut transcript = AgentTranscript::new();
+        assert!(!transcript.has_conversation(), "空转录当然没聊过");
+        transcript.push_system("正在创建 ACP 会话");
+        assert!(!transcript.has_conversation(), "只有系统提示不算聊过");
+        transcript.push_user("你好", Vec::new());
+        assert!(transcript.has_conversation());
+    }
+
+    /// 已经站在一张白纸上时点「新建会话」是 no-op：否则每点一次就多一张
+    /// 侧栏里的空条目。
+    #[gpui::test]
+    fn new_session_on_an_untouched_blank_session_does_not_pile_up_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, cx| {
+            let first = view.current_session.clone();
+            assert!(
+                view.current_session_is_blank(cx),
+                "刚打开的会话就是一张白纸"
+            );
+            view.new_session(cx);
+            assert_eq!(
+                first, view.current_session,
+                "白纸上再点一次「新建」不该produce第二张纸"
+            );
+            assert_eq!(None, view.draft_session, "no-op 不该留下草稿指针");
+        });
+    }
+
+    /// 只有系统提示的历史仍算白纸。这条真会出现在落盘数据里：一段只跑到
+    /// 「正在创建 ACP 会话」就失败、或者只有系统告示的会话，往返回来就是
+    /// `HistoryItem::System`。把它判成「聊过」会让白纸复用失效、侧栏开始堆空条目。
+    #[gpui::test]
+    fn a_session_whose_history_is_only_system_notes_is_still_reusable(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, _cx| {
+            let uid = "sess_system_only";
+            view.runtime
+                .restore_session(agent_runtime::SessionSnapshot {
+                    id: SessionId::from_string(uid),
+                    resources: ResourceContext::new(),
+                    history: vec![HistoryItem::System("正在创建 ACP 会话".into())],
+                    plan: None,
+                    system_instruction: None,
+                    skills: agent_runtime::SkillContext::new(),
+                    workspace_root: None,
+                    draft: None,
+                    context_tokens: None,
+                    acp: None,
+                });
+
+            assert!(
+                view.runtime_history_is_blank(uid),
+                "只挂了一条系统提示 = 还是白纸"
+            );
+            assert!(
+                view.reusable_blank_session(uid),
+                "白纸应当可以被「新建会话」复用"
+            );
+
+            // 真聊过之后就不再是白纸。
+            view.runtime
+                .session(&SessionId::from_string(uid))
+                .expect("restored session is live")
+                .record_user_input("你好");
+            assert!(!view.runtime_history_is_blank(uid));
+            assert!(!view.reusable_blank_session(uid), "聊过的会话不能复用");
+        });
+    }
+
+    /// 离开一张白纸后，再点「新建会话」要回到那张纸，而不是造第三张。
+    #[gpui::test]
+    fn new_session_reuses_the_blank_session_left_behind(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            let first = view.current_session.clone();
+            let first_id = view.session_id.clone();
+            view.runtime
+                .session(&first_id)
+                .expect("first session is live")
+                .record_user_input("第一段会话的话");
+
+            // 第一个会话聊过了：新建必须真的产生第二张纸。
+            view.new_session(cx);
+            let blank = view.current_session.clone();
+            assert_ne!(first, blank);
+            view.apply_pending_input_draft(window, cx);
+
+            // 离开这张白纸去看第一个会话：它应当被记成可复用的草稿。
+            view.switch_session(&first, cx);
+            assert_eq!(
+                Some(blank.clone()),
+                view.draft_session,
+                "离开的空白会话要被记下来"
+            );
+
+            // 再点「新建」：回到那张纸，不是造第三张。
+            view.new_session(cx);
+            assert_eq!(blank, view.current_session, "应当复用被留在身后的白纸");
+            assert_eq!(None, view.draft_session, "草稿被消费后要清掉");
+        });
+    }
+
+    /// 记下的白纸一旦真有了历史，就不能再被当白纸复用——否则「新建会话」
+    /// 会把用户送进一段他以为已经清空的对话。
+    #[gpui::test]
+    fn a_recorded_blank_session_stops_being_reusable_once_it_has_history(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, cx| {
+            let first = view.current_session.clone();
+            let first_id = view.session_id.clone();
+            view.runtime
+                .session(&first_id)
+                .expect("first session is live")
+                .record_user_input("第一段会话的话");
+
+            view.new_session(cx);
+            let blank = view.current_session.clone();
+            view.switch_session(&first, cx);
+            assert_eq!(Some(blank.clone()), view.draft_session);
+
+            // 模拟后台在这张「白纸」上落了内容（跑完的一轮 / 恢复的提交）。
+            view.runtime
+                .session(&SessionId::from_string(blank.clone()))
+                .expect("blank session is live")
+                .record_user_input("其实已经聊过了");
+
+            view.new_session(cx);
+            assert_ne!(
+                blank, view.current_session,
+                "已经有历史的会话不能再当白纸复用"
+            );
+            assert_eq!(None, view.draft_session, "失效的草稿指针要清掉");
+        });
+    }
+
+    /// 后退/前进沿访问历史走：a → b → c，后退两次、前进两次，栈空后 no-op；
+    /// 会话消失后导航栈里不残留它的痕迹。
+    #[gpui::test]
+    fn session_back_and_forward_navigation_walks_the_visit_history(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let a = view.current_session.clone();
+            view.start_fresh_session(cx);
+            let b = view.current_session.clone();
+            view.start_fresh_session(cx);
+            let c = view.current_session.clone();
+
+            view.navigate_session_back(cx);
+            assert_eq!(b, view.current_session, "第一次后退回到上一个会话");
+            view.navigate_session_back(cx);
+            assert_eq!(a, view.current_session, "第二次后退回到最初会话");
+            view.navigate_session_forward(cx);
+            assert_eq!(b, view.current_session, "前进逐步恢复");
+            view.navigate_session_forward(cx);
+            assert_eq!(c, view.current_session, "前进恢复到最新");
+
+            // 栈空时是 no-op，不是错误。
+            view.navigate_session_forward(cx);
+            assert_eq!(c, view.current_session);
+
+            // 会话被删除/归档：导航栈里不能有它，后退要跳过它。
+            view.session_navigation.remove(&a);
+            view.navigate_session_back(cx);
+            assert_eq!(
+                b, view.current_session,
+                "a 已消失，后退应直接落到 b（而不是 a）"
+            );
+        });
+    }
+
+    /// 只有「用户预期与实际不符」的那两档才开口提示。
+    #[test]
+    fn only_mismatched_session_continuity_reaches_the_user() {
+        let cases = [
+            (AcpSessionContinuity::StartedFresh, false),
+            (AcpSessionContinuity::ReusedWithHistory, false),
+            (AcpSessionContinuity::ReusedWithoutHistory, true),
+            (AcpSessionContinuity::RestartedAfterReuseFailure, true),
+        ];
+
+        for (continuity, expect_notice) in cases {
+            assert_eq!(
+                expect_notice,
+                super::acp_ui::session_continuity_notice(Some(continuity), "Agent").is_some(),
+                "{continuity:?} 的提示策略不对"
+            );
+        }
+        assert!(
+            super::acp_ui::session_continuity_notice(None, "Agent").is_none(),
+            "还没走到开会话这一步时不该猜一个结论"
+        );
+    }
+
+    /// 本组提示依赖四个词条。缺词条时 `t!` 会原样返回 key，占位符写错则会留下 `%{..}`——
+    /// 两种都会把内部标识直接显示给用户。
+    #[test]
+    fn context_notice_locales_resolve_and_interpolate() {
+        let notices = [
+            (
+                "AgentUi.context_boundary_to_acp",
+                t!("AgentUi.context_boundary_to_acp", name = "Agent").to_string(),
+            ),
+            (
+                "AgentUi.context_boundary_to_local",
+                t!("AgentUi.context_boundary_to_local", name = "Agent").to_string(),
+            ),
+            (
+                "AgentUi.acp_session_restarted",
+                t!("AgentUi.acp_session_restarted", name = "Agent").to_string(),
+            ),
+            (
+                "AgentUi.acp_session_resumed_without_history",
+                t!(
+                    "AgentUi.acp_session_resumed_without_history",
+                    name = "Agent"
+                )
+                .to_string(),
+            ),
+        ];
+
+        for (key, text) in notices {
+            assert_ne!(key, text, "词条 `{key}` 在 locales/ai_chat_view.yml 里缺失");
+            assert!(
+                !text.contains("%{"),
+                "词条 `{key}` 的占位符没被替换，实际文案：{text}"
+            );
+        }
+    }
+
+    /// 连接前必须把「这个会话上次用的 ACP 会话」带上：不带的话重连等于一路新开空会话，
+    /// agent 那边的上下文就接不上了。
+    #[gpui::test]
+    fn acp_connect_reuses_the_remembered_protocol_session(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+
+        view.update(cx, |view, cx| {
+            view.refresh_acp_agents_from(vec![AcpAgentEntry::ready(agent)], cx);
+            let session_uid = view.current_session.clone();
+            AppSettings::update(cx, |settings| {
+                settings
+                    .ai_chat
+                    .remember_acp_session(&session_uid, "agent", "acp-remembered");
+            });
+
+            let (operation, _providers) = view
+                .prepare_acp_connect(SharedString::from("agent"), cx)
+                .expect("ready agent must start a connect");
+
+            assert_eq!(Some("acp-remembered".to_string()), operation.resume);
+        });
+    }
+
+    fn snapshot_of_external_session(
+        uid: &str,
+        agent_id: &str,
+        protocol_id: &str,
+    ) -> agent_runtime::SessionSnapshot {
+        agent_runtime::SessionSnapshot {
+            id: SessionId::from_string(uid.to_string()),
+            resources: ResourceContext::new(),
+            history: Vec::new(),
+            plan: None,
+            system_instruction: None,
+            skills: agent_runtime::SkillContext::new(),
+            workspace_root: None,
+            draft: None,
+            context_tokens: None,
+            acp: Some(agent_runtime::AcpSessionRef {
+                agent_id: agent_id.to_string(),
+                session_id: protocol_id.to_string(),
+            }),
+        }
+    }
+
+    /// 本地后端的同一条路径：跑着的会话切走再切回，转录也得在。
+    ///
+    /// 本地侧的缓存与外部 agent 侧共用一套（`session_transcripts`），差异只在
+    /// 来源标记——共用就意味着修一边可能碰坏另一边，所以两边都钉住。
+    #[gpui::test]
+    fn switching_back_to_a_running_local_session_keeps_its_transcript(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            let running_uid = view.current_session.clone();
+            view.transcript
+                .push_message(crate::ChatMessageUI::user("本地会话的问题"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant("本地会话的回答"));
+            view.set_running(true, cx);
+
+            let other = view.runtime.create_session(view.resources.clone());
+            let other_uid = other.id().to_string();
+            view.switch_session(&other_uid, cx);
+            view.switch_session(&running_uid, cx);
+
+            assert!(view.is_running, "切回来时这一轮还在跑");
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "本地会话的问题"),
+                "切回跑着的本地会话，历史也得回来"
+            );
+        });
+    }
+
+    /// 切走再切回一条**正在跑**的外部 agent 会话：屏上历史必须原样回来。
+    ///
+    /// 这条钉住的是「后台轮次」方案的配套：轮次不再因为切走而取消，而 agent 侧的
+    /// `load` 在轮次在飞时是被挡住的（要保住前台轮次的所有权）。回来时唯一能把
+    /// 历史摆回屏幕的途径就是本地留住的那块转录——不留，屏上就只剩一个「执行中」。
+    /// 这里故意不注册 agent 配置，让 reopen 路径安静地退场，只考转录这块。
+    #[gpui::test]
+    fn switching_back_to_a_running_external_session_keeps_its_transcript(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            // 当前会话交给外部 agent，转录里已经有两轮对话，轮次还在跑。
+            let external_uid = view.current_session.clone();
+            view.runtime.restore_session(snapshot_of_external_session(
+                &external_uid,
+                "codex",
+                "acp-42",
+            ));
+            view.backend = Backend::Acp;
+            view.current_acp_id = Some(SharedString::from("codex"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::user("外部会话的问题"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant("外部会话的回答"));
+            view.running_sessions.insert(external_uid.clone());
+            view.set_running(true, cx);
+            let turn_id = TurnId::from_string("turn-external");
+            view.acp_turn_owners = vec![AcpTurnOwner {
+                event_session_id: SessionId::from_string("acp:42"),
+                session_uid: external_uid.clone(),
+                turn_id: turn_id.clone(),
+                backgrounded: false,
+                cancel_requested: false,
+            }];
+
+            // 切到另一条会话，再切回来。
+            let other = view.runtime.create_session(view.resources.clone());
+            let other_uid = other.id().to_string();
+            view.switch_session(&other_uid, cx);
+            assert!(
+                !view
+                    .transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "外部会话的问题"),
+                "切走之后屏上不该还留着上一条会话的消息"
+            );
+            view.switch_session(&external_uid, cx);
+
+            assert!(
+                view.running_sessions.contains(&external_uid),
+                "轮次还在后台跑，回来时状态应当仍是运行中"
+            );
+            assert_eq!(view.is_running, view.running_sessions.contains(&external_uid));
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "外部会话的问题"),
+                "回到正在跑的 agent 会话，历史必须回来；曾经这里只剩一个「执行中」"
+            );
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "外部会话的回答")
+            );
+            assert!(
+                view.acp_turn_owners
+                    .iter()
+                    .all(|owner| !owner.backgrounded),
+                "回到这条会话后，那一轮又成了用户眼前的轮次：输出必须落回屏幕，                 停止按钮也该作用在它身上"
+            );
+
+            // 后续输出必须上屏：轮次被打上「后台」标记时，事件会被判成「别的会话的」
+            // 而落进缓存——屏幕上就一直是切回来那一刻的样子，看起来像卡住了。
+            let before = view.transcript.messages.len();
+            view.apply_runtime_event(
+                RuntimeEvent::AssistantMessage {
+                    session_id: SessionId::from_string("acp:42"),
+                    turn_id: turn_id.clone(),
+                    text: "回来之后的输出".into(),
+                    reasoning: None,
+                },
+                cx,
+            );
+            assert!(
+                view.transcript.messages.len() > before
+                    && view
+                        .transcript
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains("回来之后的输出")),
+                "后台轮的后续输出必须回到屏幕上的转录，而不是只落进缓存"
+            );
+        });
+    }
+
+    /// 从侧栏回到一条外部 agent 会话：要按快照里的地址把 agent 那边接回来，
+    /// 而不是当成一条空的本地会话（那样用户会以为对话没了）。
+    #[gpui::test]
+    fn reopening_an_external_session_reconnects_to_its_agent(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agent_id = SharedString::from("codex");
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_acp_agents(vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+                    agent_id.clone(),
+                    "Codex",
+                    "definitely-missing-acp-binary",
+                ))]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.runtime
+                .restore_session(snapshot_of_external_session("sess_acp", "codex", "acp-42"));
+            let reference = view
+                .runtime
+                .session(&SessionId::from_string("sess_acp".to_string()))
+                .expect("会话应在运行时里")
+                .acp_ref()
+                .expect("外部地址要跟着快照回到会话上");
+
+            // 还没连在这个 agent 上：绕不开重新握手（不能就那么当成本地会话）。
+            let plan = view.plan_acp_reopen("sess_acp", &reference, cx);
+            assert!(
+                matches!(
+                    plan,
+                    Some(super::acp_sessions::AcpReopenPlan::Reconnect(ref id, ref session))
+                        if id.as_ref() == "codex" && session == "acp-42"
+                ),
+                "没连在这个 agent 上时应当重新握手，并带上要重开的协议会话"
+            );
+            assert_eq!(
+                Some("acp-42"),
+                AppSettings::current(cx)
+                    .ai_chat
+                    .remembered_acp_session("sess_acp", "codex"),
+                "地址要补回记忆里，重连才会复用那条对话而不是新开一条"
+            );
+
+            // 真去握手时，重连带的就是那条协议会话。
+            view.current_session = "sess_acp".to_string();
+            let (operation, _providers) = view
+                .prepare_acp_connect(agent_id, cx)
+                .expect("agent 就绪时应当能发起握手");
+            assert_eq!(Some("acp-42".to_string()), operation.resume);
+        });
+    }
+
+    /// 快照里的地址与记忆分叉时，重开必须以**记忆**为准，不能顺手改回旧地址。
+    ///
+    /// 两个来源写入时机不同会分叉；快照地址可能是很早以前那条会话，用它重开 agent
+    /// 会回到一段不含近期工作的旧对话（用户观感就是「它不记得前面做过的事」）。
+    #[gpui::test]
+    fn reopening_prefers_the_remembered_protocol_session_over_a_stale_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_ui(cx);
+        let agent_id = SharedString::from("codex");
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new())
+                .with_acp_agents(vec![AcpAgentEntry::ready(AcpAgentConfig::new(
+                    agent_id.clone(),
+                    "Codex",
+                    "definitely-missing-acp-binary",
+                ))]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.runtime.restore_session(snapshot_of_external_session(
+                "sess_acp",
+                "codex",
+                "acp-stale",
+            ));
+            AppSettings::update(cx, |settings| {
+                settings
+                    .ai_chat
+                    .remember_acp_session("sess_acp", "codex", "acp-current");
+            });
+            let reference = view
+                .runtime
+                .session(&SessionId::from_string("sess_acp".to_string()))
+                .expect("会话应在运行时里")
+                .acp_ref()
+                .expect("外部地址要跟着快照回到会话上");
+
+            let plan = view.plan_acp_reopen("sess_acp", &reference, cx);
+            assert!(
+                matches!(
+                    plan,
+                    Some(super::acp_sessions::AcpReopenPlan::Reconnect(ref id, ref session))
+                        if id.as_ref() == "codex" && session == "acp-current"
+                ),
+                "记忆里的协议会话比快照地址新，重开要用记忆"
+            );
+            assert_eq!(
+                Some("acp-current"),
+                AppSettings::current(cx)
+                    .ai_chat
+                    .remembered_acp_session("sess_acp", "codex"),
+                "不能把记忆改回快照里的旧地址"
+            );
+        });
+    }
+
+    /// agent 已经不在了：说清楚接不回来，不要默默变成一条空会话。
+    #[gpui::test]
+    fn reopening_an_external_session_without_its_agent_says_so(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.runtime.restore_session(snapshot_of_external_session(
+                "sess_gone",
+                "removed-agent",
+                "acp-7",
+            ));
+
+            view.select_session("sess_gone", cx);
+
+            assert!(!view.acp_connecting);
+            assert!(view.acp_reopen_pending.is_none());
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("removed-agent")),
+                "接不回来要写在转录里，别默认用户知道"
+            );
+        });
+    }
+
+    /// 重开历史会话的待办，绝不能因为「连接此刻不在手上」而被静默吞掉。
+    ///
+    /// 这就是「点开 ACP 会话消息列表是空的」的成因：`activate_acp` 先跑
+    /// `reload_acp_sessions`（它为了发 `session/list` 会 `take()` 走连接），后跑重开
+    /// 逻辑——那时 `open_protocol_session` 只能 `take()` 到 `None` 而直接返回，待办却
+    /// 已经被吃掉，那段历史再也没有第二次机会补回来，日志里也看不到任何失败。
+    #[gpui::test]
+    fn a_pending_acp_reopen_survives_while_the_connection_is_away(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.acp_reopen_pending = Some("acp-42".to_string());
+            // 连接不在手上：正是 `reload_acp_sessions` 把连接 `take()` 走之后的真实状态。
+            view.acp = None;
+
+            view.promote_pending_acp_session("acp-42", cx);
+
+            assert_eq!(
+                Some("acp-42".to_string()),
+                view.acp_reopen_pending,
+                "连接不在时不能消费待办——消费掉就再也没人去 load 那段历史了"
+            );
+        });
+    }
+
+    /// 待办只认它自己那条协议会话：换 agent / 换会话时不能被顺手用掉。
+    #[gpui::test]
+    fn a_pending_acp_reopen_is_not_spent_on_another_session(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.acp_reopen_pending = Some("acp-42".to_string());
+            view.acp = None;
+
+            view.promote_pending_acp_session("acp-99", cx);
+
+            assert_eq!(
+                Some("acp-42".to_string()),
+                view.acp_reopen_pending,
+                "连回来的不是待办里那条会话时，待办要原样留着"
+            );
+        });
+    }
+
+    /// 没记过的会话不能被凭空「恢复」到别人的会话上；换 agent 也不能串台。
+    #[gpui::test]
+    fn acp_connect_starts_fresh_without_a_matching_memory(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let agent = AcpAgentConfig::new("agent", "Agent", "noop");
+        let other = AcpAgentConfig::new("other-agent", "Other", "noop");
+
+        view.update(cx, |view, cx| {
+            view.refresh_acp_agents_from(
+                vec![AcpAgentEntry::ready(agent), AcpAgentEntry::ready(other)],
+                cx,
+            );
+            let session_uid = view.current_session.clone();
+            AppSettings::update(cx, |settings| {
+                settings
+                    .ai_chat
+                    .remember_acp_session(&session_uid, "agent", "acp-for-agent");
+            });
+
+            let (first, _providers) = view
+                .prepare_acp_connect(SharedString::from("agent"), cx)
+                .expect("ready agent must start a connect");
+            assert_eq!(Some("acp-for-agent".to_string()), first.resume);
+
+            // 前一条连接已经结束，现在才轮得到为另一个 agent 发起连接。
+            view.acp_connecting = false;
+            view.acp_connecting_id = None;
+            let (second, _providers) = view
+                .prepare_acp_connect(SharedString::from("other-agent"), cx)
+                .expect("another ready agent must start its own connect");
+            assert_eq!(
+                None, second.resume,
+                "换 agent 时不能把前一个 agent 的会话 id 带过去"
+            );
         });
     }
 
@@ -6823,12 +14073,13 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.backend = Backend::Acp;
-            view.acp_turn_owner = Some(AcpTurnOwner {
+            view.acp_turn_owners = vec![AcpTurnOwner {
                 event_session_id: SessionId::from_string("acp:owner"),
                 session_uid: view.current_session.clone(),
                 turn_id: agent_runtime::TurnId::from_string("turn-owner"),
+                backgrounded: false,
                 cancel_requested: false,
-            });
+            }];
             view.set_running(true, cx);
             let message_count = view.transcript.messages.len();
 
@@ -6851,7 +14102,173 @@ mod tests {
 
             assert_eq!(message_count, view.transcript.messages.len());
             assert!(view.is_running);
-            assert!(view.acp_turn_owner.is_some());
+            assert!(!view.acp_turn_owners.is_empty());
+        });
+    }
+
+    /// 点开一条 ACP 历史会话时，`session/load` 重放出来的事件必须落到转录里。
+    ///
+    /// 这类事件**没有轮次可归**（没有 prompt、没有 owner），之前被过滤逻辑一律丢弃 ——
+    /// 用户点开历史会话看到的就是一片空白。
+    #[gpui::test]
+    fn acp_history_replay_lands_without_a_turn_owner(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.acp_turn_owners.clear();
+            let event_session_id = SessionId::from_string("acp:replay");
+            let turn_id = TurnId::from_string("acp-replay:1");
+            view.acp_history_replay = Some(AcpHistoryReplay {
+                event_session_id: event_session_id.clone(),
+                session_uid: view.current_session.clone(),
+                turn_id: turn_id.clone(),
+            });
+            let message_count = view.transcript.messages.len();
+
+            // 别的连接推来的事件：不放行。
+            view.apply_runtime_event(
+                RuntimeEvent::UserMessage {
+                    session_id: SessionId::from_string("acp:other"),
+                    turn_id: turn_id.clone(),
+                    text: "别的会话的历史".into(),
+                },
+                cx,
+            );
+            // 同一个连接、但不是回放轮次：也不放行 —— 窗口只认那一个轮次。
+            view.apply_runtime_event(
+                RuntimeEvent::UserMessage {
+                    session_id: event_session_id.clone(),
+                    turn_id: TurnId::from_string("turn-live"),
+                    text: "不是回放".into(),
+                },
+                cx,
+            );
+            assert_eq!(message_count, view.transcript.messages.len());
+
+            view.apply_runtime_event(
+                RuntimeEvent::UserMessage {
+                    session_id: event_session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    text: "历史上问过的问题".into(),
+                },
+                cx,
+            );
+            view.apply_runtime_event(
+                RuntimeEvent::AssistantMessage {
+                    session_id: event_session_id,
+                    turn_id,
+                    text: "历史上答过的话".into(),
+                    reasoning: None,
+                },
+                cx,
+            );
+
+            assert!(!view.is_running, "回放不是一轮，不能把界面带回「正在响应」");
+        });
+
+        view.read_with(cx, |view, _| {
+            let texts = view
+                .transcript
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>();
+            assert!(texts.contains(&"历史上问过的问题"));
+            assert!(texts.contains(&"历史上答过的话"));
+            assert!(!texts.contains(&"别的会话的历史"));
+            assert!(!texts.contains(&"不是回放"));
+        });
+    }
+
+    /// 事件泵必须放行**子代理详情会话**的事件。
+    ///
+    /// 这条判据挡错一次，表现是「点了卡片、右侧面板一片空白」，而且日志里什么都不
+    /// 会留下：事件在进视图之前就被当成「别的会话的」丢掉了。
+    #[test]
+    fn the_event_pump_accepts_subagent_detail_sessions() {
+        let main = SessionId::from_string("acp:3f1a");
+        let detail = SessionId::from_string("acp-sub:ses_child");
+
+        let detail_event = RuntimeEvent::AssistantMessage {
+            session_id: detail,
+            turn_id: detail_turn_id_for("ses_child"),
+            text: "子代理的推理".into(),
+            reasoning: None,
+        };
+        let other_event = RuntimeEvent::AssistantMessage {
+            session_id: SessionId::from_string("acp:other"),
+            turn_id: TurnId::from_string("t"),
+            text: "别的连接".into(),
+            reasoning: None,
+        };
+
+        assert!(
+            runtime_event_matches_session(&detail_event, Some(&main)),
+            "详情会话的事件同属这条连接，挡下来就等于整段推理静默丢失"
+        );
+        assert!(
+            !runtime_event_matches_session(&other_event, Some(&main)),
+            "别的连接的事件仍然要挡"
+        );
+        // 没有过滤时一律放行（本地后端）。
+        assert!(runtime_event_matches_session(&other_event, None));
+    }
+
+    /// 详情事件必须落进**它自己**的转录，而不是主转录。
+    #[gpui::test]
+    fn subagent_detail_events_land_in_their_own_transcript(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        let detail_uid = view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            let detail_uid = detail_session_id_for("ses_child");
+            let main_before = view.transcript.messages.len();
+            view.apply_runtime_event(
+                RuntimeEvent::AssistantMessage {
+                    session_id: SessionId::from_string(detail_uid.clone()),
+                    turn_id: detail_turn_id_for("ses_child"),
+                    text: "子代理查了连接数".into(),
+                    reasoning: None,
+                },
+                cx,
+            );
+            assert_eq!(
+                main_before,
+                view.transcript.messages.len(),
+                "详情回放不能灌进主转录"
+            );
+            detail_uid
+        });
+
+        view.read_with(cx, |view, _| {
+            let detail = view
+                .subagent_details
+                .get(&detail_uid)
+                .expect("详情事件要落进自己的转录");
+            assert!(
+                detail
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("子代理查了连接数")),
+                "详情转录要带上回放的内容"
+            );
+            assert!(
+                !view.is_running,
+                "详情回放不是一轮，不能把界面带回「正在响应」"
+            );
+            assert!(
+                view.session_transcripts.is_empty(),
+                "详情会话不该被当成「另一条真实会话」缓存，那会被 LRU 挤掉"
+            );
         });
     }
 
@@ -6905,12 +14322,13 @@ mod tests {
             let event_session_id = SessionId::from_string("acp:need-input");
             let turn_id = TurnId::from_string("turn-needs-input");
             view.backend = Backend::Acp;
-            view.acp_turn_owner = Some(AcpTurnOwner {
+            view.acp_turn_owners = vec![AcpTurnOwner {
                 event_session_id: event_session_id.clone(),
                 session_uid: view.current_session.clone(),
                 turn_id: turn_id.clone(),
+                backgrounded: false,
                 cancel_requested: false,
-            });
+            }];
             view.pending_submissions
                 .enqueue(&view.current_session, pending_submission("queued"));
             view.set_running(true, cx);
@@ -6931,7 +14349,7 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert!(view.is_running);
-            assert!(view.acp_turn_owner.is_some());
+            assert!(!view.acp_turn_owners.is_empty());
             assert_eq!(1, view.pending_submissions.len(&view.current_session));
         });
     }
@@ -6948,12 +14366,13 @@ mod tests {
             let event_session_id = SessionId::from_string("acp:cancel");
             let turn_id = TurnId::from_string("turn-cancelled");
             view.backend = Backend::Acp;
-            view.acp_turn_owner = Some(AcpTurnOwner {
+            view.acp_turn_owners = vec![AcpTurnOwner {
                 event_session_id: event_session_id.clone(),
                 session_uid: view.current_session.clone(),
                 turn_id: turn_id.clone(),
-                cancel_requested: true,
-            });
+                backgrounded: false,
+                cancel_requested: false,
+            }];
             view.pending_submissions.enqueue(
                 &view.current_session,
                 pending_submission("queued after stop"),
@@ -6971,7 +14390,7 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert!(!view.is_running);
-            assert!(view.acp_turn_owner.is_none());
+            assert!(view.acp_turn_owners.is_empty());
             assert_eq!(
                 1,
                 view.pending_submissions.len(&view.current_session),
@@ -6997,12 +14416,13 @@ mod tests {
             let event_session_id = SessionId::from_string("acp:discarded-owner");
             let turn_id = TurnId::from_string("turn-discarded-owner");
             view.backend = Backend::Acp;
-            view.acp_turn_owner = Some(AcpTurnOwner {
+            view.acp_turn_owners = vec![AcpTurnOwner {
                 event_session_id: event_session_id.clone(),
                 session_uid: closed_uid.clone(),
                 turn_id: turn_id.clone(),
+                backgrounded: false,
                 cancel_requested: false,
-            });
+            }];
             view.set_session_running(&closed_uid, true, cx);
             view.pending_submissions
                 .enqueue(&current_uid, pending_submission("current remains queued"));
@@ -7010,7 +14430,7 @@ mod tests {
             view.discard_live_session(&closed_uid);
 
             assert!(
-                view.acp_turn_owner.is_some(),
+                !view.acp_turn_owners.is_empty(),
                 "the owner token must survive until its matching terminal event"
             );
             view.apply_runtime_event(
@@ -7024,7 +14444,7 @@ mod tests {
         });
 
         view.read_with(cx, |view, _| {
-            assert!(view.acp_turn_owner.is_none());
+            assert!(view.acp_turn_owners.is_empty());
             assert!(!view.running_sessions.contains(&closed_uid));
             assert!(!view.session_transcripts.contains_key(&closed_uid));
             assert!(
@@ -7328,17 +14748,130 @@ mod tests {
     }
 
     #[test]
-    fn composer_only_exposes_tool_execution_modes() {
-        let options = default_tool_options();
+    fn composer_exposes_ask_then_tool_execution_modes() {
+        let options = default_execution_mode_options();
 
+        // 「问答」是任务类型，与工具策略共用同一个下拉 id 空间，排在首位。
         assert_eq!(
-            vec!["auto", "readonly", "manual"],
+            vec!["ask", "auto", "readonly", "manual"],
             options
                 .iter()
                 .map(|option| option.id.as_ref())
                 .collect::<Vec<_>>()
         );
-        assert_eq!(options[0].label.as_ref(), t!("AgentUi.auto").as_ref());
+        assert_eq!(options[0].label.as_ref(), t!("AgentUi.ask_mode").as_ref());
+        assert_eq!(options[1].label.as_ref(), t!("AgentUi.auto").as_ref());
+    }
+
+    #[test]
+    fn execution_mode_ids_round_trip_to_task_kind_and_tool_policy() {
+        // 「问答」改任务类型且不动工具策略；其余改工具策略且任务类型回到常规。
+        assert_eq!(TaskKind::Ask, task_kind_from_id("ask"));
+        assert_eq!(TaskKind::Agent, task_kind_from_id("auto"));
+        assert_eq!(TaskKind::Agent, task_kind_from_id("readonly"));
+        assert_eq!(TaskKind::Agent, task_kind_from_id("manual"));
+
+        // 未知 id 不应把任务类型带偏。
+        assert_eq!(TaskKind::Agent, task_kind_from_id("acp-mode:plan"));
+
+        assert_eq!(
+            TaskKind::Ask,
+            task_kind_from_settings(AiChatToolExecutionMode::Ask)
+        );
+        assert_eq!(
+            TaskKind::Agent,
+            task_kind_from_settings(AiChatToolExecutionMode::Manual)
+        );
+    }
+
+    #[test]
+    fn acp_modes_are_namespaced_so_they_cannot_collide_with_local_ids() {
+        // ACP 的会话模式 id 由 agent 自己给定，可能与本地的 `auto` / `manual` 同名，
+        // 因此统一切到 `acp-mode:` 前缀，避免 `select_execution_mode` 走错分支。
+        let id = acp_mode_option_id("auto");
+        assert_eq!("acp-mode:auto", id);
+        assert_eq!(Some("auto"), id.strip_prefix(ACP_MODE_OPTION_PREFIX));
+        assert_eq!(TaskKind::Agent, task_kind_from_id(&id));
+    }
+
+    #[test]
+    fn acp_backend_exposes_agent_declared_session_modes() {
+        use agent_client_protocol::schema::v1::{
+            NewSessionResponse, SessionMode, SessionModeState,
+        };
+
+        let mut state = AcpSessionState::default();
+        state.apply_new_session_response(&NewSessionResponse::new("s1").modes(
+            SessionModeState::new(
+                "ask",
+                vec![
+                    SessionMode::new("ask", "Ask"),
+                    SessionMode::new("code", "Code"),
+                ],
+            ),
+        ));
+
+        let options = acp_execution_mode_options(&state);
+
+        // ACP 下拉里是 agent 自己声明的档位（带前缀防止与本地 id 撞车），
+        // 不是本地那套 auto/readonly/manual。
+        assert_eq!(
+            vec!["acp-mode:ask", "acp-mode:code"],
+            options
+                .iter()
+                .map(|option| option.id.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(options[1].label.as_ref(), "Code");
+        assert_eq!(Some("Ask".to_string()), acp_mode_label(&state));
+    }
+
+    #[test]
+    fn acp_config_mode_options_are_exposed_and_namespaced() {
+        use agent_client_protocol::schema::v1::{
+            NewSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
+            SessionConfigSelectOption,
+        };
+
+        let mut state = AcpSessionState::default();
+        state.apply_new_session_response(&NewSessionResponse::new("s1").config_options(vec![
+                SessionConfigOption::select(
+                    "mode",
+                    "Session Mode",
+                    "build",
+                    vec![
+                        SessionConfigSelectOption::new("build", "build")
+                            .description("The default agent."),
+                        SessionConfigSelectOption::new("plan", "plan"),
+                        SessionConfigSelectOption::new("scout", "scout"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::Mode),
+            ]));
+
+        let options = acp_execution_mode_options(&state);
+
+        assert_eq!(
+            vec![
+                "acp-config-mode:build",
+                "acp-config-mode:plan",
+                "acp-config-mode:scout",
+            ],
+            options
+                .iter()
+                .map(|option| option.id.as_ref())
+                .collect::<Vec<_>>()
+        );
+        // 走 config 分支的 id 不能撞上传统前缀，且必须解析回 Agent。
+        assert_eq!(TaskKind::Agent, task_kind_from_id(options[0].id.as_ref()));
+        assert_eq!(
+            Some("build"),
+            options[0]
+                .id
+                .as_ref()
+                .strip_prefix(ACP_CONFIG_MODE_OPTION_PREFIX)
+        );
+        assert_eq!(Some("build".to_string()), acp_mode_label(&state));
     }
 
     #[test]
@@ -7363,7 +14896,7 @@ mod tests {
 
         let local = build_composer_context(
             &ResourceContext::new(),
-            ToolExecutionMode::Auto,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
             None,
             Some(&plan),
             &[],
@@ -7375,10 +14908,11 @@ mod tests {
             &[],
             ComposerSkillSummary::default(),
             Vec::new(),
+            None,
         );
         let acp = build_composer_context(
             &ResourceContext::new(),
-            ToolExecutionMode::Auto,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
             None,
             Some(&plan),
             &[],
@@ -7390,6 +14924,7 @@ mod tests {
             &[],
             ComposerSkillSummary::default(),
             Vec::new(),
+            None,
         );
 
         assert_eq!(local.plan_items, acp.plan_items);
@@ -7408,7 +14943,7 @@ mod tests {
     fn local_backend_option_is_not_named_after_a_specific_cli() {
         let ctx = build_composer_context(
             &ResourceContext::new(),
-            ToolExecutionMode::Auto,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
             None,
             None,
             &[],
@@ -7420,6 +14955,7 @@ mod tests {
             &[],
             ComposerSkillSummary::default(),
             Vec::new(),
+            None,
         );
 
         assert_eq!(ctx.agent_options[0].label.as_ref(), "One Agent");
@@ -7448,7 +14984,7 @@ mod tests {
 
         let ctx = build_composer_context(
             &ResourceContext::new(),
-            ToolExecutionMode::Auto,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
             None,
             None,
             &subagents,
@@ -7460,6 +14996,7 @@ mod tests {
             &[],
             ComposerSkillSummary::default(),
             Vec::new(),
+            None,
         );
 
         assert_eq!(ctx.subagent_items.len(), 2);
@@ -7571,6 +15108,58 @@ mod tests {
         assert_eq!(vec!["One Agent", "Codex", "OpenCode"], labels);
     }
 
+    /// 切换弹层：选中之后要自己收起来，且列表再长也有个头（超出滚动）。
+    ///
+    /// 两个问题都只在真弹层里看得见 —— 选项行本身漏掉 dismiss，或者内容列
+    /// 不设上限，单元数据层面都断言不出来。
+    #[gpui::test]
+    fn header_agent_switcher_closes_after_pick_and_caps_its_height(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let agents = (0..10)
+            .map(|index| {
+                AcpAgentEntry::ready(AcpAgentConfig::new(
+                    format!("agent-{index}"),
+                    format!("Agent {index}"),
+                    "agent",
+                ))
+            })
+            .collect::<Vec<_>>();
+        // 切入口就在面板头部，侧栏形态才渲染 `render_sidebar_mode_header`。
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .with_acp_agents(agents)
+            .sidebar_mode(true);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+
+        let trigger = cx
+            .debug_bounds("agent-header-switcher-btn")
+            .expect("头部要有 agent 切换入口");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let content = cx
+            .debug_bounds("agent-header-switcher-content")
+            .expect("点开后弹层要渲染出内容");
+        // 十个 agent 排下来远超上限；上限不生效的话高度会跟着条数长。
+        assert!(
+            content.size.height <= px(AGENT_SWITCHER_MAX_HEIGHT + 1.0),
+            "弹层高度要收在上限内、超出部分靠滚动: content={content:?}"
+        );
+
+        let option = cx
+            .debug_bounds("agent-header-option-agent-option-local")
+            .expect("弹层里要有「One Agent」这一项");
+        cx.simulate_click(option.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        assert!(
+            cx.debug_bounds("agent-header-switcher-content").is_none(),
+            "选中一项之后弹层必须自己关掉"
+        );
+        assert_eq!(Backend::Local, view.read_with(cx, |view, _| view.backend));
+    }
+
     #[test]
     fn header_agent_switcher_keeps_local_available_while_acp_connects() {
         let acp_agents = vec![AcpAgentEntry::ready(AcpAgentConfig::new(
@@ -7588,7 +15177,7 @@ mod tests {
 
     #[test]
     fn composer_context_maps_acp_state_to_visible_context() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CurrentModeUpdate,
             SessionInfoUpdate, SessionMode, SessionModeState, SessionUpdate, UsageUpdate,
         };
@@ -7596,7 +15185,7 @@ mod tests {
         let mut state = AcpSessionState::default();
         state.set_agent_capabilities(AgentCapabilities::new().load_session(true));
         state.apply_new_session_response(
-            &agent_client_protocol::schema::NewSessionResponse::new("s1").modes(
+            &agent_client_protocol::schema::v1::NewSessionResponse::new("s1").modes(
                 SessionModeState::new(
                     "ask",
                     vec![
@@ -7619,7 +15208,7 @@ mod tests {
 
         let ctx = build_composer_context(
             &ResourceContext::new(),
-            ToolExecutionMode::Auto,
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
             None,
             None,
             &[],
@@ -7631,6 +15220,7 @@ mod tests {
             &[],
             ComposerSkillSummary::default(),
             Vec::new(),
+            None,
         );
 
         assert_eq!(ctx.target.unwrap().label.as_ref(), "ACP 工作会话");
@@ -7645,6 +15235,160 @@ mod tests {
             ctx.capabilities
                 .contains(&SharedString::from(format!("{}:1", t!("AgentUi.commands"))))
         );
+    }
+
+    #[test]
+    fn local_backend_reports_context_usage_with_a_best_effort_window() {
+        let model = ComposerModelOption::new(
+            "deepseek-chat-option",
+            "deepseek",
+            "DeepSeek",
+            "deepseek-chat",
+        );
+        let ctx = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            Some(&model),
+            None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            Some(1500),
+        );
+
+        let usage = ctx
+            .scopes
+            .iter()
+            .find(|scope| scope.key == "local-usage")
+            .expect("本地会话报过计量就应有用量 scope");
+        assert_eq!(usage.value.as_ref(), "1500/128000 tokens");
+    }
+
+    #[test]
+    fn local_usage_without_a_known_window_shows_tokens_only() {
+        let model =
+            ComposerModelOption::new("custom-option", "custom", "Custom", "my-private-finetune");
+        let ctx = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            Some(&model),
+            None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            Some(1500),
+        );
+
+        let usage = ctx
+            .scopes
+            .iter()
+            .find(|scope| scope.key == "local-usage")
+            .expect("窗口未知也应展示 token 数");
+        assert_eq!(usage.value.as_ref(), "1500 tokens");
+    }
+
+    #[test]
+    fn local_usage_scope_is_absent_until_the_model_reports_something() {
+        let model = ComposerModelOption::new(
+            "deepseek-chat-option",
+            "deepseek",
+            "DeepSeek",
+            "deepseek-chat",
+        );
+        let ctx = build_composer_context(
+            &ResourceContext::new(),
+            ExecutionSelection::tool(ToolExecutionMode::Auto),
+            Some(&model),
+            None,
+            &[],
+            Backend::Local,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            ComposerSkillSummary::default(),
+            Vec::new(),
+            None,
+        );
+
+        assert!(
+            !ctx.scopes.iter().any(|scope| scope.key == "local-usage"),
+            "模型还没报过计量,不该装作测过(空 chip 比假数据好)"
+        );
+    }
+
+    #[test]
+    fn slash_commands_come_from_acp_state_verbatim() {
+        use agent_client_protocol::schema::v1::{
+            AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, SessionUpdate,
+            UnstructuredCommandInput,
+        };
+
+        let state = AcpSessionState::default();
+        assert!(slash_commands_from_acp_state(&state).is_empty());
+
+        let mut state = AcpSessionState::default();
+        state.apply_session_update(&SessionUpdate::AvailableCommandsUpdate(
+            AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("plan", "Create plan"),
+                AvailableCommand::new("research", "Research the repo").input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                        "what to research",
+                    )),
+                ),
+            ]),
+        ));
+
+        let items = slash_commands_from_acp_state(&state);
+        assert_eq!(
+            vec!["plan", "research"],
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(None, items[0].input_hint);
+        assert_eq!(Some("what to research"), items[1].input_hint.as_deref());
+        assert_eq!("/research ", items[1].insert_text());
+    }
+
+    #[test]
+    fn usage_scope_appends_cost_when_the_agent_reports_one() {
+        use agent_client_protocol::schema::v1::Cost;
+
+        let unbilled = AcpUsage {
+            used: 42,
+            size: 100,
+            cost: None,
+        };
+        assert_eq!("42/100 tokens", format_acp_usage(&unbilled));
+
+        let billed = AcpUsage {
+            used: 42,
+            size: 100,
+            cost: Some(Cost::new(0.0123, "USD")),
+        };
+        assert_eq!("42/100 tokens · 0.0123 USD", format_acp_usage(&billed));
+
+        let fractional = AcpUsage {
+            used: 1,
+            size: 2,
+            cost: Some(Cost::new(2.5, "EUR")),
+        };
+        assert_eq!("1/2 tokens · 2.5 EUR", format_acp_usage(&fractional));
     }
 
     #[gpui::test]
@@ -7861,12 +15605,13 @@ mod tests {
         let (envelope, mut outcome_rx) = AcpPermissionEnvelope::new(test_acp_permission_request());
 
         view.update(cx, |view, cx| {
-            let _ = view.start_acp_permission_session(cx);
+            let _ = view.start_acp_client_session(cx);
             view.transcript.apply(&RuntimeEvent::ToolCallStarted {
                 session_id: view.session_id.clone(),
                 turn_id: agent_runtime::TurnId::from_string("turn"),
                 call_id: ToolCallId::from_string("call"),
                 tool_name: ToolName::new("terminal.exec"),
+                kind: agent_runtime::ToolAction::Execute,
                 arguments: json!({
                     "target": "haiwai comi",
                     "command": "du -xhd1 /"
@@ -7929,7 +15674,7 @@ mod tests {
         drop(outcome_rx);
 
         view.update(cx, |view, cx| {
-            let _ = view.start_acp_permission_session(cx);
+            let _ = view.start_acp_client_session(cx);
             view.receive_acp_permission(envelope, cx);
         });
         cx.run_until_parked();
@@ -8126,6 +15871,107 @@ mod tests {
     }
 
     #[gpui::test]
+    fn gpui_pending_elicitation_renders_and_submits_collected_answer(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let (envelope, mut outcome_rx) =
+            AcpElicitationEnvelope::new(test_acp_elicitation_request());
+
+        view.update(cx, |view, cx| {
+            let _ = view.start_acp_client_session(cx);
+            // 提问面板现在只长在 ACP 那份输入框里（本地那份不认识 elicitation），
+            // 所以这个场景必须有 ACP 后端——真实流程里它也只在这时才会发生。
+            view.backend = Backend::Acp;
+            view.receive_acp_elicitation(envelope, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("agent-input-elicitation").is_some(),
+            "agent 提问面板应渲染在输入框上方"
+        );
+
+        // 必填项空着时提交只应给出提示，不能把半截答案回给 agent。
+        let submit = cx
+            .debug_bounds("elicitation-submit")
+            .expect("submit button");
+        cx.simulate_click(submit.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(outcome_rx.try_recv().is_err(), "必填项没填就不该提交");
+
+        let prod = cx
+            .debug_bounds("elicitation-radio-env-prod")
+            .expect("env option");
+        cx.simulate_click(prod.center(), Modifiers::default());
+        cx.run_until_parked();
+        let submit = cx
+            .debug_bounds("elicitation-submit")
+            .expect("submit button");
+        cx.simulate_click(submit.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        let AcpElicitationOutcome::Accept(content) = outcome_rx.try_recv().expect("answer") else {
+            panic!("expected accept outcome");
+        };
+        assert_eq!(Some(&json!("prod")), content.get("env"));
+        // 布尔字段没动过也要给值，否则 agent 收到的对象缺字段。
+        assert_eq!(Some(&json!(false)), content.get("confirm"));
+        assert!(
+            cx.debug_bounds("agent-input-elicitation").is_none(),
+            "答完应收起面板"
+        );
+    }
+
+    #[gpui::test]
+    fn gpui_declining_elicitation_reports_decline_and_closes_the_panel(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let (envelope, mut outcome_rx) =
+            AcpElicitationEnvelope::new(test_acp_elicitation_request());
+
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.receive_acp_elicitation(envelope, cx);
+        });
+        cx.run_until_parked();
+        let decline = cx
+            .debug_bounds("elicitation-decline")
+            .expect("decline button");
+        cx.simulate_click(decline.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            AcpElicitationOutcome::Decline,
+            outcome_rx.try_recv().expect("decline outcome")
+        );
+        assert!(cx.debug_bounds("agent-input-elicitation").is_none());
+    }
+
+    #[gpui::test]
+    fn gpui_resetting_acp_connection_cancels_pending_elicitation(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let (envelope, mut outcome_rx) =
+            AcpElicitationEnvelope::new(test_acp_elicitation_request());
+
+        view.update(cx, |view, cx| {
+            view.backend = Backend::Acp;
+            view.receive_acp_elicitation(envelope, cx);
+            view.reset_acp_client_session(cx);
+        });
+
+        assert_eq!(
+            AcpElicitationOutcome::Cancel,
+            outcome_rx.try_recv().expect("cancelled elicitation")
+        );
+    }
+
+    #[gpui::test]
     fn gpui_resetting_acp_connection_cancels_pending_permission_card(cx: &mut TestAppContext) {
         init_test_ui(cx);
         let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
@@ -8135,7 +15981,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.receive_acp_permission(envelope, cx);
-            view.reset_acp_permission_session(cx);
+            view.reset_acp_client_session(cx);
         });
 
         assert_eq!(
@@ -8280,11 +16126,12 @@ mod tests {
         let approve_before_scroll = cx
             .debug_bounds("agent-tool-approve")
             .expect("approval button should render before scrolling");
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: approve_before_scroll.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-280.0))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Moved,
+            source: gpui::ScrollSource::default(),
         });
         cx.run_until_parked();
 
@@ -8539,6 +16386,65 @@ mod tests {
         );
     }
 
+    /// 切换模型只换模型，不换会话：同一个 session id、同一段转录，历史跟着走。
+    #[gpui::test]
+    fn gpui_model_switch_keeps_the_same_conversation(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let first = ComposerModelOption::new("openai:gpt-a", "openai", "OpenAI", "gpt-a");
+        let second = ComposerModelOption::new("ollama:qwen", "ollama", "Ollama", "qwen3:14b");
+        let runtimes = Arc::new(std::sync::Mutex::new(Vec::<Arc<Runtime>>::new()));
+        let factory_runtimes = runtimes.clone();
+        let factory: AgentRuntimeFactory = Arc::new(move |option| {
+            let runtime = test_runtime(option.model.as_ref());
+            factory_runtimes.lock().unwrap().push(runtime.clone());
+            Ok(runtime)
+        });
+        let config =
+            AgentChatViewConfig::new(test_runtime("gpt-a"), ResourceContext::new(), vec![])
+                .with_models(vec![first.clone(), second], Some(first.id.clone()), factory);
+
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let original_session = view.read_with(cx, |view, _| view.session_id.clone());
+        view.update(cx, |view, cx| {
+            // 会话里已有对话，屏幕上已有转录。
+            view.runtime
+                .session(&view.session_id)
+                .expect("current session should exist")
+                .record_user_input("列出所有表");
+            view.transcript.push_system("已在屏幕上的内容");
+            view.select_model("ollama:qwen", "ollama", "qwen3:14b", cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_id, original_session);
+            assert!(
+                view.transcript
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "已在屏幕上的内容"),
+                "切模型不该清掉屏幕上的对话"
+            );
+        });
+        let runtime = runtimes
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("factory should have built the new runtime");
+        view.read_with(cx, |view, _| {
+            assert!(Arc::ptr_eq(&view.runtime, &runtime));
+        });
+        let session = runtime
+            .session(&original_session)
+            .expect("session should be carried into the new runtime");
+        assert_eq!(
+            session.history_snapshot().len(),
+            1,
+            "历史应随会话延续到新模型"
+        );
+    }
+
     #[gpui::test]
     fn gpui_model_switch_failure_preserves_current_state(cx: &mut TestAppContext) {
         init_test_ui(cx);
@@ -8729,6 +16635,49 @@ mod tests {
         );
     }
 
+    /// 点开会话只是选中它，不能顺手改写它的工作区归属。
+    ///
+    /// 实时摘要（live）只负责「名字 / 时间」这类还在内存里变动的字段；工作区
+    /// 归属的真源是落盘快照。实时摘要里这条如果缺归属（例如进程启动时建的
+    /// 初始会话从没进过 `session_roots`），整体覆盖会把侧栏那一行从它的工作区
+    /// 分组里打到「未分组」——用户看到的就是「点一下它就换组了」。
+    #[test]
+    fn selected_live_summary_must_not_erase_workspace_root() {
+        let persisted = vec![
+            SessionSummary::new("selected", "选中任务", 10)
+                .with_workspace_root(Some("/w/project".into())),
+        ];
+        let live = vec![SessionSummary::new("selected", "选中任务", 10)];
+
+        let merged =
+            merge_live_session_summaries(persisted, &live, "selected", &HashSet::new(), false);
+
+        assert_eq!(
+            Some("/w/project"),
+            merged[0].workspace_root.as_deref(),
+            "选中会话不应把它从所属工作区分组里打出去"
+        );
+    }
+
+    /// 反过来也一样：未分组的会话不能被实时摘要凭空塞进某个分组。
+    #[test]
+    fn selected_live_summary_must_not_invent_workspace_root() {
+        let persisted = vec![SessionSummary::new("legacy", "旧会话", 10)];
+        let live = vec![
+            SessionSummary::new("legacy", "旧会话", 10)
+                .with_workspace_root(Some("/w/project".into())),
+        ];
+
+        let merged =
+            merge_live_session_summaries(persisted, &live, "legacy", &HashSet::new(), false);
+
+        assert_eq!(
+            None,
+            merged[0].workspace_root.as_deref(),
+            "未分组的会话不应因为被选中就挂到某个工作区下"
+        );
+    }
+
     #[test]
     fn archived_sidebar_does_not_mix_in_live_workbench_tasks() {
         let archived = vec![SessionSummary::new("archived", "归档任务", 10)];
@@ -8745,8 +16694,494 @@ mod tests {
 
     #[test]
     fn local_workbench_can_switch_away_from_a_running_session() {
+        // 后台轮次方案：两侧切换都不再强停；ACP 的新建/切换也不取消在飞轮次。
         assert!(!should_stop_task_before_session_switch(Backend::Local));
-        assert!(should_stop_task_before_session_switch(Backend::Acp));
+        assert!(!should_stop_task_before_session_switch(Backend::Acp));
+    }
+
+    /// 启动时那张初始会话也要记住自己的工作区。
+    ///
+    /// `session_roots` 是侧栏归属在内存里的依据。漏了这条会话，它第一次落盘
+    /// 之前实时摘要就报不出归属，侧栏先把它摆进「未分组」，落盘后才跳回分组。
+    #[gpui::test]
+    fn the_initial_session_knows_its_workspace(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .with_workspace_root(std::path::PathBuf::from("/tmp/navop-test-ws-a"));
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, _cx| {
+            assert_eq!(
+                view.session_roots
+                    .get(&view.current_session)
+                    .map(String::as_str),
+                Some("/tmp/navop-test-ws-a"),
+                "初始会话必须记住它的工作区，否则它在侧栏里会先显示成「未分组」"
+            );
+        });
+    }
+
+    /// 一条只带会话内容的存储后端；用来造「快照里没有工作区归属」的旧会话。
+    fn test_session_storage() -> one_core::storage::StorageManager {
+        use one_core::llm::chat_history::{
+            AgentSessionRepository, MessageRepository, SessionRepository,
+        };
+        use one_core::storage::StorageManager;
+        use one_core::storage::connection::SqliteConnection;
+        use one_core::storage::migration::run_migrations;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "navop-ai-chat-view-sessions-{}-{unique}.db",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let conn = SqliteConnection::open_with_pool_size(&db_path, 1).expect("open sqlite");
+        conn.with_connection(run_migrations)
+            .expect("run migrations");
+
+        let storage = StorageManager::new_with_connection(conn.clone());
+        storage.register(AgentSessionRepository::new(conn.clone()));
+        storage.register(SessionRepository::new(conn.clone()));
+        storage.register(MessageRepository::new(conn.clone()));
+        storage.register(one_core::llm::ComposerDraftRepository::new(conn));
+        storage
+    }
+
+    /// 拖过消息块会选中它，`Cmd+C` 会把**选中内容**送进剪贴板。
+    #[gpui::test]
+    fn gpui_transcript_selection_copies_the_selected_blocks(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        // 用短消息而不是 `push_conversation`：长回复会把第一条挤到视口之外，
+        // 模拟鼠标点就落不到它身上（事件要落在窗口内才命中）。
+        view.update(cx, |view, cx| {
+            view.transcript
+                .push_message(crate::ChatMessageUI::user("第一条"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant("第一条的回复"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::user("第二条"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant("第二条的回复"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::user("第三条"));
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant("第三条的回复"));
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        draw_frame(cx);
+
+        // 1) 鼠标侧：按下第一条可拖选的块，选区就落在那条消息上。
+        let first = cx
+            .debug_bounds("ai-chat-message-selectable")
+            .expect("转录里该有可拖选的消息块");
+        cx.simulate_mouse_down(first.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(first.center(), MouseButton::Left, Modifiers::default());
+        draw_frame(cx);
+        let (count, text, matches_a_message) = view.read_with(cx, |view, _| {
+            let order: Vec<String> = view
+                .transcript
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect();
+            let count = view.transcript_selection.borrow().count(&order);
+            let text = view.selected_transcript_text();
+            let matches = text.as_ref().is_some_and(|text| {
+                view.transcript.messages.iter().any(|message| {
+                    crate::message_view::message_copy_text(message)
+                        .map(|candidate| candidate.to_string())
+                        == Some(text.clone())
+                })
+            });
+            (count, text, matches)
+        });
+        assert_eq!(1, count, "按下一条消息只该选中它自己");
+        assert!(
+            matches_a_message,
+            "选中的文本必须正好是某一条消息的正文，实际 {text:?}"
+        );
+
+        // 2) 跨块：从第二条拉到第三条，复制内容按顺序拼接。
+        let expected = view.update(cx, |view, cx| {
+            let ids: Vec<String> = view
+                .transcript
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect();
+            // 从第一条拉到第三条：区间内的**每一条**都算选中（含夹在中间的那条回复），
+            // 这与「拖过一段就选中这一段」的直觉一致。
+            let expected = (0..=2)
+                .map(|index| {
+                    crate::message_view::message_copy_text(&view.transcript.messages[index])
+                        .expect("正文可复制")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            {
+                let mut selection = view.transcript_selection.borrow_mut();
+                selection.begin(&ids[0]);
+                selection.extend(&ids[2]);
+                selection.finish();
+            }
+            cx.notify();
+            expected
+        });
+        assert_eq!(
+            Some(expected.clone()),
+            view.read_with(cx, |view, _| view.selected_transcript_text()),
+            "跨块选中的是两头那两条消息"
+        );
+
+        // 3) 快捷键：焦点在按下时已经交给转录，`Cmd+C` 该把两段正文写进剪贴板。
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
+        draw_frame(cx);
+        assert_eq!(
+            Some(expected.clone()),
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            "复制到的必须是选中的两段正文"
+        );
+
+        // 4) 取消：选区清掉。
+        cx.dispatch_action(ClearTranscriptSelection);
+        draw_frame(cx);
+        assert!(
+            view.read_with(cx, |view, _| view.selected_transcript_text().is_none()),
+            "取消后不该再有选区"
+        );
+    }
+
+    /// `@` 菜单里除了业务资源还要有工作区文件，且遍历在后台跑完才并进来。
+    #[gpui::test]
+    fn gpui_workspace_files_join_the_mention_menu(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+
+        // 造一个像模像样的小工作区：一个源文件 + 一个该被整枝跳过的构建目录。
+        let root = std::env::temp_dir().join(format!(
+            "aiwb-mentions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("时钟")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("建 src");
+        std::fs::create_dir_all(root.join("target")).expect("建 target");
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("写 main.rs");
+        std::fs::write(root.join("target").join("skip.rs"), "// build").expect("写 skip.rs");
+
+        let config = AgentChatViewConfig::new(
+            test_runtime("m"),
+            ResourceContext::new(),
+            vec![MentionItem::new("c1", "prod-db", "postgres", "postgres")],
+        )
+        .with_workspace_root(root.clone());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        // 目录遍历在后台：推一次执行器让它落地。
+        cx.run_until_parked();
+
+        let labels = view.read_with(cx, |view, cx| view.input.read(cx).mention_labels());
+        assert!(
+            labels.iter().any(|label| label == "src/main.rs"),
+            "工作区文件该出现在 `@` 菜单里，实际 {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "prod-db"),
+            "业务资源不能被文件挤掉，实际 {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.contains("skip.rs")),
+            "构建目录该被整枝跳过，实际 {labels:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 命令面板搜正文：命中会话里的消息文本，跳过去并把那段词交给会话内搜索。
+    #[gpui::test]
+    fn gpui_command_palette_search_body_hits(cx: &mut TestAppContext) {
+        use crate::command_palette::PaletteAction;
+        use one_core::llm::chat_history::AgentSessionRepository;
+        use one_core::storage::GlobalStorageState;
+
+        use agent_runtime::{HistoryItem, SessionId, SessionSnapshot};
+
+        init_test_ui(cx);
+        // 快照要走真结构体序列化：`load_snapshot` 反序列化的是完整 `SessionSnapshot`，
+        // 手写一小段 JSON 会因为缺字段解析失败，切过去时会静默退回原会话。
+        let snapshot = SessionSnapshot {
+            id: SessionId::from_string("sess-body"),
+            resources: ResourceContext::new(),
+            history: vec![
+                HistoryItem::User {
+                    text: "这轮把预算压到八万".into(),
+                    images: Vec::new(),
+                },
+                HistoryItem::Assistant("好的".into()),
+            ],
+            plan: None,
+            system_instruction: None,
+            skills: agent_runtime::SkillContext::new(),
+            workspace_root: None,
+            draft: None,
+            context_tokens: None,
+            acp: None,
+        };
+        let storage = test_session_storage();
+        storage
+            .get::<AgentSessionRepository>()
+            .expect("会话仓储")
+            .save_snapshot(
+                "sess-body",
+                "预算会话",
+                &serde_json::to_string(&snapshot).expect("序列化快照"),
+            )
+            .expect("写入一条带正文的会话");
+        cx.update(|cx| cx.set_global(GlobalStorageState { storage }));
+
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        assert_ne!(
+            "sess-body",
+            view.read_with(cx, |view, _| view.current_session.clone()),
+            "前置：正文命中的那条不是当前会话"
+        );
+
+        focus_composer(&view, cx);
+        draw_frame(cx);
+        cx.dispatch_action(ToggleCommandPalette);
+        draw_frame(cx);
+        cx.simulate_input("预算压到");
+        draw_frame(cx);
+
+        // 正文检索走防抖：测试里的定时器不会自己走，得显式推时钟。
+        cx.background_executor
+            .advance_clock(PALETTE_BODY_SEARCH_DEBOUNCE + Duration::from_millis(20));
+        draw_frame(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(1, view.palette_body_hits.len(), "该按正文搜出这一条");
+            assert_eq!("sess-body", view.palette_body_hits[0].uid);
+            assert!(
+                view.palette_body_hits[0].snippet.contains("预算压到"),
+                "片段要带查询词，实际 {:?}",
+                view.palette_body_hits[0].snippet
+            );
+        });
+
+        // 命中行按身份找，不按固定下标：命令、会话段都在它前面。
+        let index = view.read_with(cx, |view, _| {
+            crate::command_palette::visible_items(&view.palette_items(), &view.palette_query)
+                .iter()
+                .position(|item| matches!(item.action, PaletteAction::OpenSessionAtMatch { .. }))
+                .expect("正文命中该出现在可见列表里")
+        });
+        view.update(cx, |view, cx| {
+            view.palette_selection = index;
+            cx.notify();
+        });
+        draw_frame(cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.run_palette_selection(window, cx)
+        });
+        draw_frame(cx);
+
+        view.update(cx, |view, cx| {
+            assert!(!view.palette_open, "执行完面板该收起来");
+            assert_eq!(
+                "sess-body", view.current_session,
+                "该跳到正文命中的那条会话"
+            );
+            assert!(view.findbar_open, "跳过去要顺手把会话内搜索打开");
+            assert_eq!(
+                "预算压到",
+                view.findbar_input.read(cx).value().to_string(),
+                "查询词要落在搜索框里"
+            );
+            assert!(
+                view.search.total() >= 1,
+                "搜索该真的命中正文，实际 {}",
+                view.search.total()
+            );
+        });
+    }
+
+    /// 草稿：输入停下来就落库，切走再切回连**附件**一起恢复，清空后标记消失。
+    ///
+    /// 附件是这次补的重点——它过去只活在内存里，重启（或这里模拟的换会话路径）
+    /// 就没了。文字那份好歹跟着快照活着。
+    #[gpui::test]
+    fn gpui_composer_drafts_survive_a_session_switch(cx: &mut TestAppContext) {
+        use one_core::storage::GlobalStorageState;
+
+        init_test_ui(cx);
+        cx.update(|cx| {
+            cx.set_global(GlobalStorageState {
+                storage: test_session_storage(),
+            })
+        });
+
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .with_workspace_root(std::path::PathBuf::from("/tmp/navop-test-drafts"));
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        cx.run_until_parked();
+
+        let first = view.read_with(cx, |view, _| view.current_session.clone());
+
+        // 打字 + 挂一张图。`set_composer_text` 走的是程序化写入，照样会发
+        // `DraftChanged`——这里就是要验它。
+        view.update_in(cx, |view, window, cx| {
+            let input = view.input.clone();
+            input.update(cx, |input, cx| {
+                input.set_composer_text("还没发送的半句话", window, cx);
+                input.set_composer_attachments(
+                    vec![crate::ImageAttachment::for_test("预算.png")],
+                    cx,
+                );
+            });
+        });
+        // 防抖到点：显式推时钟再跑任务——测试里的定时器不会自己走。
+        cx.background_executor
+            .advance_clock(DRAFT_SAVE_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            assert!(
+                view.session_has_draft(&first),
+                "输入停下来之后会话该被标上「有草稿」"
+            );
+            let record = crate::persistence::load_composer_draft(cx, &first).expect("草稿该已落库");
+            assert_eq!("还没发送的半句话", record.text);
+            assert_eq!(1, record.attachments.len());
+            assert_eq!("预算.png", record.attachments[0].name);
+        });
+
+        // 换到新会话：草稿留在旧会话身上，输入框换成新的。
+        view.update(cx, |view, cx| view.new_session(cx));
+        cx.run_until_parked();
+        let second = view.read_with(cx, |view, _| view.current_session.clone());
+        assert_ne!(first, second);
+        assert_eq!(
+            "",
+            view.read_with(cx, |view, cx| view.input.read(cx).composer_text(cx)),
+            "新会话的输入框该是空的"
+        );
+        assert!(view.read_with(cx, |view, _| view.session_has_draft(&first)));
+
+        // 切回去：文字与附件一起回来（附件是从库里那张图恢复的）。
+        view.update_in(cx, |view, _window, cx| view.switch_session(&first, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(
+                "还没发送的半句话",
+                view.input.read(cx).composer_text(cx),
+                "切回来该看到上次没发出去的半句话"
+            );
+            let attachments = view.input.read(cx).composer_attachments().to_vec();
+            assert_eq!(1, attachments.len(), "附件草稿该跟着会话一起回来");
+            assert_eq!("预算.png", attachments[0].name);
+        });
+
+        // 清空输入框：行删掉，标记跟着灭。
+        view.update_in(cx, |view, window, cx| {
+            let input = view.input.clone();
+            input.update(cx, |input, cx| {
+                input.set_composer_text("", window, cx);
+                input.set_composer_attachments(Vec::new(), cx);
+            });
+        });
+        cx.background_executor
+            .advance_clock(DRAFT_SAVE_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(
+                !view.session_has_draft(&first),
+                "清空之后不该再标「有草稿」"
+            );
+            assert!(crate::persistence::load_composer_draft(cx, &first).is_none());
+        });
+    }
+
+    /// 侧栏把它摆在「未分组」，就是因为快照里没有归属。归属的定格只发生在
+    /// **真正落盘**那一刻（见 `persist_session` 里的兜底）；只是点开看一眼
+    /// 就改写它，用户看到的就是「无分组的自己跑到分组下面去了」。
+    #[gpui::test]
+    fn opening_a_legacy_session_without_a_workspace_does_not_assign_one(cx: &mut TestAppContext) {
+        use agent_runtime::{HistoryItem, SessionId, SessionSnapshot};
+        use one_core::llm::chat_history::AgentSessionRepository;
+        use one_core::storage::GlobalStorageState;
+
+        init_test_ui(cx);
+
+        let legacy_uid = "legacy-without-workspace";
+        let snapshot = SessionSnapshot {
+            id: SessionId::from_string(legacy_uid),
+            resources: ResourceContext::new(),
+            history: vec![
+                HistoryItem::User {
+                    text: "升级前的老会话".into(),
+                    images: Vec::new(),
+                },
+                HistoryItem::Assistant("老回答".into()),
+            ],
+            plan: None,
+            system_instruction: None,
+            skills: agent_runtime::SkillContext::new(),
+            workspace_root: None,
+            draft: None,
+            context_tokens: None,
+            acp: None,
+        };
+        let snapshot_json = serde_json::to_string(&snapshot).expect("序列化快照");
+
+        let storage = test_session_storage();
+        storage
+            .get::<AgentSessionRepository>()
+            .expect("会话仓储")
+            .save_snapshot(legacy_uid, "升级前的老会话", &snapshot_json)
+            .expect("写入一条无归属旧会话");
+        cx.update(|cx| cx.set_global(GlobalStorageState { storage }));
+
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![])
+            .with_workspace_root(std::path::PathBuf::from("/tmp/navop-test-ws-a"));
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+
+        view.update_in(cx, |view, _window, cx| {
+            view.switch_session(legacy_uid, cx);
+
+            assert_eq!(
+                legacy_uid, view.current_session,
+                "前置：确实切到了那条旧会话（快照读回来了）"
+            );
+            assert_eq!(
+                None,
+                view.session_roots.get(legacy_uid).map(String::as_str),
+                "点开旧会话只是看一眼，不该凭空给它定一个工作区归属"
+            );
+        });
     }
 
     #[gpui::test]
@@ -9079,6 +17514,217 @@ mod tests {
         );
     }
 
+    /// 带图片的用户消息：走提交路径把附件交给转录，渲染成缩略图。
+    ///
+    /// 卡的是整条链路（附件 → 投影 → 消息槽），而不是某一层的纯函数：
+    /// 图片过去正是在「视图把 `submission.images` 换成 `.len()`」这一步丢的。
+    #[gpui::test]
+    fn user_message_with_images_renders_a_thumbnail_beside_the_text(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let (host, cx) = cx.add_window_view(FixedSidebarHost::new);
+        let chat = host.read_with(cx, |host, _| host.view.clone());
+        let attachments = vec![crate::ImageAttachment::for_test("screenshot.png")];
+        chat.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let resources = ResourceContext::new();
+            view.push_user_to_session(&session_uid, "看这张图", &attachments, &resources);
+            cx.notify();
+        });
+
+        let (message_id, image_count) = chat.read_with(cx, |view, _| {
+            let message = view
+                .transcript
+                .messages
+                .last()
+                .expect("用户消息应该落进当前转录");
+            (message.id.clone(), message.images.len())
+        });
+        assert_eq!(1, image_count, "附件要原样带到消息上");
+        let cx: &mut VisualTestContext = cx;
+
+        let image: &'static str =
+            Box::leak(format!("ai-chat-user-image:{message_id}:0").into_boxed_str());
+        assert!(cx.debug_bounds(image).is_some(), "图片应该渲染成缩略图");
+        assert!(
+            cx.debug_bounds("ai-chat-user-plain-text").is_some(),
+            "图片不挤掉文字"
+        );
+    }
+
+    /// 空会话要有起手态，而且第一句话一到就得让位。
+    #[gpui::test]
+    fn empty_session_shows_the_starter_state(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let (host, cx) = cx.add_window_view(FixedSidebarHost::new);
+        let cx: &mut VisualTestContext = cx;
+
+        assert!(
+            cx.debug_bounds("ai-chat-empty-state").is_some(),
+            "空会话过去是一片背景色，现在得有起手态"
+        );
+
+        let chat = host.read_with(cx, |host, _| host.view.clone());
+        let no_images: Vec<crate::ImageAttachment> = Vec::new();
+        chat.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let resources = ResourceContext::new();
+            view.push_user_to_session(&session_uid, "你好", &no_images, &resources);
+            cx.notify();
+        });
+
+        // 起手态退场靠的是「这一帧不再画它」：要一帧真重画才看得到（见 `refresh_frame`）。
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-empty-state").is_none(),
+            "有消息之后起手态必须让位"
+        );
+    }
+
+    /// 点开转录里的图：整块缩略图（图 + 文件名）都能点，放大的图挂在面板根上。
+    ///
+    /// 覆盖层必须挂面板根而不是滚动容器里——转录区会滚，绝对定位的子元素
+    /// 会被裁在视口内。
+    #[gpui::test]
+    fn clicking_a_transcript_image_opens_a_preview_and_closes_it(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let (host, cx) = cx.add_window_view(FixedSidebarHost::new);
+        let chat = host.read_with(cx, |host, _| host.view.clone());
+        let attachments = vec![crate::ImageAttachment::for_test("screenshot.png")];
+        chat.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let resources = ResourceContext::new();
+            view.push_user_to_session(&session_uid, "看这张图", &attachments, &resources);
+            cx.notify();
+        });
+
+        let message_id = chat.read_with(cx, |view, _| {
+            view.transcript
+                .messages
+                .last()
+                .expect("用户消息应该落进当前转录")
+                .id
+                .clone()
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let image: &'static str =
+            Box::leak(format!("ai-chat-user-image:{message_id}:0").into_boxed_str());
+        let tile = cx.debug_bounds(image).expect("图片应该渲染成缩略图");
+        assert!(
+            cx.debug_bounds("ai-chat-image-preview-layer").is_none(),
+            "没人点之前不该有预览层"
+        );
+
+        cx.simulate_click(tile.center(), Modifiers::default());
+
+        let layer = cx
+            .debug_bounds("ai-chat-image-preview-layer")
+            .expect("点缩略图应该打开预览层");
+        let panel = cx
+            .debug_bounds("ai-chat-image-preview")
+            .expect("预览层里要有内容面板");
+        assert!(
+            layer.size.width >= panel.size.width && layer.size.height >= panel.size.height,
+            "内容面板不该比背板大：layer={layer:?}, panel={panel:?}"
+        );
+
+        // 点背板收起（`IconButton` 不落 debug selector，就从背板点）。
+        // 取内容面板左侧的空隙：面板居中且最宽只有背板的 0.9，一定有留白。
+        cx.simulate_click(
+            point(layer.origin.x + px(2.0), panel.center().y),
+            Modifiers::default(),
+        );
+
+        assert!(
+            cx.debug_bounds("ai-chat-image-preview-layer").is_none(),
+            "点背板应该把预览收起来"
+        );
+    }
+
+    /// 只发图不带字：不画空的文字槽（那会多出一行间距）。
+    #[gpui::test]
+    fn image_only_user_message_skips_the_text_slot(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let (host, cx) = cx.add_window_view(FixedSidebarHost::new);
+        let chat = host.read_with(cx, |host, _| host.view.clone());
+        let attachments = vec![crate::ImageAttachment::for_test("screenshot.png")];
+        chat.update(cx, |view, cx| {
+            let session_uid = view.current_session.clone();
+            let resources = ResourceContext::new();
+            view.push_user_to_session(&session_uid, "", &attachments, &resources);
+            cx.notify();
+        });
+
+        let message_id = chat.read_with(cx, |view, _| {
+            view.transcript
+                .messages
+                .last()
+                .expect("用户消息应该落进当前转录")
+                .id
+                .clone()
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let image: &'static str =
+            Box::leak(format!("ai-chat-user-image:{message_id}:0").into_boxed_str());
+        assert!(cx.debug_bounds(image).is_some(), "图还是要画");
+        assert!(
+            cx.debug_bounds("ai-chat-user-plain-text").is_none(),
+            "没有文字就不该有文字槽"
+        );
+    }
+
+    /// 用量历史浮层：有数据就画、关掉就没了。
+    ///
+    /// 这里直接塞数据而不是走 `OpenUsageHistory` 事件：事件分支只多做一步
+    /// 「查库」，而查库那半步由 `persistence` 的用例覆盖；这里要卡的是覆盖层
+    /// 真的挂在面板根上、并且能关掉。
+    #[gpui::test]
+    fn usage_history_overlay_renders_over_the_panel_and_closes(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let (host, cx) = cx.add_window_view(FixedSidebarHost::new);
+        let chat = host.read_with(cx, |host, _| host.view.clone());
+        let now = crate::session_sidebar::now_unix();
+        chat.update(cx, |view, cx| {
+            let mut first = AgentUsageSample::new("sess_a", 12_000, now - 60);
+            first.window = Some(200_000);
+            let mut second = AgentUsageSample::new("sess_a", 40_000, now);
+            second.window = Some(200_000);
+            let samples = vec![first, second];
+            view.usage_history = Some(crate::usage_history::UsageHistoryData {
+                sessions: crate::usage_history::session_usage(&samples),
+                daily: crate::usage_history::daily_usage(&samples, now, 14),
+                titles: [("sess_a".to_string(), "连接数排查".into())]
+                    .into_iter()
+                    .collect(),
+            });
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        assert!(
+            cx.debug_bounds("ai-chat-usage-history-layer").is_some(),
+            "浮层背板应该铺满面板"
+        );
+        let panel = cx
+            .debug_bounds("ai-chat-usage-history")
+            .expect("浮层内容应该渲染");
+        let root = cx.debug_bounds("agent-sidebar-root").expect("面板根仍然在");
+        assert!(
+            panel.size.width < root.size.width && panel.size.height < root.size.height,
+            "浮层内容应该小于面板（四周留白）: panel={panel:?} root={root:?}"
+        );
+
+        chat.update(cx, |view, cx| view.close_usage_history(cx));
+        let cx: &mut VisualTestContext = cx;
+        // 同 `empty_session_shows_the_starter_state`：关掉不等于这一帧不画它。
+        refresh_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-usage-history-layer").is_none(),
+            "关掉之后覆盖层不该留着"
+        );
+    }
+
     #[gpui::test]
     fn sidebar_mode_keeps_input_visible_after_long_agent_reply(cx: &mut TestAppContext) {
         init_test_ui(cx);
@@ -9145,6 +17791,7 @@ mod tests {
                 ToolCardData {
                     call_id: "call-layout".to_string(),
                     tool_name: "terminal.exec".to_string(),
+                    action: agent_runtime::ToolAction::Execute,
                     target_id: Some("ssh-prod-with-a-very-long-target-id".to_string()),
                     target_label: Some("生产终端节点-很长的展示名称".to_string()),
                     input_summary: "ps aux | sort -nrk 3,3 | head -20".to_string(),
@@ -9153,6 +17800,8 @@ mod tests {
                     success: None,
                     summary: String::new(),
                     data_text: String::new(),
+                    file_changes: Vec::new(),
+                    duration_ms: None,
                 }
                 .to_json(),
             ));
@@ -9167,10 +17816,13 @@ mod tests {
             .debug_bounds("agent-tool-card")
             .expect("tool card should render");
 
-        assert_eq!(column.origin.x, card.origin.x);
+        // 工具行是活动块的子行,缩进一级(块头占最左边);除了这一级缩进,它仍
+        // 该铺满剩余宽度。
+        assert_eq!(column.origin.x + px(16.0), card.origin.x);
         assert_eq!(
-            column.size.width, card.size.width,
-            "tool card should fill sidebar message column: column={column:?}, card={card:?}"
+            column.size.width - px(16.0),
+            card.size.width,
+            "tool card should fill the rest of the sidebar message column: column={column:?}, card={card:?}"
         );
     }
 
@@ -9292,7 +17944,9 @@ mod tests {
                 .switch_model(&second, &resources)
                 .expect("runtime switch should succeed")
         );
-        assert_ne!(binding.session_id, old_session);
+        // 空会话也一起搬过去：切模型不该凭空多出一个 session id。
+        assert_eq!(binding.session_id, old_session);
+        assert!(binding.runtime.session(&old_session).is_some());
         assert_eq!(binding.runtime.services().model.model_name(), "qwen3:14b");
         assert_eq!(
             binding
@@ -9304,6 +17958,48 @@ mod tests {
             "ollama"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 切模型必须带上当前会话：本地会话的历史只活在 Runtime 内存里，换 Runtime
+    /// 若新开空会话，用户看到的就是"切完模型它不记得刚才聊过什么"。
+    #[test]
+    fn runtime_binding_switch_model_carries_the_current_session() {
+        let first = ComposerModelOption::new("openai:gpt-a", "openai", "OpenAI", "gpt-a");
+        let second = ComposerModelOption::new("ollama:qwen", "ollama", "Ollama", "qwen3:14b");
+        let factory: AgentRuntimeFactory =
+            Arc::new(|option| Ok(test_runtime(option.model.as_ref())));
+        let resources = ResourceContext::new();
+        let mut binding = RuntimeBinding::new(
+            test_runtime(first.model.as_ref()),
+            resources.clone(),
+            Some(first),
+            Some(factory),
+        );
+        let session_id = binding.session_id.clone();
+        binding
+            .runtime
+            .session(&session_id)
+            .expect("initial session should exist")
+            .record_user_input("查询当前连接数");
+
+        assert!(
+            binding
+                .switch_model(&second, &resources)
+                .expect("runtime switch should succeed")
+        );
+
+        assert_eq!(binding.session_id, session_id);
+        assert_eq!(binding.runtime.services().model.model_name(), "qwen3:14b");
+        let carried = binding
+            .runtime
+            .session(&session_id)
+            .expect("session should be restored into the new runtime");
+        assert_eq!(carried.id(), &session_id);
+        assert_eq!(
+            carried.history_snapshot().len(),
+            1,
+            "对话历史应随会话延续到新模型"
+        );
     }
 
     #[test]
@@ -9478,6 +18174,12 @@ mod tests {
         assert!(retained.is_none());
     }
 
+    /// 视图级测试里标记「本地那段对话」的哨兵文本。
+    const LOCAL_TRANSCRIPT_MARK: &str = "本地这段不能丢";
+
+    /// 视图级测试里冒充「ACP agent 那段对话」的哨兵文本。
+    const ACP_TRANSCRIPT_MARK: &str = "agent 那边说的话";
+
     fn test_runtime(model_name: &str) -> Arc<Runtime> {
         let model = Arc::new(NamedModelClient(model_name.to_string()));
         let tools = Arc::new(ToolRouter::new(ToolRegistry::new()));
@@ -9500,10 +18202,73 @@ mod tests {
         Arc::new(Runtime::new(RuntimeServices::new(model, tools)))
     }
 
+    /// 测试的配置根目录必须在临时目录里，绝不落到用户真实配置目录。
+    ///
+    /// 这不是洁癖：`AppSettings::update_and_save` 的落盘路径默认是用户真实
+    /// `settings.json`，而测试进程里的设置起步是默认值——一次保存就把用户的
+    /// 工作区根、终端、主题、MCP 配置全部覆盖成默认。工作区根一没，工作台就认
+    /// 不出仓库，审阅入口随即退化成「打开源文件、没有 diff」。
+    fn isolate_config_dir_for_tests() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let data_dir =
+                std::env::temp_dir().join(format!("navop-test-paths-{}", std::process::id()));
+            let context = one_core::app_paths::AppPathResolutionContext {
+                executable_path: std::env::current_exe().unwrap_or_default(),
+                current_dir: std::env::current_dir().unwrap_or_default(),
+                portable_environment: None,
+                data_dir_environment: None,
+                // 测试要的是"一切都钉在临时目录里"：debug 构建那套默认隔离目录
+                // 在这儿只会多一层不确定，显式关掉（真实路径仍由下面的 override 决定）。
+                development_data_dir: None,
+            };
+            let _ = one_core::app_paths::initialize_app_paths(
+                &one_core::app_paths::AppPathOverrides::with_data_dir(data_dir),
+                &context,
+            );
+        });
+    }
+
     fn init_test_ui(cx: &mut TestAppContext) {
+        isolate_config_dir_for_tests();
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::init(cx);
+        });
+    }
+
+    /// 测试里的设置保存必须落在临时配置目录，绝不碰用户真实 `settings.json`。
+    ///
+    /// 只断言「目录在临时区 + 文件确实写出」：设置是进程级全局，同一个测试二进制里
+    /// 别的用例也会 `update_and_save`，并发时后写的那份可能覆盖掉本条写进去的哨兵值，
+    /// 断言文件内容会在满载的 CI 上偶发变红（内容本身没有可隔离性）。
+    #[gpui::test]
+    fn settings_saves_stay_in_the_test_config_dir(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let before = cx.update(|cx| AppSettings::current(cx).log_file_path.clone());
+        cx.update(|cx| {
+            AppSettings::update_and_save(cx, |settings| {
+                settings.log_file_path = "/navop-test/sentinel.log".to_string();
+            });
+        });
+
+        let config_dir = one_core::app_dirs::config_dir().expect("配置目录");
+        assert!(
+            config_dir.starts_with(std::env::temp_dir()),
+            "设置落盘必须写在测试临时目录，实际是 {}",
+            config_dir.display()
+        );
+        let settings_path = config_dir.join("settings.json");
+        assert!(
+            settings_path.exists(),
+            "设置文件应已写出：{}",
+            settings_path.display()
+        );
+
+        cx.update(|cx| {
+            AppSettings::update_and_save(cx, |settings| {
+                settings.log_file_path = before;
+            });
         });
     }
 
@@ -9517,8 +18282,466 @@ mod tests {
         assert!(condition(), "GPUI test condition was not reached");
     }
 
-    struct NamedModelClient(String);
+    /// 命令面板：换键开合、方向键选择、输入过滤、回车执行、escape 关掉。
+    #[gpui::test]
+    fn gpui_command_palette_lists_runs_and_closes(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
 
+        assert!(
+            cx.debug_bounds("ai-chat-palette").is_none(),
+            "the palette must stay hidden until asked for"
+        );
+
+        // 焦点要等一帧才算落到已渲染帧上，否则按键派发的起点是空的（同 findbar 测试）。
+        focus_composer(&view, cx);
+        draw_frame(cx);
+
+        cx.dispatch_action(ToggleCommandPalette);
+        draw_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-palette").is_some(),
+            "the toggle action itself must open the palette"
+        );
+        assert!(view.read_with(cx, |view, _| view.palette_open));
+        assert_eq!(0, view.read_with(cx, |view, _| view.palette_selection));
+
+        // 查询框上有焦点，方向键必须走面板自己的绑定（复合上下文），
+        // 不能被 `Input` 自己的光标移动吃掉。
+        cx.simulate_keystrokes("down");
+        draw_frame(cx);
+        assert_eq!(1, view.read_with(cx, |view, _| view.palette_selection));
+        cx.simulate_keystrokes("up");
+        draw_frame(cx);
+        assert_eq!(0, view.read_with(cx, |view, _| view.palette_selection));
+
+        // 首 / 末 / 翻页：候选多起来以后不该只能一条条走。
+        let item_count = view.read_with(cx, |view, _| view.palette_items().len());
+        assert!(item_count > 1, "前置：得有几条候选才谈得上首末");
+        cx.simulate_keystrokes("end");
+        draw_frame(cx);
+        assert_eq!(
+            item_count - 1,
+            view.read_with(cx, |view, _| view.palette_selection)
+        );
+        cx.simulate_keystrokes("home");
+        draw_frame(cx);
+        assert_eq!(0, view.read_with(cx, |view, _| view.palette_selection));
+        cx.simulate_keystrokes("pagedown");
+        draw_frame(cx);
+        assert_eq!(
+            crate::command_palette::PALETTE_PAGE_STEP % item_count,
+            view.read_with(cx, |view, _| view.palette_selection),
+            "翻一页走一屏的行数；候选不够一屏就绕回，而不是停在最后一条"
+        );
+
+        // 命不中就给空态，而不是留一排点了没反应的行。
+        cx.simulate_input("zzz-no-such-command");
+        draw_frame(cx);
+        assert!(cx.debug_bounds("ai-chat-palette-empty").is_some());
+        assert!(cx.debug_bounds("ai-chat-palette-row-0").is_none());
+        assert_eq!(0, view.read_with(cx, |view, _| view.palette_selection));
+
+        // escape 关面板：浮层消失后焦点必须有人接，否则下一次按键静默失效。
+        cx.simulate_keystrokes("escape");
+        draw_frame(cx);
+        assert!(!view.read_with(cx, |view, _| view.palette_open));
+        assert!(cx.debug_bounds("ai-chat-palette").is_none());
+
+        // 再开一次：这次走真实按键，确认换键在 composer 焦点下真的绑上了。
+        cx.simulate_keystrokes(palette_keystroke());
+        draw_frame(cx);
+        assert!(view.read_with(cx, |view, _| view.palette_open));
+
+        // 面板自己也在换键上下文里：开着再按一次要关掉（而不是什么都不发生）。
+        cx.simulate_keystrokes(palette_keystroke());
+        draw_frame(cx);
+        assert!(!view.read_with(cx, |view, _| view.palette_open));
+
+        // 执行高亮那条：第四条命令是「显示/隐藏已归档会话」。
+        cx.simulate_keystrokes(palette_keystroke());
+        draw_frame(cx);
+        view.update(cx, |view, cx| {
+            view.palette_selection = 3;
+            cx.notify();
+        });
+        draw_frame(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.run_palette_selection(window, cx);
+        });
+        draw_frame(cx);
+        assert!(!view.read_with(cx, |view, _| view.palette_open));
+        assert!(view.read_with(cx, |view, _| view.showing_archived_sessions()));
+        assert!(cx.debug_bounds("ai-chat-palette").is_none());
+    }
+
+    // ===== 会话内搜索（findbar）=====
+
+    /// 生成足够长的回复，让消息列表真的产生滚动区——否则「跳转」无从验证。
+    fn long_reply(tag: &str) -> String {
+        (0..12)
+            .map(|index| {
+                format!(
+                    "{tag} 第 {index} 段：{}",
+                    "让这一轮长得足以撑出滚动区".repeat(6)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// 铺一段多轮对话；`needle_turns` 里的轮次额外带上 `needle`。
+    fn push_conversation(
+        view: &mut AgentChatView,
+        turns: usize,
+        needle_turns: &[usize],
+        needle: &str,
+    ) {
+        for index in 0..turns {
+            view.transcript
+                .push_message(crate::ChatMessageUI::user(format!("问题 {index}")));
+            let body = if needle_turns.contains(&index) {
+                format!("{needle}\n\n{}", long_reply(&format!("回答 {index}")))
+            } else {
+                long_reply(&format!("回答 {index}"))
+            };
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant(body));
+        }
+    }
+
+    /// 强制跑一帧。`run_until_parked` 只跑后台任务，不落帧；
+    /// 需要把焦点 / 滚动这类「下一帧才生效」的状态推进时，用一次 `debug_bounds` 触发绘制。
+    fn draw_frame(cx: &mut VisualTestContext) {
+        let _ = cx.debug_bounds("ai-chat-messages-scroll");
+        cx.run_until_parked();
+    }
+
+    /// 逼窗口整帧重画一次，然后才断言某个选择器「没了」。
+    ///
+    /// 保留渲染会给**这一帧没重画**的区域沿用上一帧的记录，调试选择器跟着一起沿用：
+    /// 刚被移除的元素于是还挂在 `debug_bounds` 里，而场景里早没有它的图元了
+    /// （拿 `Window::painted_primitives` 比对过：图元数 0，只是记录没清）。
+    /// 所以断言「某个东西消失了」之前得先要一帧真重画，否则读到的是账面残留。
+    fn refresh_frame(cx: &mut VisualTestContext) {
+        cx.update(|window, _| window.refresh());
+    }
+
+    fn palette_keystroke() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        }
+    }
+
+    fn open_find_keystroke() -> &'static str {
+        crate::find_shortcut::find_defaults_for_platform(cfg!(target_os = "macos")).0[0]
+    }
+
+    fn focus_composer(view: &Entity<AgentChatView>, cx: &mut VisualTestContext) {
+        view.update_in(cx, |view, window, cx| {
+            let input = view.input.clone();
+            input.update(cx, |input, cx| input.focus_input(window, cx));
+        });
+    }
+
+    /// 快捷键打开 → 输入即搜 → Escape 关闭并清空命中。
+    #[gpui::test]
+    fn gpui_findbar_opens_with_shortcut_searches_and_closes_with_escape(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            push_conversation(view, 3, &[2], "预算审批");
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ai-chat-findbar").is_none(),
+            "findbar must stay hidden until asked for"
+        );
+
+        // 真实姿势：用户正在输入框里打字，然后按 Cmd/Ctrl+F。
+        // 焦点要等一帧才算落到已渲染帧上，否则按键派发的起点是空的。
+        focus_composer(&view, cx);
+        draw_frame(cx);
+
+        // 先单独确认 action 接线本身是通的（与按键绑定解耦，失败时好定位）。
+        cx.dispatch_action(ToggleTranscriptFind);
+        draw_frame(cx);
+        assert!(
+            view.read_with(cx, |view, _| view.findbar_open),
+            "the toggle action itself must open the findbar"
+        );
+        cx.dispatch_action(CloseTranscriptFind);
+        draw_frame(cx);
+        assert!(!view.read_with(cx, |view, _| view.findbar_open));
+
+        cx.simulate_keystrokes(open_find_keystroke());
+        draw_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-findbar").is_some(),
+            "the find shortcut should open the findbar"
+        );
+
+        // 打开时焦点已在搜索框上，直接输入即可（不再额外点击）。
+        cx.simulate_input("预算审批");
+        cx.run_until_parked();
+        assert_eq!(
+            Some(2),
+            view.read_with(cx, |view, _| view.search.current_turn_index()),
+            "the only hit lives in the last turn"
+        );
+        assert_eq!(1, view.read_with(cx, |view, _| view.search.total()));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ai-chat-findbar").is_none(),
+            "escape should close the findbar"
+        );
+        assert!(!view.read_with(cx, |view, _| view.findbar_open));
+        assert!(
+            !view.read_with(cx, |view, _| view.search.is_active()),
+            "closing must drop the hit set, not leave stale highlights"
+        );
+    }
+
+    /// 跳转要真的把目标轮次滚到视口顶部。
+    ///
+    /// 这条同时钉住一个**结构性不变量**：滚动容器的第 N 个直接子元素就是第 N 轮
+    /// （`ScrollHandle::scroll_to_item` 以直接子元素为索引）。一旦有人再往里塞一层
+    /// 包装，跳转会静默失效，这里会先炸。
+    #[gpui::test]
+    fn gpui_findbar_jump_scrolls_the_target_turn_to_the_top(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            // needle 放在中间轮：跳它不会被「滚到底」夹住，断言才是确定的。
+            push_conversation(view, 12, &[5], "预算审批");
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        assert_eq!(
+            px(0.0),
+            view.read_with(cx, |view, _| view.scroll_handle.offset().y),
+            "the list should start at the top"
+        );
+
+        view.update(cx, |view, cx| {
+            view.findbar_open = true;
+            view.search.set_query("预算审批", &view.transcript.messages);
+            view.jump_to_current_search_hit();
+            cx.notify();
+        });
+        // 滚动是在 prepaint 里落地的：至少跑一帧，再读偏移。
+        draw_frame(cx);
+        draw_frame(cx);
+
+        assert_eq!(
+            Some(5),
+            view.read_with(cx, |view, _| view.search.current_turn_index()),
+            "the query must resolve to the middle turn"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_handle.bounds_for_item(5))
+                .is_some(),
+            "the scroll container must index its turns directly, otherwise \
+             `scroll_to_item` silently does nothing"
+        );
+
+        let (top_item, offset_y) = view.read_with(cx, |view, _| {
+            (view.scroll_handle.top_item(), view.scroll_handle.offset().y)
+        });
+        // GPUI 把滚动偏移夹在 `[-max_offset, 0]`（见 `gpui` 的 `div.rs::compute_scroll_offset`），
+        // 向下滚动时它是**负数**，所以这里不能断言「大于 0」。真正判方向的是下面的 `top_item`。
+        assert_ne!(px(0.0), offset_y, "jumping must actually scroll");
+        assert_eq!(
+            5, top_item,
+            "the hit turn should sit at the top of the viewport"
+        );
+    }
+
+    /// 前后跳转按轮次推进，且**不碰 composer**。
+    #[gpui::test]
+    fn gpui_findbar_stepping_advances_hits_without_touching_the_composer(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            push_conversation(view, 4, &[0, 3], "预算审批");
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.findbar_open = true;
+            view.search.set_query("预算审批", &view.transcript.messages);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert_eq!(2, view.read_with(cx, |view, _| view.search.total()));
+        let first = view.read_with(cx, |view, _| view.search.current_turn_index());
+        assert_eq!(Some(0), first);
+
+        let next = cx
+            .debug_bounds("ai-chat-findbar-next")
+            .expect("next button should render");
+        cx.simulate_click(next.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        let second = view.read_with(cx, |view, _| view.search.current_turn_index());
+        assert_ne!(first, second, "next must move to a different turn");
+        assert_eq!(Some(3), second, "the second hit lives in the last turn");
+
+        // composer 完全没被动过。
+        assert!(
+            view.read_with(cx, |view, cx| view.input.read(cx).composer_text(cx))
+                .is_empty(),
+            "searching must not write into the composer"
+        );
+
+        // 反向要能绕回第一条。
+        let previous = cx
+            .debug_bounds("ai-chat-findbar-prev")
+            .expect("prev button should render");
+        cx.simulate_click(previous.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            Some(0),
+            view.read_with(cx, |view, _| view.search.current_turn_index())
+        );
+    }
+
+    /// 正文变化（流式追加）后命中要重算，而不是停在旧结果上。
+    #[gpui::test]
+    fn gpui_findbar_recounts_hits_when_the_transcript_grows(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            push_conversation(view, 2, &[0], "预算审批");
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.findbar_open = true;
+            view.search.set_query("预算审批", &view.transcript.messages);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(1, view.read_with(cx, |view, _| view.search.total()));
+        // 追加一轮含命中的对话：不重新 set_query，也要靠 revision 变更自动重算。
+        view.update(cx, |view, cx| {
+            view.transcript
+                .push_message(crate::ChatMessageUI::user("再问一句".to_string()));
+            view.transcript
+                .push_message(crate::ChatMessageUI::assistant("预算审批 追加".to_string()));
+            cx.notify();
+        });
+        // 命中重算发生在渲染里（按修订号判新），必须真落一帧。
+        draw_frame(cx);
+
+        assert_eq!(2, view.read_with(cx, |view, _| view.search.total()));
+        assert!(
+            view.read_with(cx, |view, _| view.search.hits_turn(2)),
+            "the appended message belongs to a new turn and must be marked as a hit"
+        );
+    }
+
+    /// 工具栏入口与「关闭」按钮走鼠标路径，同样可用。
+    #[gpui::test]
+    fn gpui_findbar_toolbar_button_toggles_and_close_button_closes(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            push_conversation(view, 2, &[1], "预算审批");
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        let toggle = cx
+            .debug_bounds("agent-chat-find")
+            .expect("toolbar search entry should render");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.findbar_open));
+        assert!(cx.debug_bounds("ai-chat-findbar").is_some());
+
+        let close = cx
+            .debug_bounds("ai-chat-findbar-close")
+            .expect("close button should render");
+        cx.simulate_click(close.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.findbar_open));
+        assert!(cx.debug_bounds("ai-chat-findbar").is_none());
+    }
+
+    /// 快捷键打开的 findbar，再按一次同样的键**不能关掉它**。
+    ///
+    /// `Cmd/Ctrl+F` 的语义是「找东西」而不是「别找了」：用户连按两下是常见姿势，
+    /// 把面板和命中一起收掉属于误操作。关闭只走 `escape` / 关闭按钮 / 工具栏按钮。
+    #[gpui::test]
+    fn gpui_findbar_shortcut_refocuses_instead_of_closing(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config = AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), vec![]);
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        view.update(cx, |view, cx| {
+            push_conversation(view, 3, &[2], "预算审批");
+            cx.notify();
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+
+        focus_composer(&view, cx);
+        draw_frame(cx);
+        cx.simulate_keystrokes(open_find_keystroke());
+        draw_frame(cx);
+        assert!(view.read_with(cx, |view, _| view.findbar_open));
+
+        // 焦点此时已经在 findbar 的搜索框里，再按一次同样的键。
+        cx.simulate_keystrokes(open_find_keystroke());
+        draw_frame(cx);
+        assert!(
+            view.read_with(cx, |view, _| view.findbar_open),
+            "pressing the find shortcut again must not close the findbar"
+        );
+        assert!(cx.debug_bounds("ai-chat-findbar").is_some());
+
+        // 真正关掉之后，快捷键要能再打开：它是「打开/聚焦」，不是单向开关。
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.findbar_open));
+        cx.simulate_keystrokes(open_find_keystroke());
+        draw_frame(cx);
+        assert!(
+            cx.debug_bounds("ai-chat-findbar").is_some(),
+            "the shortcut must still open the findbar after it was closed"
+        );
+    }
+
+    struct NamedModelClient(String);
     #[async_trait]
     impl ModelClient for NamedModelClient {
         async fn complete(
@@ -9538,5 +18761,646 @@ mod tests {
         fn model_name(&self) -> &str {
             &self.0
         }
+    }
+
+    /// 工作台把聊天面板当普通子视图塞进内容区。聊天框与聊天记录都必须在里面真正排布出来，
+    /// 否则「工作台里没有输入框 / 看不到聊天记录」这类问题不会在面板自身的测试里暴露。
+    #[gpui::test]
+    fn gpui_workbench_content_hosts_the_chat_composer_and_transcript(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let runtime = test_runtime("m");
+        let config =
+            AgentChatViewConfig::new(runtime, ResourceContext::new(), vec![]).sidebar_mode(false);
+
+        struct NavStub;
+
+        impl Render for NavStub {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full()
+            }
+        }
+
+        let (shell, cx) = cx.add_window_view(move |window, cx| {
+            let chat = AgentChatView::view_with_config(config, window, cx);
+            // 宿主会压掉内建侧栏（会话列表由外壳统一渲染），测试必须跟宿主同形。
+            chat.update(cx, |chat, cx| chat.set_sidebar_suppressed(true, cx));
+            let nav: gpui::AnyView = cx.new(|_| NavStub).into();
+            crate::workbench::WorkbenchShell::new(
+                crate::workbench::WorkbenchShellConfig {
+                    panels: vec![crate::workbench::WorkbenchPanelEntry::new(
+                        crate::workbench::WorkbenchPanelKind::Chat,
+                        chat,
+                    )],
+                    // 宿主给的是内建会话列表；这里用等宽占位视图走同一条布局分支。
+                    session_nav: Some(nav),
+                    session_source: None,
+                    initial_state: crate::workbench::WorkbenchState::new(
+                        crate::workbench::WorkbenchPanelKind::Chat,
+                    ),
+                    theme: None,
+                    subscriptions: Vec::new(),
+                    workspace_root: None,
+                },
+                window,
+                cx,
+            )
+        });
+
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        let _ = shell;
+
+        // 内容区必须自己拿到高度：外壳的行容器默认 items_center，不写 h_full 的高
+        // 会在真机上塔成 0（子元素还在，但全被 overflow_hidden 裁掉 = 一片空白）。
+        let content = cx
+            .debug_bounds("workbench-content")
+            .expect("the workbench content area must be laid out");
+        assert!(
+            content.size.height > px(0.0) && content.size.width > px(0.0),
+            "the workbench content area must get a real size, got {:?}",
+            content.size
+        );
+
+        let composer = cx
+            .debug_bounds("agent-input-area")
+            .expect("the workbench content area must lay out the chat composer");
+        assert!(
+            composer.size.height > px(0.0),
+            "the chat composer must have a real height inside the workbench, got {:?}",
+            composer.size
+        );
+        assert!(
+            cx.debug_bounds("ai-chat-messages").is_some(),
+            "the workbench content area must lay out the chat transcript"
+        );
+    }
+
+    /// 底栏 chip 的动作必须延后到本视图的租借释放之后才执行。
+    ///
+    /// 触发链路（与线上逐字同形）：`AgentInput` emit → 本视图的
+    /// `cx.subscribe_in` → GPUI 先 `subscriber.update(...)` 再回调，回调期间
+    /// `AgentChatView` 已被租借 → `run_composer_action` 把动作交给宿主 →
+    /// 宿主末了 `refresh_composer_context()` 回头 `update` 本视图。
+    /// 原地同步调用就是 GPUI 的双重租借 panic
+    /// （`cannot update ... while it is already being updated`）；而 macOS 的
+    /// 事件回调是 `extern "C"`，panic 无法 unwind，会升级成
+    /// `fatal runtime error` 直接 abort 整个进程 —— 点一下分支 / Worktree /
+    /// 工作区就崩一次。延后（`Window::defer`）后动作照旧执行，只是落在租借
+    /// 释放之后。
+    #[gpui::test]
+    fn gpui_composer_action_re_entering_the_view_does_not_double_lease(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let runtime = test_runtime("m");
+        let config = AgentChatViewConfig::new(runtime, ResourceContext::new(), vec![]);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_branch = calls.clone();
+
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let view_for_action = view.clone();
+        let source = ComposerContextSource {
+            snapshot: Arc::new(|_: &mut gpui::App| ComposerContextSnapshot::default()),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            // 宿主真实做法：切完分支再让视图重取快照 —— 也就是 update 本视图。
+            select_branch: Arc::new(move |_: &SharedString, cx: &mut gpui::App| {
+                calls_for_branch.fetch_add(1, Ordering::SeqCst);
+                view_for_action.update(cx, |view, cx| view.refresh_composer_context(cx));
+            }),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            // 这条用例只关心 chip 动作的重入，不涉及 worktree 创建。
+            prepare_worktree: Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))),
+            report_worktree_failure: Arc::new(
+                |_: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+        };
+        view.update_in(cx, |view, _window, cx| {
+            view.set_composer_context_source(source, cx)
+        });
+
+        let input = view.update_in(cx, |view, _window, _cx| view.input.clone());
+        input.update(cx, |_, cx| {
+            cx.emit(AgentInputEvent::SelectBranch { name: "dev".into() });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            1,
+            calls.load(Ordering::SeqCst),
+            "宿主动作必须照旧执行，只是延后到租借释放之后"
+        );
+    }
+
+    /// 造一个「Worktree 已勾选、待创建」的上下文源。
+    ///
+    /// `prepare` 是「第一次发送时才创建」那一步的替身，测试用它分别走成功与失败两条路。
+    /// 返回的第二个值是宿主侧「上报失败」的记录 —— 线上那一步会弹通知，这里只记下来
+    /// 供断言。
+    fn source_with_pending_worktree(
+        prepare: Arc<dyn Fn(&mut gpui::App) -> Task<Result<(), SharedString>>>,
+    ) -> (ComposerContextSource, Arc<Mutex<Vec<SharedString>>>) {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let reported_for_source = reported.clone();
+        let source = ComposerContextSource {
+            snapshot: Arc::new(|_: &mut gpui::App| ComposerContextSnapshot {
+                worktree: ComposerWorktreeState::pending(),
+                ..Default::default()
+            }),
+            select_workspace: Arc::new(
+                |_: &std::path::Path, _: &mut gpui::Window, _: &mut gpui::App| {},
+            ),
+            browse_workspace: Arc::new(|_: &mut gpui::Window, _: &mut gpui::App| {}),
+            select_branch: Arc::new(|_: &SharedString, _: &mut gpui::App| {}),
+            toggle_worktree: Arc::new(|_: bool, _: &mut gpui::App| {}),
+            prepare_worktree: prepare,
+            report_worktree_failure: Arc::new(
+                move |message: &SharedString, _: &mut gpui::Window, _: &mut gpui::App| {
+                    reported_for_source.lock().unwrap().push(message.clone());
+                },
+            ),
+        };
+        (source, reported)
+    }
+
+    /// 走输入框的真实提交路径（与线上同一条：`AgentInput` emit → 本视图订阅）。
+    ///
+    /// 提交后必须跟着清空输入框，和 `AgentInput::submit` 同序：emit 是**延后派发**的
+    /// （视图在 `flush_effects` 时才收到），清空紧接其后立刻做。少了这一步，
+    /// 「失败时消息回到输入框」（`restore_to_composer`）的断言会因为输入框压根没被
+    /// 清过而恒真 —— 那是条假绿。
+    fn submit_from_composer(view: &Entity<AgentChatView>, text: &str, cx: &mut VisualTestContext) {
+        let input = view.update_in(cx, |view, _window, _cx| view.input.clone());
+        input.update_in(cx, |input, window, cx| {
+            input.set_composer_text(text, window, cx);
+        });
+        input.update(cx, |_, cx| {
+            cx.emit(AgentInputEvent::Submit {
+                text: text.to_string(),
+                mentions: Vec::new(),
+                images: Vec::new(),
+            });
+        });
+        input.update_in(cx, |input, window, cx| {
+            input.set_composer_text("", window, cx);
+        });
+    }
+
+    /// 勾选 Worktree 后第一次发送要先建 worktree，建好之前消息不能出去。
+    ///
+    /// 理由不是「省点资源」而是正确性：ACP 会话绑的是工作区根，根还没换到新
+    /// worktree 就发出去，等于照旧跑在主工作区上，用户却以为自己在隔离环境里。
+    #[gpui::test]
+    fn pending_worktree_defers_the_first_submission(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let prepared_for_source = prepared.clone();
+        let (source, _reported) =
+            source_with_pending_worktree(Arc::new(move |_: &mut gpui::App| {
+                prepared_for_source.fetch_add(1, Ordering::SeqCst);
+                // `git worktree add` 跑完了，但换根是**延后派发**的：
+                // 视图这边的根这时还没落地。
+                Task::ready(Ok(()))
+            }));
+        view.update_in(cx, |view, _window, cx| {
+            view.set_composer_context_source(source, cx)
+        });
+
+        submit_from_composer(&view, "在 worktree 里跑", cx);
+        cx.run_until_parked();
+
+        assert_eq!(1, prepared.load(Ordering::SeqCst), "拦下提交时要发起创建");
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.gated_submissions.is_empty(),
+                "待创建的 worktree 必须拦下这次提交，等根切过去再发"
+            );
+            assert!(
+                !view.current_session_has_messages(),
+                "worktree 还没落地，消息不能先进了会话"
+            );
+        });
+    }
+
+    /// 创建失败：中止发送并把内容还回输入框。
+    ///
+    /// **不**悄悄降到主工作区继续发 —— 那种「静默换个地方跑」会让人以为改动落在
+    /// 隔离的 worktree 里，实际全在主工作区上。勾选态保留，用户可以直接重试。
+    #[gpui::test]
+    fn worktree_creation_failure_restores_the_composer(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let (source, reported) = source_with_pending_worktree(Arc::new(|_: &mut gpui::App| {
+            Task::ready(Err(SharedString::from("fatal: 分支已存在")))
+        }));
+        view.update_in(cx, |view, _window, cx| {
+            view.set_composer_context_source(source, cx)
+        });
+
+        submit_from_composer(&view, "别把我的话弄丢了", cx);
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.gated_submissions.is_empty(),
+                "失败之后不能还挂着待发提交"
+            );
+            assert!(
+                !view.current_session_has_messages(),
+                "创建失败就不能把消息发出去"
+            );
+            assert_eq!(
+                "别把我的话弄丢了",
+                view.input.read(cx).composer_text(cx),
+                "失败时消息必须回到输入框，否则用户白打一遍"
+            );
+        });
+        assert_eq!(
+            vec![SharedString::from("fatal: 分支已存在")],
+            *reported.lock().unwrap(),
+            "失败原因要交给宿主去说（线上是弹通知），视图不能默默吞掉"
+        );
+    }
+
+    /// 根切到新 worktree 之后，被拦下的那条提交要接着发出去。
+    ///
+    /// 走 `apply_workspace_root`（`set_workspace_root` 的后半程，线上由 `RootChanged`
+    /// 的订阅者触发），而不是直接调 `resume_gated_submission`：直接调后者的话，
+    /// 「换根之后要把提交接上」这件事本身没有测试盯着 —— 把接线的那个调用删掉，
+    /// 测试照样全绿。
+    ///
+    /// 不直接调 `set_workspace_root`：它会 `AppSettings::update_and_save`，在测试里
+    /// 会拿假路径覆盖用户真实的 `last_workspace_root`。
+    #[gpui::test]
+    fn the_gated_submission_resumes_once_the_root_switches(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let (source, _reported) =
+            source_with_pending_worktree(Arc::new(|_: &mut gpui::App| Task::ready(Ok(()))));
+        view.update_in(cx, |view, _window, cx| {
+            view.set_composer_context_source(source, cx)
+        });
+
+        submit_from_composer(&view, "在 worktree 里跑", cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.gated_submissions.is_empty(), "前置：提交应当被拦下");
+            assert!(!view.current_session_has_messages(), "前置：还没发出去");
+        });
+
+        view.update(cx, |view, cx| {
+            view.apply_workspace_root(std::path::PathBuf::from("/tmp/navop-wt-under-test"), cx)
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.gated_submissions.is_empty(), "接手之后不该再挂着");
+            assert!(
+                view.current_session_has_messages(),
+                "根切过去之后必须接着把这条消息发出去"
+            );
+        });
+    }
+
+    /// 创建期间又发一条：只排队，**不能**再建第二个 worktree。
+    ///
+    /// 创建要秒级，这期间用户完全可能再发一条；单槽位实现会把上一条静默覆盖，
+    /// 所以这里同时钉住「第二条被拦下」和「`prepare_worktree` 只调一次」。
+    #[gpui::test]
+    fn a_submission_during_creation_only_queues(cx: &mut TestAppContext) {
+        init_test_ui(cx);
+        let config =
+            AgentChatViewConfig::new(test_runtime("m"), ResourceContext::new(), Vec::new());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AgentChatView::new(config, window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        let created = Arc::new(AtomicUsize::new(0));
+        let created_for_source = created.clone();
+        let (source, _reported) =
+            source_with_pending_worktree(Arc::new(move |_: &mut gpui::App| {
+                created_for_source.fetch_add(1, Ordering::SeqCst);
+                Task::ready(Ok(()))
+            }));
+        view.update_in(cx, |view, _window, cx| {
+            view.set_composer_context_source(source, cx)
+        });
+
+        submit_from_composer(&view, "第一条", cx);
+        cx.run_until_parked();
+        // 创建还没落地（线上要等 `RootChanged` 级联），用户又发了一条。
+        submit_from_composer(&view, "第二条", cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            1,
+            created.load(Ordering::SeqCst),
+            "第二条只是排队，不能再建一个 worktree"
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                vec!["第一条", "第二条"],
+                view.gated_submissions
+                    .iter()
+                    .map(|submission| submission.text.as_str())
+                    .collect::<Vec<_>>(),
+                "两条都要留着（旧的单槽位会覆盖掉第一条），且先来先发"
+            );
+            assert!(
+                !view.current_session_has_messages(),
+                "根还没切过去，两条都不许发"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod acp_probe_status_tests {
+    use super::{AcpAgentProbe, probe_status_label, truncate_probe_error};
+    use crate::acp::AcpModelInfo;
+
+    fn model(id: &str) -> AcpModelInfo {
+        AcpModelInfo {
+            id: id.to_string(),
+            label: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn identified_agent_reports_name_version_and_model_count() {
+        let probe = AcpAgentProbe {
+            name: Some("Codex".to_string()),
+            version: Some("1.2.3".to_string()),
+            models: vec![model("gpt-5"), model("gpt-5-mini")],
+            ..Default::default()
+        };
+
+        let label = probe_status_label(&probe).to_string();
+
+        assert!(label.contains("Codex"), "{label}");
+        assert!(label.contains("1.2.3"), "{label}");
+        assert!(label.contains('2'), "{label}");
+    }
+
+    #[test]
+    fn login_only_probe_marks_login_required() {
+        let probe = AcpAgentProbe {
+            name: Some("Kimi".to_string()),
+            auth_methods: vec!["oauth".to_string()],
+            ..Default::default()
+        };
+
+        let label = probe_status_label(&probe).to_string();
+
+        assert!(label.contains("Kimi"), "{label}");
+        assert_ne!("ACP Agent", label);
+    }
+
+    #[test]
+    fn failed_probe_keeps_the_error_text() {
+        let probe = AcpAgentProbe {
+            error: Some("spawn failed: no such file".to_string()),
+            ..Default::default()
+        };
+
+        let label = probe_status_label(&probe).to_string();
+
+        assert!(label.contains("spawn failed"), "{label}");
+    }
+
+    #[test]
+    fn empty_probe_falls_back_to_generic_label() {
+        assert_eq!(
+            "ACP Agent",
+            probe_status_label(&AcpAgentProbe::default()).as_ref()
+        );
+    }
+
+    #[test]
+    fn probe_error_is_first_line_only_and_bounded() {
+        let error = format!("{}\nsecond line", "x".repeat(200));
+        let label = truncate_probe_error(&error);
+
+        assert!(label.starts_with("xxx"), "{label}");
+        assert!(!label.contains("second line"));
+        assert_eq!(81, label.chars().count());
+    }
+}
+
+#[cfg(test)]
+mod acp_preconnect_model_tests {
+    use super::acp_model_options_from_probe;
+    use crate::acp::AcpModelInfo;
+    use gpui::SharedString;
+
+    fn model(id: &str, label: &str) -> AcpModelInfo {
+        AcpModelInfo {
+            id: id.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn probe_models_become_preconnect_options_with_distinct_ids() {
+        let agent = SharedString::from("builtin.codex");
+        let models = vec![model("gpt-5", "GPT-5"), model("gpt-5-mini", "GPT-5 mini")];
+
+        let options = acp_model_options_from_probe(&agent, &models);
+
+        assert_eq!(2, options.len());
+        assert_eq!("gpt-5", options[0].model.as_ref());
+        assert_eq!("builtin.codex", options[0].provider_id.as_ref());
+        assert_eq!(
+            "GPT-5",
+            options[0].hint.as_ref().map(AsRef::as_ref).unwrap_or("")
+        );
+        assert_ne!(options[0].id, options[1].id, "选项 id 必须唯一");
+        // ACP 标签只显示模型名，agent 名不进标签。
+        assert!(options[0].model_only);
+        assert_eq!("gpt-5", options[0].display_label().as_ref());
+    }
+
+    #[test]
+    fn probe_options_are_scoped_to_their_agent() {
+        let options = acp_model_options_from_probe(
+            &SharedString::from("builtin.gemini"),
+            &[model("gemini-2.5-pro", "Gemini 2.5 Pro")],
+        );
+
+        assert!(options[0].id.starts_with("acp:builtin.gemini:"));
+    }
+
+    #[test]
+    fn empty_probe_models_produce_no_options() {
+        assert!(acp_model_options_from_probe(&SharedString::from("a"), &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod acp_reconnect_tests {
+    use super::{
+        ACP_RECONNECT_MAX_ATTEMPTS, AcpReconnectDecision, acp_reconnect_decision,
+        acp_reconnect_delay,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn reconnects_only_for_an_unavailable_owned_acp_target() {
+        assert_eq!(
+            AcpReconnectDecision::Reconnect,
+            acp_reconnect_decision(true, true, false, true, 0)
+        );
+    }
+
+    #[test]
+    fn never_reconnects_without_a_target_or_when_not_acp() {
+        // 用户切到内置 Agent：has_target 为 false，永不自动重连。
+        assert_eq!(
+            AcpReconnectDecision::Idle,
+            acp_reconnect_decision(true, true, false, false, 0)
+        );
+        assert_eq!(
+            AcpReconnectDecision::Idle,
+            acp_reconnect_decision(false, true, false, true, 0)
+        );
+    }
+
+    #[test]
+    fn healthy_or_busy_connections_are_left_alone() {
+        // 连接仍可用：不重连。
+        assert_eq!(
+            AcpReconnectDecision::Idle,
+            acp_reconnect_decision(true, false, false, true, 0)
+        );
+        // 已有连接动作在飞：不并发拉起第二个进程。
+        assert_eq!(
+            AcpReconnectDecision::Idle,
+            acp_reconnect_decision(true, true, true, true, 0)
+        );
+    }
+
+    #[test]
+    fn gives_up_after_the_attempt_budget() {
+        let below = ACP_RECONNECT_MAX_ATTEMPTS - 1;
+        assert_eq!(
+            AcpReconnectDecision::Reconnect,
+            acp_reconnect_decision(true, true, false, true, below)
+        );
+        assert_eq!(
+            AcpReconnectDecision::GiveUp,
+            acp_reconnect_decision(true, true, false, true, ACP_RECONNECT_MAX_ATTEMPTS)
+        );
+        assert_eq!(
+            AcpReconnectDecision::GiveUp,
+            acp_reconnect_decision(true, true, false, true, ACP_RECONNECT_MAX_ATTEMPTS + 5)
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_bounded() {
+        assert_eq!(Duration::from_millis(600), acp_reconnect_delay(0));
+        assert_eq!(Duration::from_millis(1200), acp_reconnect_delay(1));
+        assert_eq!(Duration::from_millis(2400), acp_reconnect_delay(2));
+        // 上限：继续翻倍没有意义，且会撑大延迟。
+        assert_eq!(Duration::from_millis(4800), acp_reconnect_delay(3));
+        assert_eq!(Duration::from_millis(4800), acp_reconnect_delay(99));
+    }
+
+    #[test]
+    fn in_flight_turns_block_reconnect_and_resume_after_turn_owners_clear() {
+        // 连接断在轮次进行中：agent 那边还挂着我们的 turn，此刻拉新进程只会
+        // 得到一个「同样的对话开第二个进程」。有 owner 在就让路，等轮次收尾。
+        assert_eq!(
+            AcpReconnectDecision::Idle,
+            acp_reconnect_decision(true, true, true, true, 0)
+        );
+        // 轮次收尾（owner 清空）后：恢复重连。
+        assert_eq!(
+            AcpReconnectDecision::Reconnect,
+            acp_reconnect_decision(true, true, false, true, 0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod acp_probe_hosting_tests {
+    /// 回归：探测曾经直接在 GPUI foreground future 里 await，导致
+    /// ① 在非 Tokio 线程创建 timer → `there is no reactor running`；
+    /// ② 多个探测在同一线程交错持有 `EnterGuard` →
+    ///    `EnterGuard values dropped out of order`。
+    ///
+    /// 因此探测必须放到 GPUI 后台线程，并用 `Handle::block_on` 进入 runtime。
+    #[test]
+    fn probes_run_off_the_gpui_thread() {
+        let source = include_str!("agent_view.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn spawn_acp_probes")
+            .expect("spawn_acp_probes should exist");
+        let rest = &source[start + 1..];
+        let end = rest
+            .find("\n    fn ")
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(source.len());
+        let region = &source[start..end];
+
+        assert!(
+            region.contains("background_spawn"),
+            "探测必须跑在 GPUI 后台线程上"
+        );
+        assert!(
+            region.contains("probe_agent_blocking"),
+            "必须用 block_on 进入 runtime，避免 EnterGuard 在同线程交错"
+        );
+        assert!(
+            !region.contains("crate::acp::probe_agent("),
+            "不要在 GPUI foreground future 里直接 await 异步探测"
+        );
+    }
+
+    #[test]
+    fn context_attachment_is_prepended_to_user_text() {
+        use crate::agent_view::{ContextAttachment, compose_prompt_with_attachment};
+
+        let attachment =
+            ContextAttachment::new("选中", "<terminal_selection>\nls\n</terminal_selection>");
+
+        let prompt = compose_prompt_with_attachment("这个目录有什么", Some(&attachment));
+
+        assert_eq!(
+            prompt,
+            "<terminal_selection>\nls\n</terminal_selection>\n\n这个目录有什么"
+        );
+    }
+
+    #[test]
+    fn blank_context_attachment_keeps_user_text_verbatim() {
+        use crate::agent_view::{ContextAttachment, compose_prompt_with_attachment};
+
+        let attachment = ContextAttachment::new("空", "   \n");
+
+        let prompt = compose_prompt_with_attachment("hi", Some(&attachment));
+
+        assert_eq!(prompt, "hi");
+        assert_eq!(compose_prompt_with_attachment("hi", None), "hi");
     }
 }

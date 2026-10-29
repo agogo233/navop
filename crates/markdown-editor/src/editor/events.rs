@@ -192,7 +192,7 @@ impl Editor {
         });
     }
 
-    fn focus_block_range(
+    pub(super) fn focus_block_range(
         &mut self,
         block: &Entity<super::Block>,
         range: std::ops::Range<usize>,
@@ -959,7 +959,7 @@ impl Editor {
 
     pub(crate) fn on_editor_scroll_wheel(
         &mut self,
-        _event: &ScrollWheelEvent,
+        _event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {

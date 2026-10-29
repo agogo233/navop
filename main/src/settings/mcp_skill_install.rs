@@ -9,7 +9,7 @@ use gpui_component::{
 };
 use public_mcp::client_config::ClientConfigInstall;
 use rust_i18n::t;
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SkillTarget {
@@ -125,18 +125,29 @@ fn skill_install_args(target: SkillTarget, force: bool) -> Vec<String> {
     args
 }
 
+/// 安装动作的两类失败：启动器缺失要给可操作提示，其余走通用错误。
+enum SkillInstallFailure {
+    LauncherMissing,
+    Spawn(std::io::Error),
+}
+
 fn install_skill(target: SkillTarget, force: bool, window: &mut Window, cx: &mut App) {
     let install = ClientConfigInstall::from_current_app();
     let launcher = install.launch_spec.command;
+    let launcher_name = launcher.clone();
     let args = skill_install_args(target, force);
     let target_window = window.window_handle();
     let task = cx.background_spawn(smol::unblock(move || {
+        // macOS 上从 Finder / Dock 启动的进程只继承最小 PATH，Homebrew、nvm 等目录
+        // 都不在其中；直接 spawn `npx` 会以 ENOENT 失败。解析真实路径并补全子进程
+        // PATH（`npx` 的 shebang 是 `#!/usr/bin/env node`）后再执行。
+        let Some(mut command) = process_util::build_command(&launcher, &args) else {
+            return Err(SkillInstallFailure::LauncherMissing);
+        };
         // `npx` / `node` 这类启动器是控制台程序：无控制台的 GUI 进程直接 spawn
         // 会在 Windows 上闪一个控制台窗口，统一走后台子进程约定隐藏。
-        let mut command = Command::new(launcher);
-        command.args(args);
         process_util::configure_background_child(&mut command);
-        command.output()
+        command.output().map_err(SkillInstallFailure::Spawn)
     }));
 
     window
@@ -148,13 +159,25 @@ fn install_skill(target: SkillTarget, force: bool, window: &mut Window, cx: &mut
                         t!("Settings.General.Mcp.install_skill_success").to_string(),
                     ),
                     Ok(output) => {
-                        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let error = if stderr.is_empty() {
+                            String::from_utf8_lossy(&output.stdout).trim().to_string()
+                        } else {
+                            stderr
+                        };
                         Notification::error(
                             t!("Settings.General.Mcp.install_skill_failed", error = error)
                                 .to_string(),
                         )
                     }
-                    Err(error) => Notification::error(
+                    Err(SkillInstallFailure::LauncherMissing) => Notification::error(
+                        t!(
+                            "Settings.General.Mcp.skill_install_launcher_missing",
+                            command = launcher_name
+                        )
+                        .to_string(),
+                    ),
+                    Err(SkillInstallFailure::Spawn(error)) => Notification::error(
                         t!(
                             "Settings.General.Mcp.install_skill_failed",
                             error = error.to_string()
@@ -194,6 +217,25 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "--force"));
         assert!(args.windows(2).any(|args| args == ["--target", "agents"]));
+    }
+
+    /// 结构契约：安装技能前必须解析启动器的真实路径。
+    ///
+    /// macOS 从 Finder / Dock 启动的 GUI 进程 PATH 只有
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`，裸 `npx` 会以 ENOENT 失败。
+    #[test]
+    fn skill_install_resolves_the_launcher_before_spawning() {
+        let source = include_str!("mcp_skill_install.rs");
+
+        assert!(source.contains("process_util::build_command(&launcher, &args)"));
+        assert!(source.contains("SkillInstallFailure::LauncherMissing"));
+
+        // 只看测试模块之前的生产代码：本测试自身就含有这些字面量。
+        let production = source
+            .split("mod tests")
+            .next()
+            .expect("source contains a production section");
+        assert!(!production.contains("Command::new(launcher)"));
     }
 
     /// 结构契约：安装技能的外部启动器必须隐藏控制台窗口。

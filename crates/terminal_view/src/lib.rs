@@ -1,6 +1,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod addon;
+mod ai_live_context;
 pub mod broadcast_input;
 mod broadcast_registry;
 pub mod cd_completion;

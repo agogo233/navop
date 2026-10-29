@@ -24,8 +24,8 @@ use one_core::{
 use rust_i18n::t;
 
 use crate::{
-    AcpAgentEntry, AgentChatTheme, AgentChatView, AgentChatViewConfig, AgentChatViewEvent,
-    CodeBlockAction, MentionItem,
+    AcpAgentEntry, AcpSessionListModel, AgentChatTheme, AgentChatView, AgentChatViewConfig,
+    AgentChatViewEvent, CodeBlockAction, MentionItem, SessionSummary,
     agent_tool_config::{AgentToolConfigEvent, get_notifier as get_agent_tool_config_notifier},
     build_acp_agent_entries, build_plan_tool_registry,
 };
@@ -34,6 +34,43 @@ use crate::{
 pub enum DefaultAgentChatPanelEvent {
     Close,
     MoveTo(SidebarPlacement),
+    TurnStarted {
+        session_id: String,
+        turn_id: String,
+    },
+    TurnFinished {
+        session_id: String,
+        turn_id: String,
+        success: bool,
+    },
+    /// 用户点了某轮页脚的「回到这一轮」。宿主据此让工作区浏览器回滚。
+    RestoreTurn {
+        session_id: String,
+        turn_id: String,
+    },
+    /// 用户点了改动摘要里的某个文件。宿主据此在审阅面板里打开**这个文件的 diff**。
+    ///
+    /// `turn_id` 指明裁哪一轮的快照：点历史轮的文件时要的是那一刻的 diff，
+    /// 而不是最近一轮的。`None` 表示给不出轮次，由 Explorer 退到最近一轮。
+    OpenFileInReview {
+        session_id: String,
+        path: String,
+        turn_id: Option<String>,
+    },
+    /// 用户点了「查看改动」。宿主据此把**这一轮所有文件**的 diff 摆到审阅面板。
+    OpenTurnReview {
+        session_id: String,
+        turn_id: String,
+    },
+    /// 用户点了子代理卡片上的「查看推理过程」。宿主据此把子代理详情面板切到前台。
+    SubagentDetailRequested {
+        acp_session_id: String,
+        title: String,
+    },
+    /// 某条子代理详情的转录有了新内容。详情面板据此重绘。
+    SubagentDetailUpdated {
+        detail_session_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +126,9 @@ pub struct DefaultAgentChatPanel {
         Vec<agent_runtime::ResourceRef>,
     )>,
     pending_resource_catalog: Option<(Vec<MentionItem>, Vec<agent_runtime::ResourceRef>)>,
+    /// 每轮发送前重建资源上下文的回调（侧边栏用它注入终端等实时状态）。
+    resource_context_refresher: Option<crate::ResourceContextRefresher>,
+    context_attachment_provider: Option<crate::ContextAttachmentProvider>,
     pending_code_block_actions: Vec<CodeBlockAction>,
     pending_sidebar_shown: bool,
     connection_subscription: Option<Subscription>,
@@ -98,9 +138,22 @@ pub struct DefaultAgentChatPanel {
     window_handle: AnyWindowHandle,
     theme: Option<AgentChatTheme>,
     show_sidebar_header: bool,
+    /// 工作台外壳接管会话栏时隐藏内建侧栏。
+    sidebar_suppressed: bool,
     show_sidebar_frame_controls: bool,
     sidebar_frame_placement: SidebarPlacement,
     tab_closeable: bool,
+    workspace_root: Option<std::path::PathBuf>,
+    /// 工作台外壳注入的侧栏开关。内层视图是异步构建的，注入可能早于视图
+    /// 存在——这里暂存，视图建好（含 provider 事件触发的重建）时统一应用。
+    workbench_toggles: Option<crate::agent_view::WorkbenchSidebarToggles>,
+    /// 外壳 / 宿主注入的输入框下方上下文栏数据源。同样需要暂存并重放。
+    composer_context_source: Option<crate::agent_view::ComposerContextSource>,
+    /// 各会话当前可回滚的轮次。与 `workbench_toggles` 同理：内层视图可能还不存在，
+    /// 或者被 provider 事件整块重建过，所以这里留一份权威副本，建视图时重放。
+    restorable_turns: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// 每个会话留下了整轮 diff 的轮次；与 `restorable_turns` 一样由宿主推送。
+    reviewed_turns: std::collections::HashMap<String, std::collections::HashSet<String>>,
     error: Option<String>,
 }
 
@@ -236,6 +289,8 @@ impl DefaultAgentChatPanel {
                 available_resources.clone(),
             )),
             pending_resource_catalog: None,
+            resource_context_refresher: None,
+            context_attachment_provider: None,
             pending_code_block_actions: Vec::new(),
             pending_sidebar_shown: false,
             connection_subscription: None,
@@ -245,9 +300,15 @@ impl DefaultAgentChatPanel {
             window_handle: window.window_handle(),
             theme: None,
             show_sidebar_header: true,
+            sidebar_suppressed: false,
             show_sidebar_frame_controls: false,
             sidebar_frame_placement: SidebarPlacement::Right,
             tab_closeable: false,
+            workspace_root: None,
+            workbench_toggles: None,
+            composer_context_source: None,
+            restorable_turns: std::collections::HashMap::new(),
+            reviewed_turns: std::collections::HashMap::new(),
             error: None,
         };
         panel.subscribe_connection_events(cx);
@@ -261,6 +322,89 @@ impl DefaultAgentChatPanel {
     pub fn with_tab_closeable(mut self, closeable: bool) -> Self {
         self.tab_closeable = closeable;
         self
+    }
+
+    pub fn with_workspace_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
+    }
+
+    pub fn set_workspace_root(&mut self, root: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.workspace_root = Some(root.clone());
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.set_workspace_root(root, cx));
+        }
+    }
+
+    /// 宿主（工作区浏览器）同步「某会话里哪些轮次可以回滚」。
+    ///
+    /// 先记进本层副本：内层视图还没建好、或刚被 provider 事件重建过时，这次推送不会丢，
+    /// 建视图时统一重放。
+    pub fn set_restorable_turns(
+        &mut self,
+        session_id: String,
+        turn_ids: std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if turn_ids.is_empty() {
+            self.restorable_turns.remove(&session_id);
+        } else {
+            self.restorable_turns
+                .insert(session_id.clone(), turn_ids.clone());
+        }
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_restorable_turns(session_id, turn_ids, cx);
+            });
+        }
+    }
+
+    /// 宿主（工作区浏览器）同步「某会话里哪些轮次留下了整轮 diff」。
+    ///
+    /// 与 [`Self::set_restorable_turns`] 同样的两道存储：本层副本 + 内层视图。
+    pub fn set_reviewed_turns(
+        &mut self,
+        session_id: String,
+        turn_ids: std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if turn_ids.is_empty() {
+            self.reviewed_turns.remove(&session_id);
+        } else {
+            self.reviewed_turns
+                .insert(session_id.clone(), turn_ids.clone());
+        }
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_reviewed_turns(session_id, turn_ids, cx);
+            });
+        }
+    }
+
+    /// 取一份子代理详情转录的快照：`(修订号, 是否有失败文案, 消息, 失败文案)`。
+    ///
+    /// 返回**owned** 数据是刻意的，不是图省事：详情面板要在自己的 `render` 里同时
+    /// 拿到消息与 `cx`，而 `entity.read(cx)` 借出的切片会一直占着 `cx`，没法再交给
+    /// 需要 `&mut App` 的 `render_messages`。面板侧用修订号做去重，所以这份克隆只在
+    /// 转录真的变了时才发生。
+    ///
+    /// 内层视图还没建好时返回 `None`（provider 事件会整块重建它）。
+    pub fn subagent_detail_snapshot(
+        &self,
+        detail_session_id: &str,
+        cx: &App,
+    ) -> Option<(u64, bool, Vec<crate::ChatMessageUI>, Option<String>)> {
+        let view = self.view.as_ref()?.read(cx);
+        let (revision, has_error) = view.subagent_detail_token(detail_session_id);
+        Some((
+            revision,
+            has_error,
+            view.subagent_detail_messages(detail_session_id)
+                .map(<[crate::ChatMessageUI]>::to_vec)
+                .unwrap_or_default(),
+            view.subagent_detail_error(detail_session_id)
+                .map(str::to_owned),
+        ))
     }
 
     fn subscribe_provider_events(&mut self, cx: &mut Context<Self>) {
@@ -353,7 +497,9 @@ impl DefaultAgentChatPanel {
         let Some(connections) = list_connections(cx) else {
             return;
         };
-        let (_, catalog, mentions) = crate::build_workbench_resource_state(&connections);
+        let ai_access_levels = crate::load_ai_access_levels(cx);
+        let (_, catalog, mentions) =
+            crate::build_workbench_resource_state(&connections, &ai_access_levels);
         self.set_resource_catalog(mentions, catalog.resources, cx);
     }
 
@@ -383,6 +529,36 @@ impl DefaultAgentChatPanel {
     ) {
         let available_resources = resources.resources.clone();
         self.set_resource_context_with_catalog(resources, mentions, available_resources, cx);
+    }
+
+    /// 注册「每轮发送前重建资源上下文」的回调。
+    ///
+    /// 视图尚未建好时先存下来，建好视图后立刻生效。
+    pub fn set_resource_context_refresher(
+        &mut self,
+        refresher: Option<crate::ResourceContextRefresher>,
+        cx: &mut Context<Self>,
+    ) {
+        self.resource_context_refresher = refresher.clone();
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_resource_context_refresher(refresher, cx);
+            });
+        }
+    }
+
+    /// 设置「随消息附加正文」的回调（如终端选中内容）。
+    pub fn set_context_attachment_provider(
+        &mut self,
+        provider: Option<crate::ContextAttachmentProvider>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_attachment_provider = provider.clone();
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| {
+                view.set_context_attachment_provider(provider, cx);
+            });
+        }
     }
 
     pub fn set_resource_context_with_catalog(
@@ -477,6 +653,155 @@ impl DefaultAgentChatPanel {
         cx.notify();
     }
 
+    /// 隐藏内建会话侧栏，把会话列表交给工作台外壳渲染。
+    pub fn set_sidebar_suppressed(&mut self, suppressed: bool, cx: &mut Context<Self>) {
+        if self.sidebar_suppressed == suppressed {
+            return;
+        }
+        self.sidebar_suppressed = suppressed;
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.set_sidebar_suppressed(suppressed, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn sidebar_suppressed(&self) -> bool {
+        self.sidebar_suppressed
+    }
+
+    /// 注入工作台外壳的侧栏开关；由外壳在构造时调用一次。
+    pub fn set_workbench_toggles(
+        &mut self,
+        toggles: crate::agent_view::WorkbenchSidebarToggles,
+        cx: &mut Context<Self>,
+    ) {
+        // 先暂存：内层视图是异步构建的，外壳构造早于视图存在；
+        // 视图（重）建好时会从这里取值应用。
+        self.workbench_toggles = Some(toggles.clone());
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.set_workbench_toggles(toggles, cx));
+        }
+    }
+
+    /// 注入输入框下方上下文栏的数据源（工作区 / 分支 / Worktree）。
+    ///
+    /// 同 [`Self::set_workbench_toggles`]：先暂存再应用，视图（重）建时重放。
+    pub fn set_composer_context_source(
+        &mut self,
+        source: crate::agent_view::ComposerContextSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_context_source = Some(source.clone());
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.set_composer_context_source(source, cx));
+        }
+    }
+
+    /// 让内层视图重新向宿主取一次上下文栏快照（分支 / worktree 变化后调用）。
+    pub fn refresh_composer_context(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.refresh_composer_context(cx));
+        }
+    }
+
+    /// 当前可见会话列表；视图尚未建好时为空。
+    pub fn session_summaries(&self, cx: &App) -> Vec<SessionSummary> {
+        self.view
+            .as_ref()
+            .map(|view| view.read(cx).session_summaries())
+            .unwrap_or_default()
+    }
+
+    pub fn current_session_id(&self, cx: &App) -> Option<String> {
+        self.view
+            .as_ref()
+            .map(|view| view.read(cx).current_session_id().to_string())
+    }
+
+    /// 当前会话是否已经产生对话内容。
+    pub fn current_session_has_messages(&self, cx: &App) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).current_session_has_messages())
+    }
+
+    pub fn select_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            let id = id.to_string();
+            view.update(cx, |view, cx| view.select_session(&id, cx));
+        }
+    }
+
+    /// ACP 历史会话列表；不在 ACP 后端或 agent 不支持时是 `None`。
+    pub(crate) fn acp_session_list_model(&self, cx: &App) -> Option<AcpSessionListModel> {
+        self.view
+            .as_ref()
+            .and_then(|view| view.read(cx).acp_session_list_model())
+    }
+
+    /// 当前会话后端是否是 ACP（会话由外接 agent 管理）。
+    ///
+    /// 与 [`Self::acp_session_list_model`] 的区别：那个在 agent 没声明
+    /// `session/list` 时是 `None`，这个仍为真 —— 侧栏据此显示兜底说明。
+    pub(crate) fn backend_is_acp(&self, cx: &App) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).backend_is_acp())
+    }
+
+    /// 当前连接指向的 ACP 会话 id。
+    pub(crate) fn acp_session_id(&self, cx: &App) -> Option<String> {
+        self.view
+            .as_ref()
+            .and_then(|view| view.read(cx).acp_session_id_snapshot())
+    }
+
+    pub(crate) fn open_acp_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            let id = id.to_string();
+            view.update(cx, |view, cx| view.open_acp_session(&id, cx));
+        }
+    }
+
+    pub(crate) fn refresh_acp_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.reload_acp_sessions(cx));
+        }
+    }
+
+    pub fn create_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.create_session(cx));
+        }
+    }
+
+    /// 归档（软删除）一个内置会话。
+    pub fn archive_session(&mut self, uid: &str, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.apply_archive(uid, cx));
+        }
+    }
+
+    /// 切换「活跃 / 已归档」会话视图。
+    pub fn toggle_archived_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.toggle_archived(cx));
+        }
+    }
+
+    /// 这条会话有没有没发出去的草稿（会话列表行上的标记）。
+    pub fn session_has_draft(&self, uid: &str, cx: &App) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).session_has_draft(uid))
+    }
+
+    pub fn showing_archived_sessions(&self, cx: &App) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).showing_archived_sessions())
+    }
+
     pub fn set_theme(&mut self, theme: Option<AgentChatTheme>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
         if let Some(view) = &self.view {
@@ -540,6 +865,9 @@ impl DefaultAgentChatPanel {
                                 panel.show_sidebar_frame_controls,
                                 panel.sidebar_frame_placement,
                             );
+                            if let Some(root) = panel.workspace_root.clone() {
+                                config = config.with_workspace_root(root);
+                            }
                             let view = AgentChatView::view_with_config(config, window, cx);
                             let view_subscription =
                                 cx.subscribe(&view, |_, _, event: &AgentChatViewEvent, cx| {
@@ -549,6 +877,60 @@ impl DefaultAgentChatPanel {
                                         }
                                         AgentChatViewEvent::MoveTo(placement) => {
                                             cx.emit(DefaultAgentChatPanelEvent::MoveTo(*placement));
+                                        }
+                                        AgentChatViewEvent::TurnStarted { session_id, turn_id } => {
+                                            cx.emit(DefaultAgentChatPanelEvent::TurnStarted {
+                                                session_id: session_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                            });
+                                        }
+                                        AgentChatViewEvent::TurnFinished { session_id, turn_id, success } => {
+                                            cx.emit(DefaultAgentChatPanelEvent::TurnFinished {
+                                                session_id: session_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                                success: *success,
+                                            });
+                                        }
+                                        AgentChatViewEvent::RestoreTurn { session_id, turn_id } => {
+                                            cx.emit(DefaultAgentChatPanelEvent::RestoreTurn {
+                                                session_id: session_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                            });
+                                        }
+                                        AgentChatViewEvent::OpenFileInReview {
+                                            session_id,
+                                            path,
+                                            turn_id,
+                                        } => {
+                                            cx.emit(DefaultAgentChatPanelEvent::OpenFileInReview {
+                                                session_id: session_id.clone(),
+                                                path: path.clone(),
+                                                turn_id: turn_id.clone(),
+                                            });
+                                        }
+                                        AgentChatViewEvent::OpenTurnReview {
+                                            session_id,
+                                            turn_id,
+                                        } => {
+                                            cx.emit(DefaultAgentChatPanelEvent::OpenTurnReview {
+                                                session_id: session_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                            });
+                                        }
+                                        AgentChatViewEvent::SubagentDetailRequested { acp_session_id, title } => {
+                                            cx.emit(
+                                                DefaultAgentChatPanelEvent::SubagentDetailRequested {
+                                                    acp_session_id: acp_session_id.clone(),
+                                                    title: title.clone(),
+                                                },
+                                            );
+                                        }
+                                        AgentChatViewEvent::SubagentDetailUpdated { detail_session_id } => {
+                                            cx.emit(
+                                                DefaultAgentChatPanelEvent::SubagentDetailUpdated {
+                                                    detail_session_id: detail_session_id.clone(),
+                                                },
+                                            );
                                         }
                                     }
                                 });
@@ -586,8 +968,44 @@ impl DefaultAgentChatPanel {
                                     view.send_external_message(message, cx);
                                 });
                             }
+                            if panel.sidebar_suppressed {
+                                view.update(cx, |view, cx| {
+                                    view.set_sidebar_suppressed(true, cx);
+                                });
+                            }
+                            if let Some(toggles) = panel.workbench_toggles.clone() {
+                                view.update(cx, |view, cx| view.set_workbench_toggles(toggles, cx));
+                            }
+                            if let Some(source) = panel.composer_context_source.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_composer_context_source(source, cx)
+                                });
+                            }
+                            // 重建后重放回滚入口，否则 provider 刷新一次按钮就没了。
+                            for (session_id, turn_ids) in panel.restorable_turns.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_restorable_turns(session_id.clone(), turn_ids.clone(), cx);
+                                });
+                            }
+                            // 「查看改动」入口同理，重建一次就丢的话页脚会静悄悄地少一栏。
+                            for (session_id, turn_ids) in panel.reviewed_turns.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_reviewed_turns(session_id.clone(), turn_ids.clone(), cx);
+                                });
+                            }
                             if std::mem::take(&mut panel.pending_sidebar_shown) {
                                 view.update(cx, |view, cx| view.on_sidebar_shown(cx));
+                            }
+                            view.update(cx, |view, cx| view.restore_persisted_acp(cx));
+                            if let Some(refresher) = panel.resource_context_refresher.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_resource_context_refresher(Some(refresher), cx);
+                                });
+                            }
+                            if let Some(provider) = panel.context_attachment_provider.clone() {
+                                view.update(cx, |view, cx| {
+                                    view.set_context_attachment_provider(Some(provider), cx);
+                                });
                             }
                             panel.view = Some(view);
                             panel.view_subscription = Some(view_subscription);
@@ -595,6 +1013,7 @@ impl DefaultAgentChatPanel {
                             cx.notify();
                         }
                         Err(error) => {
+                            tracing::warn!(%error, mode = ?panel.mode, "AI chat panel view build failed");
                             panel.error = Some(error.to_string());
                             cx.notify();
                         }

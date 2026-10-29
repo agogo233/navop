@@ -19,11 +19,12 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, Size,
+    ActiveTheme, Disableable, Sizable, Size, WindowExt,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputState, Textarea, TextareaState},
+    notification::Notification,
     radio::Radio,
     select::{Select, SelectItem, SelectState},
     tab::{Tab, TabBar},
@@ -39,6 +40,7 @@ use one_core::storage::{
     StoredConnection, Workspace,
 };
 use rust_i18n::t;
+use tool_runtime::AiAccessLevel;
 use tracing::error;
 
 use crate::{GlobalRedisState, RedisManager};
@@ -48,6 +50,8 @@ use crate::{GlobalRedisState, RedisManager};
 pub struct RedisFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub initial_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub on_saved: Option<RedisFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
@@ -177,6 +181,12 @@ pub struct RedisFormWindow {
 
     // 云同步开关
     sync_enabled: bool,
+
+    /// 连接级 AI 访问策略（issue #437）：允许 / 只读 / 禁止。
+    ///
+    /// 级别保存在 `StoredConnection::ai_access_level` 上，随连接一起保存与同步；
+    /// 选项布局由 `connection_form::ai_access` 的通用组件统一渲染。
+    ai_access_level: Entity<AiAccessLevel>,
 
     // 测试状态
     is_testing: bool,
@@ -383,7 +393,12 @@ impl RedisFormWindow {
                 .map(WorkspaceSelectItem::from_workspace),
         );
 
-        let selected_workspace_id = connection_to_load.as_ref().and_then(|c| c.workspace_id);
+        // 编辑 / 复制连接回填原分组；纯新建时用新建向导传入的目标分组预选（用户仍可改）。
+        let selected_workspace_id = if connection_to_load.is_some() {
+            connection_to_load.as_ref().and_then(|c| c.workspace_id)
+        } else {
+            config.initial_workspace_id
+        };
 
         let workspace_select = cx.new(|cx| {
             let mut state = SelectState::new(workspace_items, None, window, cx);
@@ -401,6 +416,8 @@ impl RedisFormWindow {
         let mut mode = ModeSelection::Standalone;
         let mut use_tls = false;
         let mut sync_enabled = true;
+        // 新建连接默认「允许」；编辑已有连接时从连接字段回填。
+        let mut ai_access_level = AiAccessLevel::Allowed;
 
         if let Some(ref p) = existing_params {
             mode = ModeSelection::from_redis_mode(&p.mode);
@@ -409,6 +426,7 @@ impl RedisFormWindow {
 
         if let Some(ref c) = connection_to_load {
             sync_enabled = c.sync_enabled;
+            ai_access_level = connection_form::ai_access::stored_level(c.id, cx);
         }
 
         let credential_picker = create_credential_picker(
@@ -472,6 +490,7 @@ impl RedisFormWindow {
             ssh_tunnel_form,
             remark_input,
             sync_enabled,
+            ai_access_level: cx.new(|_| ai_access_level),
             is_testing: false,
             test_result: None,
             on_saved: config.on_saved,
@@ -705,6 +724,7 @@ impl RedisFormWindow {
             if r.is_empty() { None } else { Some(r) }
         };
         let sync_enabled = self.sync_enabled;
+        let ai_access_level = *self.ai_access_level.read(cx);
         let is_editing = self.is_editing;
         let editing_id = self.editing_id;
         let editing_cloud_id = self.editing_cloud_id.clone();
@@ -738,19 +758,36 @@ impl RedisFormWindow {
                 } else {
                     repo.insert(&mut conn)?;
                 }
-                Ok::<StoredConnection, anyhow::Error>(conn)
+
+                // 「AI 访问」级别随 `conn.ai_access_level` 一起落库；这里再写一次是兜底：
+                // 万一某条保存路径漏带该字段，也能在这里补上并在失败时让表单看到错误，
+                // 而不是让「限制没生效」被静默放宽。
+                // 策略写失败不算连接保存失败（连接已经写进去了），把错误带出去交给表单显示，
+                // 不能让「限制没生效」被静默吞掉。
+                let connection_id = conn
+                    .id
+                    .ok_or_else(|| anyhow::anyhow!("connection id missing after save"))?;
+                let ai_access_error =
+                    connection_form::ai_access::write_level(&repo, connection_id, ai_access_level)
+                        .err();
+
+                Ok::<(StoredConnection, Option<String>), anyhow::Error>((conn, ai_access_error))
             })
             .await;
 
             match result {
-                Ok(saved_conn) => {
+                Ok((saved_conn, ai_access_error)) => {
                     // 保存已经落地：把表单切到「已保存」，并**再关一次窗**。
                     // 前面那次关窗是同步发生的，窗口正常已经消失；只有隐藏失败时它会留在屏幕上
                     // （关闭漏斗返回 `Retained`）—— 那一次拿不到保存结果，所以提示要从这里发：
                     // 到这个点才知道「已保存」，也只有到这里下一次保存才会变成更新而不是新建。
+                    //
+                    // 「AI 访问」策略写失败时不关窗：把窗口留下来，让用户在表单里看到错误行。
                     _ = cx.update_window(window_handle, |_, window, cx| {
                         let _ = this.update(cx, |form, cx| form.mark_saved(&saved_conn, cx));
-                        let _ = one_core::window_close::close_window_after_save(window, cx);
+                        if ai_access_error.is_none() {
+                            let _ = one_core::window_close::close_window_after_save(window, cx);
+                        }
                     });
                     let _ = cx.update(|cx| {
                         if let Some(notifier) = get_notifier(cx) {
@@ -771,11 +808,25 @@ impl RedisFormWindow {
                             on_saved(saved_conn, cx);
                         }
                     });
+
+                    if let Some(ai_access_error) = ai_access_error {
+                        // 连接本身已经保存成功，只有「AI 访问」策略没写进去。这条失败必须可见：
+                        // 保存发生在窗口关闭之后，表单里的错误行只有窗口被保留时才看得到，
+                        // 所以除了错误行还要在活动窗口上弹一条通知，并把原文记进日志。
+                        let message =
+                            connection_form::ai_access::ai_access_save_failed(&ai_access_error);
+                        error!("{message}");
+                        let _ = this.update(cx, |form, cx| {
+                            form.test_result = Some(Err(message.clone()));
+                            cx.notify();
+                        });
+                        let _ = cx.update(|cx| notify_error_on_active_window(message, cx));
+                    }
                 }
                 Err(e) => {
                     error!(
                         "{}",
-                        t!("Redis.save_connection_failed", error = e).to_string()
+                        t!("ConnectionForm.save_connection_failed", error = e).to_string()
                     );
                 }
             }
@@ -888,6 +939,11 @@ impl RedisFormWindow {
                     ),
                 )
             })
+            // 连接级 AI 访问策略（issue #437）：布局与选项由通用组件统一渲染。
+            .child(self.render_form_row(
+                &connection_form::ai_access::ai_access_label(),
+                connection_form::ai_access::ai_access_selector(&self.ai_access_level, cx),
+            ))
     }
 
     /// 渲染连接模式标签页
@@ -1102,6 +1158,18 @@ impl Render for RedisFormWindow {
     }
 }
 
+/// 在活动窗口上弹一条错误通知；没有活动窗口时静默忽略。
+///
+/// 保存是异步完成的，等知道结果时连接表单窗口已经关掉了 —— 表单里的错误行用户看不到，
+/// 所以「AI 访问」策略写失败必须用通知再报一次，不能只写日志。
+fn notify_error_on_active_window(message: String, cx: &mut App) {
+    if let Some(window_handle) = cx.active_window() {
+        let _ = cx.update_window(window_handle, |_, window, cx| {
+            window.push_notification(Notification::error(message), cx);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1202,7 @@ mod tests {
     fn initial_connection_prefills_without_edit_mode() {
         let connection = redis_connection("imported redis");
         let config = RedisFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(connection),
             on_saved: None,
@@ -1154,6 +1223,7 @@ mod tests {
     #[test]
     fn editing_connection_takes_precedence_over_initial_connection() {
         let config = RedisFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: Some(redis_connection("existing redis")),
             initial_connection: Some(redis_connection("imported redis")),
             on_saved: None,
@@ -1179,6 +1249,7 @@ mod tests {
             cx.set_global(AppSettings::default());
             cx.open_window(Default::default(), |window, cx| {
                 let config = RedisFormWindowConfig {
+                    initial_workspace_id: None,
                     editing_connection: None,
                     initial_connection: Some(redis_connection("empty username")),
                     on_saved: None,
@@ -1202,6 +1273,51 @@ mod tests {
                 .read(cx)
                 .build_redis_params(cx);
             assert_eq!(Some(String::new()), params.username);
+        });
+    }
+
+    #[gpui::test]
+    fn ai_access_level_defaults_to_allowed_and_can_be_changed(cx: &mut TestAppContext) {
+        // issue #437 收尾：Redis 表单必须有「AI 访问」三档选择器；
+        // 新建连接没有策略记录时回填默认「允许」，选中后表单状态跟着走。
+        let mut form = None;
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            cx.set_global(AppSettings::default());
+            cx.open_window(Default::default(), |window, cx| {
+                let config = RedisFormWindowConfig {
+                    initial_workspace_id: None,
+                    editing_connection: None,
+                    initial_connection: Some(redis_connection("ai access redis")),
+                    on_saved: None,
+                    workspaces: Vec::new(),
+                    teams: Vec::new(),
+                    ssh_connections: Vec::new(),
+                };
+                let entity = cx.new(|cx| RedisFormWindow::new(config, window, cx));
+                form = Some(entity.clone());
+                cx.new(|cx| Root::new(entity, window, cx))
+            })
+            .expect("test window opens");
+        });
+
+        cx.update(|cx| {
+            let form = form.as_ref().expect("form created");
+            let level = |form: &gpui::Entity<RedisFormWindow>, cx: &mut gpui::App| {
+                let entity = form.read(cx).ai_access_level.clone();
+                *entity.read(cx)
+            };
+            assert_eq!(
+                level(form, cx),
+                AiAccessLevel::Allowed,
+                "没有策略记录时默认「允许」"
+            );
+
+            form.update(cx, |form, cx| {
+                let entity = form.ai_access_level.clone();
+                connection_form::ai_access::apply_level(&entity, AiAccessLevel::Denied, cx);
+            });
+            assert_eq!(level(form, cx), AiAccessLevel::Denied);
         });
     }
 }

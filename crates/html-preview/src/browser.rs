@@ -49,7 +49,9 @@ pub fn open_html_preview_document_in_browser(
     let mut process = Command::new(&command.program);
     process.args(&command.args);
     hide_background_console(&mut process);
-    process.spawn()?;
+    // 该函数由 UI 事件直接调用，裸 `spawn` 会在 UI 线程里同步 fork + 等 exec，
+    // 可能冻结窗口（见 `process_util::spawn_detached` 文档注释）。
+    process_util::spawn_detached(process, "html-preview-browser")?;
     Ok(path)
 }
 

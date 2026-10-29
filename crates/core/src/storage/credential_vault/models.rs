@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use rust_i18n::t;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::storage::SshAccountExpect;
@@ -253,6 +254,8 @@ pub enum CredentialResolutionError {
     MissingCredential(i64),
     EmptyField {
         credential_id: i64,
+        /// 记录名称，用于给用户看；记录已不存在时无从得知，所以 `MissingCredential` 仍只带 ID。
+        credential_name: String,
         field: &'static str,
     },
 }
@@ -260,11 +263,32 @@ pub enum CredentialResolutionError {
 impl std::fmt::Display for CredentialResolutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingCredential(id) => write!(formatter, "credential {id} was not found"),
+            Self::MissingCredential(id) => {
+                write!(formatter, "{}", t!("CredentialError.not_found", id = id))
+            }
             Self::EmptyField {
-                credential_id,
+                credential_name,
                 field,
-            } => write!(formatter, "credential {credential_id} has no {field}"),
+                ..
+            } => {
+                let field = match *field {
+                    "username" => t!("CredentialError.field_username"),
+                    "password" => t!("CredentialError.field_password"),
+                    "private key" => t!("CredentialError.field_private_key"),
+                    "passphrase" => t!("CredentialError.field_passphrase"),
+                    "password or private key" => t!("CredentialError.field_secret"),
+                    other => other.into(),
+                };
+                write!(
+                    formatter,
+                    "{}",
+                    t!(
+                        "CredentialError.empty_field",
+                        name = credential_name,
+                        field = field
+                    )
+                )
+            }
         }
     }
 }
@@ -322,6 +346,7 @@ pub fn resolve_credential_reference_strict(
         if selected && value.as_deref().is_none_or(str::is_empty) {
             return Err(anyhow!(CredentialResolutionError::EmptyField {
                 credential_id: reference.credential_id,
+                credential_name: credential.name.clone(),
                 field,
             }));
         }

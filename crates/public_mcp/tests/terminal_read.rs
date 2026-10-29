@@ -35,6 +35,11 @@ impl TerminalReadSessionHandle for FakeTerminalRead {
             screen_lines: 24,
             columns: 120,
             truncated: false,
+            alt_screen: true,
+            display_offset: 2,
+            cursor_row: 1,
+            cursor_column: 3,
+            selection: Some("line 2".to_string()),
         })
     }
 }
@@ -99,6 +104,11 @@ async fn terminal_read_returns_recent_pty_rows() {
     assert_eq!(json!("line 2\nline 3"), result.structured_content["text"]);
     assert_eq!(json!(2), result.structured_content["requested_lines"]);
     assert_eq!(json!(2), result.structured_content["returned_lines"]);
+    assert_eq!(json!(true), result.structured_content["alt_screen"]);
+    assert_eq!(json!(2), result.structured_content["display_offset"]);
+    assert_eq!(json!(1), result.structured_content["cursor_row"]);
+    assert_eq!(json!(3), result.structured_content["cursor_column"]);
+    assert_eq!(json!("line 2"), result.structured_content["selection"]);
 }
 
 #[test]

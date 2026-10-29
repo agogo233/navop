@@ -69,6 +69,29 @@ impl Editor {
         self.revision
     }
 
+    /// Returns the file path this editor is currently bound to, if any.
+    ///
+    /// Relative image references and image-paste destinations resolve against
+    /// this path's parent directory.
+    pub fn file_path(&self) -> Option<&Path> {
+        self.file_path.as_deref()
+    }
+
+    /// Binds the editor to the file it edits, or rebinds it after a rename.
+    ///
+    /// Relative image references resolve against the file's parent directory,
+    /// and image-paste destinations derive from the file stem, so changing the
+    /// binding refreshes every block's image runtime. The document itself,
+    /// selection, history, and dirty state are untouched.
+    pub fn set_file_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.file_path.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        self.file_path = Some(path);
+        self.rebuild_image_runtimes(cx);
+        cx.notify();
+    }
+
     /// Replaces host-only rendering services without changing the document,
     /// selection, history, focus, or dirty state.
     pub fn set_host_services(&mut self, services: EditorHostServices, cx: &mut Context<Self>) {

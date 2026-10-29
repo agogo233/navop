@@ -14,8 +14,8 @@ use crate::connection_sort::{connection_name_cmp, lru_sort_key};
 
 use super::batch_toolbar::{auto_hide_tree_toggle, batch_mode_toggle};
 use super::tree_model::{
-    ConnectionNodeInput, ConnectionTreeRow, WorkspaceNodeInput, build_connection_tree_rows,
-    filter_connection_tree_inputs, hide_empty_workspace_inputs,
+    ConnectionNodeInput, ConnectionTreeRow, TreeSectionOptions, WorkspaceNodeInput,
+    build_connection_tree_rows, filter_connection_tree_inputs, hide_empty_workspace_inputs,
 };
 use super::{PersistentConnectionSidebar, SidebarPalette};
 
@@ -160,6 +160,8 @@ impl PersistentConnectionSidebar {
                     } else {
                         workspace.name.clone()
                     },
+                    // 同级顺序由树模型按 (sort_order, name) 显式排序，与主页分组排序一致。
+                    sort_order: workspace.sort_order,
                 })
             })
             .collect::<Vec<_>>();
@@ -229,6 +231,13 @@ impl PersistentConnectionSidebar {
                 &expanded_workspaces
             } else {
                 &collapsed_workspaces
+            },
+            TreeSectionOptions {
+                // 搜索只展示命中项，不重复渲染分区标题。
+                show_groups_header: !searching,
+                show_unassigned_header: !searching,
+                // 与卡片/列表布局的“未分组”分组共用折叠状态。
+                unassigned_expanded: !home.unassigned_connections_collapsed(),
             },
         );
         if self.home_embedded && !self.home_navigation_layout && query.is_empty() {
@@ -427,6 +436,23 @@ mod tests {
         assert!(implementation.contains("home_tab::recent_connections"));
         assert!(implementation.contains("ConnectionTreeRow::RecentHeader"));
         assert!(implementation.contains("ConnectionTreeRow::RecentConnection"));
+    }
+
+    #[test]
+    fn tree_rows_feed_sort_order_and_the_unassigned_section() {
+        let source = include_str!("tree.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+
+        // 同级顺序由树模型按 (sort_order, name) 显式排序。
+        assert!(implementation.contains("sort_order: workspace.sort_order"));
+        // 未分组分区：搜索时不重复渲染标题，折叠状态与卡片/列表布局共用。
+        assert!(implementation.contains("TreeSectionOptions {"));
+        assert!(implementation.contains("show_groups_header: !searching"));
+        assert!(implementation.contains("show_unassigned_header: !searching"));
+        assert!(
+            implementation
+                .contains("unassigned_expanded: !home.unassigned_connections_collapsed()")
+        );
     }
 
     #[test]

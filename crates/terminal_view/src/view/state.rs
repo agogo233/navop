@@ -47,6 +47,13 @@ pub(super) struct PendingTerminalSearch {
 #[derive(Clone)]
 pub(crate) enum TerminalDuplicateSource {
     Local(LocalConfig),
+    /// 由扩展声明的终端型连接启动的本地进程:带固定标题,退出后可按 Enter 重启。
+    Launched {
+        config: LocalConfig,
+        title: String,
+        /// 连接设置里选的图标;复制标签时一并带上。
+        icon: Option<Icon>,
+    },
     Ssh {
         connection: StoredConnection,
         working_dir: Option<String>,
@@ -107,7 +114,7 @@ pub(super) fn terminal_tab_duplicate_supported(
     matches!(
         (source, live_connection_kind),
         (
-            Some(TerminalDuplicateSource::Local(_)),
+            Some(TerminalDuplicateSource::Local(_) | TerminalDuplicateSource::Launched { .. }),
             Some(TerminalConnectionKind::Local),
         ) | (
             Some(TerminalDuplicateSource::Ssh { .. }),
@@ -131,6 +138,17 @@ impl TerminalView {
             && terminal.ssh_mfa_request().is_none()
             && terminal.host_key_verification_request().is_none()
             && !terminal.is_locked()
+    }
+
+    /// 粘贴路径的实时终端模式。
+    ///
+    /// 代理到 `resolve_live_term_mode`（见 helpers.rs），集中维护
+    /// 「实时读取 + 快照回退」语义，避免各粘贴入口散落 try_lock。
+    pub(super) fn live_term_mode(&self, cx: &App) -> TermMode {
+        resolve_live_term_mode(
+            self.terminal.read(cx).term(),
+            self.terminal_frame_snapshot.mode,
+        )
     }
 
     pub(super) fn has_blocking_auth_prompt(&self, cx: &App) -> bool {
@@ -160,6 +178,8 @@ pub(super) fn terminal_duplicate_source_with_cwd(
             config.working_dir = Some(cwd);
             TerminalDuplicateSource::Local(config)
         }
+        // 启动参数是扩展声明的固定命令,复制时不改写工作目录。
+        launched @ TerminalDuplicateSource::Launched { .. } => launched,
         TerminalDuplicateSource::Ssh {
             connection,
             sync_path_with_terminal,

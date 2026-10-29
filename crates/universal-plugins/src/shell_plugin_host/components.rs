@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 
 pub(super) fn component_registry() -> Result<gpui_shell::FrozenComponentRegistry> {
-    gpui_component_shell::components().context("build gpui-component shell registry")
+    gpui_shell::components::components().context("build gpui-component shell registry")
 }
 
 #[cfg(test)]

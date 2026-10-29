@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::storage::{
-    ConnectionType, DbConnectionConfig, MongoDBParams, PortForwardingParams, RedisParams,
+    ConnectionType, DbConnectionConfig, MongoDBParams, MqttParams, PortForwardingParams,
+    RedisParams,
 };
 
 use super::CredentialReferenceHit;
@@ -46,6 +47,10 @@ fn tunnel_ssh_id(connection: &ScannedConnection) -> Result<Option<i64>> {
         }
         ConnectionType::MongoDB => {
             let params: MongoDBParams = parse_params(connection)?;
+            enabled_tunnel_id(params.ssh_tunnel.as_ref())
+        }
+        ConnectionType::Mqtt => {
+            let params: MqttParams = parse_params(connection)?;
             enabled_tunnel_id(params.ssh_tunnel.as_ref())
         }
         ConnectionType::PortForwarding => {

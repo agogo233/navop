@@ -176,6 +176,19 @@ pub trait DbConnection: Sync + Send {
     ) -> Result<Vec<SqlResult>, DbError>;
     async fn query(&self, query: &str) -> Result<SqlResult, DbError>;
 
+    /// 驱动本地已判定连接死亡（语句必然尚未发出）时返回 `Some(true)`。
+    ///
+    /// 这是"发送前断连"最廉价的信号（零网络往返）：不同于执行后的错误文案，
+    /// 它不依赖字符串归类。默认 `None`（驱动无法本地判死），探活退回有界
+    /// ping（见 `probe_session_liveness`）。
+    ///
+    /// [`execute_session`]: crate::manager::GlobalDbState::execute_session
+    fn connection_closed_locally(&self) -> Option<bool> {
+        None
+    }
+
+    /// 探活语句：默认 `SELECT 1`，驱动可换成更廉价的形式（如 Oracle 的
+    /// `ping_query`）。探活只验证连接可达，不触碰事务/会话状态。
     fn ping_query(&self) -> &'static str {
         "SELECT 1"
     }

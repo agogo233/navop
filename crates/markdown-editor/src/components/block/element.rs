@@ -60,6 +60,7 @@ fn build_text_runs(
     link_color: Hsla,
     code_bg: Hsla,
     show_inline_code_backgrounds: bool,
+    code_font: &Font,
 ) -> Vec<TextRun> {
     let spans = input.inline_spans();
     let mut boundaries = vec![0, display_text.len()];
@@ -101,7 +102,11 @@ fn build_text_runs(
             .map(|range| start < range.end && range.start < end)
             .unwrap_or(false);
 
-        let mut font = base_run.font.clone();
+        let mut font = if inline_style.code {
+            code_font.clone()
+        } else {
+            base_run.font.clone()
+        };
         if inline_style.bold && font.weight < FontWeight::BOLD {
             font.weight = FontWeight::BOLD;
         }
@@ -733,6 +738,7 @@ impl Element for BlockTextElement {
                     theme.colors.text_link,
                     theme.colors.code_bg,
                     show_inline_code_backgrounds,
+                    &crate::fonts::FontSettings::code_font(cx),
                 )
             }
         } else {
@@ -988,7 +994,7 @@ impl Element for BlockTextElement {
             // held (matching the gesture that opens the link); a plain hover keeps
             // the text cursor. The editor root repaints on follow-modifier
             // toggles, so this re-evaluates even when the pointer stays still.
-            if window.modifiers().secondary() {
+            if window.modifiers().secondary(cx) {
                 window.set_cursor_style(CursorStyle::PointingHand, &prepaint.hitbox);
             }
         }
@@ -1251,7 +1257,7 @@ mod tests {
         // Cmd/Ctrl+click follows the link instead: the caret is left untouched
         // and no drag-selection begins.
         block.update(cx, |block, _cx| block.selected_range = 0..0);
-        event.modifiers = Modifiers::secondary_key();
+        event.modifiers = cx.read(|cx| Modifiers::secondary_key(cx));
         cx.update(|window, app| {
             block.update(app, |block, cx| block.on_mouse_down(&event, window, cx));
         });
@@ -1343,6 +1349,7 @@ mod tests {
                 rgba(0x0066ccff).into(),
                 rgba(0x111111ff).into(),
                 true,
+                &base_run.font,
             );
             let marked_run = runs.last().expect("styled text should create a final run");
 

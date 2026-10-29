@@ -118,7 +118,8 @@ impl TerminalView {
         if !self.is_live_ssh_terminal(cx) {
             return;
         }
-        let mode = self.terminal_frame_snapshot.mode;
+        // 图片路径粘贴同样读实时模式，避免 2004 过期包装（issue #198）。
+        let mode = self.live_term_mode(cx);
         self.apply_paste_to_history_prompt(path, cx);
         self.write_to_pty(terminal_paste_bytes(path, mode), cx);
     }

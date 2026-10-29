@@ -38,12 +38,14 @@ impl NotesView {
                 crate::markdown_renderer::markdown_editor_theme(self.resolved_editor_theme(cx)),
                 crate::markdown_renderer::block_render_provider(cx),
             );
+            let editor_file_path = descriptor.absolute_path.clone();
             let editor = cx.new(move |cx| {
                 let mut editor = MarkdownEditor::from_markdown_embedded_with_host(
                     cx,
                     snapshot.source,
                     host_services,
                 );
+                editor.set_file_path(editor_file_path, cx);
                 editor.set_view_mode(editor_view_mode(mode), cx);
                 editor
             });
@@ -77,6 +79,9 @@ impl NotesView {
         if let Some(session) = self.markdown_sessions.get(&document_id) {
             focus_markdown_editor(session, window, cx);
         }
+        if self.outline.is_visible() {
+            self.refresh_markdown_outline(cx);
+        }
         Ok(())
     }
 
@@ -104,7 +109,12 @@ impl NotesView {
         if let Some(epoch) = schedule_epoch {
             self.schedule_markdown_auto_save(document_id.to_owned(), epoch, window, cx);
         }
-        if sync_state_changed {
+        let outline_changed = if self.outline.is_visible() {
+            self.refresh_markdown_outline(cx)
+        } else {
+            false
+        };
+        if sync_state_changed || outline_changed {
             cx.notify();
         }
     }
@@ -318,6 +328,7 @@ impl NotesView {
         &mut self,
         old: &std::path::Path,
         new: &std::path::Path,
+        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let updates = self
             .markdown_sessions
@@ -328,8 +339,13 @@ impl NotesView {
         for (id, relative_path) in updates {
             let absolute_path = self.storage()?.descriptor(&relative_path)?.absolute_path;
             if let Some(session) = self.markdown_sessions.get_mut(&id) {
-                session.store.set_path(absolute_path)?;
+                session.store.set_path(absolute_path.clone())?;
                 session.relative_path = relative_path;
+                // 重命名后同步编辑器绑定的文件路径，保证相对路径图片引用
+                // 仍以新路径的父目录为基准解析。
+                session
+                    .editor
+                    .update(cx, |editor, cx| editor.set_file_path(absolute_path, cx));
             }
         }
         Ok(())

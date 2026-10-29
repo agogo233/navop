@@ -1,5 +1,7 @@
 use super::WorkspaceExplorer;
 use super::frame::{ExplorerFramePlacement, WorkspaceExplorerEvent};
+use std::path::{Path, PathBuf};
+
 use gpui::{
     Anchor, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div,
@@ -103,6 +105,27 @@ impl WorkspaceExplorer {
                         cx.notify();
                     })),
             )
+            .child(
+                IconButton::new("workspace-selector", IconName::FolderOpen)
+                    .tooltip(t!("WorkspaceExplorer.workspace.tooltip").to_string())
+                    .dropdown_menu_with_anchor(Anchor::TopRight, {
+                        let view = cx.entity();
+                        let worktrees = self.worktrees.clone();
+                        let recent_roots = self.recent_roots.clone();
+                        let current_root = self.root.clone();
+                        let has_repository = self.repository.is_some();
+                        move |menu, _window, _cx| {
+                            build_workspace_menu(
+                                menu,
+                                view.clone(),
+                                &worktrees,
+                                &recent_roots,
+                                &current_root,
+                                has_repository,
+                            )
+                        }
+                    }),
+            )
             .when(self.show_frame_controls, |this| {
                 this.child(self.render_frame_options_button(cx))
                     .child(self.render_frame_close_button(cx))
@@ -199,6 +222,158 @@ impl WorkspaceExplorer {
         }
         cx.notify();
     }
+}
+
+/// worktree 菜单：创建、切换、删除。
+///
+/// 列表来自 `git worktree list`，所以应用重启后依然有效；删除只对带 `navop/`
+/// 前缀的受管 worktree 开放，主工作区不可删。
+/// 工作区菜单：选择目录、最近工作区、以及隔离 worktree 的切换/删除。
+///
+/// 工作区的唯一入口就放在这里，且不受 `show_frame_controls` 影响——工作台把
+/// frame controls 关掉了，不能因此让用户失去选择工作区的能力。
+fn build_workspace_menu(
+    mut menu: PopupMenu,
+    view: Entity<WorkspaceExplorer>,
+    worktrees: &[crate::git::WorktreeEntry],
+    recent_roots: &[PathBuf],
+    current_root: &Path,
+    has_repository: bool,
+) -> PopupMenu {
+    let choose_view = view.clone();
+    menu = menu
+        .min_w(px(280.0))
+        .label(current_root.display().to_string())
+        .item(
+            PopupMenuItem::new(t!("WorkspaceExplorer.workspace.choose").to_string())
+                .icon(IconName::FolderOpen)
+                .on_click(move |_, window, cx| {
+                    choose_view.update(cx, |this, cx| this.choose_root(window, cx));
+                }),
+        );
+
+    let recent = recent_workspace_choices(recent_roots, current_root);
+    if !recent.is_empty() {
+        menu = menu
+            .separator()
+            .label(t!("WorkspaceExplorer.workspace.recent").to_string());
+        for root in recent {
+            let label = workspace_label(&root);
+            let switch_view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .icon(IconName::FolderOpen)
+                    .on_click(move |_, _, cx| {
+                        let root = root.clone();
+                        switch_view.update(cx, |this, cx| this.switch_workspace(root, cx));
+                    }),
+            );
+        }
+    }
+
+    let commit_view = view.clone();
+    let push_view = view.clone();
+    let create_view = view.clone();
+    menu = menu
+        .separator()
+        .item(
+            PopupMenuItem::new(t!("WorkspaceExplorer.commit.menu").to_string())
+                .icon(IconName::Upload)
+                .disabled(!has_repository)
+                .on_click(move |_, window, cx| {
+                    commit_view.update(cx, |this, cx| this.prompt_commit(window, cx));
+                }),
+        )
+        .item(
+            PopupMenuItem::new(t!("WorkspaceExplorer.push.menu").to_string())
+                .icon(IconName::ArrowUp)
+                .disabled(!has_repository)
+                .on_click(move |_, window, cx| {
+                    push_view.update(cx, |this, cx| this.push_current(window, cx));
+                }),
+        )
+        .item(
+            PopupMenuItem::new(t!("WorkspaceExplorer.worktree.create").to_string())
+                .icon(IconName::GitBranch)
+                .disabled(!has_repository)
+                .on_click(move |_, _, cx| {
+                    create_view.update(cx, |this, cx| this.create_worktree(cx));
+                }),
+        );
+
+    let linked: Vec<&crate::git::WorktreeEntry> =
+        worktrees.iter().filter(|entry| !entry.is_main).collect();
+    if linked.is_empty() {
+        return menu;
+    }
+    menu = menu
+        .separator()
+        .label(t!("WorkspaceExplorer.worktree.section", count = linked.len()).to_string());
+    for entry in linked {
+        let label = worktree_label(entry);
+        let is_current = entry.path == current_root;
+        let switch_view = view.clone();
+        let switch_root = entry.path.clone();
+        menu = menu.item(
+            PopupMenuItem::new(label.clone())
+                .icon(IconName::FolderOpen)
+                .checked(is_current)
+                .on_click(move |_, _, cx| {
+                    let root = switch_root.clone();
+                    switch_view.update(cx, |this, cx| this.switch_worktree(root, cx));
+                }),
+        );
+        if entry.managed && !entry.is_main {
+            let remove_view = view.clone();
+            let remove_root = entry.path.clone();
+            menu = menu.item(
+                PopupMenuItem::new(
+                    t!("WorkspaceExplorer.worktree.remove", name = label).to_string(),
+                )
+                .icon(IconName::Delete)
+                .on_click(move |_, _, cx| {
+                    let root = remove_root.clone();
+                    remove_view.update(cx, |this, cx| this.confirm_remove_worktree(root, cx));
+                }),
+            );
+        }
+    }
+    menu
+}
+
+/// 最近工作区里可切换的项：排除当前项与已失效目录。
+fn recent_workspace_choices(recent_roots: &[PathBuf], current_root: &Path) -> Vec<PathBuf> {
+    recent_roots
+        .iter()
+        .filter(|root| root.as_path() != current_root && root.is_dir())
+        .cloned()
+        .collect()
+}
+
+fn workspace_label(root: &Path) -> String {
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let parent = root
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_default();
+    if parent.is_empty() {
+        name
+    } else {
+        format!("{name}  —  {parent}")
+    }
+}
+
+fn worktree_label(entry: &crate::git::WorktreeEntry) -> String {
+    entry.branch.clone().unwrap_or_else(|| {
+        entry
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| entry.path.display().to_string())
+    })
 }
 
 fn build_frame_options_menu(
@@ -304,5 +479,45 @@ fn frame_placement_icon(placement: ExplorerFramePlacement) -> IconName {
         ExplorerFramePlacement::Left => IconName::PanelLeft,
         ExplorerFramePlacement::Right => IconName::PanelRight,
         ExplorerFramePlacement::Bottom => IconName::PanelBottom,
+    }
+}
+
+#[cfg(test)]
+mod workspace_menu_tests {
+    use super::{recent_workspace_choices, workspace_label};
+    use std::path::PathBuf;
+
+    #[test]
+    fn recent_choices_skip_the_current_root_and_missing_directories() {
+        let existing = std::env::temp_dir();
+        // 不能拿固定路径（如 `/tmp`）当「另一个有效目录」：Linux 上
+        // `std::env::temp_dir()` 本身就是 `/tmp`，两者相等会被当成当前工作区过滤掉。
+        let sibling = existing.join("navop-workspace-choices-test");
+        std::fs::create_dir_all(&sibling).expect("create sibling dir");
+        let roots = vec![
+            existing.clone(),
+            PathBuf::from("/nonexistent/navop-workspace-test"),
+            sibling.clone(),
+        ];
+
+        let choices = recent_workspace_choices(&roots, &existing);
+
+        assert!(!choices.contains(&existing), "当前工作区不应出现在最近列表");
+        assert!(
+            choices.iter().all(|root| root.is_dir()),
+            "失效目录不应出现在最近列表: {choices:?}"
+        );
+        assert!(choices.contains(&sibling));
+
+        let _ = std::fs::remove_dir(&sibling);
+    }
+
+    #[test]
+    fn workspace_label_shows_name_and_parent() {
+        assert_eq!(
+            "app  —  /Users/me/projects",
+            workspace_label(std::path::Path::new("/Users/me/projects/app"))
+        );
+        assert_eq!("app", workspace_label(std::path::Path::new("app")));
     }
 }

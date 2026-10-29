@@ -196,7 +196,7 @@ impl HomePage {
                     })
                     .tooltip(home_shortcuts::new_connection_tooltip(cx))
                     .on_click(cx.listener(|home, _, window, cx| {
-                        home.show_new_connection_dialog(window, cx)
+                        home.show_new_connection_dialog(None, window, cx)
                     })),
             )
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {

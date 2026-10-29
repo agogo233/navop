@@ -32,6 +32,25 @@ pub enum HistoryItem {
     ToolCall(ToolCall),
     /// 工具观测结果。
     Observation(ToolObservation),
+    /// 本轮可用的工具声明（名称快照）。纯 transcript 事实记录：
+    /// 模型侧由每轮请求的 `tools` 字段携带定义，重放/审计时从这里还原
+    /// 「当时模型看到了哪些工具」。内容变化时才记一条，不逐轮重复。
+    ToolsDeclared { names: Vec<String> },
+}
+
+impl HistoryItem {
+    /// 这条历史是否**只是**系统提示 / 内部说明。
+    ///
+    /// 这是「会话还算空白吗」的唯一判据，刻意写成**白名单**而不是黑名单：
+    /// 新增变体默认落进「不是系统提示」= 不算空白，宁可不复用也不误吞用户内容。
+    /// 见 `ai_chat_view::AgentChatView::reusable_blank_session`——那边用它决定
+    /// 「新建会话」能不能复用一张旧白纸。
+    pub fn is_system_note(&self) -> bool {
+        matches!(
+            self,
+            HistoryItem::System(_) | HistoryItem::ToolsDeclared { .. }
+        )
+    }
 }
 
 /// 默认最多保留的历史条目数。
@@ -144,6 +163,26 @@ impl RuntimeHistory {
 
     pub fn record_observation(&mut self, observation: ToolObservation) {
         self.record(HistoryItem::Observation(observation));
+    }
+
+    /// 历史里最近一次工具声明（无则空切片）。
+    pub fn last_declared_tools(&self) -> &[String] {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                HistoryItem::ToolsDeclared { names } => Some(names.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+
+    /// 记录工具声明快照。与最近一次声明相同则不记（避免逐轮重复膨胀）。
+    pub fn record_tools_declared(&mut self, names: Vec<String>) {
+        if self.last_declared_tools() == names.as_slice() {
+            return;
+        }
+        self.record(HistoryItem::ToolsDeclared { names });
     }
 
     pub fn items(&self) -> &[HistoryItem] {
@@ -262,6 +301,57 @@ mod tests {
     use super::*;
     use crate::ids::ToolCallId;
     use crate::tools::{ObservationData, ToolName, ToolObservation};
+
+    /// 「还算空白」的判据写成白名单：只有系统提示算「没聊过」，
+    /// 用户 / 助手 / 工具调用 / 观测 / 摘要一律算聊过。见 [`HistoryItem::is_system_note`]。
+    #[test]
+    fn only_system_notes_do_not_count_as_a_conversation() {
+        assert!(HistoryItem::System("正在创建 ACP 会话".into()).is_system_note());
+        assert!(
+            !HistoryItem::User {
+                text: "hi".into(),
+                images: Vec::new(),
+            }
+            .is_system_note()
+        );
+        assert!(!HistoryItem::Assistant("hello".into()).is_system_note());
+        assert!(
+            !HistoryItem::AssistantWithReasoning {
+                text: "hello".into(),
+                reasoning: "因为".into(),
+            }
+            .is_system_note()
+        );
+        assert!(
+            !HistoryItem::ContextSummary {
+                text: "摘要".into(),
+                original_items: 3,
+            }
+            .is_system_note()
+        );
+    }
+
+    /// 工具声明：变化才记，重复去重；且不算「聊过」（is_system_note）。
+    #[test]
+    fn tools_declared_records_only_changes() {
+        let mut history = RuntimeHistory::new();
+        history.record_tools_declared(vec!["echo".into(), "read_file".into()]);
+        history.record_tools_declared(vec!["echo".into(), "read_file".into()]); // 相同 → 不记
+        history.record_tools_declared(vec!["echo".into()]); // 变化 → 记
+
+        let declared: Vec<_> = history
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ToolsDeclared { names } => Some(names.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(2, declared.len(), "相同快照不重复记录");
+        assert_eq!(vec!["echo".to_string()], declared[1]);
+        assert_eq!(history.last_declared_tools(), ["echo".to_string()]);
+        assert!(HistoryItem::ToolsDeclared { names: Vec::new() }.is_system_note());
+    }
 
     #[test]
     fn evicts_oldest_when_over_capacity() {

@@ -32,6 +32,8 @@ pub mod settings;
 mod sidebar;
 pub mod sql_editor;
 #[cfg(test)]
+mod sql_cache_runtime_contract_tests;
+#[cfg(test)]
 mod sql_editor_completion_tests;
 mod sql_editor_definition;
 mod sql_editor_hover;

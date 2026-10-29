@@ -9,7 +9,7 @@ use gpui::{App, Font, FontFallbacks, Global, font, px};
 use gpui_component::{Theme, ThemeMode};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
@@ -100,6 +100,21 @@ pub enum StartupDefaultPage {
     #[default]
     Home,
     AiWorkbench,
+}
+
+/// 「记住主密码」时主密钥的保存位置。
+///
+/// 系统凭据库由操作系统按当前用户隔离（macOS 钥匙串 / Windows 凭据管理器）；
+/// 本机文件写在数据目录里，使用程序内置密钥加密，安全强度弱于系统凭据库，
+/// 由用户显式选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MasterKeyStorage {
+    /// 系统凭据库（macOS 钥匙串 / Windows 凭据管理器）
+    #[default]
+    SystemCredentialStore,
+    /// 本机文件（数据目录，程序内置密钥加密）
+    LocalFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -571,9 +586,25 @@ pub enum AiChatToolExecutionMode {
     ReadOnly,
     #[default]
     Manual,
+    /// 问答模式：只回答，不向模型暴露工具（对应 `TaskKind::Ask`）。
+    Ask,
 }
 
+/// 用户在对话里最后选择的驱动后端。
+///
+/// 与 [`AiChatSettings::last_acp_agent_id`] 的区别：后者只记「上次用过的 ACP
+/// agent」，选回内置 One Agent 时无法表达；这个枚举把「内置」也当成一个明确的
+/// 选择记下来，启动时照它恢复，而不是永远回到 One Agent。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AiChatBackendSelection {
+    /// 内置 One Agent（navop 自研内核）。
+    Builtin,
+    /// 外部 ACP agent。
+    Acp { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiChatSettings {
     #[serde(default)]
     pub tool_execution_mode: AiChatToolExecutionMode,
@@ -596,6 +627,73 @@ pub struct AiChatSettings {
         deserialize_with = "deserialize_ai_request_timeout_secs"
     )]
     pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub last_acp_agent_id: Option<String>,
+    /// 上次在对话里明确选择的驱动后端（内置 One Agent 或某个 ACP agent）。
+    ///
+    /// `None` 表示旧配置里没有这条记录，启动时回落到 `last_acp_agent_id` 的
+    /// 旧行为（有值就恢复 ACP，没有就停在 One Agent）。
+    #[serde(default)]
+    pub last_backend: Option<AiChatBackendSelection>,
+    #[serde(default)]
+    pub acp_models: HashMap<String, String>,
+    /// 内置会话 uid → ACP agent id → 该 agent 上次实际在用的协议会话 id。
+    ///
+    /// 重连 / 重启后据此走 `session/load` 或 `session/resume`，而不是每回都 `session/new`：
+    /// 后者会让外接 agent 那边凭空多一个空会话，用户看到的现象是「agent 全忘了」。
+    #[serde(default)]
+    pub acp_sessions: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    pub last_workspace_root: Option<PathBuf>,
+    /// 最近使用的工作区根目录，最近在前。
+    #[serde(default)]
+    pub recent_workspace_roots: Vec<PathBuf>,
+    /// AI 工作台外壳的布局（面板落位、会话栏折叠）。
+    #[serde(default)]
+    pub workbench_layout: WorkbenchLayoutSettings,
+}
+
+/// AI 工作台外壳的布局。
+///
+/// 面板用**稳定字符串 id** 记录，这样 `one_core` 不必反向依赖 `ai_chat_view`；
+/// 悬空 id（面板已下线、或配置被手改坏）由消费方在还原时忽略，见
+/// `ai_chat_view::workbench::WorkbenchState::from_settings`。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkbenchLayoutSettings {
+    /// 会话导航栏是否折叠。默认展开，所以 `false` 是正确缺省。
+    #[serde(default)]
+    pub nav_collapsed: bool,
+    /// 中心区显示的面板 id。
+    #[serde(default)]
+    pub center: Option<String>,
+    /// 左侧单槽的面板 id。
+    #[serde(default)]
+    pub left: Option<String>,
+    /// 底部单槽的面板 id。
+    #[serde(default)]
+    pub bottom: Option<String>,
+    /// 右侧标签组的面板 id，顺序即标签顺序。
+    #[serde(default)]
+    pub right: Vec<String>,
+    /// 右侧标签组当前显示的面板 id。
+    #[serde(default)]
+    pub right_active: Option<String>,
+    /// 会话导航栏宽度（像素）。`None` 用内置默认值。
+    #[serde(default)]
+    pub nav_width: Option<f32>,
+    /// 右侧标签组宽度（像素）。`None` 用内置默认值。
+    #[serde(default)]
+    pub right_width: Option<f32>,
+    /// 右侧标签组是否被顶栏开关收起（标签保留，仅隐藏）。
+    #[serde(default)]
+    pub right_collapsed: bool,
+    /// 右侧标签组是否放大占满工作台行。
+    #[serde(default)]
+    pub right_maximized: bool,
+    /// 侧栏里被用户「移除」的工作区根目录（绝对路径）。分组由此派生，
+    /// 不记名单的话移除后下次渲染又会回来。用户显式切回该工作区时移出名单。
+    #[serde(default)]
+    pub hidden_workspaces: Vec<String>,
 }
 
 /// 自定义系统提示词的最大字符数（按 chars 计），防止拖垮上下文长度。
@@ -608,7 +706,64 @@ pub const MIN_AI_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// 模型请求空闲超时允许的最大值（秒），1 小时。
 pub const MAX_AI_REQUEST_TIMEOUT_SECS: u64 = 3600;
 
+/// 最近工作区列表上限，避免设置文件无界增长。
+pub const MAX_RECENT_WORKSPACE_ROOTS: usize = 8;
+
+/// ACP 会话记忆的外层条目上限（按内置会话 uid 计）。
+///
+/// 不按 LRU 精确淘汰：这条信息是可重建的，丢掉一条的代价只是下次多开一个 ACP 会话，
+/// 不值得为此在设置里再维护一份访问序。
+pub const MAX_REMEMBERED_ACP_SESSIONS: usize = 32;
+
 impl AiChatSettings {
+    /// 记住「这个内置会话 + 这个 ACP agent」当前指向的协议会话。
+    ///
+    /// 空值一律忽略：写入空 id 会让下次重连试着 resume 到一个不存在的会话。
+    pub fn remember_acp_session(
+        &mut self,
+        session_uid: &str,
+        agent_id: &str,
+        acp_session_id: &str,
+    ) {
+        if session_uid.is_empty() || agent_id.is_empty() || acp_session_id.is_empty() {
+            return;
+        }
+        self.acp_sessions
+            .entry(session_uid.to_string())
+            .or_default()
+            .insert(agent_id.to_string(), acp_session_id.to_string());
+        while self.acp_sessions.len() > MAX_REMEMBERED_ACP_SESSIONS {
+            let Some(victim) = self
+                .acp_sessions
+                .keys()
+                .find(|uid| uid.as_str() != session_uid)
+                .cloned()
+            else {
+                break;
+            };
+            self.acp_sessions.remove(&victim);
+        }
+    }
+
+    /// 取回「这个内置会话 + 这个 ACP agent」上次用的协议会话 id。
+    pub fn remembered_acp_session(&self, session_uid: &str, agent_id: &str) -> Option<&str> {
+        self.acp_sessions
+            .get(session_uid)?
+            .get(agent_id)
+            .map(String::as_str)
+    }
+
+    /// 记录一个工作区：去重、置顶、限长，并同步 `last_workspace_root`。
+    pub fn remember_workspace_root(&mut self, root: &std::path::Path) {
+        let root = root.to_path_buf();
+        self.recent_workspace_roots
+            .retain(|existing| existing != &root);
+        self.recent_workspace_roots.insert(0, root);
+        self.recent_workspace_roots
+            .truncate(MAX_RECENT_WORKSPACE_ROOTS);
+        self.last_workspace_root = self.recent_workspace_roots.first().cloned();
+    }
+
     /// 返回规范化后的自定义系统提示词；空白内容返回 `None`。
     ///
     /// 超长内容按 [`MAX_CUSTOM_SYSTEM_PROMPT_CHARS`] 截断，避免配置文件里
@@ -661,6 +816,13 @@ impl Default for AiChatSettings {
             max_iterations: default_agent_max_iterations(),
             custom_system_prompt: String::new(),
             request_timeout_secs: default_ai_request_timeout_secs(),
+            last_acp_agent_id: None,
+            last_backend: None,
+            acp_models: HashMap::new(),
+            acp_sessions: HashMap::new(),
+            last_workspace_root: None,
+            recent_workspace_roots: Vec::new(),
+            workbench_layout: WorkbenchLayoutSettings::default(),
         }
     }
 }
@@ -1038,6 +1200,9 @@ pub struct AppSettings {
     pub sql_editor_hover_enabled: bool,
     #[serde(default = "default_monospace_font_family")]
     pub table_preview_font_family: String,
+    /// Markdown 编辑器代码字体（行内代码、代码块、表格内代码）。
+    #[serde(default = "default_monospace_font_family")]
+    pub markdown_code_font_family: String,
     #[serde(default = "default_monospace_font_family")]
     pub terminal_font_family: String,
     #[serde(
@@ -1133,8 +1298,14 @@ pub struct AppSettings {
     /// 便携模式下是否在数据目录保存可自动恢复的主密钥副本
     #[serde(default)]
     pub portable_remember_master_key: bool,
+    /// 自动解锁时主密钥的保存位置
+    #[serde(default)]
+    pub master_key_storage: MasterKeyStorage,
     #[serde(default)]
     pub home_connection_layout: HomeConnectionLayout,
+    /// 首页是否显示「最近连接」分组
+    #[serde(default = "default_true")]
+    pub home_show_recent_connections: bool,
     /// 连接列表排序方式
     #[serde(default)]
     pub connection_sort_order: ConnectionSortOrder,
@@ -1480,6 +1651,7 @@ impl Default for AppSettings {
             sql_editor_font_size: default_sql_editor_font_size(),
             sql_editor_hover_enabled: default_sql_editor_hover_enabled(),
             table_preview_font_family: default_monospace_font_family(),
+            markdown_code_font_family: default_monospace_font_family(),
             terminal_font_family: default_monospace_font_family(),
             custom_fonts: Vec::new(),
             terminal_font_size: default_terminal_font_size(),
@@ -1519,7 +1691,9 @@ impl Default for AppSettings {
             startup_default_page: StartupDefaultPage::default(),
             require_master_key_on_startup: false,
             portable_remember_master_key: false,
+            master_key_storage: MasterKeyStorage::SystemCredentialStore,
             home_connection_layout: HomeConnectionLayout::default(),
+            home_show_recent_connections: true,
             connection_sort_order: ConnectionSortOrder::default(),
             connection_sidebar_expanded: true,
             connection_sidebar_tree_state: ConnectionSidebarTreeState::default(),
@@ -1619,6 +1793,8 @@ impl AppSettings {
             normalize_grid_monospace_font_family(&self.sql_editor_font_family);
         self.table_preview_font_family =
             normalize_grid_monospace_font_family(&self.table_preview_font_family);
+        self.markdown_code_font_family =
+            normalize_grid_monospace_font_family(&self.markdown_code_font_family);
         self.terminal_font_family =
             normalize_grid_monospace_font_family(&self.terminal_font_family);
     }
@@ -1741,7 +1917,40 @@ impl AppSettings {
             return Self::default();
         }
 
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&path)
+    }
+
+    /// 只把 settings.json 里的 `log_file_path` 取出来，不做整份反序列化。
+    ///
+    /// 启动期必须在 [`Self::load`] **之前**用它初始化 tracing：否则 `load()` 里的
+    /// "Failed to parse settings" 会发生在 subscriber 安装之前，被直接丢掉，生产上就只剩
+    /// 「设置被还原成默认值」这个结果，永远看不到原因。
+    pub fn peek_log_file_path() -> String {
+        let Some(path) = Self::config_path() else {
+            return String::new();
+        };
+
+        Self::peek_log_file_path_from(&path)
+    }
+
+    fn peek_log_file_path_from(path: &Path) -> String {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return String::new();
+        };
+
+        serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("log_file_path")
+                    .and_then(|path| path.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+    }
+
+    fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
                 Ok(mut settings) => {
                     info!("Settings loaded from {:?}", path);
@@ -1751,13 +1960,28 @@ impl AppSettings {
                     settings.normalize_terminal_settings();
                     settings
                 }
-                Err(e) => {
-                    error!("Failed to parse settings: {}", e);
+                Err(parse_error) => {
+                    // 解析失败绝不能静默回落默认值：里层是整份 `Default`，紧接着启动期任意
+                    // 一次 save() 就会把用户设置全量覆盖掉，现象就是「启动后被还原成默认值」。
+                    // 先把坏文件改名留作现场证据，再用 eprintln 兜底（此时 tracing 未必装好）。
+                    let quarantined = quarantine_corrupt_settings(path);
+                    let message = match &quarantined {
+                        Some(path) => format!(
+                            "Failed to parse settings: {parse_error} (坏文件已保留: {})",
+                            path.display()
+                        ),
+                        None => format!("Failed to parse settings: {parse_error}"),
+                    };
+                    error!("{message}");
+                    eprintln!("[settings] {message}");
                     Self::default()
                 }
             },
-            Err(e) => {
-                error!("Failed to read settings file: {}", e);
+            Err(read_error) => {
+                // 读不出来不等于内容坏了（可能是权限或文件被占用），保留原文件不动。
+                let message = format!("Failed to read settings file: {read_error}");
+                error!("{message}");
+                eprintln!("[settings] {message}");
                 Self::default()
             }
         }
@@ -1769,23 +1993,31 @@ impl AppSettings {
             return;
         };
 
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                error!("Failed to create config directory: {}", e);
-                return;
-            }
+        self.save_to(&path);
+    }
+
+    fn save_to(&self, path: &Path) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            error!("Failed to create config directory: {}", e);
+            return;
         }
 
-        match serde_json::to_string_pretty(self) {
-            Ok(content) => {
-                if let Err(e) = std::fs::write(&path, content) {
-                    error!("Failed to write settings file: {}", e);
-                } else {
-                    info!("Settings saved to {:?}", path);
-                }
-            }
+        let content = match serde_json::to_string_pretty(self) {
+            Ok(content) => content,
             Err(e) => {
                 error!("Failed to serialize settings: {}", e);
+                return;
+            }
+        };
+
+        match write_settings_atomically(path, &content) {
+            Ok(()) => info!("Settings saved to {:?}", path),
+            Err(write_error) => {
+                let message = format!("Failed to write settings file: {write_error}");
+                error!("{message}");
+                eprintln!("[settings] {message}");
             }
         }
     }
@@ -1863,21 +2095,67 @@ impl AppSettings {
     }
 }
 
+/// 原子写 settings.json，并在覆盖前保留上一份为 `settings.json.bak`。
+///
+/// 直接 `fs::write` 覆盖有两个老问题：写到一半崩溃会留下半截 JSON，而半截 JSON 会让
+/// [`AppSettings::load`] 走进 `Err` 分支、把整份设置回落成默认值；覆盖前也没有任何可回滚的副本。
+fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp_path, content)?;
+
+    if path.exists() {
+        let backup_path = path.with_file_name(format!("{file_name}.bak"));
+        // 备份失败不阻断主写入：保住用户这次的改动比保住旧副本更重要。
+        if let Err(e) = std::fs::copy(path, &backup_path) {
+            error!("Failed to back up settings file: {}", e);
+        }
+    }
+
+    std::fs::rename(&tmp_path, path)
+}
+
+/// 把无法解析的 settings.json 改名保留为 `settings.json.corrupt-<时间戳>`。
+///
+/// 只改名不删除：坏文件是「设置为什么被还原」的唯一现场证据。返回 `None` 表示改名失败
+/// （例如目录只读），调用方此时仍按默认值启动，但下一次保存会覆盖掉原文件。
+fn quarantine_corrupt_settings(path: &Path) -> Option<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let quarantined = path.with_file_name(format!("{file_name}.corrupt-{stamp}"));
+
+    match std::fs::rename(path, &quarantined) {
+        Ok(()) => Some(quarantined),
+        Err(e) => {
+            error!("Failed to quarantine corrupt settings file: {}", e);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::px;
     use gpui_component::{Theme, ThemeMode};
+    use std::path::PathBuf;
 
     use super::{
-        AiChatSettings, AiChatToolExecutionMode, AppSettings, CloseButtonBehavior,
-        ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+        AiChatBackendSelection, AiChatSettings, AiChatToolExecutionMode, AppSettings,
+        CloseButtonBehavior, ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
         DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
         DEFAULT_TERMINAL_THEME, HomeConnectionLayout, LOCALE_SYSTEM, LargeTextCellEditorOpenMode,
         LocalTerminalProfileKind, LocalTerminalProfileSettings, MAX_AI_REQUEST_TIMEOUT_SECS,
-        MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState,
-        McpPermissionMode, McpServerMode, PersonalSyncBackendKind, RemoteFileOpenMode,
-        SqlFormatSettings, SqlIndentStyle, SqlKeywordCase, StartupDefaultPage, SyncProvider,
-        TableViewMode, default_grid_font_fallback_families, default_grid_monospace_font_family,
+        MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MAX_RECENT_WORKSPACE_ROOTS, MAX_REMEMBERED_ACP_SESSIONS,
+        MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState, MasterKeyStorage, McpPermissionMode,
+        McpServerMode, PersonalSyncBackendKind, RemoteFileOpenMode, SqlFormatSettings,
+        SqlIndentStyle, SqlKeywordCase, StartupDefaultPage, SyncProvider, TableViewMode,
+        default_grid_font_fallback_families, default_grid_monospace_font_family,
         grid_monospace_font, installed_grid_monospace_font, is_installed_font_family,
         resolve_installed_grid_monospace_font_family,
     };
@@ -1885,6 +2163,127 @@ mod tests {
     #[test]
     fn app_settings_disables_sync_by_default() {
         assert!(!AppSettings::default().sync_enabled);
+    }
+
+    #[test]
+    fn corrupt_settings_file_is_quarantined_instead_of_silently_reset() {
+        // 回归保护：解析失败若直接回落 Default、再被启动期任意一次 save() 全量覆盖，
+        // 用户的设置就永久丢失且不留任何现场证据（现象就是「启动后设置被还原」）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"font_size":"不是数字"}"#).expect("write corrupt settings");
+
+        let settings = AppSettings::load_from(&path);
+
+        assert!(
+            (settings.font_size - AppSettings::default().font_size).abs() < f64::EPSILON,
+            "解析失败应回落默认值"
+        );
+        assert!(!path.exists(), "坏文件应被改名挪走，避免下一次保存直接覆盖");
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "临时目录里应只剩坏文件副本: {names:?}");
+        assert!(
+            names[0].starts_with("settings.json.corrupt-"),
+            "坏文件应带 .corrupt- 前缀: {names:?}"
+        );
+    }
+
+    #[test]
+    fn save_writes_atomically_and_keeps_previous_file_as_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"font_size":21.0}"#).expect("write previous settings");
+
+        let settings = AppSettings {
+            font_size: 13.0,
+            ..AppSettings::default()
+        };
+        settings.save_to(&path);
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read saved settings"))
+                .expect("saved settings is json");
+        assert_eq!(saved["font_size"], serde_json::json!(13.0));
+        assert!(
+            !dir.path().join("settings.json.tmp").exists(),
+            "临时文件应在 rename 后消失"
+        );
+
+        let backup: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json.bak")).expect("read backup"),
+        )
+        .expect("backup is json");
+        assert_eq!(
+            backup["font_size"],
+            serde_json::json!(21.0),
+            "备份应保留覆盖前的上一份内容"
+        );
+    }
+
+    #[test]
+    fn peek_log_file_path_works_even_if_full_deserialize_fails() {
+        // 启动期要先靠它装好 tracing，才可能看见随后 load() 的解析错误。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"log_file_path":"/tmp/navop.log","font_size":"坏值"}"#,
+        )
+        .expect("write settings");
+
+        assert_eq!(AppSettings::peek_log_file_path_from(&path), "/tmp/navop.log");
+        assert!(
+            serde_json::from_str::<AppSettings>(
+                &std::fs::read_to_string(&path).expect("read settings")
+            )
+            .is_err(),
+            "整份反序列化应当失败，而 peek 仍要能取到日志路径"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_with_nested_objects_still_deserialize() {
+        // 回归保护：下面这些嵌套对象里存在没有 #[serde(default)] 的字段。一旦给它们新增必填
+        // 字段或改类型，旧配置文件会在加载时整份回落成默认值（「设置被还原」的真凶之一）。
+        let legacy = serde_json::json!({
+            "font_size": 13.0,
+            "main_window_state": {"x": 10.0, "y": 20.0, "width": 1200.0, "height": 800.0},
+            "sql_format": {"keyword_case": "upper", "indent": "tabs"},
+            "local_terminal_profile": {"kind": "system"},
+            "ai_chat": {"tool_execution_mode": "manual", "max_iterations": 32},
+            "unknown_field_from_a_newer_version": {"whatever": true}
+        });
+
+        let settings: AppSettings = serde_json::from_value(legacy).expect("历史配置应能解析");
+        assert!((settings.font_size - 13.0).abs() < f64::EPSILON);
+        assert_eq!(settings.sql_format.keyword_case, SqlKeywordCase::Upper);
+        assert_eq!(settings.sql_format.indent, SqlIndentStyle::Tabs);
+    }
+
+    #[test]
+    fn home_show_recent_connections_defaults_on_and_round_trips() {
+        // 默认开启(与历史行为一致)。
+        assert!(AppSettings::default().home_show_recent_connections);
+
+        // 关闭后序列化往返保持关闭。
+        let settings = AppSettings {
+            home_show_recent_connections: false,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize app settings");
+        assert!(json.contains(r#""home_show_recent_connections":false"#));
+        let restored: AppSettings = serde_json::from_str(&json).expect("roundtrip");
+        assert!(!restored.home_show_recent_connections);
+
+        // 旧配置文件缺省该字段时,反序列化回退到默认开启(向后兼容)。
+        let legacy_settings: AppSettings =
+            serde_json::from_value(serde_json::json!({})).expect("empty deserialize");
+        assert!(legacy_settings.home_show_recent_connections);
     }
 
     #[test]
@@ -2478,6 +2877,37 @@ mod tests {
     }
 
     #[test]
+    fn app_settings_defaults_to_system_credential_store() {
+        assert_eq!(
+            MasterKeyStorage::SystemCredentialStore,
+            AppSettings::default().master_key_storage
+        );
+    }
+
+    #[test]
+    fn legacy_settings_default_to_system_credential_store() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "require_master_key_on_startup": true
+        }))
+        .expect("旧设置应能安全迁移");
+
+        assert_eq!(
+            MasterKeyStorage::SystemCredentialStore,
+            settings.master_key_storage
+        );
+    }
+
+    #[test]
+    fn app_settings_deserializes_local_file_master_key_storage() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "master_key_storage": "local_file"
+        }))
+        .expect("master_key_storage 应能读取");
+
+        assert_eq!(MasterKeyStorage::LocalFile, settings.master_key_storage);
+    }
+
+    #[test]
     fn app_settings_defaults_to_modern_home_with_cards_and_expanded_sidebar() {
         let settings = AppSettings::default();
 
@@ -3020,6 +3450,168 @@ mod tests {
         assert_eq!(
             AiChatToolExecutionMode::ReadOnly,
             restored.ai_chat.tool_execution_mode
+        );
+    }
+
+    #[test]
+    fn ai_chat_acp_workspace_selection_round_trip_is_preserved() {
+        let mut settings = AppSettings::default();
+        settings.ai_chat.last_acp_agent_id = Some("builtin.codex".to_string());
+        settings
+            .ai_chat
+            .acp_models
+            .insert("builtin.codex".to_string(), "gpt-5".to_string());
+        settings.ai_chat.last_workspace_root = Some(PathBuf::from("/tmp/project"));
+
+        let json = serde_json::to_string(&settings).expect("serialize AI ACP settings");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize AI ACP settings");
+
+        assert_eq!(
+            settings.ai_chat.last_acp_agent_id,
+            restored.ai_chat.last_acp_agent_id
+        );
+        assert_eq!(settings.ai_chat.acp_models, restored.ai_chat.acp_models);
+        assert_eq!(
+            settings.ai_chat.last_workspace_root,
+            restored.ai_chat.last_workspace_root
+        );
+    }
+
+    #[test]
+    fn ai_chat_backend_selection_round_trips_and_legacy_config_falls_back() {
+        let mut settings = AppSettings::default();
+        settings.ai_chat.last_backend = Some(AiChatBackendSelection::Acp {
+            id: "builtin.codex".to_string(),
+        });
+
+        let json = serde_json::to_string(&settings).expect("serialize AI backend selection");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize AI backend selection");
+        assert_eq!(settings.ai_chat.last_backend, restored.ai_chat.last_backend);
+
+        settings.ai_chat.last_backend = Some(AiChatBackendSelection::Builtin);
+        let json = serde_json::to_string(&settings).expect("serialize builtin selection");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize builtin selection");
+        assert_eq!(
+            Some(AiChatBackendSelection::Builtin),
+            restored.ai_chat.last_backend
+        );
+
+        // 旧配置没有这条记录：保持 None，启动时回落到 last_acp_agent_id 的旧恢复路径。
+        let legacy: AiChatSettings =
+            serde_json::from_str("{}").expect("deserialize legacy ai_chat settings");
+        assert_eq!(None, legacy.last_backend);
+    }
+
+    #[test]
+    fn acp_session_memory_round_trips_per_session_and_agent() {
+        let mut settings = AppSettings::default();
+        settings
+            .ai_chat
+            .remember_acp_session("session-a", "agent-1", "acp-session-a1");
+        settings
+            .ai_chat
+            .remember_acp_session("session-a", "agent-2", "acp-session-a2");
+        settings
+            .ai_chat
+            .remember_acp_session("session-b", "agent-1", "acp-session-b1");
+
+        let json = serde_json::to_string(&settings).expect("serialize ACP session memory");
+        let restored: AppSettings =
+            serde_json::from_str(&json).expect("deserialize ACP session memory");
+
+        assert_eq!(
+            Some("acp-session-a1"),
+            restored
+                .ai_chat
+                .remembered_acp_session("session-a", "agent-1")
+        );
+        assert_eq!(
+            Some("acp-session-a2"),
+            restored
+                .ai_chat
+                .remembered_acp_session("session-a", "agent-2")
+        );
+        assert_eq!(
+            Some("acp-session-b1"),
+            restored
+                .ai_chat
+                .remembered_acp_session("session-b", "agent-1")
+        );
+        // 没记过的组合必须是 None，而不是退回到别的 agent 的会话。
+        assert_eq!(
+            None,
+            restored
+                .ai_chat
+                .remembered_acp_session("session-b", "agent-2")
+        );
+    }
+
+    #[test]
+    fn remembering_an_acp_session_overwrites_the_previous_target() {
+        let mut settings = AiChatSettings::default();
+        settings.remember_acp_session("session-a", "agent", "old");
+        settings.remember_acp_session("session-a", "agent", "new");
+
+        assert_eq!(
+            Some("new"),
+            settings.remembered_acp_session("session-a", "agent")
+        );
+    }
+
+    #[test]
+    fn remembering_an_acp_session_ignores_blank_values() {
+        let mut settings = AiChatSettings::default();
+        settings.remember_acp_session("", "agent", "acp");
+        settings.remember_acp_session("session-a", "", "acp");
+        settings.remember_acp_session("session-a", "agent", "");
+
+        assert!(settings.acp_sessions.is_empty());
+    }
+
+    #[test]
+    fn remembered_acp_sessions_are_capped_without_dropping_the_latest() {
+        let mut settings = AiChatSettings::default();
+        for index in 0..(MAX_REMEMBERED_ACP_SESSIONS + 4) {
+            settings.remember_acp_session(&format!("session-{index}"), "agent", "acp");
+        }
+
+        assert_eq!(MAX_REMEMBERED_ACP_SESSIONS, settings.acp_sessions.len());
+        let latest = format!("session-{}", MAX_REMEMBERED_ACP_SESSIONS + 3);
+        assert_eq!(
+            Some("acp"),
+            settings.remembered_acp_session(&latest, "agent")
+        );
+    }
+
+    #[test]
+    fn remembering_a_workspace_dedupes_moves_to_front_and_caps() {
+        let mut settings = AiChatSettings::default();
+        settings.remember_workspace_root(PathBuf::from("/a").as_path());
+        settings.remember_workspace_root(PathBuf::from("/b").as_path());
+        settings.remember_workspace_root(PathBuf::from("/a").as_path());
+
+        assert_eq!(
+            vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            settings.recent_workspace_roots
+        );
+        assert_eq!(Some(PathBuf::from("/a")), settings.last_workspace_root);
+
+        for index in 0..(MAX_RECENT_WORKSPACE_ROOTS + 4) {
+            settings.remember_workspace_root(PathBuf::from(format!("/extra/{index}")).as_path());
+        }
+        assert_eq!(
+            MAX_RECENT_WORKSPACE_ROOTS,
+            settings.recent_workspace_roots.len()
+        );
+        assert_eq!(
+            Some(PathBuf::from(format!(
+                "/extra/{}",
+                MAX_RECENT_WORKSPACE_ROOTS + 3
+            ))),
+            settings.last_workspace_root
         );
     }
 

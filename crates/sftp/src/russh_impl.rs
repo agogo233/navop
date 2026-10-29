@@ -59,7 +59,10 @@ const SFTP_MAX_CONCURRENT_READS: usize = MAX_INFLIGHT_REQUESTS;
 /// leaving it at the upstream default (32 KiB) or at `PIPELINE_CHUNK_SIZE`
 /// would shrink the in-flight write window by 2x-4x instead.
 const SFTP_MAX_WRITE_PACKET_LEN: u32 = SFTP_MAX_PACKET_LEN;
-const SFTP_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// 单条 SFTP 请求的超时。卡死链路上这个值决定了任务最快何时失败、释放车道，
+/// 所以不能太长；但 fsync（flush 阶段）在慢速网络存储上合法耗时可能到几十秒，
+/// 满载服务器也可能延迟应答，所以保留 60s 余量而不用更激进的 30s。
+const SFTP_REQUEST_TIMEOUT_SECS: u64 = 60;
 const OWNER_LOOKUP_BATCH_SIZE: usize = 128;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -1021,6 +1024,83 @@ fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
         return Err(TransferCancelled.into());
     }
     Ok(())
+}
+
+/// 取消标志的轮询间隔：`race_with_cancel` 用它检测取消。
+///
+/// 100 ms 对人是即时的，同时轮询开销可以忽略（每个上传文件并发期最多几个）。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 在途网络请求与取消标志竞速：取消只能在 await 边界生效。
+///
+/// `ensure_not_cancelled` 这类协作式检查只在 chunk/文件之间执行；一旦请求卡在
+/// 无响应的服务器上（如网络中断、服务端停摆），要等满请求超时
+/// 才能脱身，期间整个传输车道被占死、取消按钮形同虚设。这里用 `select!` 让
+/// 在途 future 与取消轮询竞速，取消后立即返回。
+///
+/// 被打断的写入会留下远端暂存文件：原始文件不受影响（发布走 rename），暂存
+/// 残留是刻意接受的取舍——在已停摆的链路上做清理同样会卡住。
+async fn race_with_cancel<T>(
+    cancelled: &AtomicBool,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let watch = async {
+        loop {
+            ensure_not_cancelled(cancelled)?;
+            tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+        }
+    };
+    tokio::select! {
+        result = watch => result,
+        result = fut => result,
+    }
+}
+
+/// 递归扫描本地目录，产出待上传条目：`(路径, 是否目录, 文件大小)`。
+///
+/// 符号链接需要显式处理：上传时会 `File::open` 跟随链接读取真实内容，
+/// 因此不能用链接自身的大小（目标路径字符串长度）作为 expected_size，
+/// 否则写入字节数校验必然失败并中止整个目录上传。
+/// - 指向文件的链接：跟随解析，按真实大小上传；
+/// - 指向目录的链接：跳过，避免把目标内容重复上传且防止环；
+/// - 坏链（目标不存在/不可访问）：跳过。
+fn scan_local_dir_entries(
+    local_base: &std::path::Path,
+    cancelled: &AtomicBool,
+) -> Result<Vec<(std::path::PathBuf, bool, u64)>> {
+    let mut entries: Vec<(std::path::PathBuf, bool, u64)> = Vec::new();
+    let mut dirs_to_scan = vec![local_base.to_path_buf()];
+
+    while let Some(dir) = dirs_to_scan.pop() {
+        ensure_not_cancelled(cancelled)?;
+        let read_dir = std::fs::read_dir(&dir)
+            .map_err(|e| anyhow!("Failed to read directory {:?}: {}", dir, e))?;
+
+        for entry in read_dir {
+            let entry = entry.map_err(|e| anyhow!("Failed to read entry: {}", e))?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| anyhow!("Failed to get metadata for {:?}: {}", path, e))?;
+
+            if metadata.file_type().is_symlink() {
+                let target = match std::fs::metadata(&path) {
+                    Ok(target) => target,
+                    Err(_) => continue,
+                };
+                if target.is_dir() {
+                    continue;
+                }
+                entries.push((path, false, target.len()));
+            } else if metadata.is_dir() {
+                entries.push((path.clone(), true, 0));
+                dirs_to_scan.push(path);
+            } else {
+                entries.push((path, false, metadata.len()));
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 struct SftpHandler {
@@ -2331,11 +2411,9 @@ impl RemoteFileClient for RusshSftpClient {
 
         let mut local_file = BufReader::with_capacity(BUFFER_SIZE, local_file);
 
-        let result = with_remote_replace(
-            &self.sftp,
-            remote_path,
-            total_size,
-            |mut remote_file| async {
+        let result = race_with_cancel(
+            &cancelled,
+            with_remote_replace(&self.sftp, remote_path, total_size, |mut remote_file| async {
                 let mut buffer = vec![0u8; BUFFER_SIZE];
                 let mut transferred = 0u64;
                 let started_at = Instant::now();
@@ -2385,7 +2463,7 @@ impl RemoteFileClient for RusshSftpClient {
 
                 ensure_not_cancelled(&cancelled)?;
                 Ok((remote_file, transferred))
-            },
+            }),
         )
         .await;
 
@@ -2871,28 +2949,7 @@ impl RemoteFileClient for RusshSftpClient {
             anyhow::bail!("Local path is not a directory: {}", local_path);
         }
 
-        let mut entries: Vec<(std::path::PathBuf, bool, u64)> = Vec::new();
-        let mut dirs_to_scan = vec![local_base.to_path_buf()];
-
-        while let Some(dir) = dirs_to_scan.pop() {
-            ensure_not_cancelled(&cancelled)?;
-            let read_dir = std::fs::read_dir(&dir)
-                .map_err(|e| anyhow!("Failed to read directory {:?}: {}", dir, e))?;
-
-            for entry in read_dir {
-                let entry = entry.map_err(|e| anyhow!("Failed to read entry: {}", e))?;
-                let path = entry.path();
-                let metadata = std::fs::symlink_metadata(&path)
-                    .map_err(|e| anyhow!("Failed to get metadata for {:?}: {}", path, e))?;
-
-                if metadata.is_dir() {
-                    entries.push((path.clone(), true, 0));
-                    dirs_to_scan.push(path);
-                } else {
-                    entries.push((path, false, metadata.len()));
-                }
-            }
-        }
+        let entries = scan_local_dir_entries(local_base, &cancelled)?;
 
         let total_size: u64 = entries
             .iter()
@@ -2900,9 +2957,12 @@ impl RemoteFileClient for RusshSftpClient {
             .map(|(_, _, size)| size)
             .sum();
         let mut replacement = if conflict_policy == DirectoryConflictPolicy::Replace {
-            Some(self.begin_directory_replace(remote_path).await?)
+            Some(
+                race_with_cancel(&cancelled, self.begin_directory_replace(remote_path))
+                    .await?,
+            )
         } else {
-            self.ensure_copy_directory(remote_path).await?;
+            race_with_cancel(&cancelled, self.ensure_copy_directory(remote_path)).await?;
             None
         };
         let upload_root = replacement
@@ -2928,7 +2988,7 @@ impl RemoteFileClient for RusshSftpClient {
                     upload_root.trim_end_matches('/'),
                     relative_str.replace('\\', "/")
                 );
-                self.ensure_copy_directory(&remote_dir).await?;
+                race_with_cancel(&cancelled, self.ensure_copy_directory(&remote_dir)).await?;
             }
 
             let files: Vec<_> = entries
@@ -2975,57 +3035,59 @@ impl RemoteFileClient for RusshSftpClient {
                     let expected_size = file_size;
                     let current_file_name = relative_str;
 
-                    with_remote_replace(
-                        sftp,
-                        &remote_file_path,
-                        expected_size,
-                        |mut remote_file| async {
-                            let mut buffer = vec![0u8; BUFFER_SIZE];
-                            let mut current_file_transferred: u64 = 0;
+                    race_with_cancel(
+                        cancelled,
+                        with_remote_replace(
+                            sftp,
+                            &remote_file_path,
+                            expected_size,
+                            |mut remote_file| async {
+                                let mut buffer = vec![0u8; BUFFER_SIZE];
+                                let mut current_file_transferred: u64 = 0;
 
-                            loop {
-                                ensure_not_cancelled(cancelled)?;
-                                let bytes_read =
-                                    local_file.read(&mut buffer).await.map_err(|e| {
-                                        anyhow!("Failed to read from local file: {}", e)
-                                    })?;
+                                loop {
+                                    ensure_not_cancelled(cancelled)?;
+                                    let bytes_read = local_file.read(&mut buffer).await.map_err(
+                                        |e| anyhow!("Failed to read from local file: {}", e),
+                                    )?;
 
-                                if bytes_read == 0 {
-                                    break;
+                                    if bytes_read == 0 {
+                                        break;
+                                    }
+
+                                    remote_file.write_all(&buffer[..bytes_read]).await.map_err(
+                                        |e| anyhow!("Failed to write to remote file: {}", e),
+                                    )?;
+
+                                    current_file_transferred += bytes_read as u64;
+
+                                    // 多个文件交错上报，先汇总成全局进度再走高水位，
+                                    // 否则后到的回调会带着更小的值把进度条拽回去。
+                                    let written_so_far = written
+                                        .fetch_add(bytes_read as u64, Ordering::Relaxed)
+                                        + bytes_read as u64;
+                                    let displayed_transferred = published.publish(written_so_far);
+                                    let elapsed = start_time.elapsed().as_secs_f64();
+                                    let speed = if elapsed > 0.0 {
+                                        displayed_transferred as f64 / elapsed
+                                    } else {
+                                        0.0
+                                    };
+
+                                    progress(TransferProgress {
+                                        transferred: displayed_transferred,
+                                        total: total_size,
+                                        speed,
+                                        current_file: Some(current_file_name.clone()),
+                                        current_file_transferred,
+                                        current_file_total: expected_size,
+                                    });
                                 }
 
-                                remote_file.write_all(&buffer[..bytes_read]).await.map_err(
-                                    |e| anyhow!("Failed to write to remote file: {}", e),
-                                )?;
-
-                                current_file_transferred += bytes_read as u64;
-
-                                // 多个文件交错上报，先汇总成全局进度再走高水位，
-                                // 否则后到的回调会带着更小的值把进度条拽回去。
-                                let written_so_far = written
-                                    .fetch_add(bytes_read as u64, Ordering::Relaxed)
-                                    + bytes_read as u64;
-                                let displayed_transferred = published.publish(written_so_far);
-                                let elapsed = start_time.elapsed().as_secs_f64();
-                                let speed = if elapsed > 0.0 {
-                                    displayed_transferred as f64 / elapsed
-                                } else {
-                                    0.0
-                                };
-
-                                progress(TransferProgress {
-                                    transferred: displayed_transferred,
-                                    total: total_size,
-                                    speed,
-                                    current_file: Some(current_file_name.clone()),
-                                    current_file_transferred,
-                                    current_file_total: expected_size,
-                                });
-                            }
-
-                            ensure_not_cancelled(cancelled)?;
-                            Ok((remote_file, current_file_transferred))
-                        },
+                                ensure_not_cancelled(cancelled)?;
+                                Ok((remote_file, current_file_transferred))
+                            },
+                        ),
                     )
                     .await
                     .map_err(|error| {
@@ -3065,8 +3127,11 @@ impl RemoteFileClient for RusshSftpClient {
         };
 
         if let Some(replacement) = replacement {
-            self.commit_directory_replace(replacement, remote_path)
-                .await?;
+            race_with_cancel(
+                &cancelled,
+                self.commit_directory_replace(replacement, remote_path),
+            )
+            .await?;
         }
 
         progress(TransferProgress {
@@ -3127,6 +3192,133 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    /// 硬取消：取消标志置位后，卡死的在途请求必须立即被打断并返回
+    /// TransferCancelled，而不是等满请求超时。
+    #[tokio::test]
+    async fn race_with_cancel_interrupts_pending_request_when_flag_is_set() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+
+        let started = Instant::now();
+        let result: Result<()> = race_with_cancel(&cancelled, std::future::pending()).await;
+        let elapsed = started.elapsed();
+
+        setter.await.expect("setter task");
+        assert!(elapsed < Duration::from_secs(5), "cancel took {elapsed:?}");
+        let error = result.expect_err("must be interrupted by cancellation");
+        assert!(error.downcast_ref::<TransferCancelled>().is_some());
+    }
+
+    /// 硬取消不得误伤：标志未置位时，正常完成的请求必须原样通过。
+    #[tokio::test]
+    async fn race_with_cancel_passes_through_completed_request() {
+        let cancelled = AtomicBool::new(false);
+        let result: Result<u64> =
+            race_with_cancel(&cancelled, async { Ok(42u64) }).await;
+        assert_eq!(result.expect("must pass through"), 42);
+    }
+
+    /// 取消标志已置位时立即返回，不再进入在途请求。
+    #[tokio::test]
+    async fn race_with_cancel_returns_immediately_when_flag_already_set() {
+        let cancelled = AtomicBool::new(true);
+        let result: Result<()> = race_with_cancel(&cancelled, std::future::pending()).await;
+        let error = result.expect_err("must return immediately");
+        assert!(error.downcast_ref::<TransferCancelled>().is_some());
+    }
+
+    /// 目录上传扫描必须对符号链接做显式处理：文件链接跟随取真实大小，
+    /// 目录链接与坏链跳过。否则链接自身的大小（目标路径字符串长度）会被
+    /// 当作 expected_size，写入校验必然失败并中止整个目录上传。
+    #[test]
+    fn scan_local_dir_entries_handles_symlinks() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let base = temp.path();
+
+        // 普通文件与子目录
+        std::fs::write(base.join("regular.txt"), b"hello").expect("write regular file");
+        std::fs::create_dir(base.join("subdir")).expect("create subdir");
+        std::fs::write(base.join("subdir").join("nested.txt"), b"nested!")
+            .expect("write nested file");
+
+        // 指向文件的链接（真实内容 5 字节，链接自身大小是目标路径字符串长度）
+        let file_target = base.join("regular.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&file_target, base.join("file_link")).expect("create symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&file_target, base.join("file_link"))
+            .expect("create symlink");
+
+        // 指向目录的链接：应被跳过
+        let dir_target = base.join("subdir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dir_target, base.join("dir_link")).expect("create symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&dir_target, base.join("dir_link"))
+            .expect("create symlink");
+
+        // 坏链：应被跳过
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("missing.txt"), base.join("broken_link"))
+            .expect("create symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(base.join("missing.txt"), base.join("broken_link"))
+            .expect("create symlink");
+
+        let cancelled = AtomicBool::new(false);
+        let mut entries = scan_local_dir_entries(base, &cancelled).expect("scan");
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let names: Vec<String> = entries
+            .iter()
+            .map(|(path, _, _)| {
+                path.strip_prefix(base)
+                    .expect("strip prefix")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        // 目录链接和坏链不出现在条目中
+        assert!(!names.iter().any(|name| name == "dir_link"));
+        assert!(!names.iter().any(|name| name == "broken_link"));
+
+        let find = |name: &str| {
+            entries
+                .iter()
+                .find(|(path, _, _)| {
+                    path.strip_prefix(base)
+                        .expect("strip prefix")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        == name
+                })
+        };
+
+        let regular = find("regular.txt").expect("regular.txt should be present");
+        assert_eq!(regular.1, false);
+        assert_eq!(regular.2, 5);
+
+        let subdir = find("subdir").expect("subdir should be present");
+        assert_eq!(subdir.1, true);
+        assert_eq!(subdir.2, 0);
+
+        let nested = find("subdir/nested.txt").expect("nested file should be present");
+        assert_eq!(nested.1, false);
+        assert_eq!(nested.2, 7);
+
+        // 文件链接跟随到真实内容大小（5 字节），而不是链接字符串长度
+        let file_link = find("file_link").expect("file_link should be present");
+        assert_eq!(file_link.1, false);
+        assert_eq!(file_link.2, 5);
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum FakeRemoteEntry {
@@ -3427,6 +3619,13 @@ mod tests {
         assert_eq!(config.max_concurrent_writes, MAX_INFLIGHT_REQUESTS);
         assert_eq!(config.max_write_packet_len, SFTP_MAX_WRITE_PACKET_LEN);
         assert_eq!(config.request_timeout_secs, SFTP_REQUEST_TIMEOUT_SECS);
+        // 请求超时决定卡死链路上任务最快何时失败、释放传输车道，必须保持在
+        // 分钟级以内；此前是 300s，一个停摆请求能把车道占住近 10 分钟（含重试）。
+        assert!(
+            config.request_timeout_secs <= 60,
+            "request timeout {}s is too long, a stalled request would hold the transfer lane",
+            config.request_timeout_secs
+        );
         assert_eq!(
             config.max_packet_len as usize * config.max_concurrent_reads,
             16 * 1024 * 1024

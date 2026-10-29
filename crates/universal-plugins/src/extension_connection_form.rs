@@ -30,6 +30,8 @@ use crate::universal_plugins::GlobalUniversalPluginService;
 pub struct ExtensionConnectionFormConfig {
     pub contribution: extension_runtime::RegisteredResourceConnectionContribution,
     pub editing_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
 }
@@ -90,10 +92,11 @@ impl ExtensionConnectionForm {
         let name = create_name_input(name_value, window, cx);
         let form_config = declarative_config(&config.contribution.form);
         let fields = cx.new(|cx| DeclarativeForm::new(form_config, &initial_config, window, cx));
-        let selected_workspace = config
-            .editing_connection
-            .as_ref()
-            .and_then(|connection| connection.workspace_id);
+        // 编辑连接回填原分组；纯新建时用新建向导传入的目标分组预选（用户仍可改）。
+        let selected_workspace = match config.editing_connection.as_ref() {
+            Some(connection) => connection.workspace_id,
+            None => config.initial_workspace_id,
+        };
         let workspace = create_workspace_select(&config.workspaces, selected_workspace, window, cx);
         let team = connection_form::team::create_team_select(
             &config.teams,

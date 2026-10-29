@@ -29,6 +29,8 @@ pub enum SyncError {
     StorageError(String),
     /// 未登录
     NotLoggedIn,
+    /// 团队管理操作被服务端拒绝（文案已本地化，可直接展示）
+    TeamAdmin(String),
 }
 
 impl SyncError {
@@ -63,6 +65,7 @@ impl std::fmt::Display for SyncError {
             SyncError::DataFormatError(e) => write!(f, "数据格式错误: {}", e),
             SyncError::StorageError(e) => write!(f, "存储错误: {}", e),
             SyncError::NotLoggedIn => write!(f, "请先登录云端账户"),
+            SyncError::TeamAdmin(message) => f.write_str(message),
         }
     }
 }
@@ -99,6 +102,11 @@ pub struct CloudSyncService {
     operation_queues: HashMap<String, OperationQueue>,
     /// 团队密钥缓存：team_id -> team_key
     team_keys: HashMap<String, String>,
+    /// 主密钥是否由调用方显式指定且应保持权威
+    ///
+    /// 应用内的共享服务不设置该标志，由同步引擎在每次同步前从本地 crypto
+    /// 模块对齐；持有独立测试/迁移场景的密钥时置位，避免被进程级主密钥覆盖。
+    master_key_pinned: bool,
 }
 
 impl CloudSyncService {
@@ -112,6 +120,7 @@ impl CloudSyncService {
             sync_states: HashMap::new(),
             operation_queues: HashMap::new(),
             team_keys: HashMap::new(),
+            master_key_pinned: false,
         }
     }
 
@@ -141,6 +150,7 @@ impl CloudSyncService {
         self.logged_in = false;
         self.user_id = None;
         self.master_key = None;
+        self.master_key_pinned = false;
         self.key_version = 0;
         self.sync_states.clear();
         self.operation_queues.clear();
@@ -173,11 +183,23 @@ impl CloudSyncService {
 
     /// 直接设置主密钥（不验证）
     ///
-    /// 用于从本地 crypto 模块同步密钥状态，跳过云端验证。
-    /// 调用者需确保密钥已通过本地验证。
+    /// 调用者显式声明该密钥为本服务实例的权威密钥：此后同步引擎不会再用
+    /// 本地 crypto 模块的全局主密钥覆盖它。用于改主密钥后的迁移、测试等
+    /// 场景；应用内的共享服务请交给引擎在同步前自动对齐。
     pub fn set_master_key_directly(&mut self, master_key: String) {
         self.master_key = Some(master_key);
+        self.master_key_pinned = true;
         // key_version 保持默认或之前的值，实际同步时会从云端更新
+    }
+
+    /// 由同步引擎从本地 crypto 模块注入主密钥（不取得权威、不置位 pinned）
+    pub fn set_master_key_from_local(&mut self, master_key: String) {
+        self.master_key = Some(master_key);
+    }
+
+    /// 当前主密钥是否由调用方显式指定
+    pub fn master_key_pinned(&self) -> bool {
+        self.master_key_pinned
     }
 
     /// 服务内当前的主密钥是否与给定密钥一致
@@ -394,6 +416,7 @@ impl CloudSyncService {
                 .unwrap_or(Value::Object(serde_json::Map::new())),
             owner_id: conn.owner_id.clone(),
             preferred_open_mode: conn.preferred_open_mode,
+            ai_access_level: conn.ai_access_level,
         };
 
         let plaintext = serde_json::to_string(&plain_data)
@@ -547,6 +570,7 @@ impl CloudSyncService {
                 team_id: cloud_data.team_id.clone(),
                 owner_id: plain_data.owner_id,
                 preferred_open_mode: plain_data.preferred_open_mode,
+                ai_access_level: plain_data.ai_access_level,
             },
             workspace_cloud_id,
         ))
@@ -681,6 +705,80 @@ impl CloudSyncService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tool_runtime::AiAccessLevel;
+
+    fn ai_access_connection(level: AiAccessLevel) -> StoredConnection {
+        StoredConnection {
+            ai_access_level: level,
+            id: Some(1),
+            credential_revision: Some(1),
+            name: "prod".to_string(),
+            connection_type: ConnectionType::Database,
+            params: r#"{"host":"localhost","port":5432}"#.to_string(),
+            workspace_id: None,
+            selected_databases: None,
+            remark: None,
+            sync_enabled: true,
+            cloud_id: None,
+            last_synced_at: None,
+            last_used_at: None,
+            sort_order: None,
+            created_at: None,
+            updated_at: None,
+            team_id: None,
+            owner_id: None,
+            preferred_open_mode: None,
+        }
+    }
+
+    #[test]
+    fn connection_sync_payload_carries_ai_access_level() {
+        let mut service = CloudSyncService::new();
+        service.set_master_key_directly("test_blob_key".to_string());
+
+        let cloud_data = service
+            .prepare_sync_data_upload(&ai_access_connection(AiAccessLevel::Denied), None, &[])
+            .unwrap();
+        let plaintext = service
+            .decrypt_blob(&cloud_data.encrypted_data, None)
+            .unwrap();
+        // 载荷必须带级别，否则换设备/换客户端后策略会丢。
+        assert!(
+            plaintext.contains(r#""ai_access_level":"denied""#),
+            "payload should carry the level: {plaintext}"
+        );
+
+        let (decrypted, _) = service
+            .decrypt_sync_data_connection_with_workspace_cloud_id(&cloud_data)
+            .unwrap();
+        assert_eq!(AiAccessLevel::Denied, decrypted.ai_access_level);
+    }
+
+    #[test]
+    fn connection_sync_payload_defaults_missing_ai_access_level_to_allowed() {
+        let mut service = CloudSyncService::new();
+        service.set_master_key_directly("test_blob_key".to_string());
+
+        // 老客户端上传的载荷没有该字段：必须按默认「允许」解析，而不是报错。
+        let legacy_plain = r#"{"id":1,"name":"prod","connection_type":"Database","params":"{}"}"#;
+        let data = service.encrypt_blob(legacy_plain, None).unwrap();
+        let cloud_data = CloudSyncData {
+            id: "cloud-1".to_string(),
+            owner_id: "user-1".to_string(),
+            team_id: None,
+            data_type: data_type::CONNECTION.to_string(),
+            encrypted_data: data,
+            key_version: 1,
+            checksum: String::new(),
+            version: 1,
+            updated_at: 1,
+            deleted_at: None,
+        };
+        let (decrypted, _) = service
+            .decrypt_sync_data_connection_with_workspace_cloud_id(&cloud_data)
+            .unwrap();
+        assert_eq!(AiAccessLevel::Allowed, decrypted.ai_access_level);
+    }
 
     #[test]
     fn test_blob_encrypt_decrypt() {
@@ -737,6 +835,7 @@ mod tests {
         service.set_master_key_directly("test_blob_key".to_string());
 
         let conn = StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(1),
             credential_revision: Some(1),
             name: "db".to_string(),

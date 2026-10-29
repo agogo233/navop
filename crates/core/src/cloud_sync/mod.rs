@@ -30,9 +30,14 @@ mod service;
 pub mod state_manager;
 pub mod supabase;
 pub mod sync_type;
+pub mod team_admin;
 pub mod team_key_envelope;
 pub mod team_key_manager;
 pub mod team_scope;
+
+#[cfg(test)]
+#[path = "team_admin_engine_tests.rs"]
+mod team_admin_engine_tests;
 
 #[cfg(test)]
 #[path = "team_key_envelope_tests.rs"]
@@ -63,6 +68,7 @@ pub use queue::*;
 pub use service::*;
 pub use state_manager::*;
 pub use sync_type::*;
+pub use team_admin::*;
 pub use team_key_manager::*;
 pub use team_scope::*;
 

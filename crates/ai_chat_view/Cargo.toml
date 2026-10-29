@@ -23,7 +23,9 @@ gpui-component.workspace = true
 one-ui.workspace = true
 one-core.workspace = true
 agent_runtime = { path = "../agent_runtime" }
+tool_runtime.workspace = true
 html-preview.workspace = true
+process-util.workspace = true
 agent-client-protocol.workspace = true
 llm-connector = { workspace = true, features = ["streaming"] }
 async-trait.workspace = true
@@ -36,6 +38,7 @@ base64.workspace = true
 image.workspace = true
 uuid.workspace = true
 lsp-types.workspace = true
+chrono.workspace = true
 sum-tree.workspace = true
 gpui-webview = { workspace = true, optional = true }
 wry = { version = "0.53.3", package = "lb-wry", optional = true }

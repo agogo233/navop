@@ -133,6 +133,12 @@ fn plan_external_launch_for_os(
     }
 }
 
+/// 拉起外部编辑器。
+///
+/// 真正的 `spawn` 交给 [`process_util::spawn_detached`] 在独立线程里做：本函数
+/// 会被 UI 事件处理直接调用，而 `Command::spawn` 会在调用线程里同步 `fork` 并
+/// 阻塞等待子进程 exec，一旦 macOS 的 atfork 处理器互等就会冻结整个窗口
+/// （0.22.0 同类事故见 `spawn_detached` 的文档注释）。
 pub fn launch_external_editor(
     program: &str,
     args: &[String],
@@ -142,7 +148,7 @@ pub fn launch_external_editor(
     let mut command = std::process::Command::new(&plan.program);
     command.args(&plan.args);
     process_util::configure_background_child(&mut command);
-    command.spawn()?;
+    process_util::spawn_detached(command, "external-editor")?;
     Ok(())
 }
 

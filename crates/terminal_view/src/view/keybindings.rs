@@ -27,12 +27,22 @@ pub(super) const TERMINAL_SEARCH_BACKWARD_SHORTCUT: &str = "cmd-g";
 #[cfg(not(target_os = "macos"))]
 pub(super) const TERMINAL_SEARCH_BACKWARD_SHORTCUT: &str = "ctrl-shift-g";
 pub(super) const TERMINAL_TOGGLE_VI_MODE_SHORTCUT: &str = "f7";
+// 回滚历史滚动：沿用 Windows Terminal / Alacritty 的约定，翻页用 Shift+PageUp/PageDown，
+// 逐行用 Ctrl+Shift+Up/Down。不占用 Shift+Up/Down，它们在历史提示中仍用于导航。
+pub(super) const TERMINAL_SCROLL_LINE_UP_SHORTCUT: &str = "ctrl-shift-up";
+pub(super) const TERMINAL_SCROLL_LINE_DOWN_SHORTCUT: &str = "ctrl-shift-down";
+pub(super) const TERMINAL_SCROLL_PAGE_UP_SHORTCUT: &str = "shift-pageup";
+pub(super) const TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT: &str = "shift-pagedown";
 // Escape is terminal input (for example, Vim uses it to leave insert mode).
 // ClearSelection remains available from the context menu and can still be
 // assigned by users, but must not consume Escape by default.
 pub(super) const TERMINAL_CLEAR_SELECTION_DEFAULTS: &[&str] = &[];
 pub(super) fn terminal_shortcut_label(shortcut: &str) -> SharedString {
-    Kbd::format(&Keystroke::parse(shortcut).expect("终端快捷键定义非法")).into()
+    Kbd::format(
+        &Keystroke::parse_with_os(shortcut, one_core::keybindings::current_os())
+            .expect("终端快捷键定义非法"),
+    )
+    .into()
 }
 
 /// 对路径进行简单 shell 转义（用单引号包裹，处理内部单引号）
@@ -56,22 +66,22 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
     keybindings.extend(
         shortcuts_for(cx, action_id::TERMINAL_SEND_TAB, &["tab"])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, SendTab, Some(TERMINAL_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SendTab, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::TERMINAL_SEND_SHIFT_TAB, &["shift-tab"])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, SendShiftTab, Some(TERMINAL_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SendShiftTab, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::TERMINAL_COPY, &[TERMINAL_COPY_SHORTCUT])
             .into_iter()
-            .map(|key| KeyBinding::new(&key, Copy, Some(TERMINAL_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, Copy, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::TERMINAL_PASTE, &terminal_paste_defaults())
             .into_iter()
-            .map(|key| KeyBinding::new(&key, Paste, Some(TERMINAL_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, Paste, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -80,7 +90,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[TERMINAL_SELECT_ALL_SHORTCUT],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, SelectAll, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SelectAll, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -89,7 +99,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[TERMINAL_CLEAR_SCREEN_SHORTCUT],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ClearScreen, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ClearScreen, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -98,7 +108,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             TERMINAL_CLEAR_SELECTION_DEFAULTS,
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ClearSelection, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ClearSelection, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -107,7 +117,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[TERMINAL_SEARCH_FORWARD_SHORTCUT],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, SearchForward, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SearchForward, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -116,7 +126,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[TERMINAL_SEARCH_BACKWARD_SHORTCUT],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, SearchBackward, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SearchBackward, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -125,7 +135,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[TERMINAL_TOGGLE_VI_MODE_SHORTCUT],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ToggleViMode, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ToggleViMode, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -134,7 +144,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &terminal_increase_font_defaults(),
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, IncreaseFont, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, IncreaseFont, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -143,7 +153,7 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[terminal_platform_shortcut("cmd--", "ctrl--")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, DecreaseFont, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, DecreaseFont, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -152,7 +162,43 @@ pub(super) fn init_keybindings(cx: &App) -> Vec<KeyBinding> {
             &[terminal_platform_shortcut("cmd-0", "ctrl-0")],
         )
         .into_iter()
-        .map(|key| KeyBinding::new(&key, ResetFont, Some(TERMINAL_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ResetFont, Some(TERMINAL_CONTEXT), cx)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
+            action_id::TERMINAL_SCROLL_LINE_UP,
+            &[TERMINAL_SCROLL_LINE_UP_SHORTCUT],
+        )
+        .into_iter()
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ScrollLineUp, Some(TERMINAL_CONTEXT), cx)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
+            action_id::TERMINAL_SCROLL_LINE_DOWN,
+            &[TERMINAL_SCROLL_LINE_DOWN_SHORTCUT],
+        )
+        .into_iter()
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ScrollLineDown, Some(TERMINAL_CONTEXT), cx)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
+            action_id::TERMINAL_SCROLL_PAGE_UP,
+            &[TERMINAL_SCROLL_PAGE_UP_SHORTCUT],
+        )
+        .into_iter()
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ScrollPageUp, Some(TERMINAL_CONTEXT), cx)),
+    );
+    keybindings.extend(
+        shortcuts_for(
+            cx,
+            action_id::TERMINAL_SCROLL_PAGE_DOWN,
+            &[TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT],
+        )
+        .into_iter()
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ScrollPageDown, Some(TERMINAL_CONTEXT), cx)),
     );
     keybindings
 }
@@ -251,6 +297,34 @@ pub(super) fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
         Some(TERMINAL_CONTEXT),
         ResetFont,
     ));
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::TERMINAL_SCROLL_LINE_UP,
+        &[TERMINAL_SCROLL_LINE_UP_SHORTCUT],
+        Some(TERMINAL_CONTEXT),
+        ScrollLineUp,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::TERMINAL_SCROLL_LINE_DOWN,
+        &[TERMINAL_SCROLL_LINE_DOWN_SHORTCUT],
+        Some(TERMINAL_CONTEXT),
+        ScrollLineDown,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::TERMINAL_SCROLL_PAGE_UP,
+        &[TERMINAL_SCROLL_PAGE_UP_SHORTCUT],
+        Some(TERMINAL_CONTEXT),
+        ScrollPageUp,
+    ));
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::TERMINAL_SCROLL_PAGE_DOWN,
+        &[TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT],
+        Some(TERMINAL_CONTEXT),
+        ScrollPageDown,
+    ));
     keybindings
 }
 
@@ -320,6 +394,22 @@ pub(super) fn is_terminal_action_shortcut(keystroke: &Keystroke, cx: &App) -> bo
             action_id::TERMINAL_RESET_FONT,
             vec![terminal_platform_shortcut("cmd-0", "ctrl-0")],
         ),
+        (
+            action_id::TERMINAL_SCROLL_LINE_UP,
+            vec![TERMINAL_SCROLL_LINE_UP_SHORTCUT],
+        ),
+        (
+            action_id::TERMINAL_SCROLL_LINE_DOWN,
+            vec![TERMINAL_SCROLL_LINE_DOWN_SHORTCUT],
+        ),
+        (
+            action_id::TERMINAL_SCROLL_PAGE_UP,
+            vec![TERMINAL_SCROLL_PAGE_UP_SHORTCUT],
+        ),
+        (
+            action_id::TERMINAL_SCROLL_PAGE_DOWN,
+            vec![TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT],
+        ),
     ]
     .into_iter()
     .any(|(action_id, defaults)| {
@@ -329,10 +419,43 @@ pub(super) fn is_terminal_action_shortcut(keystroke: &Keystroke, cx: &App) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::TERMINAL_CLEAR_SELECTION_DEFAULTS;
+    use super::{
+        TERMINAL_CLEAR_SELECTION_DEFAULTS, TERMINAL_SCROLL_LINE_DOWN_SHORTCUT,
+        TERMINAL_SCROLL_LINE_UP_SHORTCUT, TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT,
+        TERMINAL_SCROLL_PAGE_UP_SHORTCUT,
+    };
+    use gpui::Keystroke;
 
     #[test]
     fn clear_selection_does_not_consume_escape_by_default() {
         assert!(TERMINAL_CLEAR_SELECTION_DEFAULTS.is_empty());
+    }
+
+    #[test]
+    fn scroll_shortcuts_are_valid_keystrokes() {
+        for shortcut in [
+            TERMINAL_SCROLL_LINE_UP_SHORTCUT,
+            TERMINAL_SCROLL_LINE_DOWN_SHORTCUT,
+            TERMINAL_SCROLL_PAGE_UP_SHORTCUT,
+            TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT,
+        ] {
+            assert!(Keystroke::parse(shortcut).is_ok(), "{shortcut} 必须可解析");
+        }
+    }
+
+    #[test]
+    fn scroll_shortcuts_do_not_shadow_plain_terminal_keys() {
+        // 无修饰的 PageUp/PageDown 与 Shift+Up/Down 属于 shell/TUI 输入，不能被占用。
+        for shortcut in [
+            TERMINAL_SCROLL_LINE_UP_SHORTCUT,
+            TERMINAL_SCROLL_LINE_DOWN_SHORTCUT,
+            TERMINAL_SCROLL_PAGE_UP_SHORTCUT,
+            TERMINAL_SCROLL_PAGE_DOWN_SHORTCUT,
+        ] {
+            let modifiers = Keystroke::parse(shortcut).unwrap().modifiers;
+            assert!(modifiers.shift, "{shortcut} 必须带 Shift");
+        }
+        assert_ne!("shift-up", TERMINAL_SCROLL_LINE_UP_SHORTCUT);
+        assert_ne!("shift-down", TERMINAL_SCROLL_LINE_DOWN_SHORTCUT);
     }
 }

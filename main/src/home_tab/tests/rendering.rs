@@ -194,7 +194,7 @@ fn connection_render_uses_cached_team_permissions() {
 }
 
 #[test]
-fn team_key_entry_uses_team_management_feature_gate() {
+fn team_entry_uses_team_feature_gate() {
     assert!(
         include_str!("../account_menu.rs")
             .contains("is_feature_enabled(Feature::TeamManagement, cx)")
@@ -208,7 +208,7 @@ fn account_menu_groups_sync_keys_and_authentication() {
         "Encryption.personal_key",
         "Home.unlock_state_unlocked",
         "Home.unlock_state_locked",
-        "Encryption.team_key",
+        "TeamManagement.title",
         "Auth.logout",
         "Auth.login",
     ] {
@@ -442,6 +442,33 @@ fn recent_section_does_not_participate_in_search() {
 }
 
 #[test]
+fn recent_group_respects_home_show_recent_connections_setting() {
+    let settings = include_str!("../../../../crates/core/src/settings.rs");
+    let content = include_str!("../content.rs");
+    let display_group = include_str!("../../settings/connection_display_settings.rs");
+
+    // 设置字段默认开启,旧配置缺省字段时回退开启(向后兼容)。
+    assert!(settings.contains("home_show_recent_connections"));
+    assert!(settings.contains(r#"#[serde(default = "default_true")]"#));
+
+    // 分组内容区与导航主页两处最近连接渲染都被设置短路。
+    assert!(
+        content.contains(
+            "if !recent.is_empty() && AppSettings::global(cx).home_show_recent_connections"
+        )
+    );
+    let navigation = content
+        .split("fn render_navigation_home_content")
+        .nth(1)
+        .expect("navigation home content exists");
+    assert!(navigation.contains("home_show_recent_connections"));
+
+    // 设置页提供「连接显示」分组的开关,修改后立即持久化。
+    assert!(display_group.contains("home_show_recent_connections"));
+    assert!(display_group.contains("update_and_save"));
+}
+
+#[test]
 fn persistent_sidebar_supports_connection_group_drag_and_drop() {
     let rows = include_str!("../../persistent_connection_sidebar/rows.rs");
     let grouping = include_str!("../connection_grouping.rs");
@@ -474,17 +501,20 @@ fn both_settings_entries_use_the_existing_tab_opener() {
 }
 
 #[test]
-fn team_key_settings_tab_has_feature_guard() {
+fn team_tab_has_feature_guard() {
     let source = include_str!("../../home/home_tabs.rs");
     let entry = source
-        .split("pub(crate) fn add_team_key_settings_tab(")
+        .split("pub(crate) fn add_team_tab(")
         .nth(1)
-        .expect("team key settings entry exists")
+        .expect("team tab entry exists")
         .split("pub(crate) fn add_extensions_tab(")
         .next()
-        .expect("team key settings entry has an end marker");
+        .expect("team tab entry has an end marker");
 
+    // 团队入口仍受 TeamManagement 特性开关控制，且必须落到原生 tab 而不是浏览器。
     assert!(entry.contains("is_feature_enabled(Feature::TeamManagement, cx)"));
+    assert!(entry.contains("TabItem::new(\"team\", \"home\", team_tab)"));
+    assert!(!entry.contains("open_url"));
 }
 
 #[test]
@@ -508,4 +538,45 @@ fn home_render_uses_cached_external_driver_registry() {
     assert!(quick_open.contains("external_driver_registry: IpcDriverRegistry"));
     assert!(!icon.contains("IpcDriverRegistry::load_default()"));
     assert!(!quick_open.contains("IpcDriverRegistry::load_default()"));
+}
+
+/// 分组过滤只能筛分组，不能把「未分组」桶一起筛掉。
+///
+/// 否则在过滤状态下新建的连接（没有分组）会从首页列表里凭空消失，而侧栏还在显示它；
+/// 这条用例守住 `home_groups` 里「未分组桶无条件参与渲染」的接线。
+#[test]
+fn home_groups_keep_the_unassigned_bucket_under_a_workspace_filter() {
+    let content = include_str!("../content.rs");
+    let production = content.split("#[cfg(test)]").next().expect("production");
+
+    assert!(
+        production.contains("connection_bucket("),
+        "连接落桶必须走 connection_bucket，才能把孤儿连接兜回未分组"
+    );
+    let home_groups = production
+        .split("fn home_groups(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    fn ").next())
+        .expect("home_groups 实现");
+    assert_eq!(
+        1,
+        home_groups
+            .matches("filtered_workspace_ids.is_empty()")
+            .count(),
+        "只剩「哪些分组参与渲染」这一处过滤；未分组桶不能再被过滤条件包住"
+    );
+}
+
+/// 分组右键菜单必须能改父级：没有这个入口，子分组永远回不到顶层。
+#[test]
+fn workspace_context_menu_offers_move_to_parent() {
+    let menu = include_str!("../../persistent_connection_sidebar/workspace_context_menu.rs");
+    let production = menu.split("#[cfg(test)]").next().expect("production");
+
+    assert!(production.contains("append_move_to_parent_submenu("));
+    assert!(production.contains("move_workspace_to_parent("));
+    assert!(
+        production.contains("move_target_menu_excluding("),
+        "移动目标必须排除分组自己那颗子树，否则菜单里会出现必然成环的目标"
+    );
 }

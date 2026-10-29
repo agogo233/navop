@@ -274,11 +274,29 @@ fn every_builtin_database_uses_its_typed_literals() {
         (DatabaseType::SQLite, "BOOLEAN", "1"),
         (DatabaseType::MSSQL, "BIT", "1"),
         (DatabaseType::Oracle, "BOOLEAN", "TRUE"),
-        (DatabaseType::ClickHouse, "Boolean", "true"),
     ];
     for (database_type, data_type, expected) in cases {
         assert_typed_insert(database_type, data_type, expected);
     }
+}
+
+#[test]
+fn clickhouse_driver_uses_clickhouse_typed_literals() {
+    // ClickHouse 已无内置原生插件,改由 clickhouse IPC 驱动提供;宿主按
+    // dialect.compatible_database_type 复用 ClickHouse 字面量格式化(布尔写作 true)。
+    let plugin = compatible_driver_plugin(DatabaseType::ClickHouse);
+    let data = vec![vec![Some("true".into())]];
+    let columns = vec!["enabled".into()];
+    let metadata = TableMetadata::new("flags")
+        .with_columns(columns.clone())
+        .with_column_meta(vec![column("enabled", "Boolean")]);
+
+    let sql = CopyFormatter::format(
+        CopyFormat::SqlInsert,
+        sql_context((&data, &columns, &metadata), &plugin),
+    );
+
+    assert!(sql.contains("VALUES\n(true);"), "{sql}");
 }
 
 #[test]
@@ -554,6 +572,14 @@ fn clipboard_tsv_round_trip_is_lossless() {
             ],
         ),
         (
+            "字段是 JSON",
+            vec![
+                Some("1".into()),
+                Some(r#"{"name":"张三","age":1}"#.into()),
+                Some("tail".into()),
+            ],
+        ),
+        (
             "含空值与 SQL NULL",
             vec![None, Some(String::new()), Some("\\N".into())],
         ),
@@ -612,6 +638,35 @@ fn clipboard_tsv_escapes_fields_with_separators() {
         CopyFormatter::format(CopyFormat::Tsv, context),
         "1\t\"a\tb\""
     );
+}
+
+/// 表数据里复制 JSON 字段（Ctrl/Cmd+C 与右键「复制」）时，剪贴板内容必须等于存储
+/// 原文；两侧再套一层引号会让粘到应用外的内容和库里的值不一致。
+#[test]
+fn clipboard_tsv_copies_json_cell_verbatim() {
+    const JSON: &str = r#"{"name":"张三","age":1}"#;
+    let columns = vec!["id".into(), "payload".into()];
+    let metadata = TableMetadata::new("t").with_columns(columns.clone());
+
+    let data = vec![vec![Some("1".into()), Some(JSON.into())]];
+    assert_eq!(
+        format!("1\t{JSON}"),
+        CopyFormatter::format(
+            CopyFormat::Tsv,
+            CopyFormatContext::new(&data, &columns, &metadata),
+        )
+    );
+
+    // 只复制这一个单元格时同样是原文。
+    let single = vec![vec![Some(JSON.into())]];
+    let one_column = vec!["payload".into()];
+    let single_metadata = TableMetadata::new("t").with_columns(one_column.clone());
+    let clipboard = CopyFormatter::format(
+        CopyFormat::Tsv,
+        CopyFormatContext::new(&single, &one_column, &single_metadata),
+    );
+    assert_eq!(JSON, clipboard);
+    assert_eq!(vec![vec![JSON.to_string()]], parse_tsv_rows(&clipboard));
 }
 
 /// 查询结果里的表名是 `库.表` 的拼接形式，复制出来的 SQL 必须逐段引用，

@@ -1,8 +1,27 @@
 use std::cell::RefCell;
 
-use gpui::{App, ElementId, HighlightStyle, Hsla, Pixels, SharedString, StyleRefinement};
+use gpui::{App, ElementId, HighlightStyle, Hsla, Pixels, Rems, SharedString, StyleRefinement};
 use gpui_base::{TextView, TextViewStyle};
-use gpui_component::ActiveTheme;
+use gpui_component::{ActiveTheme, Theme};
+
+/// navop 默认界面字号（px）：`sp()` 的书写基准。
+///
+/// 与 `navop settings` 的 `default_font_size()` 保持一致。术语：这里的
+/// 「界面尺寸」指边框、间距、圆角、控件高度这些 chrome；**文字**已经由
+/// `text_xs()/text_sm()`（rems）自己缩放，内容面（markdown 正文、代码块、
+/// diff 行）保持 `px` 不参与缩放。
+const UI_BASE_FONT_SIZE: f32 = 14.0;
+
+/// 按 14px 基准书写的界面尺寸 → rem，随「字体大小 × 界面缩放」缩放。
+///
+/// navop 的 rem 基准取自主题字号（gpui-component 的 `Root::render` 会
+/// `window.set_rem_size(cx.theme().font_size)`，而 `apply_font_settings` 把
+/// 缩放倍率乘进了字号）。所以走这里的尺寸会与 gpui-component 组件内部一致地
+/// 缩放；写死的 `px` 则不会。**发丝线（边框、分隔线）保持 `px`** —— 缩放会
+/// 让 1px 线在非整数倍下发糊。
+pub(crate) fn sp(value: f32) -> Rems {
+    gpui::rems(value / UI_BASE_FONT_SIZE)
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentChatTheme {
@@ -25,31 +44,155 @@ pub struct AgentChatTheme {
     pub link: Hsla,
     pub text_selection: Hsla,
     pub surface_radius: Pixels,
+    /// 浮层表面：popover / 菜单 / 命令面板 / 悬浮卡。
+    ///
+    /// 属于**调色板**而不是语义槽：它回答的是「这块面板上浮起来的一层是什么颜色」，
+    /// 与面板底色是同一件事的两级。跟着应用主题走会在深色侧边栏里浮出一块浅色
+    /// （终端 + 浅色应用主题的组合必然踩到），所以由基础槽提供。
+    pub raised: Hsla,
+    /// 内嵌区表面：输入框、代码槽、inset 容器这类「比卡片更沉一层」的底。
+    ///
+    /// 同样属于调色板：终端侧边栏里它就取终端自己的 `muted`。直接用组件的
+    /// `input_background()` 会出事——它在浅色主题下等于背景色（白），落到深色
+    /// 面板上就是一块白；`ThemeColor::input` 又只是描边色，铺底会变成一块重灰。
+    pub inset: Hsla,
+
+    // ── 语义槽：面板内的层次与状态色。全部取自宿主主题，不另立调色板，
+    // 这样 navop 换肤 / 深浅切换时面板自动跟随。
+    /// 悬停 / 选中叠加层，半透明，画在内容之下。
+    pub overlay: Hsla,
+    /// 更强的叠加层（按下 / 选中强调）。
+    pub overlay_strong: Hsla,
+    /// 结构性分隔线：比 `border` 明确，用于面板边界 / 标题栏。
+    pub border_strong: Hsla,
+    /// 最弱一级文字：占位符、禁用、角落元信息。
+    pub text_ghost: Hsla,
+    /// 用量 / 进度条填充。
+    pub gauge: Hsla,
+    /// 用量接近上限时的告警填充。
+    pub gauge_warning: Hsla,
+    /// 用量越过上限时的危险填充。
+    pub gauge_danger: Hsla,
+    pub success: Hsla,
+    pub warning: Hsla,
+    pub danger: Hsla,
+    pub info: Hsla,
+    /// 骨架屏占位底色。
+    pub skeleton: Hsla,
+    /// 用量历史图表的正向 / 反向柱与网格线。
+    pub chart_bullish: Hsla,
+    pub chart_bearish: Hsla,
+    pub chart_grid: Hsla,
+}
+
+/// 自定义配色的面板构造对话主题时的基础槽。
+///
+/// 包含「这块面板自己决定」的二十一个基础槽（含 `raised` / `inset` 两个表面层级）。
+/// 状态色、用量档位、图表色等语义槽**故意不在这里**：它们由
+/// [`AgentChatTheme::from_base_colors`] 从应用主题统一取。
+///
+/// 这样分的目的是让新增语义槽只改一处。反面教材：终端侧边栏曾经逐字段列举整
+/// 个 `AgentChatTheme`，于是每次加一个语义槽都会把那个构造点打爆一次。
+#[derive(Clone, Debug)]
+pub struct AgentChatThemeBase {
+    pub is_dark: bool,
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub muted: Hsla,
+    pub muted_foreground: Hsla,
+    pub border: Hsla,
+    pub panel: Hsla,
+    pub panel_hover: Hsla,
+    pub accent: Hsla,
+    pub accent_foreground: Hsla,
+    pub code_background: Hsla,
+    pub code_foreground: Hsla,
+    pub table_header: Hsla,
+    pub table_row: Hsla,
+    pub table_row_alt: Hsla,
+    pub quote_border: Hsla,
+    pub link: Hsla,
+    pub text_selection: Hsla,
+    pub surface_radius: Pixels,
+    pub raised: Hsla,
+    pub inset: Hsla,
 }
 
 impl AgentChatTheme {
     pub fn from_app(cx: &App) -> Self {
-        let theme = cx.theme();
+        Self::from_base_colors(base_from_app_theme(cx.theme()), cx.theme())
+    }
+
+    /// 用一组基础色 + 应用主题的语义槽构造。
+    ///
+    /// 语义槽（状态色 / 用量档位 / 图表色 / 分隔线 / 浮层叠加）一律取自
+    /// `theme`：它们的含义是全局面板共有的（「危险」到哪都是那个红），不该
+    /// 因为某块面板保留自有配色就自成一系。
+    ///
+    /// `raised` / `inset` 不在此列，见 [`AgentChatThemeBase`]：它们是表面层级，
+    /// 必须跟面板自己的底色配套，否则深色面板上会长出浅色浮层与白色输入框。
+    pub fn from_base_colors(base: AgentChatThemeBase, theme: &Theme) -> Self {
+        let colors = &theme.colors;
+        let AgentChatThemeBase {
+            is_dark,
+            background,
+            foreground,
+            muted,
+            muted_foreground,
+            border,
+            panel,
+            panel_hover,
+            accent,
+            accent_foreground,
+            code_background,
+            code_foreground,
+            table_header,
+            table_row,
+            table_row_alt,
+            quote_border,
+            link,
+            text_selection,
+            surface_radius,
+            raised,
+            inset,
+        } = base;
         Self {
-            is_dark: theme.is_dark(),
-            background: theme.background,
-            foreground: theme.foreground,
-            muted: theme.muted,
-            muted_foreground: theme.muted_foreground,
-            border: theme.border,
-            panel: theme.muted,
-            panel_hover: theme.muted.opacity(0.72),
-            accent: theme.accent,
-            accent_foreground: theme.accent_foreground,
-            code_background: theme.muted,
-            code_foreground: theme.foreground,
-            table_header: theme.muted,
-            table_row: theme.background,
-            table_row_alt: theme.muted.opacity(0.35),
-            quote_border: theme.border,
-            link: theme.link,
-            text_selection: theme.selection,
-            surface_radius: theme.radius,
+            is_dark,
+            background,
+            foreground,
+            muted,
+            muted_foreground,
+            border,
+            panel,
+            panel_hover,
+            accent,
+            accent_foreground,
+            code_background,
+            code_foreground,
+            table_header,
+            table_row,
+            table_row_alt,
+            quote_border,
+            link,
+            text_selection,
+            surface_radius,
+            raised,
+            inset,
+            overlay: colors.overlay,
+            overlay_strong: colors.overlay.opacity(1.6),
+            border_strong: colors.window_border,
+            text_ghost: muted_foreground.opacity(0.6),
+            gauge: colors.progress_bar,
+            gauge_warning: colors.warning,
+            gauge_danger: colors.danger,
+            success: colors.success,
+            warning: colors.warning,
+            danger: colors.danger,
+            info: colors.info,
+            skeleton: colors.skeleton,
+            chart_bullish: colors.chart_bullish,
+            chart_bearish: colors.chart_bearish,
+            chart_grid: colors.chart_grid,
         }
     }
 
@@ -100,6 +243,41 @@ impl AgentChatTheme {
     }
 }
 
+/// 应用主题 → 对话主题的基础槽。
+///
+/// 单独成函数是为了让 [`AgentChatTheme::from_app`] 与终端侧边栏这类自定义配色
+/// 走同一条组装路径：差异只在基础槽的来源，语义槽一律来自应用主题。
+fn base_from_app_theme(theme: &Theme) -> AgentChatThemeBase {
+    AgentChatThemeBase {
+        is_dark: theme.is_dark(),
+        background: theme.background,
+        foreground: theme.foreground,
+        muted: theme.muted,
+        muted_foreground: theme.muted_foreground,
+        border: theme.border,
+        panel: theme.muted,
+        panel_hover: theme.muted.opacity(0.72),
+        accent: theme.accent,
+        accent_foreground: theme.accent_foreground,
+        code_background: theme.muted,
+        code_foreground: theme.foreground,
+        table_header: theme.muted,
+        table_row: theme.background,
+        table_row_alt: theme.muted.opacity(0.35),
+        quote_border: theme.border,
+        link: theme.link,
+        text_selection: theme.selection,
+        surface_radius: theme.radius,
+        // 应用主题自己的浮层与内嵌表面：`from_app` 出来的主题必须与宿主一致。
+        //
+        // `inset` 取 `muted` 而不是 `ThemeColor::input`：后者是输入框的**描边**色
+        // （浅色主题下 neutral-200），拿来铺底会把编辑区刷成一块比卡片更重的灰。
+        // 真正的「内嵌一层」在应用主题里就是 `muted`。
+        raised: theme.popover,
+        inset: theme.muted,
+    }
+}
+
 thread_local! {
     static ACTIVE_AGENT_CHAT_THEME: RefCell<Option<AgentChatTheme>> = const { RefCell::new(None) };
 }
@@ -143,12 +321,114 @@ pub(crate) fn themed_html(
 
 #[cfg(test)]
 mod tests {
-    use gpui::rgb;
+    use gpui::{TestAppContext, rgb};
+    use gpui_component::ThemeColor;
 
     use super::*;
 
     fn color(hex: u32) -> Hsla {
         rgb(hex).into()
+    }
+
+    /// 一份「终端侧边栏那种自定义配色」的基础槽。
+    fn custom_base() -> AgentChatThemeBase {
+        AgentChatThemeBase {
+            is_dark: false,
+            background: color(0x112233),
+            foreground: color(0xeeeeee),
+            muted: color(0x223344),
+            muted_foreground: color(0x99aabb),
+            border: color(0x334455),
+            panel: color(0x223344),
+            panel_hover: color(0x334455),
+            accent: color(0x00aaff),
+            accent_foreground: color(0x001122),
+            code_background: color(0x223344),
+            code_foreground: color(0xeeeeee),
+            table_header: color(0x223344),
+            table_row: color(0x112233),
+            table_row_alt: color(0x1a2a3a),
+            quote_border: color(0x334455),
+            link: color(0x00aaff),
+            text_selection: color(0x445566),
+            surface_radius: gpui::px(4.0),
+            raised: color(0x2a3a4a),
+            inset: color(0x0a1a2a),
+        }
+    }
+
+    /// 自定义配色的面板：基础槽（含 `raised` / `inset` 两个表面层）听自己的，
+    /// 语义槽听应用主题。
+    ///
+    /// 卡的是「面板换了自己的底色之后，状态色与图表色不能变成没填的透明值」——
+    /// 那会让用量圆环、骨架屏、图表在终端侧边栏里直接隐形。
+    ///
+    /// 另外卡「表面层必须跟面板底色走」：终端侧边栏配的是深色终端配色，若
+    /// `raised` / `inset` 仍取应用主题（浅色）的 popover / muted，浮层与输入框
+    /// 就会在深色面板上白成一片 —— 这正是 composer 编辑区白框的来源。
+    #[test]
+    fn custom_base_colors_keep_application_semantic_slots() {
+        let application_theme = Theme::from(ThemeColor::dark().as_ref());
+        let base = custom_base();
+        let base_muted_foreground = base.muted_foreground;
+        let theme = AgentChatTheme::from_base_colors(base, &application_theme);
+
+        assert!(!theme.is_dark);
+        assert_eq!(color(0x112233), theme.background);
+        assert_eq!(color(0xeeeeee), theme.foreground);
+        assert_eq!(gpui::px(4.0), theme.surface_radius);
+        // 表面层来自面板自己的调色板，不随应用主题漂移。
+        assert_eq!(color(0x2a3a4a), theme.raised);
+        assert_eq!(color(0x0a1a2a), theme.inset);
+        assert_ne!(application_theme.colors.popover, theme.raised);
+        assert_ne!(application_theme.colors.muted, theme.inset);
+
+        let colors = &application_theme.colors;
+        assert_eq!(colors.danger, theme.danger);
+        assert_eq!(colors.progress_bar, theme.gauge);
+        assert_eq!(colors.warning, theme.gauge_warning);
+        assert_eq!(colors.skeleton, theme.skeleton);
+        assert_eq!(colors.chart_bullish, theme.chart_bullish);
+        assert_eq!(base_muted_foreground.opacity(0.6), theme.text_ghost);
+
+        for (name, slot) in [
+            ("gauge", theme.gauge),
+            ("success", theme.success),
+            ("warning", theme.warning),
+            ("danger", theme.danger),
+            ("info", theme.info),
+            ("skeleton", theme.skeleton),
+            ("chart_bullish", theme.chart_bullish),
+            ("chart_bearish", theme.chart_bearish),
+            ("chart_grid", theme.chart_grid),
+        ] {
+            assert!(
+                slot.a > 0.0,
+                "{name} 不该是透明的：面板会画出一个看不见的状态"
+            );
+        }
+    }
+
+    /// `from_app` 与自定义配色走同一条组装路径，结果不能因此变形。
+    #[gpui::test]
+    fn from_app_still_mirrors_the_application_theme(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let theme = AgentChatTheme::from_app(cx);
+            let app_theme = cx.theme();
+
+            assert_eq!(app_theme.is_dark(), theme.is_dark);
+            assert_eq!(app_theme.background, theme.background);
+            assert_eq!(app_theme.muted, theme.panel);
+            assert_eq!(app_theme.radius, theme.surface_radius);
+            assert_eq!(app_theme.colors.danger, theme.danger);
+            assert_eq!(app_theme.colors.progress_bar, theme.gauge);
+            assert_eq!(app_theme.colors.skeleton, theme.skeleton);
+            // 应用主题自己的表面层要和宿主一致：面板在应用主题下不该有第二种层次。
+            assert_eq!(app_theme.colors.popover, theme.raised);
+            assert_eq!(app_theme.colors.muted, theme.inset);
+            assert!(theme.text_ghost.a > 0.0);
+        });
     }
 
     fn dark_theme() -> AgentChatTheme {
@@ -172,6 +452,23 @@ mod tests {
             link: color(0x38bdf8),
             text_selection: color(0x164e63),
             surface_radius: gpui::px(6.0),
+            raised: color(0x1e293b),
+            inset: color(0x020617),
+            overlay: color(0x334155),
+            overlay_strong: color(0x475569),
+            border_strong: color(0x475569),
+            text_ghost: color(0x64748b),
+            gauge: color(0x38bdf8),
+            gauge_warning: color(0xf59e0b),
+            gauge_danger: color(0xef4444),
+            success: color(0x22c55e),
+            warning: color(0xf59e0b),
+            danger: color(0xef4444),
+            info: color(0x38bdf8),
+            skeleton: color(0x1e293b),
+            chart_bullish: color(0x22c55e),
+            chart_bearish: color(0xef4444),
+            chart_grid: color(0x334155),
         }
     }
 

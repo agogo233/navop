@@ -423,6 +423,16 @@ impl TabContent for ExtensionConnectionTab {
         self.title.clone()
     }
 
+    /// 与「打开连接」列表同一套规则:用户选择 → manifest 图标 → 通用扩展图标。
+    fn icon(&self, _cx: &App) -> Option<gpui_component::Icon> {
+        Some(
+            crate::connection_icon::extension_connection_icon_or_default(
+                &self.connection,
+                Some(&self.contribution),
+            ),
+        )
+    }
+
     fn can_rename(&self, _cx: &App) -> bool {
         false
     }

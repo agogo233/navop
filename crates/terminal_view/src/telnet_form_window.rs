@@ -37,6 +37,8 @@ use rust_i18n::t;
 #[derive(Clone)]
 pub struct TelnetFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
 }
@@ -210,7 +212,12 @@ impl TelnetFormWindow {
         let team_select = create_team_select(&config.teams, None, window, cx);
 
         let mut sync_enabled = true;
-        let mut workspace_id: Option<i64> = None;
+        // 新建连接向导指定了目标分组时预选该分组（编辑连接走下面的回填逻辑）。
+        let mut workspace_id: Option<i64> = if is_editing {
+            None
+        } else {
+            config.initial_workspace_id
+        };
         let mut team_id: Option<String> = None;
         let mut credential_reference = None;
         let mut login_script_steps = Vec::new();
@@ -720,10 +727,12 @@ impl Render for TelnetFormWindow {
                                     Input::new(&self.host_input),
                                 ),
                             )
-                            .child(self.render_form_row(
-                                &t!("Telnet.port"),
-                                Input::new(&self.port_input),
-                            ))
+                            .child(
+                                self.render_form_row(
+                                    &t!("Telnet.port"),
+                                    Input::new(&self.port_input),
+                                ),
+                            )
                             .child(self.render_form_row(
                                 &t!("Telnet.backspace_code"),
                                 Select::new(&self.backspace_code_select).w_full(),

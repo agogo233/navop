@@ -286,6 +286,17 @@ impl std::fmt::Display for TeamRole {
     }
 }
 
+impl TeamRole {
+    /// 服务端（team_members.role / RPC 参数）使用的角色标识
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TeamRole::Owner => "owner",
+            TeamRole::Admin => "admin",
+            TeamRole::Member => "member",
+        }
+    }
+}
+
 /// 团队成员
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamMember {
@@ -295,6 +306,26 @@ pub struct TeamMember {
     pub team_id: String,
     /// 用户 ID
     pub user_id: String,
+    /// 成员角色
+    pub role: TeamRole,
+    /// 加入时间戳（毫秒）
+    pub joined_at: i64,
+}
+
+/// 带邮箱的团队成员
+///
+/// 由 `list_team_members_with_email` 返回：服务端把 `team_members` 与
+/// `auth.users` 关联后直接带上邮箱，管理界面不必再逐条查询用户信息。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMemberWithEmail {
+    /// 成员记录 UUID
+    pub id: String,
+    /// 所属团队 ID
+    pub team_id: String,
+    /// 用户 ID
+    pub user_id: String,
+    /// 用户邮箱
+    pub email: String,
     /// 成员角色
     pub role: TeamRole,
     /// 加入时间戳（毫秒）
@@ -325,6 +356,9 @@ pub struct ConnectionPlainData {
     /// 打开方式偏好（终端 / 双栏文件视图）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_open_mode: Option<crate::storage::PreferredOpenMode>,
+    /// AI 访问策略（缺省为「允许」，兼容旧载荷）
+    #[serde(default)]
+    pub ai_access_level: tool_runtime::AiAccessLevel,
 }
 
 /// 工作空间同步载荷的当前格式版本

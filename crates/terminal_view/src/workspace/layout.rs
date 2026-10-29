@@ -14,12 +14,16 @@ use crate::view::TerminalWorkspaceSidebarSnapshot;
 
 impl TerminalWorkspace {
     pub(super) fn render_workspace(
-        &self,
+        &mut self,
         layout: TerminalToolDockLayout,
         snapshot: Option<TerminalWorkspaceSidebarSnapshot>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let split_content = self.render_node(self.split_tree.root(), "root", cx);
+        // 结构变化(增删窗格)后先把已保存的分隔比例搬到新的槽位,
+        // 再渲染,避免尺寸错位。
+        self.split_sizing.reconcile(&self.split_tree, cx);
+        let root = self.split_tree.root().clone();
+        let split_content = self.render_node(&root, "root", cx);
         let panel_size = self.sidebar_panel_size;
         let left = snapshot.as_ref().and_then(|snapshot| {
             layout

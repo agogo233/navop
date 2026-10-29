@@ -1,7 +1,9 @@
+pub mod acp_agents_settings;
 pub mod agent_settings;
 pub mod appearance;
 mod appearance_import;
 mod appearance_state;
+pub mod connection_display_settings;
 pub mod database_settings;
 pub mod llm_providers_view;
 pub mod local_terminal_settings;

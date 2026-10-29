@@ -119,8 +119,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/20260929000001_credential_forward_to_agent.sql"),
     ),
     (
+        "20260930000001",
+        include_str!("../../migrations/20260930000001_agent_usage_samples.sql"),
+    ),
+    (
+        "20261001000001",
+        include_str!("../../migrations/20261001000001_agent_composer_drafts.sql"),
+    ),
+    (
         "20261013000001",
         include_str!("../../migrations/20261013000001_remove_builtin_navop_ai_provider.sql"),
+    ),
+    (
+        "20261022000001",
+        include_str!("../../migrations/20261022000001_connection_ai_access.sql"),
     ),
 ];
 

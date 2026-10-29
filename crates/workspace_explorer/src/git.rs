@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result, anyhow};
 use process_util::configure_background_child;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -11,17 +12,17 @@ pub struct GitRepository {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GitBranchKind {
+pub enum GitBranchKind {
     Local,
     Remote,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GitBranch {
-    pub(crate) name: String,
-    pub(crate) kind: GitBranchKind,
-    pub(crate) current: bool,
-    pub(crate) upstream: Option<String>,
+pub struct GitBranch {
+    pub name: String,
+    pub kind: GitBranchKind,
+    pub current: bool,
+    pub upstream: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +56,7 @@ pub struct GitChange {
     pub staged: bool,
 }
 
-pub(crate) fn discover_repository(path: &Path) -> Result<Option<GitRepository>> {
+pub fn discover_repository(path: &Path) -> Result<Option<GitRepository>> {
     let output = run_git(path, ["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
         return Ok(None);
@@ -69,7 +70,659 @@ pub(crate) fn discover_repository(path: &Path) -> Result<Option<GitRepository>> 
     Ok(Some(GitRepository { root, branch }))
 }
 
-pub(crate) fn load_changes(repository: &GitRepository) -> Result<Vec<GitChange>> {
+/// 本应用创建的 worktree 分支前缀。
+///
+/// 删除时只清理该前缀下的分支，绝不碰用户自己的分支。
+const MANAGED_WORKTREE_BRANCH_PREFIX: &str = "navop/";
+
+/// 新建 worktree 的结果：包含被注册到仓库里的真实路径。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedWorktree {
+    /// 从当前项目映射到新 worktree 内的路径（可能不是 worktree 根）。
+    pub path: PathBuf,
+    /// 新 worktree 的根目录。
+    pub worktree_root: PathBuf,
+    pub branch: String,
+}
+
+/// 仓库已注册的一个 worktree。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    /// `None` 表示 detached HEAD。
+    pub branch: Option<String>,
+    /// 是否是仓库主工作区（不可删除）。
+    pub is_main: bool,
+    /// 是否受本应用管理（分支带 `navop/` 前缀）。
+    pub managed: bool,
+}
+
+pub fn create_worktree(
+    repository: &GitRepository,
+    project_root: &Path,
+    base_branch: Option<&str>,
+) -> Result<CreatedWorktree> {
+    let worktree_root = dirs::home_dir()
+        .ok_or_else(|| anyhow!("Home directory is unavailable"))?
+        .join(".navop/worktrees");
+    create_worktree_in(&worktree_root, repository, project_root, base_branch)
+}
+
+/// 在指定根目录下创建 worktree；根目录可注入，便于测试不污染用户目录。
+///
+/// 生产路径走 [`create_worktree`]（落在 `~/.navop/worktrees`）。宿主传注入根是为了
+/// 让测试能把 worktree 建到临时目录：真建到用户 home 不只会留垃圾目录，还会在
+/// 用户真实仓库的 `.git/worktrees` 里注册一条指向临时目录、随后就失效的条目。
+pub fn create_worktree_in(
+    worktree_root: &Path,
+    repository: &GitRepository,
+    project_root: &Path,
+    base_branch: Option<&str>,
+) -> Result<CreatedWorktree> {
+    let relative_project = project_root
+        .strip_prefix(&repository.root)
+        .unwrap_or(Path::new(""));
+    let base = base_branch
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            repository
+                .branch
+                .clone()
+                .filter(|branch| !branch.starts_with("detached@"))
+        })
+        .unwrap_or_else(|| "HEAD".to_string());
+    let name = format!(
+        "{}-{}",
+        repository
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let worktree_root = worktree_root.join(&name);
+    fs::create_dir_all(
+        worktree_root
+            .parent()
+            .ok_or_else(|| anyhow!("Worktree root has no parent"))?,
+    )?;
+    let branch = format!("{MANAGED_WORKTREE_BRANCH_PREFIX}{name}");
+    let output = run_git_vec(
+        &repository.root,
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            "-b".to_string(),
+            branch.clone(),
+            worktree_root.to_string_lossy().into_owned(),
+            base,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(git_command_error("git worktree add", &output));
+    }
+    // 统一使用真实路径：macOS 的 `/var` → `/private/var` 等符号链接会让字符串比较失配。
+    let worktree_root = fs::canonicalize(&worktree_root).unwrap_or(worktree_root);
+    Ok(CreatedWorktree {
+        path: worktree_root.join(relative_project),
+        worktree_root,
+        branch,
+    })
+}
+
+/// 列出仓库已注册的 worktree。数据来自 git 自身，跨重启保持有效。
+pub fn list_worktrees(repository: &GitRepository) -> Result<Vec<WorktreeEntry>> {
+    let output = run_git(&repository.root, ["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(git_command_error("git worktree list", &output));
+    }
+    let main_root = main_worktree_root(repository);
+    Ok(parse_worktrees(
+        &String::from_utf8_lossy(&output.stdout),
+        &main_root,
+    ))
+}
+
+/// 主工作区的根目录，供 [`parse_worktrees`] 判定 `is_main`。
+///
+/// 不能拿 `repository.root` 顶替：从 linked worktree 里跑
+/// `rev-parse --show-toplevel` 得到的是**那个 worktree 自己**的路径，用它当「主」
+/// 会把两边的 `is_main` 判反 —— worktree 被当成主工作区（「切回主工作区」变成原地
+/// 空转），真正的主工作区被当成可删除的 worktree。
+///
+/// 改问 common dir：主工作区里它是相对的 `.git`，linked worktree 里是
+/// `<主工作区>/.git` 的绝对路径 —— 取父目录（相对路径先按仓库根展开）都是主工作区根。
+///
+/// 例外是 `--separate-git-dir` 这类 git 目录独立于工作区的布局：common dir 的父目录
+/// 不再是主工作区，此时退回 `repository.root`。那种布局下所有条目都判不出「主」，
+/// 表现为「认不出 worktree」（不会误判成 worktree）。本应用自己建的 worktree 不走
+/// 这种布局。
+fn main_worktree_root(repository: &GitRepository) -> PathBuf {
+    let fallback = canonical_or_self(&repository.root);
+    let Ok(output) = run_git(&repository.root, ["rev-parse", "--git-common-dir"]) else {
+        return fallback;
+    };
+    if !output.status.success() {
+        return fallback;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return fallback;
+    }
+    let common = PathBuf::from(&raw);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        repository.root.join(common)
+    };
+    match common.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => canonical_or_self(parent),
+        _ => fallback,
+    }
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// 删除一个受管理的 worktree：先移除工作目录，再删除其分支。
+///
+/// 主工作区与不受管理的 worktree 会被拒绝，避免误删用户自己的检出。
+pub fn remove_worktree(repository: &GitRepository, path: &Path) -> Result<()> {
+    let target = canonical_or_self(path);
+    let entries = list_worktrees(repository)?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path == target)
+        .cloned()
+        .ok_or_else(|| anyhow!("Worktree is not registered: {}", path.display()))?;
+    if entry.is_main {
+        return Err(anyhow!("Refusing to remove the main worktree"));
+    }
+    if !entry.managed {
+        return Err(anyhow!(
+            "Refusing to remove a worktree this app did not create: {}",
+            path.display()
+        ));
+    }
+    // 后面几步不能用 `repository.root` 当 cwd：它可能正是要删的那个 worktree
+    // （用户就站在里面删自己）。`git worktree remove` 会把这个目录删掉，紧接着的
+    // `branch -D` / `prune` 便没有 cwd 可用，直接报 `Unable to run git`，留下一个
+    // 「目录已删、分支还在」的半成品。主工作区不在被删之列，拿它当落点。
+    let cwd = entries
+        .iter()
+        .find(|entry| entry.is_main)
+        .map(|entry| entry.path.clone())
+        .unwrap_or_else(|| canonical_or_self(&repository.root));
+    let output = run_git_vec(
+        &cwd,
+        vec![
+            "worktree".to_string(),
+            "remove".to_string(),
+            "--force".to_string(),
+            path.to_string_lossy().into_owned(),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(git_command_error("git worktree remove", &output));
+    }
+    if let Some(branch) = entry
+        .branch
+        .as_deref()
+        .filter(|branch| is_managed_branch(branch))
+    {
+        let output = run_git_vec(
+            &cwd,
+            vec!["branch".to_string(), "-D".to_string(), branch.to_string()],
+        )?;
+        if !output.status.success() {
+            return Err(git_command_error("git branch -D", &output));
+        }
+    }
+    // 清理 git 侧残留的 worktree 记录。
+    let _ = run_git(&cwd, ["worktree", "prune"]);
+    Ok(())
+}
+
+/// Capture current worktree, including untracked files, without touching user's index.
+pub fn capture_worktree_snapshot(repository: &GitRepository) -> Result<String> {
+    let common_dir = git_stdout(&repository.root, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        repository.root.join(common_dir)
+    };
+    let temporary_index =
+        common_dir.join(format!("navop-checkpoint-index-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let head = git_stdout(&repository.root, &["rev-parse", "--verify", "HEAD"])?;
+        run_git_with_index(&repository.root, &temporary_index, &["read-tree", &head])?;
+        run_git_with_index(
+            &repository.root,
+            &temporary_index,
+            &["add", "-A", "--", "."],
+        )?;
+        let tree = git_stdout_with_index(&repository.root, &temporary_index, &["write-tree"])?;
+        let commit = git_output_with_index(
+            &repository.root,
+            &temporary_index,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                &head,
+                "-m",
+                "Navop worktree checkpoint",
+            ],
+        )?;
+        let commit = commit.trim();
+        (!commit.is_empty())
+            .then(|| commit.to_string())
+            .ok_or_else(|| anyhow!("git commit-tree returned no object id"))
+    })();
+    let _ = fs::remove_file(&temporary_index);
+    let _ = fs::remove_file(temporary_index.with_extension("lock"));
+    result
+}
+
+/// checkpoint 锚定 ref 的命名空间。落在 refs/navop/ 下：
+/// 不占分支名、`git branch` 不显示、不会被普通 push 带走，且能防 gc。
+const CHECKPOINT_REF_PREFIX: &str = "refs/navop/checkpoints/";
+
+/// 仓库根的 FNV-1a 哈希：同仓库跨重启同名，不同仓库互不冲突。
+fn repository_hash(repository: &GitRepository) -> String {
+    let root = repository.root.display().to_string();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in root.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 为仓库生成稳定的基线 checkpoint ref 名。
+fn checkpoint_ref_name(repository: &GitRepository) -> String {
+    format!("{CHECKPOINT_REF_PREFIX}{}", repository_hash(repository))
+}
+
+/// 把一次快照锚定为持久 ref，防止被 gc，并让重启后可恢复。
+pub fn anchor_checkpoint(repository: &GitRepository, commit: &str) -> Result<()> {
+    let reference = checkpoint_ref_name(repository);
+    run_git_operation(
+        repository,
+        "git update-ref checkpoint",
+        vec!["update-ref".to_string(), reference, commit.to_string()],
+    )
+}
+
+/// 读取该仓库上次锚定的 checkpoint；从未记录时返回 `None`。
+pub fn anchored_checkpoint(repository: &GitRepository) -> Result<Option<String>> {
+    let reference = checkpoint_ref_name(repository);
+    let output = run_git(
+        &repository.root,
+        ["rev-parse", "--verify", "--quiet", &reference],
+    )?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!commit.is_empty()).then_some(commit))
+}
+
+/// 逐轮快照 ref 的命名空间：`refs/navop/turn-checkpoints/<repo-hash>/<turn-id>`。
+///
+/// **必须与基线 ref 分处两个命名空间**：git 不允许同一路径既是 ref 又是目录，而基线 ref
+/// 恰好占用了 `refs/navop/checkpoints/<repo-hash>` 这一级。挂在它下面会报
+/// `cannot lock ref ... exists; cannot create ...`，逐轮链永远建不起来（踩过一次）。
+const TURN_CHECKPOINT_PREFIX: &str = "refs/navop/turn-checkpoints/";
+
+/// 「撤销恢复」槽位：`refs/navop/restore-backups/<repo-hash>`。
+///
+/// 只留最近一次，固定名覆盖式写入——避免每恢复一次就多留一个 ref。
+/// 单独占一个槽位而不是复用基线 ref：基线要参与下一轮 diff 的计算，不能被恢复动作带偏。
+const RESTORE_BACKUP_PREFIX: &str = "refs/navop/restore-backups/";
+
+/// 一次工作区恢复的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointRestore {
+    /// 恢复前的现场（锚定在 [`RESTORE_BACKUP_REF`]，传回 [`restore_checkpoint`] 即可撤销）。
+    pub backup: String,
+    /// 实际恢复到的快照。
+    pub target: String,
+}
+
+/// 把工作区恢复到某个快照。
+///
+/// 三步：
+/// 1. `restore --source <commit> --worktree --staged -- .` 把快照内容铺到工作区与暂存区；
+/// 2. `clean -fd -- .` 删掉快照之后新出现的 untracked（**不带 `-x`**，`.gitignore` 命中的不动）；
+/// 3. `reset --quiet -- .` 再把暂存区退回 HEAD，使差异只落在工作区。
+///
+/// 恢复前先拍一次当前现场当备份：任一步失败就用它回滚，不把工作区留在「恢复了一半」。
+pub fn restore_checkpoint(repository: &GitRepository, commit: &str) -> Result<CheckpointRestore> {
+    let target = resolve_commit(repository, commit)?;
+    let backup = capture_worktree_snapshot(repository)?;
+    anchor_restore_backup(repository, &backup)?;
+    match apply_worktree_snapshot(repository, &target) {
+        Ok(()) => Ok(CheckpointRestore { backup, target }),
+        Err(error) => {
+            // 回滚只是尽力而为：失败时保留原始错误，它更接近根因。
+            let _ = apply_worktree_snapshot(repository, &backup);
+            Err(error)
+        }
+    }
+}
+
+/// 把「恢复前的现场」锚进撤销槽位。
+pub fn anchor_restore_backup(repository: &GitRepository, commit: &str) -> Result<()> {
+    run_git_operation(
+        repository,
+        "git update-ref restore backup",
+        vec![
+            "update-ref".to_string(),
+            restore_backup_ref_name(repository),
+            commit.to_string(),
+        ],
+    )
+}
+
+/// 读取撤销槽位里的现场；没做过恢复时返回 `None`。
+pub fn restore_backup(repository: &GitRepository) -> Result<Option<String>> {
+    let reference = restore_backup_ref_name(repository);
+    let output = run_git(
+        &repository.root,
+        ["rev-parse", "--verify", "--quiet", &reference],
+    )?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!commit.is_empty()).then_some(commit))
+}
+
+fn restore_backup_ref_name(repository: &GitRepository) -> String {
+    format!("{RESTORE_BACKUP_PREFIX}{}", repository_hash(repository))
+}
+
+/// 把一个 commit-ish 解析成确定的 commit 对象 id。
+///
+/// 快照被 gc 掉或名字写错时在这里给出明确错误，而不是让 `restore --source` 报晦涩的 git 文案。
+pub fn resolve_commit(repository: &GitRepository, commit: &str) -> Result<String> {
+    let output = run_git_vec(
+        &repository.root,
+        vec![
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            format!("{commit}^{{commit}}"),
+        ],
+    )?;
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || resolved.is_empty() {
+        return Err(anyhow!("checkpoint `{commit}` is unavailable"));
+    }
+    Ok(resolved)
+}
+
+fn apply_worktree_snapshot(repository: &GitRepository, commit: &str) -> Result<()> {
+    run_git_operation(
+        repository,
+        "git restore checkpoint",
+        vec![
+            "restore".to_string(),
+            "--source".to_string(),
+            commit.to_string(),
+            "--worktree".to_string(),
+            "--staged".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ],
+    )?;
+    run_git_operation(
+        repository,
+        "git clean checkpoint",
+        vec![
+            "clean".to_string(),
+            "-fd".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ],
+    )?;
+    // 未出生的仓库（还没有 HEAD）没有可退回的基线，`reset -- .` 会直接失败。
+    if repository_has_head(repository)? {
+        run_git_operation(
+            repository,
+            "git reset checkpoint",
+            vec![
+                "reset".to_string(),
+                "--quiet".to_string(),
+                "--".to_string(),
+                ".".to_string(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// 生成某一轮快照的 ref 名。
+///
+/// `turn_id` 来自运行时事件（形如 `turn_<uuid>`），进 ref 路径前先校验字符集：
+/// 非法字符会让 `update-ref` 直接报错，早一点给出可读的诊断更划算。
+fn turn_checkpoint_ref_name(repository: &GitRepository, turn_id: &str) -> Result<String> {
+    if turn_id.is_empty()
+        || !turn_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(anyhow!("`{turn_id}` is not a usable checkpoint turn id"));
+    }
+    Ok(format!("{}/{turn_id}", turn_checkpoint_prefix(repository)))
+}
+
+/// 逐轮快照 ref 的前缀（到仓库哈希为止，不含 turn id）。
+fn turn_checkpoint_prefix(repository: &GitRepository) -> String {
+    format!("{TURN_CHECKPOINT_PREFIX}{}", repository_hash(repository))
+}
+
+/// 把一轮结束时的快照锚成持久 ref：防 gc，且能按轮恢复。
+pub fn anchor_turn_checkpoint(
+    repository: &GitRepository,
+    turn_id: &str,
+    commit: &str,
+) -> Result<()> {
+    let reference = turn_checkpoint_ref_name(repository, turn_id)?;
+    run_git_operation(
+        repository,
+        "git update-ref turn checkpoint",
+        vec!["update-ref".to_string(), reference, commit.to_string()],
+    )
+}
+
+/// 列出该仓库已有逐轮快照，返回 `turn_id -> commit`。
+///
+/// 一次 `for-each-ref` 拿全，不按轮数逐条 `rev-parse`。
+pub fn turn_checkpoints(repository: &GitRepository) -> Result<BTreeMap<String, String>> {
+    let prefix = format!("{}/", turn_checkpoint_prefix(repository));
+    let output = run_git_vec(
+        &repository.root,
+        vec![
+            "for-each-ref".to_string(),
+            "--format=%(refname) %(objectname)".to_string(),
+            prefix.clone(),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(git_command_error(
+            "git for-each-ref turn checkpoints",
+            &output,
+        ));
+    }
+    let mut checkpoints = BTreeMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((reference, commit)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(turn_id) = reference.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !turn_id.is_empty() && !commit.is_empty() {
+            checkpoints.insert(turn_id.to_string(), commit.to_string());
+        }
+    }
+    Ok(checkpoints)
+}
+
+/// 丢弃若干轮的快照 ref（回滚之后，被截断的那些轮不再需要）。
+pub fn delete_turn_checkpoints(repository: &GitRepository, turn_ids: &[String]) -> Result<()> {
+    for turn_id in turn_ids {
+        let reference = turn_checkpoint_ref_name(repository, turn_id)?;
+        run_git_vec(
+            &repository.root,
+            vec!["update-ref".to_string(), "-d".to_string(), reference],
+        )?;
+    }
+    Ok(())
+}
+
+/// Compare two checkpoint/tree-ish values without changing working files or index.
+pub fn diff_snapshots(repository: &GitRepository, before: &str, after: &str) -> Result<String> {
+    let output = run_git_vec(
+        &repository.root,
+        vec![
+            "diff".to_string(),
+            "--binary".to_string(),
+            "--find-renames".to_string(),
+            before.to_string(),
+            after.to_string(),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(git_command_error("git diff snapshots", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 提交全部变更（含 untracked）。
+///
+/// 走用户真实 index：`add -A` 后 `git commit`。与快照路径不同——checkpoint 是
+/// dangling commit 不动分支；这里必须真正推进分支，绕过 index 直接 update-ref
+/// 会让真实 index 与新 HEAD 脱节（staged 状态错乱、出现假删除）。
+pub fn commit_all(repository: &GitRepository, message: &str) -> Result<()> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(anyhow!("Commit message cannot be empty"));
+    }
+    run_git_operation(
+        repository,
+        "git add -A",
+        vec![
+            "add".to_string(),
+            "-A".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ],
+    )?;
+    run_git_operation(
+        repository,
+        "git commit",
+        vec!["commit".to_string(), "-m".to_string(), message.to_string()],
+    )
+}
+
+fn run_git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<()> {
+    let output = git_command(cwd, args)
+        .env("GIT_INDEX_FILE", index)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_command_error("git checkpoint", &output))
+    }
+}
+
+fn git_stdout_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let output = git_command(cwd, args)
+        .env("GIT_INDEX_FILE", index)
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(git_command_error("git checkpoint", &output))
+    }
+}
+
+fn git_output_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let output = git_command(cwd, &[])
+        .env("GIT_INDEX_FILE", index)
+        .args(["-c", "user.name=Navop", "-c", "user.email=navop@localhost"])
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(git_command_error("git commit-tree", &output))
+    }
+}
+
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    configure_background_child(&mut command);
+    command.current_dir(cwd).args(args);
+    command
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = git_command(cwd, args).output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(git_command_error("git", &output))
+    }
+}
+
+fn is_managed_branch(branch: &str) -> bool {
+    branch.starts_with(MANAGED_WORKTREE_BRANCH_PREFIX)
+}
+
+fn parse_worktrees(output: &str, main_root: &Path) -> Vec<WorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    let mut flush = |path: &mut Option<PathBuf>, branch: &mut Option<String>| {
+        if let Some(path) = path.take() {
+            let canonical = canonical_or_self(&path);
+            let branch = branch.take();
+            entries.push(WorktreeEntry {
+                is_main: canonical == main_root,
+                managed: branch.as_deref().is_some_and(is_managed_branch),
+                path: canonical,
+                branch,
+            });
+        }
+    };
+    for line in output.lines() {
+        if line.is_empty() {
+            flush(&mut path, &mut branch);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut branch);
+            path = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            branch = value
+                .strip_prefix("refs/heads/")
+                .map(str::to_owned)
+                .or_else(|| Some(value.to_owned()));
+        }
+    }
+    flush(&mut path, &mut branch);
+    entries
+}
+
+pub fn load_changes(repository: &GitRepository) -> Result<Vec<GitChange>> {
     let output = run_git(
         &repository.root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -80,13 +733,13 @@ pub(crate) fn load_changes(repository: &GitRepository) -> Result<Vec<GitChange>>
     parse_porcelain_v1_z(&output.stdout)
 }
 
-pub(crate) fn stage_change(repository: &GitRepository, change: &GitChange) -> Result<()> {
+pub fn stage_change(repository: &GitRepository, change: &GitChange) -> Result<()> {
     let mut args = vec!["add".to_string(), "-A".to_string(), "--".to_string()];
     append_change_path_args(&mut args, change);
     run_git_operation(repository, "git add", args)
 }
 
-pub(crate) fn unstage_change(repository: &GitRepository, change: &GitChange) -> Result<()> {
+pub fn unstage_change(repository: &GitRepository, change: &GitChange) -> Result<()> {
     let mut args = if repository_has_head(repository)? {
         vec![
             "reset".to_string(),
@@ -113,7 +766,7 @@ pub(crate) fn unstage_change(repository: &GitRepository, change: &GitChange) -> 
 /// paths are removed from the working tree after their index entries have been
 /// reset. Handling each rename path independently avoids `git restore`
 /// rejecting the new side of a rename because it does not exist in HEAD.
-pub(crate) fn discard_change(repository: &GitRepository, change: &GitChange) -> Result<()> {
+pub fn discard_change(repository: &GitRepository, change: &GitChange) -> Result<()> {
     if change.kind == GitChangeKind::Untracked {
         let path = repository.root.join(&change.path);
         remove_worktree_path(&path)?;
@@ -164,7 +817,7 @@ pub(crate) fn discard_change(repository: &GitRepository, change: &GitChange) -> 
     Ok(())
 }
 
-pub(crate) fn load_branches(repository: &GitRepository) -> Result<Vec<GitBranch>> {
+pub fn load_branches(repository: &GitRepository) -> Result<Vec<GitBranch>> {
     let output = run_git(
         &repository.root,
         [
@@ -181,7 +834,7 @@ pub(crate) fn load_branches(repository: &GitRepository) -> Result<Vec<GitBranch>
     parse_branches(&String::from_utf8_lossy(&output.stdout))
 }
 
-pub(crate) fn switch_branch(repository: &GitRepository, branch: &GitBranch) -> Result<()> {
+pub fn switch_branch(repository: &GitRepository, branch: &GitBranch) -> Result<()> {
     let args = match branch.kind {
         GitBranchKind::Local => vec!["switch".to_string(), branch.name.clone()],
         GitBranchKind::Remote => vec![
@@ -193,7 +846,7 @@ pub(crate) fn switch_branch(repository: &GitRepository, branch: &GitBranch) -> R
     run_git_operation(repository, "git switch", args)
 }
 
-pub(crate) fn create_branch(repository: &GitRepository, name: &str) -> Result<()> {
+pub fn create_branch(repository: &GitRepository, name: &str) -> Result<()> {
     validate_branch_name(repository, name)?;
     run_git_operation(
         repository,
@@ -202,11 +855,7 @@ pub(crate) fn create_branch(repository: &GitRepository, name: &str) -> Result<()
     )
 }
 
-pub(crate) fn rename_branch(
-    repository: &GitRepository,
-    old_name: &str,
-    new_name: &str,
-) -> Result<()> {
+pub fn rename_branch(repository: &GitRepository, old_name: &str, new_name: &str) -> Result<()> {
     validate_branch_name(repository, new_name)?;
     run_git_operation(
         repository,
@@ -220,7 +869,7 @@ pub(crate) fn rename_branch(
     )
 }
 
-pub(crate) fn merge_branch(repository: &GitRepository, name: &str) -> Result<()> {
+pub fn merge_branch(repository: &GitRepository, name: &str) -> Result<()> {
     run_git_operation(
         repository,
         "git merge",
@@ -232,7 +881,7 @@ pub(crate) fn merge_branch(repository: &GitRepository, name: &str) -> Result<()>
     )
 }
 
-pub(crate) fn delete_branch(repository: &GitRepository, branch: &GitBranch) -> Result<()> {
+pub fn delete_branch(repository: &GitRepository, branch: &GitBranch) -> Result<()> {
     let args = match branch.kind {
         GitBranchKind::Local => vec!["branch".to_string(), "-d".to_string(), branch.name.clone()],
         GitBranchKind::Remote => {
@@ -251,7 +900,7 @@ pub(crate) fn delete_branch(repository: &GitRepository, branch: &GitBranch) -> R
     run_git_operation(repository, "git branch delete", args)
 }
 
-pub(crate) fn fetch_branches(repository: &GitRepository) -> Result<()> {
+pub fn fetch_branches(repository: &GitRepository) -> Result<()> {
     run_git_operation(
         repository,
         "git fetch",
@@ -262,7 +911,70 @@ pub(crate) fn fetch_branches(repository: &GitRepository) -> Result<()> {
     )
 }
 
-pub(crate) fn push_branch(repository: &GitRepository, branch: &GitBranch) -> Result<()> {
+/// 为提交信息生成收集变更摘要：numstat + 上下文 diff + untracked 列表（有界）。
+///
+/// 只读操作；输出会交给 LLM，因此限制体量。
+pub fn commit_context(repository: &GitRepository, max_bytes: usize) -> Result<String> {
+    let numstat = git_stdout(&repository.root, &["diff", "--numstat", "HEAD"])?;
+    let mut context = String::from("Changed files (added\tdeleted\tpath):\n");
+    context.push_str(&numstat);
+    let untracked = untracked_files(repository)?;
+    if !untracked.is_empty() {
+        context.push_str("\n\nNew files:\n");
+        for path in &untracked {
+            context.push_str(&format!("- {}\n", path.display()));
+        }
+    }
+    context.push_str("\n\nDiff (unified=3, truncated):\n");
+    let full = git_stdout(&repository.root, &["diff", "HEAD", "--unified=3"])?;
+    let remaining = max_bytes.saturating_sub(context.len());
+    let diff = truncate_on_char_boundary(&full, remaining);
+    context.push_str(diff);
+    if context.len() >= max_bytes || diff.len() < full.len() {
+        context.push_str("\n... (truncated)");
+    }
+    Ok(context)
+}
+
+/// 把 `text` 截断到 `max_bytes` 以内，并回退到最近的 UTF-8 字符边界。
+///
+/// 不能直接写 `&text[..n]`：预算落在多字节字符内部时按下标切会让 `&str`
+/// 直接 panic（`byte index N is not a char boundary; it is inside '…'`）。
+/// 这里的输入是 diff 原文，常常整段是中文，预算几乎必然落在某个汉字中间；
+/// 调用方又在后台线程里（`cx.background_spawn`），线程 panic 无法 unwind，
+/// 会升级成 `fatal runtime error: failed to initiate panic` 直接 abort 进程。
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+    &text[..text.floor_char_boundary(max_bytes.min(text.len()))]
+}
+
+/// untracked 文件相对路径列表。
+fn untracked_files(repository: &GitRepository) -> Result<Vec<PathBuf>> {
+    let output = run_git(
+        &repository.root,
+        ["ls-files", "--others", "--exclude-standard"],
+    )?;
+    if !output.status.success() {
+        return Err(git_command_error("git ls-files", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// 推送当前分支；无上游时按默认 remote 建立 `-u` 跟踪。
+///
+/// detached HEAD 直接拒绝，不猜测目标。
+pub fn push_current_branch(repository: &GitRepository) -> Result<()> {
+    let branch = load_branches(repository)?
+        .into_iter()
+        .find(|branch| branch.current && branch.kind == GitBranchKind::Local)
+        .ok_or_else(|| anyhow!("No current branch to push (detached HEAD?)"))?;
+    push_branch(repository, &branch)
+}
+
+pub fn push_branch(repository: &GitRepository, branch: &GitBranch) -> Result<()> {
     if branch.kind != GitBranchKind::Local {
         return Err(anyhow!("Only local branches can be pushed"));
     }
@@ -287,7 +999,7 @@ pub(crate) fn push_branch(repository: &GitRepository, branch: &GitBranch) -> Res
     run_git_operation(repository, "git push", args)
 }
 
-pub(crate) fn load_diff(repository: &GitRepository, change: &GitChange) -> Result<String> {
+pub fn load_diff(repository: &GitRepository, change: &GitChange) -> Result<String> {
     if change.kind == GitChangeKind::Untracked {
         return untracked_file_diff(repository, change);
     }

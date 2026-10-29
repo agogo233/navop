@@ -103,11 +103,15 @@ impl TerminalView {
             .on_action(cx.listener(Self::increase_font))
             .on_action(cx.listener(Self::decrease_font))
             .on_action(cx.listener(Self::reset_font))
+            .on_action(cx.listener(Self::scroll_line_up))
+            .on_action(cx.listener(Self::scroll_line_down))
+            .on_action(cx.listener(Self::scroll_page_up))
+            .on_action(cx.listener(Self::scroll_page_down))
             .on_key_down(cx.listener(Self::handle_key_event))
             .flex_1()
             .relative()
             .overflow_hidden()
-            .on_scroll_wheel(cx.listener(Self::handle_scroll))
+            .on_scroll(cx.listener(Self::handle_scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_down(
                 MouseButton::Middle,

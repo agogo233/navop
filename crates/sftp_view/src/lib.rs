@@ -1527,6 +1527,13 @@ fn upload_conflict_prompt_labels(position: (usize, usize)) -> FileConflictPrompt
         keep_both: t!("Conflict.keep_both").to_string().into(),
         merge: t!("Conflict.merge").to_string().into(),
         overwrite: t!("Conflict.overwrite").to_string().into(),
+        overwrite_warning_title: t!("Conflict.overwrite_warning_title").to_string().into(),
+        overwrite_warning: t!("Conflict.overwrite_warning").to_string().into(),
+        overwrite_warning_apply_all: t!("Conflict.overwrite_warning_apply_all")
+            .to_string()
+            .into(),
+        overwrite_confirm: t!("Conflict.overwrite_confirm").to_string().into(),
+        cancel: t!("Common.cancel").to_string().into(),
     }
 }
 
@@ -1614,12 +1621,8 @@ pub struct SftpView {
     local_path_input: Entity<InputState>,
     remote_path_input: Entity<InputState>,
     /// 本地栏磁盘下拉的展开状态。
-    /// WIP：磁盘下拉 UI 未接线（checkpoint 93701c530），接线前无读者。
-    #[allow(dead_code)]
     local_volume_popover_open: bool,
     /// 缓存的可跳转本地卷；打开下拉时刷新，避免每帧读盘。
-    /// WIP：同上，接线前无读者。
-    #[allow(dead_code)]
     local_volumes: Vec<local_volume::LocalVolume>,
     local_favorite_popover_open: bool,
     remote_favorite_popover_open: bool,
@@ -1656,6 +1659,46 @@ pub struct SftpView {
 
     /// 标签页序号（用于多实例显示）
     tab_index: Option<usize>,
+}
+
+/// 磁盘下拉的渲染输入：卷列表、当前卷下标与宿主视图。
+#[derive(Clone)]
+struct LocalVolumeMenu {
+    volumes: Vec<local_volume::LocalVolume>,
+    current_index: Option<usize>,
+    view: Entity<SftpView>,
+}
+
+/// 卷名，必要时在其后补一行完整路径（挂载点名字看不出位置时）。
+fn volume_label(label: &str, location: String, cx: &App) -> AnyElement {
+    let show_location = location != label;
+    h_flex()
+        .flex_1()
+        .min_w(px(0.0))
+        .gap_2()
+        .items_center()
+        .overflow_hidden()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().foreground)
+                .whitespace_nowrap()
+                .child(label.to_string()),
+        )
+        .when(show_location, |row| {
+            row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .child(location),
+            )
+        })
+        .into_any_element()
 }
 
 impl SftpView {
@@ -1933,7 +1976,11 @@ impl SftpView {
             local_path_input,
             remote_path_input,
             local_volume_popover_open: false,
-            local_volumes: local_volume::local_volumes(),
+            local_volumes: if local_volume::volume_menu_enabled() {
+                local_volume::local_volumes()
+            } else {
+                Vec::new()
+            },
             local_favorite_popover_open: false,
             remote_favorite_popover_open: false,
             local_favorite_search_input,
@@ -3085,6 +3132,108 @@ impl SftpView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.render_favorite_paths_popover(PanelSide::Local, favorite_paths, true, cx)
+    }
+
+    /// 本地磁盘下拉：点击后列出可快速跳转的本地卷（issue #276）。
+    fn render_local_volume_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.local_volume_popover_open;
+        let menu = LocalVolumeMenu {
+            volumes: self.local_volumes.clone(),
+            current_index: local_volume::current_volume_index(
+                &self.local_volumes,
+                &self.local_current_path,
+            ),
+            view: cx.entity().clone(),
+        };
+
+        Popover::new("local_volume_popover")
+            .open(open)
+            .on_open_change(cx.listener(|this, open, _window, cx| {
+                this.local_volume_popover_open = *open;
+                if *open {
+                    // 插拔 U 盘、挂载新盘后要能看到，但平时不读盘。
+                    this.local_volumes = local_volume::local_volumes();
+                }
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("local_volume_button")
+                    .icon(IconName::HardDrive)
+                    .ghost()
+                    .xsmall()
+                    .compact()
+                    .dropdown_caret(true)
+                    .tooltip(t!("Volume.open").to_string())
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        // 地址栏整条是「点击进入编辑」，这里不能被它接管。
+                        cx.stop_propagation();
+                    })),
+            )
+            .content(move |_state, window, cx| {
+                Self::render_local_volume_rows(menu.clone(), window, cx)
+            })
+    }
+
+    fn render_local_volume_rows(
+        menu: LocalVolumeMenu,
+        window: &mut Window,
+        cx: &mut Context<PopoverState>,
+    ) -> AnyElement {
+        let mut column = v_flex()
+            .w(px(280.0))
+            .max_h(px(360.0))
+            .gap_1()
+            .p_2()
+            .overflow_y_scrollbar();
+
+        if menu.volumes.is_empty() {
+            return column
+                .child(
+                    div()
+                        .px_2()
+                        .py_3()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("Volume.empty").to_string()),
+                )
+                .into_any_element();
+        }
+
+        for (index, volume) in menu.volumes.iter().enumerate() {
+            let active = menu.current_index == Some(index);
+            let path = volume.path().to_path_buf();
+            let row_id = SharedString::from(format!("local-volume-{index}"));
+
+            column = column.child(
+                h_flex()
+                    .id(row_id)
+                    .items_center()
+                    .gap_2()
+                    .h_8()
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(active, |row| row.bg(cx.theme().list_active))
+                    .hover(|row| row.bg(cx.theme().list_hover))
+                    .child(Icon::new(IconName::HardDrive).with_size(Size::Small))
+                    .child(volume_label(volume.label(), volume.location(), cx))
+                    .when(active, |row| {
+                        row.child(
+                            Icon::new(IconName::Check)
+                                .with_size(Size::Small)
+                                .text_color(cx.theme().primary),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        window.listener_for(&menu.view, move |this, _, _window, cx| {
+                            this.navigate_local_to(path.clone(), cx);
+                        }),
+                    ),
+            );
+        }
+
+        column.into_any_element()
     }
 
     fn render_favorite_paths_popover(
@@ -6773,6 +6922,10 @@ impl SftpView {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.start_local_path_editing(window, cx);
                             }))
+                            .when(
+                                !is_left_remote && local_volume::volume_menu_enabled(),
+                                |bar| bar.child(self.render_local_volume_menu(cx)),
+                            )
                             .child(breadcrumb.flex_1().min_w(px(0.)).overflow_hidden())
                             .into_any_element()
                     })
@@ -8370,7 +8523,15 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create temporary fixture directory");
         let (provider, _executor, view, _window) = sftp_view_fixture(cx, &temp_dir);
         let first = submit_upload(cx, &view, "first.txt");
+        let filler = submit_upload(cx, &view, "filler.txt");
+        let filler_two = submit_upload(cx, &view, "filler-two.txt");
+        // 执行器每连接车道容量为 3：占满后第四个任务才会真正排队。
         let second = submit_upload(cx, &view, "second.txt");
+
+        wait_until(cx, |_| {
+            let started = provider.started();
+            started.len() == 3 && started.contains(&first)
+        });
 
         let second_task_id = view.read_with(cx, |view, _| {
             view.transfer_queue
@@ -8390,8 +8551,9 @@ mod tests {
             )
         });
 
-        wait_until(cx, |_| provider.started().contains(&first));
         provider.complete(first, Ok(()));
+        provider.complete(filler, Ok(()));
+        provider.complete(filler_two, Ok(()));
         wait_until(cx, |cx| {
             matches!(
                 mirror_snapshot(cx, &view, first),
@@ -8399,7 +8561,13 @@ mod tests {
             )
         });
 
-        assert_eq!(vec![first], provider.started());
+        let started = provider.started();
+        assert_eq!(3, started.len());
+        assert!(started.contains(&first));
+        assert!(
+            !started.contains(&second),
+            "cancelled while queued, must never reach the provider"
+        );
     }
 
     #[gpui::test]
@@ -9665,6 +9833,73 @@ mod default_open_wiring_tests {
             external.contains("ExternalEditorOpenRequest")
                 && external.contains("open_remote_file_external_editor("),
             "explicit Edit With route still opens the chosen external editor"
+        );
+    }
+}
+
+/// 本地地址栏磁盘下拉（issue #276）与裸盘符解析（issue #375）的接线契约。
+///
+/// 纯逻辑由 `local_volume` 的单测覆盖，这里只钉住「行为确实被接线到 UI/入口」，
+/// 避免后续重构把规范化或下拉入口悄悄拆掉。
+#[cfg(test)]
+mod local_volume_wiring_tests {
+    fn method_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let marker = format!("fn {name}(");
+        let start = source.find(&marker).expect(name);
+        let rest = &source[start..];
+        let body_start = start + marker.len();
+        let end = rest[marker.len()..]
+            .find("\n    fn ")
+            .map(|offset| body_start + offset)
+            .unwrap_or(source.len());
+        &source[start..end]
+    }
+
+    #[test]
+    fn local_address_bar_normalizes_the_input_before_probing_it() {
+        let source = include_str!("lib.rs");
+        let body = method_body(source, "confirm_local_path");
+        assert!(
+            body.contains("local_volume::normalize_local_path_input"),
+            "裸盘符 D: 必须先补成盘根，再判断目录是否存在"
+        );
+    }
+
+    #[test]
+    fn local_path_bar_hosts_the_volume_menu_on_windows_only() {
+        let source = include_str!("lib.rs");
+        let body = method_body(source, "render_local_panel");
+        assert!(
+            body.contains("render_local_volume_menu"),
+            "本地地址栏必须挂上磁盘下拉"
+        );
+        assert!(
+            body.contains("local_volume::volume_menu_enabled()"),
+            "磁盘下拉只在 Windows 上显示"
+        );
+    }
+
+    #[test]
+    fn volume_menu_refreshes_the_list_when_opening() {
+        let source = include_str!("lib.rs");
+        let body = method_body(source, "render_local_volume_menu");
+        assert!(
+            body.contains("local_volume::local_volumes()"),
+            "打开下拉时重新枚举卷，插拔磁盘要能看到"
+        );
+        assert!(
+            body.contains("dropdown_caret"),
+            "触发按钮要带下拉指示"
+        );
+    }
+
+    #[test]
+    fn volume_rows_navigate_the_local_pane() {
+        let source = include_str!("lib.rs");
+        let body = method_body(source, "render_local_volume_rows");
+        assert!(
+            body.contains("navigate_local_to"),
+            "选中卷必须跳转左侧本地栏"
         );
     }
 }

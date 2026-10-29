@@ -61,8 +61,13 @@ impl HomePage {
         });
     }
 
+    /// 打开「新建连接」向导。
+    ///
+    /// `target_workspace` 为进入向导的分组（UI 上的「文件夹」）：从某分组右键新建时传该分组 id，
+    /// 表单会预选这个分组，保存后连接直接落在该分组；其它入口传 `None`。
     pub(crate) fn show_new_connection_dialog(
         &mut self,
+        target_workspace: Option<i64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -85,6 +90,7 @@ impl HomePage {
                         parent.clone(),
                         parent_window,
                         external_driver_registry.clone(),
+                        target_workspace,
                         window,
                         cx,
                     )
@@ -299,7 +305,14 @@ pub(crate) fn resolve_connection_credentials(
                 "无法解析连接引用的凭据"
             );
             window.push_notification(
-                Notification::error(format!("无法解析连接凭据：{error:#}")).autohide(true),
+                Notification::error(
+                    t!(
+                        "Connection.credential_resolve_failed",
+                        error = format!("{error:#}")
+                    )
+                    .to_string(),
+                )
+                .autohide(true),
                 cx,
             );
             None

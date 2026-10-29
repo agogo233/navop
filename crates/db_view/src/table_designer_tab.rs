@@ -2,16 +2,16 @@ use crate::search_shortcut::{DB_SEARCH_CONTEXT, FocusSearchInput, focus_search_i
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Div, DragMoveEvent, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton,
-    ParentElement, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, App, AsyncApp, ClipboardItem, Context, Div, DragMoveEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
+    ListSizingBehavior, MouseButton, ParentElement, Pixels, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Subscription, Task, UniformListScrollHandle, Window, div,
+    px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IndexPath, Sizable, Size, Theme, WindowExt,
+    ActiveTheme, Disableable, Icon, IndexPath, Sizable, Size, Theme, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
-    clipboard::Clipboard,
     dialog::{DialogButtonProps, DialogFooter},
     form::{field, h_form},
     h_flex,
@@ -52,7 +52,7 @@ use rust_i18n::t;
 const COLUMN_EDITOR_RESIZE_GRAB_PADDING: Pixels = px(4.0);
 /// 分隔线本身的宽度。
 const COLUMN_EDITOR_RESIZE_LINE_WIDTH: Pixels = px(1.0);
-const COLUMN_EDITOR_COLUMN_COUNT: usize = 7;
+const COLUMN_EDITOR_COLUMN_COUNT: usize = 8;
 const COLUMN_NAME_COL: usize = 0;
 const COLUMN_TYPE_COL: usize = 1;
 const COLUMN_LENGTH_COL: usize = 2;
@@ -60,6 +60,8 @@ const COLUMN_SCALE_COL: usize = 3;
 const COLUMN_NULLABLE_COL: usize = 4;
 const COLUMN_PRIMARY_KEY_COL: usize = 5;
 const COLUMN_AUTO_INCREMENT_COL: usize = 6;
+/// 默认值列紧跟在自增之后、注释之前，与各家设计器的习惯顺序一致。
+const COLUMN_DEFAULT_COL: usize = 7;
 const COLUMN_DRAG_HANDLE_WIDTH: Pixels = px(24.0);
 const COLUMN_EDITOR_DEFAULT_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(160.0),
@@ -69,6 +71,7 @@ const COLUMN_EDITOR_DEFAULT_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(50.0),
     px(50.0),
     px(50.0),
+    px(120.0),
 ];
 const COLUMN_EDITOR_MIN_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(96.0),
@@ -78,6 +81,7 @@ const COLUMN_EDITOR_MIN_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(42.0),
     px(42.0),
     px(42.0),
+    px(80.0),
 ];
 const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(360.0),
@@ -87,6 +91,7 @@ const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(120.0),
     px(120.0),
     px(140.0),
+    px(260.0),
 ];
 
 /// 列/索引行的选中底色透明度。
@@ -350,6 +355,11 @@ pub(crate) fn find_loaded_table_info(
 
 fn column_order_snapshot(design: &TableDesign) -> Vec<&str> {
     design.columns.iter().map(|col| col.name.as_str()).collect()
+}
+
+/// 复制预览页签内容的载荷：空白内容返回 `None`，避免把空串写进剪贴板。
+fn preview_sql_to_copy(sql: &str) -> Option<ClipboardItem> {
+    (!sql.trim().is_empty()).then(|| ClipboardItem::new_string(sql.to_string()))
 }
 
 pub struct TableDesigner {
@@ -1515,6 +1525,13 @@ impl TableDesigner {
     }
 
     fn render_toolbar(&self, cx: &Context<Self>) -> AnyElement {
+        // 只有预览类和 DDL 页签有可复制的 SQL，其它页签不摆这个按钮。
+        let preview_source = match self.active_tab {
+            DesignerTab::SqlPreview => Some(&self.sql_preview_input),
+            DesignerTab::Ddl => Some(&self.ddl_preview_input),
+            _ => None,
+        };
+
         h_flex()
             .px_3()
             .py_2()
@@ -1548,6 +1565,9 @@ impl TableDesigner {
                     .child(Input::new(&self.table_comment_input).w(px(300.))),
             )
             .child(div().flex_1())
+            .when_some(preview_source, |this, source| {
+                this.child(self.render_copy_action(PREVIEW_COPY_SELECTOR, source, cx))
+            })
             .child(
                 Button::new("execute")
                     .primary()
@@ -1603,7 +1623,7 @@ impl TableDesigner {
             DesignerTab::Indexes => self.indexes_editor.clone().into_any_element(),
             DesignerTab::Options => self.render_options(cx),
             DesignerTab::SqlPreview => self.render_sql_preview(cx),
-            DesignerTab::Ddl => self.render_ddl_preview(cx),
+            DesignerTab::Ddl => self.render_ddl_preview(),
         }
     }
 
@@ -1686,8 +1706,9 @@ impl TableDesigner {
             .when(self.sql_preview_loading, |this| {
                 this.child(
                     h_flex()
-                        .gap_2()
+                        .w_full()
                         .items_center()
+                        .gap_2()
                         .child(Spinner::new().with_size(Size::Small))
                         .child(
                             div()
@@ -1700,30 +1721,68 @@ impl TableDesigner {
             .child(
                 Editor::new(&self.sql_preview_input)
                     .size_full()
-                    .disabled(true),
+                    .readonly(true),
             )
             .into_any_element()
     }
 
-    fn render_ddl_preview(&self, cx: &Context<Self>) -> AnyElement {
-        let ddl_sql = self.ddl_preview_input.read(cx).text().to_string();
-
+    fn render_ddl_preview(&self) -> AnyElement {
         v_flex()
             .size_full()
             .p_4()
             .gap_3()
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .child(Clipboard::new("table-designer-copy-ddl").value(ddl_sql)),
-            )
-            .child(
                 Editor::new(&self.ddl_preview_input)
                     .size_full()
-                    .disabled(true),
+                    .readonly(true),
             )
             .into_any_element()
+    }
+
+    /// 预览类页签的复制入口，摆在工具栏「保存」旁边。
+    ///
+    /// 编辑器虽然是只读的（可以选中、复制），但整段 SQL 一键取走更省事；
+    /// 没有可复制的 SQL 时置灰，避免复制出空内容。
+    fn render_copy_action(
+        &self,
+        selector: &'static str,
+        source: &Entity<EditorState>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let source = source.clone();
+        let can_copy = !source.read(cx).text().to_string().trim().is_empty();
+
+        div()
+            .debug_selector(move || selector.to_owned())
+            .child(
+                Button::new(selector)
+                    .small()
+                    .ghost()
+                    .icon(IconName::Copy)
+                    .label(t!("Table.copy_sql").to_string())
+                    .tooltip(t!("Table.copy_sql").to_string())
+                    .disabled(!can_copy)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.copy_preview_sql(&source, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// 把预览页签里生成好的 SQL 写进剪贴板并给出提示；空内容不写。
+    fn copy_preview_sql(
+        &self,
+        source: &Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sql = source.read(cx).text().to_string();
+        let Some(item) = preview_sql_to_copy(&sql) else {
+            return;
+        };
+
+        cx.write_to_clipboard(item);
+        window.push_notification(t!("Table.sql_copied").to_string(), cx);
     }
 }
 
@@ -1748,6 +1807,11 @@ impl Render for TableDesigner {
             ))
     }
 }
+
+/// 工具栏复制按钮的调试选择器（供回归测试定位该按钮）。
+///
+/// 一个按钮服务两个页签：当前页签是 SQL 预览就复制预览，是 DDL 就复制 DDL。
+const PREVIEW_COPY_SELECTOR: &str = "table-designer-copy-preview";
 
 /// 表结构加载面板的调试选择器（供回归测试定位该面板）。
 const STRUCTURE_LOADING_SELECTOR: &str = "table-designer-structure-loading";
@@ -2911,6 +2975,12 @@ impl ColumnsEditor {
                 true,
                 cx,
             ))
+            .child(self.render_header_cell(
+                COLUMN_DEFAULT_COL,
+                t!("Table.default_value").to_string(),
+                false,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -3115,13 +3185,28 @@ impl ColumnsEditor {
             )
             .child(
                 div()
+                    .w(self.column_width(COLUMN_DEFAULT_COL))
+                    .child(Input::new(&row.default_input).w_full()),
+            )
+            .child(
+                div()
                     .flex_1()
                     .child(Input::new(&row.comment_input).w_full()),
             )
             .into_any_element()
     }
 
+    /// 详情面板只剩「列表行放不下」的字段：默认值已经在列表列里直接编辑，
+    /// 这里只留字符集、排序规则和枚举可选值。某个库三者都没有时（SQL Server、
+    /// Oracle 等）整个面板不渲染，避免底部留下一条空白带子挤压列表。
     fn render_detail_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let has_detail_fields = self.column_editor_capabilities.show_charset_in_detail
+            || self.column_editor_capabilities.show_collation_in_detail
+            || self.column_editor_capabilities.supports_enum_values;
+        if !has_detail_fields {
+            return div().into_any_element();
+        }
+
         let Some(idx) = self.selected_index else {
             return v_flex()
                 .items_center()
@@ -3156,6 +3241,10 @@ impl ColumnsEditor {
             && self.is_enum_type(&selected_type, cx);
         let show_charset = self.column_editor_capabilities.show_charset_in_detail;
         let show_collation = self.column_editor_capabilities.show_collation_in_detail;
+        // 支持枚举值但当前类型不是 enum/set 时也没有可填的字段。
+        if !show_charset && !show_collation && !is_enum_or_set {
+            return div().into_any_element();
+        }
 
         v_flex()
             .w_full()
@@ -3167,19 +3256,6 @@ impl ColumnsEditor {
             .bg(cx.theme().background)
             .p_3()
             .gap_3()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(70.))
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}:", t!("Table.default_value"))),
-                    )
-                    .child(Input::new(&row.default_input).w(px(200.))),
-            )
             .when(show_charset, |this| {
                 this.child(
                     h_flex()
@@ -3881,20 +3957,25 @@ impl Render for TableOptionsEditor {
 mod tests {
     use super::*;
     use db::{
-        clickhouse::ClickHousePlugin, mssql::MsSqlPlugin, mysql::MySqlPlugin, oracle::OraclePlugin,
-        plugin::DatabasePlugin, postgresql::PostgresPlugin, sqlite::SqlitePlugin,
+        mssql::MsSqlPlugin, mysql::MySqlPlugin, oracle::OraclePlugin, plugin::DatabasePlugin,
+        postgresql::PostgresPlugin, sqlite::SqlitePlugin,
     };
     use gpui_component::{Theme, ThemeColor};
     use std::{cell::Cell, rc::Rc};
 
     /// 表设计器 DDL 断言仅覆盖仍带原生插件的数据库类型。
     ///
-    /// TDengine 原生插件已移除(改由 tdengine IPC 外部驱动提供,DDL 行为由扩展侧覆盖),
-    /// 因此 `DatabaseType::TDengine` 与 `External` 一同排除在本组测试之外。
+    /// ClickHouse/TDengine 原生插件已移除(分别改由对应 IPC 外部驱动提供,
+    /// DDL 行为由扩展侧覆盖),因此这两类与 `External` 一同排除在本组测试之外。
     fn design_test_database_types() -> Vec<DatabaseType> {
         DatabaseType::all()
             .into_iter()
-            .filter(|database_type| !matches!(database_type, DatabaseType::TDengine))
+            .filter(|database_type| {
+                !matches!(
+                    database_type,
+                    DatabaseType::ClickHouse | DatabaseType::TDengine
+                )
+            })
             .cloned()
             .collect()
     }
@@ -3992,9 +4073,10 @@ mod tests {
             DatabaseType::DuckDB => Box::new(ExternalDatabasePlugin::new()),
             DatabaseType::MSSQL => Box::new(MsSqlPlugin::new()),
             DatabaseType::Oracle => Box::new(OraclePlugin::new()),
-            DatabaseType::ClickHouse => Box::new(ClickHousePlugin::new()),
-            DatabaseType::TDengine | DatabaseType::External { .. } => {
-                unreachable!("TDengine/External 无原生插件,表设计器 DDL 断言已过滤该类型",)
+            DatabaseType::ClickHouse | DatabaseType::TDengine | DatabaseType::External { .. } => {
+                unreachable!(
+                    "ClickHouse/TDengine/External 无原生插件,表设计器 DDL 断言已过滤该类型",
+                )
             }
         }
     }
@@ -4235,7 +4317,10 @@ mod tests {
         );
 
         assert!(design.columns[0].is_primary_key, "id must be primary");
-        assert!(!design.columns[1].is_primary_key, "amount must not be primary");
+        assert!(
+            !design.columns[1].is_primary_key,
+            "amount must not be primary"
+        );
         // 精度随 raw_type 走解析链，不能丢。
         assert_eq!(design.columns[0].length, Some(10));
         assert_eq!(design.columns[1].length, Some(10));
@@ -4334,13 +4419,6 @@ mod tests {
         let plugin = OraclePlugin::new();
         let sql = plugin.build_column_rename_sql("users", "b", "a", None);
         assert!(sql.contains("RENAME COLUMN \"b\" TO \"a\""));
-    }
-
-    #[test]
-    fn test_clickhouse_rename_sql_uses_rename_column() {
-        let plugin = ClickHousePlugin::new();
-        let sql = plugin.build_column_rename_sql("users", "b", "a", None);
-        assert!(sql.contains("RENAME COLUMN `b` TO `a`"));
     }
 
     #[test]
@@ -5836,6 +5914,172 @@ mod tests {
             width_after > width_before + px(DESIGNER_WIDENED_AT_LEAST),
             "从分隔线左侧拖动也应把第 0 列拖宽约 {DESIGNER_DRAG_DISTANCE}px：{width_before:?} → {width_after:?}"
         );
+    }
+
+    /// 空白预览内容不进剪贴板，否则复制出来的是一串空气。
+    #[test]
+    fn blank_preview_sql_is_not_offered_for_copy() {
+        assert_eq!(None, preview_sql_to_copy(""));
+        assert_eq!(None, preview_sql_to_copy("  \n\t"));
+    }
+
+    /// 复制载荷必须与生成出来的 SQL 逐字一致（缩进和换行都不能动）。
+    #[test]
+    fn preview_sql_copy_payload_keeps_the_generated_sql_verbatim() {
+        const SQL: &str = "CREATE TABLE `users` (\n  `id` INT\n);";
+
+        assert_eq!(
+            Some(SQL.to_string()),
+            preview_sql_to_copy(SQL).and_then(|item| item.text())
+        );
+    }
+
+    /// 复制按钮跟着页签走：预览类和 DDL 页签在「保存」左边出现一个，
+    /// 其它页签没有可复制的 SQL，就不摆这个按钮。
+    #[gpui::test]
+    fn the_copy_action_follows_the_preview_and_ddl_tabs(cx: &mut gpui::TestAppContext) {
+        const SQL: &str = "CREATE TABLE `users` (\n  `id` INT\n);";
+        let (designer, _armed_at_open, visual) = designer_window(cx, None);
+
+        for tab in [DesignerTab::SqlPreview, DesignerTab::Ddl] {
+            visual.update(|window, cx| {
+                designer.update(cx, |designer, cx| {
+                    designer.active_tab = tab.clone();
+                    let input = if designer.active_tab == DesignerTab::SqlPreview {
+                        designer.sql_preview_input.clone()
+                    } else {
+                        designer.ddl_preview_input.clone()
+                    };
+                    input.update(cx, |state, cx| state.set_value(SQL, window, cx));
+                    cx.notify();
+                });
+            });
+            visual.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+
+            assert!(
+                visual.debug_bounds(PREVIEW_COPY_SELECTOR).is_some(),
+                "{tab:?} 页签应当在工具栏渲染复制按钮"
+            );
+        }
+
+        visual.update(|window, cx| {
+            designer.update(cx, |designer, cx| {
+                designer.active_tab = DesignerTab::Columns;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        assert!(
+            visual.debug_bounds(PREVIEW_COPY_SELECTOR).is_none(),
+            "列页签没有可复制的 SQL，不该渲染复制按钮"
+        );
+    }
+
+    /// 复制按钮的词条必须真实存在。
+    ///
+    /// 词条写错时 `t!` 会退回字面 key 直接画在按钮上（用户看到的就是
+    /// 「Query.copy_sql」），这类错误编译和渲染都不会报。
+    #[test]
+    fn the_copy_action_wording_is_translated() {
+        for key in ["Table.copy_sql", "Table.sql_copied"] {
+            assert_ne!(key, t!(key).as_ref(), "词条 `{key}` 缺失");
+        }
+    }
+
+    /// 两个预览页签的编辑器都必须只读而不是禁用：禁用态收不到选区，
+    /// 用户就没法自己在编辑器里选中片段复制。
+    #[test]
+    fn preview_editors_are_readonly_so_text_can_be_selected() {
+        let source = include_str!("table_designer_tab.rs");
+
+        for (name, field) in [
+            ("render_sql_preview", "sql_preview_input"),
+            ("render_ddl_preview", "ddl_preview_input"),
+        ] {
+            let body = function_body(source, name);
+            assert!(
+                body.contains(&format!("Editor::new(&self.{field})")),
+                "{name} 应当渲染 {field} 的编辑器"
+            );
+            assert!(
+                body.contains(".readonly(true)"),
+                "{name} 的编辑器要只读，才能选中复制"
+            );
+            assert!(
+                !body.contains(".disabled(true)"),
+                "{name} 的编辑器不能是禁用态，否则选区都拿不到"
+            );
+        }
+    }
+
+    /// 列列表要能直接看到并改默认值（issue #477）：
+    /// 表头有默认值列、行里是可编辑输入框、详情面板不再重复渲染同一个输入。
+    #[test]
+    fn the_columns_list_shows_the_default_value_column() {
+        let source = include_str!("table_designer_tab.rs");
+
+        let header = function_body(source, "render_table_header");
+        let default_header = header
+            .find("COLUMN_DEFAULT_COL")
+            .expect("列列表表头要显示默认值列");
+        let comment_header = header.find("Table.comment").expect("表头要有注释列");
+        assert!(
+            default_header < comment_header,
+            "默认值列要排在注释列之前，和各家设计器的习惯顺序一致"
+        );
+
+        let row = function_body(source, "render_row");
+        assert!(
+            row.contains("column_width(COLUMN_DEFAULT_COL)"),
+            "列列表行要按默认值列的宽度渲染单元格"
+        );
+        assert!(
+            row.contains("Input::new(&row.default_input)"),
+            "默认值要在列列表里直接编辑"
+        );
+
+        // 同一个 InputState 渲染两处，两处都会画出焦点框和光标。
+        let detail = function_body(source, "render_detail_panel");
+        assert!(
+            !detail.contains("row.default_input"),
+            "详情面板不能再渲染默认值输入框，否则和列表行抢同一份输入状态"
+        );
+        assert!(
+            detail.contains("show_charset")
+                && detail.contains("show_collation")
+                && detail.contains("is_enum_or_set"),
+            "详情面板只保留字符集 / 排序规则 / 枚举可选值"
+        );
+    }
+
+    /// 工具栏里复制按钮摆在「保存」左边，而不是预览区里单独占一行。
+    #[test]
+    fn the_copy_action_sits_next_to_the_save_button_in_the_toolbar() {
+        let toolbar = function_body(include_str!("table_designer_tab.rs"), "render_toolbar");
+
+        let copy_at = toolbar
+            .find("render_copy_action(PREVIEW_COPY_SELECTOR")
+            .expect("工具栏要渲染复制按钮");
+        let save_at = toolbar
+            .find("Button::new(\"execute\")")
+            .expect("工具栏要有保存按钮");
+
+        assert!(
+            copy_at < save_at,
+            "复制按钮要放在保存按钮旁边（保存左边），而不是页签内容区"
+        );
+    }
+
+    /// 截出 `fn <name>(` 的实现体，断言只看实现，不看别处。
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let needle = format!("fn {name}(");
+        let start = source.find(&needle).expect("function implementation");
+        let body = &source[start..];
+        let end = body.find("\n    fn ").expect("next method");
+        &body[..end]
     }
 
     /// 构造表设计器窗口，返回 (designer, 打开瞬间是否在加载态, visual)。

@@ -13,6 +13,8 @@ use crate::install_flow::{notify_error, run_install_with_progress_prompt};
 const DUCKDB_DRIVER_ID: &str = "duckdb";
 /// TDengine IPC 驱动扩展 id(navop-extensions,driver_id "tdengine")
 const TDENGINE_DRIVER_ID: &str = "tdengine";
+/// ClickHouse IPC 驱动扩展 id(navop-extensions,driver_id "clickhouse")
+const CLICKHOUSE_DRIVER_ID: &str = "clickhouse";
 /// OceanBase IPC 驱动扩展 id(navop-extensions,driver_id "oceanbase")
 const OCEANBASE_DRIVER_ID: &str = "oceanbase";
 /// OceanBase 驱动 0.1.12 起 u64 cell 才按宿主契约发 JSON 数字
@@ -174,6 +176,11 @@ pub fn required_driver_for_config(config: &DbConnectionConfig) -> DriverRequirem
         // 未安装 tdengine 驱动时引导用户从扩展市场安装,与 DuckDB 同策略。
         DatabaseType::TDengine => DriverRequirement::Required {
             driver_id: TDENGINE_DRIVER_ID.to_string(),
+            minimum_version: None,
+        },
+        // ClickHouse 同理:原生插件已移除,未安装 clickhouse 驱动时引导安装。
+        DatabaseType::ClickHouse => DriverRequirement::Required {
+            driver_id: CLICKHOUSE_DRIVER_ID.to_string(),
             minimum_version: None,
         },
         DatabaseType::External { .. } => required_external_driver(config),

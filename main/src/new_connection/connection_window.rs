@@ -38,6 +38,8 @@ pub(crate) struct NewConnectionWindow {
     selected_kind: Option<NewConnectionKind>,
     connection_kinds: Vec<NewConnectionKind>,
     external_driver_registry: IpcDriverRegistry,
+    /// 从某个分组右键进入向导时的目标分组，透传给各连接表单用于预选分组。
+    target_workspace: Option<i64>,
     form: Option<AnyView>,
 }
 
@@ -46,6 +48,7 @@ impl NewConnectionWindow {
         parent: Entity<HomePage>,
         parent_window: AnyWindowHandle,
         external_driver_registry: IpcDriverRegistry,
+        target_workspace: Option<i64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -88,6 +91,7 @@ impl NewConnectionWindow {
             selected_kind,
             connection_kinds,
             external_driver_registry,
+            target_workspace,
             form: None,
         }
     }
@@ -146,6 +150,7 @@ impl NewConnectionWindow {
             self.parent.clone(),
             self.parent_window,
             &self.external_driver_registry,
+            self.target_workspace,
             window,
             cx,
         ) {

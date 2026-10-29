@@ -9,6 +9,31 @@ use gpui_component::{
 };
 use one_assets::IconName;
 use rust_i18n::t;
+use std::cell::Cell;
+
+thread_local! {
+    /// 渲染「当前段」的推理时临时置位。
+    ///
+    /// 推理块默认只在流式期间展开，流一停就收起。可过程区是一段一段推进的：
+    /// 每来一个工具调用或下一段推理，上一段就塌下去、又把高度撑回来，用户看到
+    /// 的就是一直闪。当前段是用户正在读的那一段，渲染它的时候置位，让推理块保持
+    /// 展开；更早的段落照旧收起（分段，而不是整轮不折叠）。
+    static FORCE_OPEN_REASONING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 在「当前段」里渲染：进程内的推理块不随流结束自行收起。
+pub(crate) fn with_reasoning_force_open<R>(force: bool, render: impl FnOnce() -> R) -> R {
+    FORCE_OPEN_REASONING.with(|flag| {
+        let previous = flag.replace(force);
+        let rendered = render();
+        flag.set(previous);
+        rendered
+    })
+}
+
+fn reasoning_force_open() -> bool {
+    FORCE_OPEN_REASONING.with(|flag| flag.get())
+}
 
 pub fn render_reasoning_block<E: MessageExtension>(
     msg: &ChatMessageUIGeneric<E>,
@@ -21,7 +46,11 @@ pub fn render_reasoning_block<E: MessageExtension>(
     let expanded_state = window.use_keyed_state(state_id, cx, |_, _| {
         msg.is_reasoning_expanded && !msg.is_streaming
     });
-    let is_expanded = reasoning_is_expanded(msg.is_streaming, *expanded_state.read(cx));
+    let is_expanded = reasoning_is_expanded(
+        msg.is_streaming,
+        *expanded_state.read(cx),
+        reasoning_force_open(),
+    );
 
     v_flex()
         .w_full()
@@ -90,8 +119,13 @@ fn reasoning_header<E: MessageExtension>(
         .into_any_element()
 }
 
-fn reasoning_is_expanded(is_streaming: bool, is_user_expanded: bool) -> bool {
-    is_streaming || is_user_expanded
+/// 推理块展开态。
+///
+/// - 正在流式：一定展开（用户要看实时思考）。
+/// - 用户手动点开：尊重选择。
+/// - 落在过程区「当前段」里：保持展开 —— 这一段还在推进，塌下去只会闪。
+fn reasoning_is_expanded(is_streaming: bool, is_user_expanded: bool, force_open: bool) -> bool {
+    is_streaming || is_user_expanded || force_open
 }
 
 fn reasoning_body<E: MessageExtension>(
@@ -124,8 +158,15 @@ mod tests {
 
     #[test]
     fn streaming_reasoning_expands_without_persisting_completed_state() {
-        assert!(reasoning_is_expanded(true, false));
-        assert!(!reasoning_is_expanded(false, false));
-        assert!(reasoning_is_expanded(false, true));
+        assert!(reasoning_is_expanded(true, false, false));
+        assert!(!reasoning_is_expanded(false, false, false));
+        assert!(reasoning_is_expanded(false, true, false));
+    }
+
+    /// 当前段里的推理：流结束了也不收，直到这一段成为上一段。
+    #[test]
+    fn live_segment_reasoning_stays_open_after_the_stream_stops() {
+        assert!(reasoning_is_expanded(false, false, true));
+        assert!(reasoning_is_expanded(true, false, true));
     }
 }

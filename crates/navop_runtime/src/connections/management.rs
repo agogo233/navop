@@ -8,7 +8,7 @@ use one_core::storage::{
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tool_runtime::{ToolError, ToolResult};
+use tool_runtime::{AiAccessLevel, ToolError, ToolResult};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -140,12 +140,41 @@ fn filtered_connections(
     repo: &ConnectionRepository,
     query: &ConnectionQuery,
 ) -> Result<Vec<StoredConnection>, ToolError> {
+    let ai_access_levels = ai_access_levels(repo)?;
     Ok(repo
         .list()
         .map_err(input::tool_error)?
         .into_iter()
+        .filter(|connection| {
+            ai_access_level(&ai_access_levels, connection) != AiAccessLevel::Denied
+        })
         .filter(|connection| query.matches(connection))
         .collect())
+}
+
+/// 连接级 AI 访问策略（issue #437）：一次读出全部非默认级别，避免逐条查询。
+fn ai_access_levels(repo: &ConnectionRepository) -> Result<HashMap<i64, AiAccessLevel>, ToolError> {
+    repo.ai_access_levels().map_err(input::tool_error)
+}
+
+fn ai_access_level(
+    ai_access_levels: &HashMap<i64, AiAccessLevel>,
+    connection: &StoredConnection,
+) -> AiAccessLevel {
+    connection
+        .id
+        .and_then(|id| ai_access_levels.get(&id).copied())
+        .unwrap_or(AiAccessLevel::Allowed)
+}
+
+/// 禁止 AI 操作的连接对 MCP 工具表现为“无法访问”，避免自动化读写其配置。
+fn denied_connection_error(connection: &StoredConnection) -> ToolError {
+    ToolError::Failed {
+        message: format!(
+            "连接 `{}` 已被用户设置为「禁止 AI 操作」，不会通过 MCP 暴露；请由用户在 Navop 界面手动完成该操作，或请用户调整该连接的 AI 访问设置。",
+            connection.name
+        ),
+    }
 }
 
 fn page_response(
@@ -183,25 +212,36 @@ pub(super) fn find_unique_connection(
     repo: &ConnectionRepository,
     reference: &str,
 ) -> Result<StoredConnection, ToolError> {
-    if let Ok(id) = reference.parse::<i64>() {
-        return load_connection(repo, id);
-    }
-    let matches = repo
-        .list()
-        .map_err(input::tool_error)?
-        .into_iter()
-        .filter(|stored| stored.name == reference)
-        .collect::<Vec<_>>();
-    match matches.len() {
-        0 => Err(ToolError::Failed {
-            message: format!("unknown connection: {reference}"),
-        }),
-        1 => Ok(matches.into_iter().next().expect("one match should exist")),
-        _ => Err(ToolError::Failed {
-            message: format!(
-                "multiple connections named `{reference}`; use a numeric id or connections.find"
-            ),
-        }),
+    let connection = if let Ok(id) = reference.parse::<i64>() {
+        load_connection(repo, id)?
+    } else {
+        let matches = repo
+            .list()
+            .map_err(input::tool_error)?
+            .into_iter()
+            .filter(|stored| stored.name == reference)
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => {
+                return Err(ToolError::Failed {
+                    message: format!("unknown connection: {reference}"),
+                });
+            }
+            1 => matches.into_iter().next().expect("one match should exist"),
+            _ => {
+                return Err(ToolError::Failed {
+                    message: format!(
+                        "multiple connections named `{reference}`; use a numeric id or connections.find"
+                    ),
+                });
+            }
+        }
+    };
+    let ai_access_levels = ai_access_levels(repo)?;
+    if ai_access_level(&ai_access_levels, &connection) != AiAccessLevel::Denied {
+        Ok(connection)
+    } else {
+        Err(denied_connection_error(&connection))
     }
 }
 

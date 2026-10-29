@@ -61,6 +61,7 @@ impl CompareSyncExecutionOptions {
             transactional: self.use_transaction && !self.continue_on_error,
             max_rows: None,
             streaming: true,
+            reconnect_on_lost_connection: false,
         }
     }
 }

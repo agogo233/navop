@@ -186,7 +186,7 @@ impl HomePage {
                 crate::personal_sync_runtime::runtime_status(cx),
                 crate::personal_sync_status::PersonalSyncRuntimeStatus::Syncing
             );
-        let show_team_key = is_feature_enabled(Feature::TeamManagement, cx)
+        let show_team = is_feature_enabled(Feature::TeamManagement, cx)
             && should_show_team_key_menu_item(sync_route(cx), self.team_permissions.teams().len());
         let personal_unlocked = crypto::has_master_key();
 
@@ -254,16 +254,17 @@ impl HomePage {
             |home, window, cx| home.show_reset_master_key_dialog(window, cx),
         ));
 
-        if show_team_key {
+        // 团队入口直接打开原生团队页：团队密钥已搬进该页，不再单独开设置页。
+        if show_team {
             menu = menu.child(account_menu_row(
                 view.clone(),
                 IconName::Building2,
-                t!("Encryption.team_key").to_string(),
+                t!("TeamManagement.title").to_string(),
                 None,
                 false,
                 false,
                 cx,
-                |home, window, cx| home.add_team_key_settings_tab(window, cx),
+                |home, window, cx| home.add_team_tab(window, cx),
             ));
         }
 

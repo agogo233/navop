@@ -1,60 +1,125 @@
 //! 从应用连接数据构建 AgentChatView 的 ResourceContext。
+//!
+//! 连接级 AI 访问策略（issue #437）在这里落地为「可见性 + 能力」两级收窄：
+//! 禁止 AI 操作的连接不产生任何资源或 `@` 提及；只读连接保留资源但能力被
+//! 裁剪为只读子集。执行期的 ToolAccessGuard 是第二道防线，不依赖这一层。
+
+use std::collections::HashMap;
 
 use agent_runtime::{
     AgentResourceScope, DefaultTargetReason, ResourceCapability, ResourceCatalog, ResourceContext,
     ResourceId, ResourceKind, ResourceRef, ResourceScope,
 };
-use one_core::storage::{ConnectionType, StoredConnection};
+use gpui::App;
+use one_core::storage::{
+    ConnectionRepository, ConnectionType, GlobalStorageState, StoredConnection,
+};
 use serde_json::Value;
+use tool_runtime::AiAccessLevel;
 
 use crate::input::MentionItem;
 use crate::resource_display::{first_visible_alias, visible_alias};
 
+/// 连接 id → AI 访问级别，只包含非默认（非 `Allowed`）的记录。
+pub type AiAccessLevels = HashMap<i64, AiAccessLevel>;
+
+/// 从全局存储读取连接级 AI 访问策略。
+///
+/// 读取失败时按「全部允许」处理并记录告警：这里只负责可见性收窄，执行期还有
+/// `ToolAccessGuard` 兜底，不能因为存储异常让整个 AI 面板不可用。
+pub fn load_ai_access_levels(cx: &App) -> AiAccessLevels {
+    let Some(state) = cx.try_global::<GlobalStorageState>() else {
+        return AiAccessLevels::new();
+    };
+    let Some(repo) = state.storage.get::<ConnectionRepository>() else {
+        return AiAccessLevels::new();
+    };
+    match repo.ai_access_levels() {
+        Ok(levels) => levels,
+        Err(error) => {
+            tracing::warn!(error = %error, "读取连接 AI 访问策略失败，按全部允许处理");
+            AiAccessLevels::new()
+        }
+    }
+}
+
+fn ai_access_level(
+    ai_access_levels: &AiAccessLevels,
+    connection: &StoredConnection,
+) -> AiAccessLevel {
+    connection
+        .id
+        .and_then(|id| ai_access_levels.get(&id).copied())
+        .unwrap_or(AiAccessLevel::Allowed)
+}
+
 /// 从单个连接构建 ResourceContext（用于侧边栏模式）。
-pub fn build_resource_context_single(connection: &StoredConnection) -> ResourceContext {
-    let resource = connection_to_resource_ref(connection);
-    ResourceContext::new().with_resource(resource)
+///
+/// 被设置为「禁止 AI 操作」的连接返回空上下文。
+pub fn build_resource_context_single(
+    connection: &StoredConnection,
+    ai_access_levels: &AiAccessLevels,
+) -> ResourceContext {
+    match connection_to_resource_ref(connection, ai_access_levels) {
+        Some(resource) => ResourceContext::new().with_resource(resource),
+        None => ResourceContext::new(),
+    }
 }
 
 /// 从单个连接构建 Agent 视图所需的资源上下文与 `@` 提及项。
 pub fn build_agent_context_single(
     connection: &StoredConnection,
+    ai_access_levels: &AiAccessLevels,
 ) -> (ResourceContext, Vec<MentionItem>) {
     (
-        build_resource_context_single(connection),
-        build_mentions_single(connection),
+        build_resource_context_single(connection, ai_access_levels),
+        build_mentions_single(connection, ai_access_levels),
     )
 }
 
 /// 从连接列表构建可添加到资源池的资源 catalog。
-pub fn build_resource_catalog(connections: &[StoredConnection]) -> Vec<ResourceRef> {
-    connections.iter().map(connection_to_resource_ref).collect()
+pub fn build_resource_catalog(
+    connections: &[StoredConnection],
+    ai_access_levels: &AiAccessLevels,
+) -> Vec<ResourceRef> {
+    connections
+        .iter()
+        .filter_map(|connection| connection_to_resource_ref(connection, ai_access_levels))
+        .collect()
 }
 
 /// 从单个连接构建侧边栏默认资源池,并附带全部连接 catalog。
 pub fn build_agent_context_single_with_catalog(
     connection: &StoredConnection,
     connections: &[StoredConnection],
+    ai_access_levels: &AiAccessLevels,
 ) -> (ResourceContext, Vec<MentionItem>, Vec<ResourceRef>) {
-    let (pool, mentions) = build_agent_context_single(connection);
+    let (pool, mentions) = build_agent_context_single(connection, ai_access_levels);
     let mentions = if connections.is_empty() {
         mentions
     } else {
-        build_mentions_from_connections(connections)
+        build_mentions_from_connections(connections, ai_access_levels)
     };
-    (pool, mentions, build_resource_catalog(connections))
+    (
+        pool,
+        mentions,
+        build_resource_catalog(connections, ai_access_levels),
+    )
 }
 
 /// 从所有连接构建 ResourceContext，并设置默认目标（用于非侧边栏模式）。
 pub fn build_resource_context_all(
     current_connection: Option<&StoredConnection>,
     all_connections: Vec<StoredConnection>,
+    ai_access_levels: &AiAccessLevels,
 ) -> ResourceContext {
     let mut ctx = ResourceContext::new();
     let mut current_id: Option<ResourceId> = None;
 
     for conn in all_connections {
-        let resource = connection_to_resource_ref(&conn);
+        let Some(resource) = connection_to_resource_ref(&conn, ai_access_levels) else {
+            continue;
+        };
         if let (Some(current), Some(conn_id)) = (current_connection, &conn.id) {
             if current.id == Some(*conn_id) {
                 current_id = Some(resource.id.clone());
@@ -74,28 +139,32 @@ pub fn build_resource_context_all(
 pub fn build_agent_context_all(
     current_connection: Option<&StoredConnection>,
     connections: &[StoredConnection],
+    ai_access_levels: &AiAccessLevels,
 ) -> (ResourceContext, Vec<MentionItem>) {
     (
-        build_resource_context_all(current_connection, connections.to_vec()),
-        build_mentions_from_connections(connections),
+        build_resource_context_all(current_connection, connections.to_vec(), ai_access_levels),
+        build_mentions_from_connections(connections, ai_access_levels),
     )
 }
 
 /// 从所有连接构建工作台模式所需的资源池、`@` 提及项与可添加资源 catalog。
 pub fn build_workbench_agent_context(
     connections: &[StoredConnection],
+    ai_access_levels: &AiAccessLevels,
 ) -> (ResourceContext, Vec<MentionItem>, Vec<ResourceRef>) {
-    let (resources, mentions) = build_agent_context_all(connections.first(), connections);
-    let catalog = build_resource_catalog(connections);
+    let (resources, mentions) =
+        build_agent_context_all(connections.first(), connections, ai_access_levels);
+    let catalog = build_resource_catalog(connections, ai_access_levels);
     (resources, mentions, catalog)
 }
 
 /// 从所有连接构建工作台资源状态:catalog 全量可见,scope 初始为空。
 pub fn build_workbench_resource_state(
     connections: &[StoredConnection],
+    ai_access_levels: &AiAccessLevels,
 ) -> (AgentResourceScope, ResourceCatalog, Vec<MentionItem>) {
-    let catalog = ResourceCatalog::new(build_resource_catalog(connections));
-    let mentions = build_mentions_from_connections(connections);
+    let catalog = ResourceCatalog::new(build_resource_catalog(connections, ai_access_levels));
+    let mentions = build_mentions_from_connections(connections, ai_access_levels);
     (AgentResourceScope::empty(), catalog, mentions)
 }
 
@@ -104,34 +173,57 @@ pub fn build_sidebar_resource_state(
     current_connection: &StoredConnection,
     connections: &[StoredConnection],
     reason: DefaultTargetReason,
+    ai_access_levels: &AiAccessLevels,
 ) -> (AgentResourceScope, ResourceCatalog, Vec<MentionItem>) {
     let catalog_connections = if connections.is_empty() {
         vec![current_connection.clone()]
     } else {
         connections.to_vec()
     };
-    let catalog = ResourceCatalog::new(build_resource_catalog(&catalog_connections));
-    let current_resource = connection_to_resource_ref(current_connection);
-    let scope = AgentResourceScope::single_default(current_resource, reason);
-    let mentions = build_mentions_from_connections(&catalog_connections);
+    let catalog = ResourceCatalog::new(build_resource_catalog(
+        &catalog_connections,
+        ai_access_levels,
+    ));
+    let scope = match connection_to_resource_ref(current_connection, ai_access_levels) {
+        Some(resource) => AgentResourceScope::single_default(resource, reason),
+        None => AgentResourceScope::empty(),
+    };
+    let mentions = build_mentions_from_connections(&catalog_connections, ai_access_levels);
     (scope, catalog, mentions)
 }
 
 /// 从单个连接构建 `@` 提及项。
-pub fn build_mentions_single(connection: &StoredConnection) -> Vec<MentionItem> {
-    connection_to_mention(connection).into_iter().collect()
+pub fn build_mentions_single(
+    connection: &StoredConnection,
+    ai_access_levels: &AiAccessLevels,
+) -> Vec<MentionItem> {
+    connection_to_mention(connection, ai_access_levels)
+        .into_iter()
+        .collect()
 }
 
 /// 从连接列表构建 `@` 提及项。
-pub fn build_mentions_from_connections(connections: &[StoredConnection]) -> Vec<MentionItem> {
+pub fn build_mentions_from_connections(
+    connections: &[StoredConnection],
+    ai_access_levels: &AiAccessLevels,
+) -> Vec<MentionItem> {
     connections
         .iter()
-        .filter_map(connection_to_mention)
+        .filter_map(|connection| connection_to_mention(connection, ai_access_levels))
         .collect()
 }
 
 /// 将 StoredConnection 转换为 ResourceRef。
-fn connection_to_resource_ref(connection: &StoredConnection) -> ResourceRef {
+///
+/// 被禁止 AI 操作的连接返回 `None`；只读连接的能力被裁剪为只读子集。
+fn connection_to_resource_ref(
+    connection: &StoredConnection,
+    ai_access_levels: &AiAccessLevels,
+) -> Option<ResourceRef> {
+    let ai_access_level = ai_access_level(ai_access_levels, connection);
+    if ai_access_level == AiAccessLevel::Denied {
+        return None;
+    }
     let kind = connection_type_to_resource_kind(&connection.connection_type, &connection.params);
     let label = if connection.name.is_empty() {
         format!("连接 {:?}", connection.id)
@@ -152,14 +244,17 @@ fn connection_to_resource_ref(connection: &StoredConnection) -> ResourceRef {
     for scope in connection_scopes(connection) {
         resource.set_scope(scope);
     }
-    for capability in connection_capabilities(connection) {
+    for capability in ai_access_level.narrow_capabilities(&connection_capabilities(connection)) {
         resource = resource.with_capability(capability);
     }
-    resource
+    Some(resource)
 }
 
-fn connection_to_mention(connection: &StoredConnection) -> Option<MentionItem> {
-    let resource = connection_to_resource_ref(connection);
+fn connection_to_mention(
+    connection: &StoredConnection,
+    ai_access_levels: &AiAccessLevels,
+) -> Option<MentionItem> {
+    let resource = connection_to_resource_ref(connection, ai_access_levels)?;
     let id = connection.id?.to_string();
     let label = resource.label.clone();
     let display_label = mention_display_label(&resource);

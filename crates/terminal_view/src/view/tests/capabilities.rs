@@ -196,6 +196,10 @@ fn quick_command_shortcuts_do_not_override_any_terminal_action_shortcut() {
         "action_id::TERMINAL_INCREASE_FONT",
         "action_id::TERMINAL_DECREASE_FONT",
         "action_id::TERMINAL_RESET_FONT",
+        "action_id::TERMINAL_SCROLL_LINE_UP",
+        "action_id::TERMINAL_SCROLL_LINE_DOWN",
+        "action_id::TERMINAL_SCROLL_PAGE_UP",
+        "action_id::TERMINAL_SCROLL_PAGE_DOWN",
     ] {
         assert!(
             guard.contains(action_id),
@@ -437,6 +441,21 @@ fn playback_has_dedicated_read_only_view_and_workspace_constructors() {
     );
     assert!(workspace_constructor.contains("TerminalView::new_recording_playback"));
     assert!(workspace_constructor.contains("with_workspace_pane()"));
+}
+
+#[test]
+fn workspace_pane_terminal_never_renders_the_internal_sidebar() {
+    // AI 工作台里的终端走 WorkspacePane：它不渲染内建侧栏，因此原始终端侧栏
+    // 恢复出来的 AI 面板不会出现在 AI 工作台的终端里。这里钉住这个前提。
+    let support = include_str!("../workspace_support.rs");
+    let render_layout = include_str!("../render_layout.rs");
+
+    assert!(support.contains("self.render_mode = TerminalRenderMode::WorkspacePane;"));
+    assert!(
+        render_layout.contains(
+            "let render_internal_dock = self.render_mode == TerminalRenderMode::Embedded;"
+        )
+    );
 }
 
 #[test]

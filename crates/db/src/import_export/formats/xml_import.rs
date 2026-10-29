@@ -216,6 +216,7 @@ async fn execute_statements(
         transactional: request.config.use_transaction,
         max_rows: None,
         streaming: false,
+        reconnect_on_lost_connection: false,
     };
     match request
         .connection

@@ -24,9 +24,17 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub(super) enum FileActionEditorMode {
-    CreateFile { parent: PathBuf },
-    CreateDirectory { parent: PathBuf },
-    Rename { path: PathBuf },
+    CreateFile {
+        parent: PathBuf,
+    },
+    CreateDirectory {
+        parent: PathBuf,
+    },
+    Rename {
+        path: PathBuf,
+    },
+    /// 提交当前全部变更（含 untracked）。
+    CommitAll,
 }
 
 #[derive(Clone)]
@@ -39,6 +47,8 @@ pub(super) struct FileActionEditor {
 pub(super) enum ExplorerConfirmationOperation {
     Delete(PathBuf),
     Discard(GitChange),
+    /// 删除受管理的 worktree（会丢弃该工作区里未提交的改动）。
+    RemoveWorktree(PathBuf),
 }
 
 #[derive(Clone)]
@@ -366,6 +376,12 @@ impl WorkspaceExplorer {
                     t!("WorkspaceExplorer.file_action.renamed").to_string(),
                 )
             }
+            FileActionEditorMode::CommitAll => {
+                self.file_action_editor = None;
+                self.file_action_subscription = None;
+                self.commit_all(name, window, cx);
+                return;
+            }
         };
         self.file_action_editor = None;
         self.file_action_subscription = None;
@@ -389,6 +405,11 @@ impl WorkspaceExplorer {
                     ExplorerOperation::Discard { repository, change },
                     t!("WorkspaceExplorer.git_action.discarded").to_string(),
                 )
+            }
+            ExplorerConfirmationOperation::RemoveWorktree(path) => {
+                // 走 worktree 专用清理路径：移除目录 + 删除其分支。
+                self.remove_worktree(path, cx);
+                return;
             }
         };
         self.execute_explorer_operation(operation, success_message, window, cx);
@@ -531,6 +552,7 @@ impl WorkspaceExplorer {
                     FileActionEditorMode::Rename { .. } => {
                         t!("WorkspaceExplorer.file_action.rename")
                     }
+                    FileActionEditorMode::CommitAll => t!("WorkspaceExplorer.commit.menu"),
                 };
                 this.child(
                     v_flex()
@@ -579,9 +601,28 @@ impl WorkspaceExplorer {
         confirmation: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let is_commit_editor = self
+            .file_action_editor
+            .as_ref()
+            .is_some_and(|editor| matches!(editor.mode, FileActionEditorMode::CommitAll));
         h_flex()
             .justify_end()
             .gap_1()
+            .when(is_commit_editor && !confirmation, |this| {
+                this.child(
+                    Button::new("workspace-commit-generate")
+                        .label(t!("WorkspaceExplorer.commit.generate"))
+                        .small()
+                        .custom(self.theme.icon_button_style(cx))
+                        .disabled(self.file_operation_running || self.commit_message_generating)
+                        .when(self.commit_message_generating, |button| {
+                            button.label(t!("WorkspaceExplorer.commit.generating"))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_commit_message(cx);
+                        })),
+                )
+            })
             .child(
                 Button::new("workspace-file-action-cancel")
                     .label(t!("WorkspaceExplorer.action.cancel"))

@@ -10,6 +10,7 @@ impl TerminalView {
             terminal,
             connection_id,
             stored_connection,
+            connection_icon,
             sync_path_enabled,
             local_working_dir,
             workspace_source,
@@ -107,13 +108,18 @@ impl TerminalView {
                 backend,
             });
 
+        // 连接设置里选的图标(SSH 自定义 / 扩展 Icon 字段)。`stored_connection`
+        // 随后会移交给侧边栏;扩展终端没有它,图标由调用方解析后传入。
+        let connection_icon =
+            connection_icon.or_else(|| stored_connection.as_ref().and_then(stored_connection_icon));
+
         // 创建侧边栏（传递 StoredConnection 用于文件管理器）
         let sidebar = cx.new(|cx| {
             TerminalSidebar::new(
                 connection_id,
                 connection_kind,
                 stored_connection,
-                terminal_ai_resource,
+                terminal_ai_resource.clone(),
                 ssh_config,
                 ssh_session_manager,
                 local_workspace,
@@ -126,6 +132,29 @@ impl TerminalView {
                 cx,
             )
         });
+        // 侧边栏 AI 每轮重建资源上下文，才能看到终端的实时状态。SSH 终端带上
+        // 连接的资源 id，让刷新器把活动终端挂到连接旁边（默认目标不变）。
+        if let Some(resource) = terminal_ai_resource {
+            let current_connection = sidebar.read(cx).ai_connection_resource();
+            // 附件正文里要写明来源，资源被移交前先留一份标签。
+            let source_label = resource.label.clone();
+            let refresher = crate::sidebar::live_terminal_resource_refresher(
+                terminal.clone(),
+                resource,
+                current_connection,
+            );
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_ai_resource_context_refresher(refresher, cx);
+            });
+            // 用户选中的正文随下一轮消息一起发送，模型不用再猜「选了什么」。
+            let attachment = crate::sidebar::live_terminal_context_attachment_provider(
+                terminal.clone(),
+                source_label,
+            );
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_ai_context_attachment_provider(attachment, cx);
+            });
+        }
         let sidebar_toolbar = cx.new(|_| TerminalSidebarToolbar::new(sidebar.clone()));
         // 临时连接等需要运行时凭据的 SSH 会话此时还没有 SSH 工具面板，
         // 等凭据提交后再补建（见 `TerminalView::ensure_ssh_tool_panels`）。
@@ -225,6 +254,7 @@ impl TerminalView {
 
         let mut this = Self {
             terminal,
+            connection_icon,
             duplicate_source,
             recording_playback_name,
             session_log_name,

@@ -95,6 +95,7 @@ impl FormatHandler for SqlFormatHandler {
                 transactional: config.use_transaction,
                 max_rows: None,
                 streaming: false,
+                reconnect_on_lost_connection: false,
             };
 
             match connection.execute(plugin, &script, exec_options).await {

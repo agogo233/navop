@@ -282,9 +282,9 @@ impl russh::server::Handler for FakeChainHandler {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        public_key: &russh::keys::PublicKey,
+        public_key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        Ok(self.answer_public_key(public_key))
+        Ok(self.answer_public_key(public_key.public_key))
     }
 
     async fn auth_keyboard_interactive<'a>(

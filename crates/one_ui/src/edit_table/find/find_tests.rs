@@ -150,9 +150,10 @@ fn scroll_returns_none_for_an_empty_table() {
 fn find_shortcuts_are_bound_in_the_edit_table_context() {
     let source = include_str!("../mod.rs");
 
-    assert!(source.contains("KeyBinding::new(key, Find, Some(CONTEXT))"));
-    assert!(source.contains("KeyBinding::new(key, FindNext, Some(CONTEXT))"));
-    assert!(source.contains("KeyBinding::new(key, FindPrevious, Some(CONTEXT))"));
+    // v0.1.12 起动态键位走 `load_dynamic_keybinding`（KeyBinding::new 只收 &'static str）。
+    assert!(source.contains("load_dynamic_keybinding(key, Find, Some(CONTEXT), cx)"));
+    assert!(source.contains("load_dynamic_keybinding(key, FindNext, Some(CONTEXT), cx)"));
+    assert!(source.contains("load_dynamic_keybinding(key, FindPrevious, Some(CONTEXT), cx)"));
 }
 
 #[test]
@@ -161,8 +162,8 @@ fn hosted_find_bar_binds_the_same_navigation_shortcuts() {
 
     // 宿主渲染的输入框要能复用同一份（可重绑的）上下跳键位。
     assert!(source.contains("pub const HOSTED_FIND_CONTEXT: &str = \"EditTableHostedFind\";"));
-    assert!(source.contains("KeyBinding::new(key, FindNext, Some(HOSTED_FIND_CONTEXT))"));
-    assert!(source.contains("KeyBinding::new(key, FindPrevious, Some(HOSTED_FIND_CONTEXT))"));
+    assert!(source.contains("load_dynamic_keybinding(key, FindNext, Some(HOSTED_FIND_CONTEXT), cx)"));
+    assert!(source.contains("load_dynamic_keybinding(key, FindPrevious, Some(HOSTED_FIND_CONTEXT), cx)"));
     assert!(source.contains("Some(HOSTED_FIND_CONTEXT),\n        FindNext,"));
     assert!(source.contains("Some(HOSTED_FIND_CONTEXT),\n        FindPrevious,"));
 }

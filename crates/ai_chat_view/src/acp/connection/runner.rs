@@ -1,26 +1,29 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{
-    ReadTextFileRequest, RequestPermissionRequest, SessionNotification, WriteTextFileRequest,
+use agent_client_protocol::schema::v1::{
+    CreateElicitationRequest, ReadTextFileRequest, RequestPermissionRequest,
+    SessionId as AcpSessionId, SessionNotification, WriteTextFileRequest,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
-use agent_runtime::{RuntimeEvent, SessionId};
+use agent_runtime::{RuntimeEvent, SessionId, TurnId};
 use gpui::AsyncApp;
 use one_core::gpui_tokio::Tokio;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::acp::client::{handle_read_text_file_request, handle_write_text_file_request};
 use crate::acp::config::AcpAgentConfig;
-use crate::acp::permission::{AcpPermissionProvider, resolve_acp_permission_request};
+use crate::acp::elicitation::resolve_acp_elicitation_request;
+use crate::acp::permission::resolve_acp_permission_request;
 use crate::acp::state::{AcpConnectionPhase, AcpSessionState};
-use crate::acp::turn::AcpTurnTracker;
 
 use super::notifications::{NotificationContext, handle_notification};
 use super::outcome::finish_connect;
 use super::setup::{SetupOutcome, setup_connection};
 use super::{
-    AcpConnectOutcome, connection_closed_error, fail_connection_and_take_active_turn,
+    AcpActiveTurns, AcpClientProviders, AcpConnectOutcome, AcpDetailSessions,
+    AcpInteractiveSession, connection_closed_error, fail_connection_and_take_active_turn,
     transition_state,
 };
 
@@ -34,9 +37,29 @@ pub(super) struct ConnectShared {
     pub(super) events_tx: broadcast::Sender<RuntimeEvent>,
     pub(super) session_id: SessionId,
     pub(super) state: Arc<Mutex<AcpSessionState>>,
-    pub(super) active_turn: Arc<Mutex<Option<AcpTurnTracker>>>,
+    /// 在飞轮次表；与 [`AcpConnection::active_turn`] 是同一个 `Arc`。
+    pub(super) active_turn: AcpActiveTurns,
+    /// 交互会话指针；与 [`AcpConnection::interactive_session`] 是同一个 `Arc`。
+    ///
+    /// 通知处理跑在另一条任务上（ACP 的 dispatch loop），拿不到 `AcpConnection`，
+    /// 只能靠这个共享指针知道「一条 `session/update` 要不要应用到交互状态」。
+    pub(super) interactive_session: AcpInteractiveSession,
+    /// 历史回放窗口；与 [`AcpConnection::history_replay`] 是同一个 `Arc`。
+    ///
+    /// 通知处理跑在另一条任务上（ACP 的 dispatch loop），拿不到 `AcpConnection`，
+    /// 只能靠这个共享槽位知道「现在收到的是 `session/load` 重放出来的历史」。
+    pub(super) history_replay: Arc<Mutex<Option<TurnId>>>,
+    /// 子代理详情会话注册表；与 [`AcpConnection::detail_sessions`] 是同一个 `Arc`。
+    ///
+    /// 通知处理拿不到 `AcpConnection`（跑在 ACP 的 dispatch loop 上），只能靠这块
+    /// 共享表判断一条 `session/update` 是不是子代理详情会话的。
+    pub(super) detail_sessions: AcpDetailSessions,
     pub(super) workspace_root: PathBuf,
     pub(super) config: AcpAgentConfig,
+    /// 调用方希望复用的 ACP 协议会话（上次这个内置会话用的那个）。
+    ///
+    /// `None` 或复用失败都退回 `session/new`；见 `setup::open_session`。
+    pub(super) resume: Option<AcpSessionId>,
 }
 
 pub(super) struct SpawnedConnection {
@@ -47,7 +70,7 @@ pub(super) struct SpawnedConnection {
 
 struct ClientTaskContext {
     agent: AcpAgent,
-    permission_provider: Option<AcpPermissionProvider>,
+    providers: AcpClientProviders,
     shared: ConnectShared,
     ready_tx: oneshot::Sender<ReadyMessage>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -55,43 +78,92 @@ struct ClientTaskContext {
 
 pub(super) async fn connect(
     config: &AcpAgentConfig,
+    workspace_root: PathBuf,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<AcpConnectOutcome> {
     let handle = cx.update(|cx| Tokio::handle(cx));
-    connect_with_parts(config, handle, None).await
+    connect_with_parts(
+        config,
+        workspace_root,
+        handle,
+        AcpClientProviders::default(),
+        None,
+    )
+    .await
 }
 
-pub(super) async fn connect_with_permission_provider(
+pub(super) async fn connect_with_providers(
     config: &AcpAgentConfig,
-    permission_provider: AcpPermissionProvider,
+    workspace_root: PathBuf,
+    providers: AcpClientProviders,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<AcpConnectOutcome> {
     let handle = cx.update(|cx| Tokio::handle(cx));
-    connect_with_parts(config, handle, Some(permission_provider)).await
+    connect_with_parts(config, workspace_root, handle, providers, None).await
+}
+
+/// 带「沿用哪个 ACP 会话」的连接入口：重连 / 重启时优先 `load` 或 `resume`。
+pub(super) async fn connect_with_providers_and_resume(
+    config: &AcpAgentConfig,
+    workspace_root: PathBuf,
+    providers: AcpClientProviders,
+    resume: Option<AcpSessionId>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<AcpConnectOutcome> {
+    let handle = cx.update(|cx| Tokio::handle(cx));
+    connect_with_parts(config, workspace_root, handle, providers, resume).await
 }
 
 pub(super) async fn connect_with_runtime(
     config: &AcpAgentConfig,
+    workspace_root: PathBuf,
     handle: tokio::runtime::Handle,
 ) -> anyhow::Result<AcpConnectOutcome> {
-    connect_with_parts(config, handle, None).await
+    connect_with_parts(
+        config,
+        workspace_root,
+        handle,
+        AcpClientProviders::default(),
+        None,
+    )
+    .await
 }
 
-pub(super) async fn connect_with_runtime_and_permission_provider(
+/// 带复用目标的运行时变体（不给视图、只给测试与嵌入式调用方）。
+pub(super) async fn connect_with_runtime_and_resume(
     config: &AcpAgentConfig,
+    workspace_root: PathBuf,
     handle: tokio::runtime::Handle,
-    permission_provider: AcpPermissionProvider,
+    resume: Option<AcpSessionId>,
 ) -> anyhow::Result<AcpConnectOutcome> {
-    connect_with_parts(config, handle, Some(permission_provider)).await
+    connect_with_parts(
+        config,
+        workspace_root,
+        handle,
+        AcpClientProviders::default(),
+        resume,
+    )
+    .await
+}
+
+pub(super) async fn connect_with_runtime_and_providers(
+    config: &AcpAgentConfig,
+    workspace_root: PathBuf,
+    handle: tokio::runtime::Handle,
+    providers: AcpClientProviders,
+) -> anyhow::Result<AcpConnectOutcome> {
+    connect_with_parts(config, workspace_root, handle, providers, None).await
 }
 
 async fn connect_with_parts(
     config: &AcpAgentConfig,
+    workspace_root: PathBuf,
     handle: tokio::runtime::Handle,
-    permission_provider: Option<AcpPermissionProvider>,
+    providers: AcpClientProviders,
+    resume: Option<AcpSessionId>,
 ) -> anyhow::Result<AcpConnectOutcome> {
-    let shared = prepare_shared(config, handle);
-    let mut spawned = spawn_client(shared.clone(), permission_provider);
+    let shared = prepare_shared(config, workspace_root, handle, resume);
+    let mut spawned = spawn_client(shared.clone(), providers);
     let ready_rx = spawned.ready_rx.take().expect("ready receiver must exist");
     let ready = wait_for_ready(&shared.handle, config.timeouts.connect, ready_rx).await;
     finish_connect(shared, spawned, ready)
@@ -102,12 +174,28 @@ async fn wait_for_ready(
     timeout: std::time::Duration,
     ready_rx: oneshot::Receiver<ReadyMessage>,
 ) -> ReadyWait {
-    let _runtime = handle.enter();
-    tokio::time::timeout(timeout, ready_rx).await
+    // GPUI foreground executor 是单线程的：多个 ACP 连接并发时，各自跨 await 持有
+    // `EnterGuard` 无法保证按 LIFO 顺序 drop，tokio 1.53 起会直接 panic
+    // （"EnterGuard values dropped out of order"）。这里只让 guard 覆盖 timer 的
+    // 创建范围——timer 在创建时就把自己注册到 driver，await 期间不再需要 runtime
+    // context。
+    let wait = {
+        let _runtime = handle.enter();
+        tokio::time::timeout(timeout, ready_rx)
+    };
+    wait.await
 }
 
-fn prepare_shared(config: &AcpAgentConfig, handle: tokio::runtime::Handle) -> ConnectShared {
-    let (events_tx, _keep) = broadcast::channel(512);
+fn prepare_shared(
+    config: &AcpAgentConfig,
+    workspace_root: PathBuf,
+    handle: tokio::runtime::Handle,
+    resume: Option<AcpSessionId>,
+) -> ConnectShared {
+    // 4096：ACP 一轮会把每个工具调用展开成几十上百条 `session/update`，512 在
+    // 长任务（子代理实测连续 182 分钟）里会被冲掉，订阅端 lagged 丢事件。
+    // 丢了还有 `on_runtime_events_dropped` 的自愈兜底，但容量先把常见场景挡住。
+    let (events_tx, _keep) = broadcast::channel(4096);
     let state = Arc::new(Mutex::new(AcpSessionState::default()));
     transition_state(&state, AcpConnectionPhase::Initializing);
     ConnectShared {
@@ -115,21 +203,22 @@ fn prepare_shared(config: &AcpAgentConfig, handle: tokio::runtime::Handle) -> Co
         events_tx,
         session_id: SessionId::from_string(format!("acp:{}", uuid::Uuid::new_v4())),
         state,
-        active_turn: Arc::new(Mutex::new(None)),
-        workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        active_turn: Arc::new(Mutex::new(HashMap::new())),
+        interactive_session: Arc::new(Mutex::new(String::new())),
+        history_replay: Arc::new(Mutex::new(None)),
+        detail_sessions: Arc::new(Mutex::new(HashMap::new())),
+        workspace_root,
         config: config.clone(),
+        resume,
     }
 }
 
-fn spawn_client(
-    shared: ConnectShared,
-    permission_provider: Option<AcpPermissionProvider>,
-) -> SpawnedConnection {
+fn spawn_client(shared: ConnectShared, providers: AcpClientProviders) -> SpawnedConnection {
     let (ready_tx, ready_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let context = ClientTaskContext {
         agent: shared.config.to_acp_agent(),
-        permission_provider,
+        providers,
         shared: shared.clone(),
         ready_tx,
         shutdown_rx,
@@ -144,7 +233,8 @@ fn spawn_client(
 
 async fn run_client(context: ClientTaskContext) {
     let agent = context.agent;
-    let permission_provider = context.permission_provider;
+    let permission_provider = context.providers.permission;
+    let elicitation_provider = context.providers.elicitation;
     let shared = context.shared;
     let ready_tx = context.ready_tx;
     let shutdown_rx = context.shutdown_rx;
@@ -184,6 +274,15 @@ async fn run_client(context: ClientTaskContext) {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // agent 主动提问：交给视图渲染成聊天里的问答卡片，结果原样送回。
+        .on_receive_request(
+            async move |request: CreateElicitationRequest, responder, _connection| {
+                responder.respond(
+                    resolve_acp_elicitation_request(elicitation_provider.clone(), request).await,
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(agent, async move |connection| {
             setup_and_park(connection, setup_shared, ready_tx, shutdown_rx).await
         })
@@ -204,6 +303,7 @@ async fn setup_and_park(
         &shared.config,
         &shared.state,
         shared.workspace_root,
+        shared.resume.clone(),
     )
     .await;
     match setup {

@@ -116,6 +116,8 @@ async fn assert_error_and_transaction(plugin: &DuckDbPlugin, connection: &DuckDb
                 transactional: true,
                 max_rows: Some(10),
                 streaming: false,
+                // 显式事务不重试，与其它驱动的 core_flow 保持一致。
+                reconnect_on_lost_connection: false,
             },
         )
         .await

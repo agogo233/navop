@@ -26,10 +26,37 @@ use tracing::{debug, info, warn};
 pub struct SchemaInvalidationScope {
     pub database: String,
     pub schema: Option<String>,
+    /// 触发本次失效的具体表。仅数据级事件（`data_only == true`）携带，
+    /// 供调用方发 `TableDataCleared` 通知让数据页签刷新。
+    pub table: Option<String>,
+    /// `true` 表示仅数据变化（TRUNCATE / 无 WHERE 的整表 DELETE），
+    /// 结构未变：订阅方只需刷新数据，树结构与元数据保持原样。
+    pub data_only: bool,
 }
 
 impl SchemaInvalidationScope {
     fn from_event(event: &DdlEvent) -> Self {
+        // 整表清空（TRUNCATE / DELETE FROM 无 WHERE）只改数据不改结构，
+        // 归为数据级范围；其余事件按结构级处理。
+        if let DdlEvent::TruncateTable {
+            database,
+            schema,
+            table,
+        }
+        | DdlEvent::DeleteAllRows {
+            database,
+            schema,
+            table,
+        } = event
+        {
+            return Self {
+                database: database.clone(),
+                schema: schema.clone(),
+                table: Some(table.clone()),
+                data_only: true,
+            };
+        }
+
         let (database, schema) = match event {
             DdlEvent::CreateTable {
                 database, schema, ..
@@ -38,9 +65,6 @@ impl SchemaInvalidationScope {
                 database, schema, ..
             }
             | DdlEvent::DropTable {
-                database, schema, ..
-            }
-            | DdlEvent::TruncateTable {
                 database, schema, ..
             }
             | DdlEvent::RenameTable {
@@ -79,9 +103,17 @@ impl SchemaInvalidationScope {
             | DdlEvent::DropFunction { database, .. }
             | DdlEvent::CreateProcedure { database, .. }
             | DdlEvent::DropProcedure { database, .. } => (database.clone(), None),
+            DdlEvent::TruncateTable { .. } | DdlEvent::DeleteAllRows { .. } => unreachable!(
+                "data-only events are handled above and must not be classified as structural"
+            ),
         };
 
-        Self { database, schema }
+        Self {
+            database,
+            schema,
+            table: None,
+            data_only: false,
+        }
     }
 }
 
@@ -103,7 +135,12 @@ impl SchemaInvalidationPlan {
         Self {
             events: Vec::new(),
             connection_wide: true,
-            fallback_scope: Some(SchemaInvalidationScope { database, schema }),
+            fallback_scope: Some(SchemaInvalidationScope {
+                database,
+                schema,
+                table: None,
+                data_only: false,
+            }),
         }
     }
 
@@ -601,8 +638,9 @@ impl GlobalNodeCache {
 
     /// 解析 SQL 并触发 DDL 失效（MetadataCache + NodeCache）
     ///
-    /// 返回解析到的 DDL 事件信息（connection_id, database, schema），供调用方发射 SchemaChanged 事件。
-    /// 支持多语句：返回第一个 DDL 事件的范围信息。
+    /// 返回本次失效涉及的全部 [`SchemaInvalidationScope`]，供调用方发通知：
+    /// `data_only` 的范围发 `TableDataCleared`，其余发 `SchemaChanged`。
+    /// 支持多语句。
     pub async fn process_sql_for_invalidation(
         &self,
         connection_id: &str,
@@ -611,7 +649,7 @@ impl GlobalNodeCache {
         current_schema: Option<&str>,
         database_type: &DatabaseType,
         cache_ctx: Option<&CacheContext>,
-    ) -> Option<(String, String, Option<String>)> {
+    ) -> Vec<SchemaInvalidationScope> {
         let plan = self.plan_sql_invalidation(
             sql,
             SqlInvalidationContext {
@@ -622,9 +660,6 @@ impl GlobalNodeCache {
         );
         self.apply_invalidation_plan(connection_id, &plan, cache_ctx)
             .await
-            .into_iter()
-            .next()
-            .map(|scope| (connection_id.to_string(), scope.database, scope.schema))
     }
 
     /// 使表相关缓存失效
@@ -1181,10 +1216,14 @@ mod tests {
                 SchemaInvalidationScope {
                     database: "app".to_string(),
                     schema: Some("public".to_string()),
+                    table: None,
+                    data_only: false,
                 },
                 SchemaInvalidationScope {
                     database: "app".to_string(),
                     schema: Some("audit".to_string()),
+                    table: None,
+                    data_only: false,
                 },
             ]
         );
@@ -1204,6 +1243,36 @@ mod tests {
             vec![SchemaInvalidationScope {
                 database: "app".to_string(),
                 schema: Some("public".to_string()),
+                table: None,
+                data_only: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn data_clearing_events_map_to_data_only_scopes() {
+        // TRUNCATE 与无 WHERE 的 DELETE 是数据级范围：携带表名、data_only，
+        // 订阅方据此发 TableDataCleared 而不是 SchemaChanged。
+        let plan = SchemaInvalidationPlan::from_events(vec![
+            DdlEvent::TruncateTable {
+                database: "app".to_string(),
+                schema: Some("public".to_string()),
+                table: "users".to_string(),
+            },
+            DdlEvent::DeleteAllRows {
+                database: "app".to_string(),
+                schema: Some("public".to_string()),
+                table: "users".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            plan.scopes(),
+            vec![SchemaInvalidationScope {
+                database: "app".to_string(),
+                schema: Some("public".to_string()),
+                table: Some("users".to_string()),
+                data_only: true,
             }]
         );
     }

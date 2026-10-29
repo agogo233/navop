@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Action, App, KeyBinding, Keystroke, NoAction};
+use gpui::{Action, App, KeyBinding, Keystroke, NoAction, OperatingSystem};
 
 use crate::settings::AppSettings;
 
@@ -42,6 +42,10 @@ pub mod action_id {
     pub const TERMINAL_INCREASE_FONT: &str = "terminal.increase_font";
     pub const TERMINAL_DECREASE_FONT: &str = "terminal.decrease_font";
     pub const TERMINAL_RESET_FONT: &str = "terminal.reset_font";
+    pub const TERMINAL_SCROLL_LINE_UP: &str = "terminal.scroll_line_up";
+    pub const TERMINAL_SCROLL_LINE_DOWN: &str = "terminal.scroll_line_down";
+    pub const TERMINAL_SCROLL_PAGE_UP: &str = "terminal.scroll_page_up";
+    pub const TERMINAL_SCROLL_PAGE_DOWN: &str = "terminal.scroll_page_down";
     pub const REMOTE_EDITOR_SEARCH: &str = "remote_editor.search";
     pub const REMOTE_EDITOR_REPLACE: &str = "remote_editor.replace";
     pub const REDIS_CLEAR_OUTPUT: &str = "redis.clear_output";
@@ -57,6 +61,12 @@ pub mod action_id {
     pub const TABLE_FIND: &str = "table.find";
     pub const TABLE_FIND_NEXT: &str = "table.find_next";
     pub const TABLE_FIND_PREVIOUS: &str = "table.find_previous";
+    pub const AI_CHAT_FIND: &str = "ai_chat.find";
+    pub const AI_CHAT_FIND_NEXT: &str = "ai_chat.find_next";
+    pub const AI_CHAT_FIND_PREVIOUS: &str = "ai_chat.find_previous";
+    pub const AI_CHAT_SESSION_BACK: &str = "ai_chat.session_back";
+    pub const AI_CHAT_SESSION_FORWARD: &str = "ai_chat.session_forward";
+    pub const AI_CHAT_SESSION_SWITCHER: &str = "ai_chat.session_switcher";
 }
 
 pub fn shortcuts_for(cx: &App, action_id: &str, defaults: &[&str]) -> Vec<String> {
@@ -75,12 +85,32 @@ pub fn shortcuts_for(cx: &App, action_id: &str, defaults: &[&str]) -> Vec<String
 pub fn keystroke_matches_shortcuts(keystroke: &Keystroke, shortcuts: &[String]) -> bool {
     shortcut_spec_from_keystroke(keystroke).is_some_and(|spec| {
         shortcuts.iter().any(|shortcut| {
-            Keystroke::parse(shortcut)
+            Keystroke::parse_with_os(shortcut, current_os())
                 .ok()
                 .and_then(|shortcut| shortcut_spec_from_keystroke(&shortcut))
                 .is_some_and(|shortcut| shortcut == spec)
         })
     })
+}
+
+/// 动态字符串构造 KeyBinding（gpui-fast v0.1.12 起 KeyBinding::new 只收 &'static str）。
+pub fn load_dynamic_keybinding<A: Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> KeyBinding {
+    let context_predicate = context
+        .map(|context| gpui::KeyBindingContextPredicate::parse(context).unwrap().into());
+    KeyBinding::load(
+        keystrokes,
+        Box::new(action),
+        context_predicate,
+        true,
+        None,
+        cx,
+    )
+    .unwrap()
 }
 
 pub fn rebind_keybindings<A>(
@@ -98,16 +128,16 @@ where
         .key_bindings()
         .borrow()
         .bindings_for_action(&action)
-        .map(|binding| shortcut_spec_from_binding(binding))
+        .map(|binding| shortcut_spec_from_binding(binding, cx.platform_info().os))
         .collect::<Vec<_>>();
     let mut keybindings = rebind_shadow_shortcuts(defaults, &current, active)
         .into_iter()
-        .map(|shortcut| KeyBinding::new(&shortcut, NoAction, context))
+        .map(|shortcut| load_dynamic_keybinding(&shortcut, NoAction, context, cx))
         .collect::<Vec<_>>();
     keybindings.extend(
         current
             .into_iter()
-            .map(|shortcut| KeyBinding::new(&shortcut, action.clone(), context)),
+            .map(|shortcut| load_dynamic_keybinding(&shortcut, action.clone(), context, cx)),
     );
     keybindings
 }
@@ -140,7 +170,20 @@ pub fn resolve_shortcuts(
 }
 
 fn is_valid_shortcut(shortcut: &str) -> bool {
-    Keystroke::parse(shortcut).is_ok()
+    Keystroke::parse_with_os(shortcut, current_os()).is_ok()
+}
+
+/// 编译目标对应的 gpui `OperatingSystem`（gpui-fast v0.1.12 起动态解析键位需要）。
+pub fn current_os() -> OperatingSystem {
+    match std::env::consts::OS {
+        "macos" => OperatingSystem::Mac,
+        "windows" => OperatingSystem::Windows,
+        "linux" => OperatingSystem::Linux,
+        "freebsd" => OperatingSystem::FreeBsd,
+        "ios" => OperatingSystem::Ios,
+        "android" => OperatingSystem::Android,
+        _ => OperatingSystem::Unknown,
+    }
 }
 
 pub fn rebind_shadow_shortcuts(
@@ -163,11 +206,11 @@ pub fn rebind_shadow_shortcuts(
     shortcuts
 }
 
-fn shortcut_spec_from_binding(binding: &KeyBinding) -> String {
+fn shortcut_spec_from_binding(binding: &KeyBinding, os: OperatingSystem) -> String {
     binding
         .keystrokes()
         .iter()
-        .map(|keystroke| keystroke.to_string())
+        .map(|keystroke| keystroke.display(os).to_string())
         .collect::<Vec<_>>()
         .join(" ")
 }

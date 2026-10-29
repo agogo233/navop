@@ -47,7 +47,7 @@ impl ToolHandler for TerminalReadRuntime {
         ToolDescriptor {
             id: "terminal.read".to_string(),
             title: "Read visible terminal output".to_string(),
-            description: "Read a bounded tail of the current visible terminal PTY, including scrollback, without executing a command or changing the user's viewport. Use it to inspect output from commands the user ran manually, diagnose the current terminal state, or recover context before deciding whether another command is needed. Prefer ssh.command.output for a known command_id and do not rerun a command merely to see its output. The returned text may contain sensitive terminal content, so request only the number of lines needed.".to_string(),
+            description: "Read a bounded tail of the current visible terminal PTY, including scrollback, without executing a command or changing the user's viewport. Use it to inspect output from commands the user ran manually, diagnose the current terminal state, or recover context before deciding whether another command is needed. Prefer ssh.command.output for a known command_id and do not rerun a command merely to see its output. Besides the text, the result reports `alt_screen` (true while a full-screen program such as vim or less owns the screen, meaning the text is that program's UI and the shell prompt is hidden), `selection` (the text the user has selected, if any), `cursor_row`/`cursor_column`, and `display_offset` (non-zero while the user is scrolled back into history). The returned text may contain sensitive terminal content, so request only the number of lines needed.".to_string(),
             input_schema: read_schema(),
             output_schema: json!({ "type": "object" }),
             permissions: Vec::new(),

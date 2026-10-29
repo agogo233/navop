@@ -5,12 +5,21 @@ use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const DISCOVERY_VERSION: u32 = 1;
 const APP_NAME: &str = "navop";
 const LEGACY_APP_NAME: &str = "onetcli";
 const DISCOVERY_FILE_NAME: &str = "public-mcp.json";
 const TOKEN_HEX_LEN: usize = 64;
+
+/// 宿主注入的发现文件路径（正式、开发、便携必须各自落在自己的目录里）。
+///
+/// `dirs::config_dir()` 对已安装版和开发版返回同一个目录，而发现文件里有
+/// pid、端口与令牌：开发版一旦发布到正式版的位置，外部 MCP 客户端就会被
+/// 劫持到开发实例上（2026-10-28 事故）。宿主解析出运行模式后必须调用
+/// [`set_public_mcp_discovery_paths`] 注入隔离后的路径。
+static DISCOVERY_PATH_OVERRIDE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,13 +91,43 @@ impl DiscoveryDocument {
     }
 }
 
+/// 覆盖发现文件位置。只在进程启动早期调用一次；重复调用返回 `false`，
+/// 已生效的路径不会被改掉。
+pub fn set_public_mcp_discovery_paths(
+    canonical: impl Into<PathBuf>,
+    legacy: impl Into<PathBuf>,
+) -> bool {
+    DISCOVERY_PATH_OVERRIDE
+        .set((canonical.into(), legacy.into()))
+        .is_ok()
+}
+
 pub fn public_mcp_discovery_path() -> PathBuf {
-    let base = default_config_dir();
-    public_mcp_discovery_path_from(&base)
+    match DISCOVERY_PATH_OVERRIDE.get() {
+        Some((canonical, _)) => canonical.clone(),
+        None => public_mcp_discovery_path_from(&default_config_dir()),
+    }
 }
 
 pub fn legacy_public_mcp_discovery_path() -> PathBuf {
-    legacy_public_mcp_discovery_path_from(&default_config_dir())
+    match DISCOVERY_PATH_OVERRIDE.get() {
+        Some((_, legacy)) => legacy.clone(),
+        None => legacy_public_mcp_discovery_path_from(&default_config_dir()),
+    }
+}
+
+/// 由运行模式的数据目录推导发现文件位置。
+///
+/// 正式版的数据目录是 `~/Library/Application Support/navop`，推导结果与历史
+/// 安装位置完全一致（`.../navop/public-mcp.json` 与 `.../onetcli/public-mcp.json`）；
+/// 开发/便携版的数据根不同，推导结果自然落到各自的目录，不会碰到正式版。
+pub fn public_mcp_discovery_paths_in(data_dir: &Path) -> (PathBuf, PathBuf) {
+    let canonical = data_dir.join(DISCOVERY_FILE_NAME);
+    let legacy_root = match data_dir.parent() {
+        Some(parent) => parent.join(LEGACY_APP_NAME),
+        None => data_dir.join(LEGACY_APP_NAME),
+    };
+    (canonical, legacy_root.join(DISCOVERY_FILE_NAME))
 }
 
 pub fn public_mcp_discovery_path_from(base: &Path) -> PathBuf {

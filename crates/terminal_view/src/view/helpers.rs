@@ -1,4 +1,5 @@
 use super::*;
+use alacritty_terminal::sync::FairMutex;
 
 pub(super) const REMOTE_CLIPBOARD_IMAGE_DIR: &str = "/tmp";
 pub(super) const REMOTE_CLIPBOARD_IMAGE_PREFIX: &str = "onetcli-paste";
@@ -113,6 +114,23 @@ pub(super) fn terminal_paste_bytes(text: &str, mode: TermMode) -> Vec<u8> {
             Cow::Owned(text) => text.into_bytes(),
         }
     }
+}
+
+/// 粘贴等一次性输入决策用的实时终端模式。
+///
+/// 渲染帧缓存的 `terminal_frame_snapshot.mode` 在解析线程持锁时会保留旧值
+/// （见 `terminal_render.rs` 的 with_terminal_if_ready 注释），而 bash 5.1+
+/// 每次执行命令都会翻转 2004 bracketed paste 模式：用过期快照判断是否包装
+/// `\x1b[200~` 会让远端把包装序列当字面文本显示（issue #198）。这里在输入
+/// 事件线程上用 try_lock 读最新模式；锁被解析器占用时回退快照（与既有
+/// 行为一致，且该场景下粘贴本身也会被写队列排队）。
+pub(super) fn resolve_live_term_mode(
+    term: &FairMutex<Term<GpuiEventProxy>>,
+    fallback: TermMode,
+) -> TermMode {
+    term.try_lock_unfair()
+        .map(|term| *term.mode())
+        .unwrap_or(fallback)
 }
 
 pub(super) fn should_direct_paste_on_right_click(enabled: bool, button: MouseButton) -> bool {

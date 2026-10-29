@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use crate::app_init::is_valid_system_hotkey;
 use crate::auth::get_auth_service;
-use crate::license::{get_license_service, is_feature_enabled, offline_license_public_key};
+use crate::license::{get_license_service, offline_license_public_key};
+use crate::settings::acp_agents_settings::AcpAgentsView;
 use crate::settings::agent_settings::agent_setting_group;
 use crate::settings::appearance::render as render_appearance_settings;
 use crate::settings::database_settings::database_setting_group;
+use crate::settings::connection_display_settings::connection_display_setting_group;
 use crate::settings::llm_providers_view::LlmProvidersView;
 use crate::settings::local_terminal_settings::local_terminal_setting_group;
 use crate::settings::mcp_settings::mcp_setting_group;
@@ -47,28 +49,20 @@ use gpui_component::{
     v_flex,
 };
 use one_assets::IconName;
-use one_core::cloud_sync::{
-    CloudSyncService, GlobalCloudUser, SyncEngine, TeamKeyCacheStatus, TeamOption,
-    get_cached_team_options,
-    personal::{SyncStoreHealth, open_webdav_password, seal_webdav_password},
-};
-use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
+use one_core::cloud_sync::personal::{SyncStoreHealth, open_webdav_password, seal_webdav_password};
 use one_core::crypto;
 use one_core::gpui_tokio::Tokio;
 use one_core::keybindings::action_id;
-use one_core::license::Feature;
 use one_core::llm::manager::GlobalProviderState;
 use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
-use one_core::storage::GlobalStorageState;
 pub const DEFAULT_SYSTEM_HOTKEY_MACOS: &str = "cmd-alt-m";
 pub const DEFAULT_SYSTEM_HOTKEY_OTHER: &str = "ctrl-alt-m";
-const SYNC_SETTINGS_PAGE_INDEX: usize = 5;
-const TEAM_KEYS_SETTINGS_PAGE_INDEX: usize = 6;
+const SYNC_SETTINGS_PAGE_INDEX: usize = 6;
 
 use gpui_component::input::InputEvent;
 pub use one_core::settings::{
     AppSettings, CloseButtonBehavior, CustomFont, DatabaseOpenMode, GlobalCurrentUser,
-    GlobalProxySettings, LOCALE_EN, LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK,
+    GlobalProxySettings, LOCALE_EN, LOCALE_SYSTEM, LOCALE_ZH_CN, LOCALE_ZH_HK, MasterKeyStorage,
     PersonalSyncBackendKind, PersonalSyncSettings, ProxyType, SyncProvider,
     effective_locale_for_setting, is_installed_font_family, is_supported_grid_monospace_font,
 };
@@ -351,7 +345,19 @@ fn upsert_custom_font(
 }
 
 pub fn init_settings(cx: &mut App) {
-    let settings = AppSettings::load();
+    // 先按磁盘上的 log_file_path 装好日志，再加载设置：`AppSettings::load()` 里的
+    // 「Failed to parse settings」如果发生在 subscriber 安装之前，会被直接丢掉，
+    // 生产上就只剩「设置被还原成默认值」这个结果，永远查不到原因。
+    init_tracing(&AppSettings::peek_log_file_path());
+    let mut settings = AppSettings::load();
+    // 没有系统凭据库的平台只提供本机文件：把从别处带来的「系统凭据库」配置归一到
+    // 实际可用的选项，避免设置页下拉框出现一个永远选不中的值。
+    if !one_core::key_storage::system_storage_supported()
+        && settings.master_key_storage == MasterKeyStorage::SystemCredentialStore
+    {
+        settings.master_key_storage = MasterKeyStorage::LocalFile;
+    }
+    one_core::key_storage::set_preferred_backend(settings.master_key_storage);
     // 初始化自动保存配置全局状态
     cx.set_global(AutoSaveConfig::new(
         settings.enable_sql_auto_save,
@@ -359,17 +365,16 @@ pub fn init_settings(cx: &mut App) {
     ));
     settings.apply(cx);
     load_custom_fonts(&settings.custom_fonts, cx);
-    init_tracing(&settings);
     let http_client = build_app_http_client(&settings.global_proxy).expect("HTTP 客户端初始化失败");
     cx.set_http_client(http_client);
     cx.set_global(settings);
 }
 
-fn init_tracing(settings: &AppSettings) {
+fn init_tracing(log_file_path: &str) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    match crate::navop_app::configured_log_file_path(&settings.log_file_path) {
+    match crate::navop_app::configured_log_file_path(log_file_path) {
         Ok(log_file_path) => match crate::navop_app::log_file_appender(&log_file_path) {
             Ok(file_appender) => {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -429,13 +434,15 @@ fn master_key_setting_enabled(settings: &AppSettings, is_portable: bool) -> bool
 
 fn update_master_key_setting(is_portable: bool, enabled: bool, cx: &mut App) {
     let should_remember = if is_portable { enabled } else { !enabled };
-    let result = if should_remember {
-        crypto::remember_master_key_for_future_startups()
-    } else {
-        crypto::forget_persisted_master_key()
-    };
-    if let Err(error) = result {
-        // 当前没有内存主密钥时仍保留用户选择；下次成功设置或解锁后会再次尝试保存。
+    if should_remember {
+        // 系统凭据库不可用时保存必然失败：不把开关留在「已开启」，让界面如实反映
+        // 「主密钥没有被记住」。旧版固定密钥文件已停用写入，这里不做静默回退。
+        if let Err(error) = crypto::remember_master_key_for_future_startups() {
+            tracing::warn!("保存自动解锁主密钥失败，设置保持关闭: {error}");
+            return;
+        }
+    } else if let Err(error) = crypto::forget_persisted_master_key() {
+        // 删除失败不阻止用户表达意图：下次启动会再试一次
         tracing::warn!("更新自动解锁主密钥失败，设置会在后续主密钥操作时重试: {error}");
     }
 
@@ -448,9 +455,104 @@ fn update_master_key_setting(is_portable: bool, enabled: bool, cx: &mut App) {
     });
 }
 
+fn default_master_key_storage() -> MasterKeyStorage {
+    if one_core::key_storage::system_storage_supported() {
+        MasterKeyStorage::SystemCredentialStore
+    } else {
+        MasterKeyStorage::LocalFile
+    }
+}
+
+fn master_key_storage_value(storage: MasterKeyStorage) -> &'static str {
+    match storage {
+        MasterKeyStorage::SystemCredentialStore => "system_credential_store",
+        MasterKeyStorage::LocalFile => "local_file",
+    }
+}
+
+fn master_key_storage_from_value(value: &str) -> MasterKeyStorage {
+    if value == "local_file" {
+        MasterKeyStorage::LocalFile
+    } else {
+        MasterKeyStorage::SystemCredentialStore
+    }
+}
+
+/// 当前平台的系统凭据库名称：macOS 钥匙串 / Windows 凭据管理器 / 通用名称。
+fn system_key_storage_label() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        t!("Settings.General.Startup.master_key_storage_keychain").to_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        t!("Settings.General.Startup.master_key_storage_credential_manager").to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        t!("Settings.General.Startup.master_key_storage_system").to_string()
+    }
+}
+
+/// 保存位置下拉选项：支持系统凭据库的平台多一项，其它平台只有本机文件。
+fn master_key_storage_select_options() -> Vec<(SharedString, SharedString)> {
+    let mut options = Vec::new();
+    if one_core::key_storage::system_storage_supported() {
+        options.push((
+            SharedString::from(master_key_storage_value(
+                MasterKeyStorage::SystemCredentialStore,
+            )),
+            SharedString::from(system_key_storage_label()),
+        ));
+    }
+    options.push((
+        SharedString::from(master_key_storage_value(MasterKeyStorage::LocalFile)),
+        t!("Settings.General.Startup.master_key_storage_local").into(),
+    ));
+    options
+}
+
+/// 切换主密钥保存位置，并把已记住的副本搬到新位置
+fn update_master_key_storage(backend: MasterKeyStorage, cx: &mut App) {
+    let settings = AppSettings::current(cx);
+    if settings.master_key_storage == backend {
+        return;
+    }
+
+    let previous_storage = one_core::key_storage::storage_for(settings.master_key_storage);
+    one_core::key_storage::set_preferred_backend(backend);
+    AppSettings::update_and_save(cx, |settings| {
+        settings.master_key_storage = backend;
+    });
+
+    let is_portable = one_core::app_paths::is_portable();
+    let should_remember = if is_portable {
+        settings.portable_remember_master_key
+    } else {
+        !settings.require_master_key_on_startup
+    };
+    if !should_remember {
+        return;
+    }
+
+    // 会话未解锁时没有可搬运的明文密钥，等下次解锁/记住时再迁移，先不删旧副本。
+    if crypto::get_raw_master_key().is_none() {
+        return;
+    }
+    // 先写到新位置，成功后再删除旧副本：迁移失败时旧副本还在，不至于两头落空。
+    if let Err(error) = crypto::remember_master_key_for_future_startups() {
+        tracing::warn!("主密钥迁移到新的保存位置失败，保留旧副本: {error}");
+        return;
+    }
+    if let Err(error) = previous_storage.delete() {
+        tracing::warn!("清理旧保存位置的主密钥副本失败: {error}");
+    }
+}
+
 pub struct SettingsPanel {
     focus_handle: FocusHandle,
     llm_providers_view: Entity<LlmProvidersView>,
+    acp_agents_view: Entity<AcpAgentsView>,
     update_check_state: Entity<update::UpdateCheckState>,
     _update_check_subscription: gpui::Subscription,
     size: Size,
@@ -477,16 +579,13 @@ impl SettingsPanel {
         Self::new_with_initial_page(0, cx)
     }
 
-    pub fn new_team_keys(_window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_with_initial_page(TEAM_KEYS_SETTINGS_PAGE_INDEX, cx)
-    }
-
     pub fn new_sync(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_with_initial_page(SYNC_SETTINGS_PAGE_INDEX, cx)
     }
 
     fn new_with_initial_page(initial_page_index: usize, cx: &mut Context<Self>) -> Self {
         let llm_providers_view = cx.new(|cx| LlmProvidersView::new(cx));
+        let acp_agents_view = cx.new(|cx| AcpAgentsView::new(cx));
         // 检查更新状态由 app 持有（启动时的自动检查可能早于设置页打开），这里只观察它，
         // 让「检查中」和「上次检查结果」能驱动设置页重绘。
         let update_check_state = update::update_check_state(cx);
@@ -494,6 +593,7 @@ impl SettingsPanel {
         Self {
             focus_handle: cx.focus_handle(),
             llm_providers_view,
+            acp_agents_view,
             update_check_state,
             _update_check_subscription,
             size: Size::default(),
@@ -535,6 +635,7 @@ impl SettingsPanel {
 
     fn setting_pages(&mut self, _window: &mut Window, cx: &App) -> Vec<SettingPage> {
         let llm_view = self.llm_providers_view.clone();
+        let acp_view = self.acp_agents_view.clone();
         let default_settings = AppSettings::default();
         let default_system_hotkey = AppSettings::default().current_system_hotkey().to_string();
         let (app_font_options, font_options) = self.cached_font_options(cx);
@@ -544,14 +645,37 @@ impl SettingsPanel {
         } else {
             t!("Settings.General.Startup.require_master_key").to_string()
         };
-        let master_key_setting_description = if is_portable {
+        let mut master_key_setting_description = if is_portable {
             t!("Settings.General.Startup.remember_portable_master_key_desc").to_string()
         } else {
             t!("Settings.General.Startup.require_master_key_desc").to_string()
         };
+        if !one_core::key_storage::system_storage_supported() {
+            master_key_setting_description = format!(
+                "{master_key_setting_description} {}",
+                t!("Settings.General.Startup.system_key_storage_unavailable")
+            );
+        }
         let default_master_key_setting = master_key_setting_enabled(&default_settings, is_portable);
+        let master_key_storage_description = {
+            let mut description =
+                t!("Settings.General.Startup.master_key_storage_desc").to_string();
+            if !one_core::key_storage::system_storage_supported() {
+                description = format!(
+                    "{description} {}",
+                    t!("Settings.General.Startup.system_key_storage_unavailable")
+                );
+            }
+            if AppSettings::global(cx).master_key_storage == MasterKeyStorage::LocalFile {
+                description = format!(
+                    "{description} {}",
+                    t!("Settings.General.Startup.master_key_storage_local_risk")
+                );
+            }
+            description
+        };
 
-        let mut pages = vec![
+        let pages = vec![
             SettingPage::new(t!("Settings.General.title"))
                 .resettable(true)
                 .default_open(true)
@@ -624,6 +748,27 @@ impl SettingsPanel {
                                 .default_value(default_master_key_setting),
                             )
                             .description(master_key_setting_description),
+                            SettingItem::new(
+                                t!("Settings.General.Startup.master_key_storage"),
+                                SettingField::dropdown(
+                                    master_key_storage_select_options(),
+                                    |cx: &App| {
+                                        SharedString::from(master_key_storage_value(
+                                            AppSettings::global(cx).master_key_storage,
+                                        ))
+                                    },
+                                    |value: SharedString, cx: &mut App| {
+                                        update_master_key_storage(
+                                            master_key_storage_from_value(&value),
+                                            cx,
+                                        );
+                                    },
+                                )
+                                .default_value(SharedString::from(
+                                    master_key_storage_value(default_master_key_storage()),
+                                )),
+                            )
+                            .description(master_key_storage_description),
                         ]),
                     SettingGroup::new()
                         .title(t!("Settings.General.FileTransfer.group_title"))
@@ -648,7 +793,7 @@ impl SettingsPanel {
                             ),
                         ),
                     close_behavior_setting_group(default_settings.close_button_behavior),
-                    notes_setting_group(),
+                    notes_setting_group(font_options.clone()),
                     SettingGroup::new()
                         .title(t!("Settings.General.Appearance.group_title"))
                         .item(SettingItem::render(render_appearance_settings)),
@@ -939,6 +1084,7 @@ impl SettingsPanel {
                             .description(t!("Settings.General.Log.file_path_desc").to_string()),
                         ),
                     remote_file_editor_setting_group(&default_settings.remote_file_editor, cx),
+                    connection_display_setting_group(),
                     SettingGroup::new()
                         .title(t!("Settings.General.Proxy.group_title"))
                         .item(
@@ -970,6 +1116,19 @@ impl SettingsPanel {
                     agent_setting_group(&default_settings.ai_chat),
                     agent_tool_exposure_setting_group(&default_settings.tool_exposure),
                 ]),
+            // ACP 智能体设置页（插在 Agent 与 MCP 之间，改这里必须同步 SYNC_SETTINGS_PAGE_INDEX）
+            SettingPage::new(t!("Settings.AcpAgents.title")).group(
+                SettingGroup::new().item(
+                    SettingItem::render(move |_options, _window, _cx| {
+                        acp_view.clone().into_any_element()
+                    })
+                    .keywords([
+                        t!("Settings.AcpAgents.title").to_string(),
+                        t!("Settings.AcpAgents.group_title").to_string(),
+                        t!("Settings.AcpAgents.description").to_string(),
+                    ]),
+                ),
+            ),
             // MCP 设置页
             SettingPage::new(t!("Settings.Mcp.title"))
                 .resettable(true)
@@ -985,9 +1144,6 @@ impl SettingsPanel {
                     &default_settings.personal_sync,
                     AppSettings::global(cx).personal_sync.backend,
                 )),
-            SettingPage::new(t!("TeamSync.manage_keys"))
-                .resettable(false)
-                .group(team_key_setting_group()),
             // 快捷键页面
             SettingPage::new(t!("Settings.Shortcuts.title")).group(
                 SettingGroup::new().item(
@@ -1006,7 +1162,7 @@ impl SettingsPanel {
                 ),
             ),
             // 账户设置页：账户信息与主密钥是两件独立的事——没有账户也可以有主密钥，
-// 所以拆成两个并列分组，关系与「关于 / 更新」一致。
+            // 所以拆成两个并列分组，关系与「关于 / 更新」一致。
             SettingPage::new(t!("Settings.Account.title"))
                 .group(
                     SettingGroup::new().title(t!("Settings.Account.title")).item(
@@ -1056,9 +1212,6 @@ impl SettingsPanel {
                     self.update_check_state.clone(),
                 )),
         ];
-        if !is_feature_enabled(Feature::TeamManagement, cx) {
-            pages.remove(TEAM_KEYS_SETTINGS_PAGE_INDEX);
-        }
         pages
     }
 }
@@ -1751,585 +1904,6 @@ fn render_personal_sync_actions(_window: &mut Window, cx: &mut App) -> gpui::Any
         .into_any_element()
 }
 
-fn team_key_setting_group() -> SettingGroup {
-    SettingGroup::new().title(t!("TeamSync.manage_keys")).item(
-        SettingItem::render(move |_options, window, cx| {
-            render_team_key_management_section(window, cx)
-        })
-        .keywords([t!("TeamSync.manage_keys").to_string()]),
-    )
-}
-
-fn render_team_key_management_section(_window: &mut Window, cx: &mut App) -> gpui::AnyElement {
-    let teams = get_cached_team_options(cx);
-    v_flex()
-        .w_full()
-        .gap_3()
-        .child(
-            h_flex()
-                .w_full()
-                .items_start()
-                .justify_between()
-                .gap_3()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t!("TeamSync.page_desc").to_string()),
-                )
-                .child(
-                    Button::new("team-key-refresh")
-                        .icon(IconName::Refresh)
-                        .label(t!("TeamSync.refresh_teams").to_string())
-                        .small()
-                        .on_click(|_, window, cx| {
-                            refresh_team_key_cache_from_settings(window, cx);
-                        }),
-                ),
-        )
-        .when(teams.is_empty(), |this| {
-            this.child(render_team_key_empty(cx))
-        })
-        .children(teams.into_iter().map(|team| render_team_key_row(team, cx)))
-        .into_any_element()
-}
-
-fn render_team_key_empty(cx: &mut App) -> gpui::AnyElement {
-    v_flex()
-        .w_full()
-        .gap_2()
-        .p_4()
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded(gpui::px(8.0))
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(t!("TeamSync.empty_title").to_string()),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(t!("TeamSync.no_teams").to_string()),
-        )
-        .into_any_element()
-}
-
-fn render_team_key_row(team: TeamOption, cx: &mut App) -> gpui::AnyElement {
-    let can_rotate = team_key_role_can_rotate(team.role.as_deref());
-    let can_forget = !matches!(team.key_status, TeamKeyCacheStatus::Missing);
-    let team_for_save = team.clone();
-    let team_for_rotate = team.clone();
-    let team_id_for_forget = team.id.clone();
-
-    v_flex()
-        .w_full()
-        .gap_3()
-        .p_3()
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded(gpui::px(8.0))
-        .child(
-            h_flex()
-                .w_full()
-                .items_start()
-                .justify_between()
-                .gap_3()
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(team.name.clone()),
-                        )
-                        .child(render_team_key_meta(&team, cx)),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new(format!("team-key-save-{}", team.id))
-                                .icon(IconName::Key)
-                                .label(t!("TeamSync.save_local_key").to_string())
-                                .small()
-                                .on_click(move |_, window, cx| {
-                                    show_team_key_entry_dialog(team_for_save.clone(), window, cx);
-                                }),
-                        )
-                        .child(
-                            Button::new(format!("team-key-rotate-{}", team.id))
-                                .icon(IconName::Refresh)
-                                .label(t!("TeamSync.rotate_key").to_string())
-                                .small()
-                                .disabled(!can_rotate)
-                                .on_click(move |_, window, cx| {
-                                    show_team_key_rotation_dialog(
-                                        team_for_rotate.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        )
-                        .child(
-                            Button::new(format!("team-key-forget-{}", team.id))
-                                .icon(IconName::Key)
-                                .label(t!("TeamSync.forget_local_key").to_string())
-                                .small()
-                                .danger()
-                                .disabled(!can_forget)
-                                .on_click(move |_, window, cx| {
-                                    forget_team_key_from_settings(
-                                        team_id_for_forget.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn render_team_key_meta(team: &TeamOption, cx: &mut App) -> gpui::AnyElement {
-    h_flex()
-        .gap_3()
-        .flex_wrap()
-        .child(team_key_status_badge(team.key_status, cx))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{} {}", t!("TeamSync.version"), team.key_version)),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!(
-                    "{} {}",
-                    t!("TeamSync.role"),
-                    team.role.as_deref().unwrap_or("-")
-                )),
-        )
-        .into_any_element()
-}
-
-fn team_key_status_badge(status: TeamKeyCacheStatus, cx: &mut App) -> gpui::AnyElement {
-    let (label, color) = match status {
-        TeamKeyCacheStatus::Missing => (
-            t!("TeamSync.status_missing").to_string(),
-            cx.theme().warning,
-        ),
-        TeamKeyCacheStatus::Cached => {
-            (t!("TeamSync.status_cached").to_string(), cx.theme().success)
-        }
-        TeamKeyCacheStatus::VersionMismatch => (
-            t!("TeamSync.status_version_mismatch").to_string(),
-            cx.theme().danger,
-        ),
-        TeamKeyCacheStatus::Invalid => {
-            (t!("TeamSync.status_invalid").to_string(), cx.theme().danger)
-        }
-    };
-    div()
-        .text_xs()
-        .text_color(color)
-        .child(label)
-        .into_any_element()
-}
-
-fn show_team_key_entry_dialog(team: TeamOption, window: &mut Window, cx: &mut App) {
-    let team_id = team.id.clone();
-    let team_name = team.name.clone();
-    let key_input = cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder(t!("TeamSync.key_placeholder").to_string())
-            .masked(true)
-    });
-    let error_message = cx.new(|_| Option::<String>::None);
-    let key_input_for_ok = key_input.clone();
-    let key_input_for_render = key_input.clone();
-    let error_for_ok = error_message.clone();
-    let error_for_render = error_message.clone();
-    let team_for_ok = team.clone();
-
-    window.open_dialog(cx, move |dialog, _window, cx| {
-        let team_id_ok = team_id.clone();
-        let team_ok = team_for_ok.clone();
-        let key_input_ok = key_input_for_ok.clone();
-        let error_ok = error_for_ok.clone();
-        dialog
-            .title(format!("{} - {}", t!("TeamSync.save_local_key"), team_name))
-            .width(gpui::px(460.))
-            .confirm()
-            .on_ok(move |_, window, cx: &mut App| {
-                let team_key = key_input_ok.read(cx).text().to_string();
-                if team_key.is_empty() {
-                    set_team_key_dialog_error(&error_ok, t!("TeamSync.key_empty").to_string(), cx);
-                    return false;
-                }
-                if team_ok.key_verification.is_none() {
-                    if !team_key_role_can_rotate(team_ok.role.as_deref()) {
-                        set_team_key_dialog_error(
-                            &error_ok,
-                            t!("TeamSync.initialize_requires_manager").to_string(),
-                            cx,
-                        );
-                        return false;
-                    }
-                    save_or_initialize_team_key_from_settings(
-                        TeamKeySaveRequest::initialize(team_id_ok.clone(), team_key),
-                        window,
-                        cx,
-                    );
-                    return true;
-                }
-                save_or_initialize_team_key_from_settings(
-                    TeamKeySaveRequest::save(team_id_ok.clone(), team_key),
-                    window,
-                    cx,
-                );
-                true
-            })
-            .child(
-                v_flex()
-                    .gap_4()
-                    .p_4()
-                    .child(Input::new(&key_input_for_render).mask_toggle().w_full())
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t!("TeamSync.key_help").to_string()),
-                    )
-                    .when_some(error_for_render.read(cx).clone(), |this, msg| {
-                        this.child(div().text_sm().text_color(cx.theme().danger).child(msg))
-                    }),
-            )
-    });
-}
-
-fn show_team_key_rotation_dialog(team: TeamOption, window: &mut Window, cx: &mut App) {
-    let team_id = team.id.clone();
-    let team_name = team.name.clone();
-    let old_key_input = team_key_input(window, cx, t!("TeamSync.key_placeholder").to_string());
-    let new_key_input = team_key_input(window, cx, t!("TeamSync.new_key_placeholder").to_string());
-    let error_message = cx.new(|_| Option::<String>::None);
-    let old_for_ok = old_key_input.clone();
-    let new_for_ok = new_key_input.clone();
-    let old_for_render = old_key_input.clone();
-    let new_for_render = new_key_input.clone();
-    let error_for_ok = error_message.clone();
-    let error_for_render = error_message.clone();
-
-    window.open_dialog(cx, move |dialog, _window, cx| {
-        let team_id_ok = team_id.clone();
-        let old_ok = old_for_ok.clone();
-        let new_ok = new_for_ok.clone();
-        let error_ok = error_for_ok.clone();
-        dialog
-            .title(format!("{} - {}", t!("TeamSync.rotate_key"), team_name))
-            .width(gpui::px(500.))
-            .confirm()
-            .on_ok(move |_, window, cx: &mut App| {
-                let old_key = old_ok.read(cx).text().to_string();
-                let new_key = new_ok.read(cx).text().to_string();
-                if !team_key_rotation_inputs_valid(&old_key, &new_key) {
-                    set_team_key_dialog_error(
-                        &error_ok,
-                        t!("TeamSync.rotate_key_empty").to_string(),
-                        cx,
-                    );
-                    return false;
-                }
-                rotate_team_key_from_settings(team_id_ok.clone(), old_key, new_key, window, cx);
-                true
-            })
-            .child(
-                v_flex()
-                    .gap_4()
-                    .p_4()
-                    .child(Input::new(&old_for_render).mask_toggle().w_full())
-                    .child(Input::new(&new_for_render).mask_toggle().w_full())
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t!("TeamSync.rotate_help").to_string()),
-                    )
-                    .when_some(error_for_render.read(cx).clone(), |this, msg| {
-                        this.child(div().text_sm().text_color(cx.theme().danger).child(msg))
-                    }),
-            )
-    });
-}
-
-fn team_key_input(window: &mut Window, cx: &mut App, placeholder: String) -> Entity<InputState> {
-    cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder(placeholder)
-            .masked(true)
-    })
-}
-
-fn team_key_rotation_inputs_valid(old_key: &str, new_key: &str) -> bool {
-    !old_key.is_empty() && !new_key.is_empty()
-}
-
-fn set_team_key_dialog_error(error: &Entity<Option<String>>, message: String, cx: &mut App) {
-    error.update(cx, |msg, cx| {
-        *msg = Some(message);
-        cx.notify();
-    });
-}
-
-fn team_key_change_completed(window: &mut Window, cx: &mut App) {
-    if !cfg!(test) {
-        window.refresh();
-    }
-    emit_team_key_change_event(cx);
-}
-
-fn emit_team_key_change_event(cx: &mut App) {
-    let Some(notifier) = get_notifier(cx) else {
-        tracing::warn!("团队密钥状态变化后无法通知首页同步：GlobalConnectionNotifier 未初始化");
-        return;
-    };
-    notifier.update(cx, |_, cx| {
-        cx.emit(ConnectionDataEvent::CloudSyncRequested);
-    });
-}
-
-fn team_key_refresh_success_message(count: usize) -> String {
-    t!("TeamSync.refresh_success", count = count).to_string()
-}
-
-fn refresh_team_key_cache_from_settings(window: &mut Window, cx: &mut App) {
-    let Some(user) = GlobalCloudUser::get_user(cx) else {
-        window.push_notification(t!("Home.cloud_need_login").to_string(), cx);
-        return;
-    };
-    let Some(storage) = cx.try_global::<GlobalStorageState>() else {
-        window.push_notification(t!("Common.storage_unavailable").to_string(), cx);
-        return;
-    };
-    let sync_service = Arc::new(std::sync::RwLock::new(CloudSyncService::new()));
-    if let Ok(mut service) = sync_service.write() {
-        service.set_logged_in(user.id);
-    }
-    let engine = SyncEngine::new(
-        get_auth_service(cx).cloud_client(),
-        sync_service,
-        storage.storage.clone(),
-    );
-    window.push_notification(t!("TeamSync.refresh_started").to_string(), cx);
-    window
-        .spawn(cx, async move |cx| {
-            let result = engine.refresh_team_key_cache().await;
-            let (message, completed_event) = match result {
-                Ok(count) => (
-                    team_key_refresh_success_message(count),
-                    Some(ConnectionDataEvent::TeamCacheUpdated),
-                ),
-                Err(error) => (error.to_string(), None),
-            };
-            if let Err(error) = cx.update(|window, cx: &mut App| {
-                window.push_notification(message, cx);
-                if let Some(event) = completed_event
-                    && let Some(notifier) = get_notifier(cx)
-                {
-                    notifier.update(cx, |_, cx| {
-                        cx.emit(event);
-                    });
-                }
-                window.refresh();
-            }) {
-                tracing::warn!("团队列表刷新完成后更新窗口失败: {error}");
-            }
-        })
-        .detach();
-}
-
-struct TeamKeySaveRequest {
-    team_id: String,
-    team_key: String,
-    started_message: Option<String>,
-    success_message: String,
-}
-
-impl TeamKeySaveRequest {
-    fn initialize(team_id: String, team_key: String) -> Self {
-        Self {
-            team_id,
-            team_key,
-            started_message: Some(t!("TeamSync.initialize_started").to_string()),
-            success_message: t!("TeamSync.initialize_success").to_string(),
-        }
-    }
-
-    fn save(team_id: String, team_key: String) -> Self {
-        Self {
-            team_id,
-            team_key,
-            started_message: None,
-            success_message: t!("TeamSync.save_success").to_string(),
-        }
-    }
-}
-
-fn save_or_initialize_team_key_from_settings(
-    request: TeamKeySaveRequest,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(personal_key) = crypto::get_raw_master_key() else {
-        window.push_notification(t!("Encryption.key_locked_tooltip").to_string(), cx);
-        return;
-    };
-    let Some(engine) = team_key_engine_from_settings(window, cx) else {
-        return;
-    };
-    if let Some(message) = request.started_message {
-        window.push_notification(message, cx);
-    }
-    window
-        .spawn(cx, async move |cx| {
-            let result = engine
-                .save_or_initialize_team_key_for_cached_team(
-                    &request.team_id,
-                    &request.team_key,
-                    &personal_key,
-                )
-                .await;
-            let (message, key_changed) = match result {
-                Ok(_) => (request.success_message, true),
-                Err(error) => (error.to_string(), false),
-            };
-            if let Err(error) = cx.update(|window, cx: &mut App| {
-                window.push_notification(message, cx);
-                if key_changed {
-                    team_key_change_completed(window, cx);
-                } else {
-                    window.refresh();
-                }
-            }) {
-                tracing::warn!("团队密钥保存完成后更新窗口失败: {error}");
-            }
-        })
-        .detach();
-}
-
-fn forget_team_key_from_settings(team_id: String, window: &mut Window, cx: &mut App) {
-    let Some(engine) = team_key_engine_from_settings(window, cx) else {
-        return;
-    };
-    window
-        .spawn(cx, async move |cx| {
-            let result = engine.forget_team_key_for_cached_team(&team_id).await;
-            let (message, key_changed) = match result {
-                Ok(()) => (t!("TeamSync.forget_success").to_string(), true),
-                Err(error) => (error.to_string(), false),
-            };
-            if let Err(error) = cx.update(|window, cx: &mut App| {
-                window.push_notification(message, cx);
-                if key_changed {
-                    team_key_change_completed(window, cx);
-                } else {
-                    window.refresh();
-                }
-            }) {
-                tracing::warn!("团队密钥移除完成后更新窗口失败: {error}");
-            }
-        })
-        .detach();
-}
-
-fn team_key_engine_from_settings(window: &mut Window, cx: &mut App) -> Option<SyncEngine> {
-    let Some(user) = GlobalCloudUser::get_user(cx) else {
-        window.push_notification(t!("Home.cloud_need_login").to_string(), cx);
-        return None;
-    };
-    let Some(storage) = cx.try_global::<GlobalStorageState>() else {
-        window.push_notification(t!("Common.storage_unavailable").to_string(), cx);
-        return None;
-    };
-    let sync_service = Arc::new(std::sync::RwLock::new(CloudSyncService::new()));
-    if let Ok(mut service) = sync_service.write() {
-        service.set_logged_in(user.id);
-    }
-    Some(SyncEngine::new(
-        get_auth_service(cx).cloud_client(),
-        sync_service,
-        storage.storage.clone(),
-    ))
-}
-
-fn rotate_team_key_from_settings(
-    team_id: String,
-    old_key: String,
-    new_key: String,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(user) = GlobalCloudUser::get_user(cx) else {
-        window.push_notification(t!("Home.cloud_need_login").to_string(), cx);
-        return;
-    };
-    let Some(storage) = cx.try_global::<GlobalStorageState>() else {
-        window.push_notification(t!("Common.storage_unavailable").to_string(), cx);
-        return;
-    };
-    let sync_service = Arc::new(std::sync::RwLock::new(CloudSyncService::new()));
-    if let Ok(mut service) = sync_service.write() {
-        service.set_logged_in(user.id);
-    }
-    let engine = SyncEngine::new(
-        get_auth_service(cx).cloud_client(),
-        sync_service,
-        storage.storage.clone(),
-    );
-    window.push_notification(t!("TeamSync.rotate_started").to_string(), cx);
-    window
-        .spawn(cx, async move |cx| {
-            let result = engine.rotate_team_key(&team_id, &old_key, &new_key).await;
-            let (message, key_changed) = match result {
-                Ok(rotation) => (
-                    t!(
-                        "TeamSync.rotate_success",
-                        count = rotation.re_encrypted,
-                        version = rotation.key_version
-                    )
-                    .to_string(),
-                    true,
-                ),
-                Err(error) => (error.to_string(), false),
-            };
-            if let Err(error) = cx.update(|window, cx: &mut App| {
-                window.push_notification(message, cx);
-                if key_changed {
-                    team_key_change_completed(window, cx);
-                } else {
-                    window.refresh();
-                }
-            }) {
-                tracing::warn!("团队密钥轮换完成后更新窗口失败: {error}");
-            }
-        })
-        .detach();
-}
-
-fn team_key_role_can_rotate(role: Option<&str>) -> bool {
-    matches!(role, Some("owner" | "admin"))
-}
-
 impl Focusable for SettingsPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2368,16 +1942,9 @@ impl Render for SettingsPanel {
             init_settings(cx);
         }
 
-        let team_keys_page_hidden = self.initial_page_index == TEAM_KEYS_SETTINGS_PAGE_INDEX
-            && !is_feature_enabled(Feature::TeamManagement, cx);
-        let initial_page_index = if team_keys_page_hidden {
-            0
-        } else {
-            self.initial_page_index
-        };
+        let initial_page_index = self.initial_page_index;
         let settings_id = match initial_page_index {
             SYNC_SETTINGS_PAGE_INDEX => "main-app-settings-sync",
-            TEAM_KEYS_SETTINGS_PAGE_INDEX => "main-app-settings-team-keys",
             _ => "main-app-settings",
         };
 
@@ -3412,6 +2979,34 @@ const TERMINAL_SHORTCUTS: &[ShortcutEntry] = &[
         action_id: Some(action_id::TERMINAL_TOGGLE_VI_MODE),
         system_hotkey: false,
     },
+    ShortcutEntry {
+        keys_macos: &["ctrl-shift-up"],
+        keys_other: &["ctrl-shift-up"],
+        label_key: "Settings.Shortcuts.terminal_scroll_line_up",
+        action_id: Some(action_id::TERMINAL_SCROLL_LINE_UP),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["ctrl-shift-down"],
+        keys_other: &["ctrl-shift-down"],
+        label_key: "Settings.Shortcuts.terminal_scroll_line_down",
+        action_id: Some(action_id::TERMINAL_SCROLL_LINE_DOWN),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["shift-pageup"],
+        keys_other: &["shift-pageup"],
+        label_key: "Settings.Shortcuts.terminal_scroll_page_up",
+        action_id: Some(action_id::TERMINAL_SCROLL_PAGE_UP),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: &["shift-pagedown"],
+        keys_other: &["shift-pagedown"],
+        label_key: "Settings.Shortcuts.terminal_scroll_page_down",
+        action_id: Some(action_id::TERMINAL_SCROLL_PAGE_DOWN),
+        system_hotkey: false,
+    },
 ];
 
 const DATABASE_SHORTCUTS: &[ShortcutEntry] = &[
@@ -3608,6 +3203,55 @@ const REDIS_CLI_SHORTCUTS: &[ShortcutEntry] = &[
     },
 ];
 
+/// AI 会话（agent 聊天 / 工作台）快捷键。
+///
+/// 默认值直接引用绑定层的常量（`ai_chat_view::find_shortcut`），
+/// 不在这里再写一份字面量——设置页展示的与真正生效的必须是同一份数据。
+const AI_CHAT_SHORTCUTS: &[ShortcutEntry] = &[
+    ShortcutEntry {
+        keys_macos: ai_chat_view::FIND_MACOS,
+        keys_other: ai_chat_view::FIND_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_find",
+        action_id: Some(action_id::AI_CHAT_FIND),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::FIND_NEXT_MACOS,
+        keys_other: ai_chat_view::FIND_NEXT_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_find_next",
+        action_id: Some(action_id::AI_CHAT_FIND_NEXT),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::FIND_PREVIOUS_MACOS,
+        keys_other: ai_chat_view::FIND_PREVIOUS_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_find_previous",
+        action_id: Some(action_id::AI_CHAT_FIND_PREVIOUS),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::SESSION_BACK_MACOS,
+        keys_other: ai_chat_view::SESSION_BACK_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_session_back",
+        action_id: Some(action_id::AI_CHAT_SESSION_BACK),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::SESSION_FORWARD_MACOS,
+        keys_other: ai_chat_view::SESSION_FORWARD_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_session_forward",
+        action_id: Some(action_id::AI_CHAT_SESSION_FORWARD),
+        system_hotkey: false,
+    },
+    ShortcutEntry {
+        keys_macos: ai_chat_view::SESSION_SWITCHER_MACOS,
+        keys_other: ai_chat_view::SESSION_SWITCHER_OTHER,
+        label_key: "Settings.Shortcuts.ai_chat_session_switcher",
+        action_id: Some(action_id::AI_CHAT_SESSION_SWITCHER),
+        system_hotkey: false,
+    },
+];
+
 const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title_key: "Settings.Shortcuts.window",
@@ -3641,6 +3285,10 @@ const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
         title_key: "Settings.Shortcuts.redis_cli",
         entries: REDIS_CLI_SHORTCUTS,
     },
+    ShortcutGroup {
+        title_key: "Settings.Shortcuts.ai_chat",
+        entries: AI_CHAT_SHORTCUTS,
+    },
 ];
 
 #[derive(Clone)]
@@ -3670,7 +3318,7 @@ fn shortcut_specs_for_entry(entry: &ShortcutEntry, cx: &App) -> Vec<String> {
 }
 
 fn render_shortcut_value(key_str: &str, cx: &App) -> gpui::AnyElement {
-    match Keystroke::parse(key_str) {
+    match Keystroke::parse_with_os(key_str, one_core::keybindings::current_os()) {
         Ok(keystroke) => Kbd::new(keystroke).into_any_element(),
         Err(_) => div()
             .text_sm()
@@ -3799,7 +3447,7 @@ fn capture_shortcut(
     let is_valid = if system_hotkey {
         is_valid_system_hotkey(&spec)
     } else {
-        Keystroke::parse(&spec).is_ok()
+        Keystroke::parse_with_os(&spec, one_core::keybindings::current_os()).is_ok()
     };
 
     if !is_valid {
@@ -4047,25 +3695,23 @@ fn render_shortcuts_section(
 
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, http_client::HttpClient};
+    use gpui::http_client::HttpClient as _;
     use one_core::cloud_sync::personal::SyncStoreHealth;
-    use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
     use rust_i18n::t;
 
     use super::{
         AppSettings, CustomFont, DATABASE_SHORTCUTS, FontFamilyKind, GlobalProxySettings,
         ProxyType, WINDOW_SHORTCUTS, app_font_options, build_app_http_client,
-        builtin_monospace_font_options, emit_team_key_change_event, is_supported_font_file,
-        master_key_setting_enabled, merge_font_options_with_custom_fonts, monospace_font_options,
-        parse_font_families, personal_sync_backend_options, personal_sync_status_label,
-        personal_sync_status_view_model, team_key_refresh_success_message,
-        team_key_rotation_inputs_valid,
+        builtin_monospace_font_options, default_master_key_storage, is_supported_font_file,
+        master_key_setting_enabled, master_key_storage_from_value,
+        master_key_storage_select_options, master_key_storage_value,
+        merge_font_options_with_custom_fonts, monospace_font_options, parse_font_families,
+        personal_sync_backend_options, personal_sync_status_label, personal_sync_status_view_model,
     };
     use crate::local_terminal_profiles::setting_options as local_terminal_profile_options;
     use crate::personal_sync_status::PersonalSyncRuntimeStatus;
-    use one_core::settings::LocalTerminalProfileKind;
+    use one_core::settings::{LocalTerminalProfileKind, MasterKeyStorage};
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
 
     /// `include_str!` 的源码契约必须先截掉测试模块本身，否则断言会命中测试自己写的字面量。
     fn implementation_source() -> &'static str {
@@ -4204,6 +3850,64 @@ mod tests {
         assert!(!entry.system_hotkey);
     }
 
+    /// AI 会话的三条会话键：设置页展示的默认值必须与绑定层同源。
+    ///
+    /// `AI_CHAT_SHORTCUTS` 直接引用 `ai_chat_view::SESSION_*` 常量，所以这条真正
+    /// 钉的是「macOS / 其他 两栏有没有接反」与「三条动作有没有漏进设置页」——
+    /// 接反了用户会在 macOS 上看到 `ctrl-[`，而真正生效的是 `cmd-[`。
+    #[test]
+    fn ai_chat_session_shortcuts_match_the_binding_layer() {
+        use one_core::keybindings::action_id;
+
+        for is_macos in [true, false] {
+            let (back, forward, switcher) =
+                ai_chat_view::session_shortcut_defaults_for_platform(is_macos);
+            for (action, expected) in [
+                (action_id::AI_CHAT_SESSION_BACK, back),
+                (action_id::AI_CHAT_SESSION_FORWARD, forward),
+                (action_id::AI_CHAT_SESSION_SWITCHER, switcher),
+            ] {
+                let entry = super::AI_CHAT_SHORTCUTS
+                    .iter()
+                    .find(|entry| entry.action_id == Some(action))
+                    .unwrap_or_else(|| panic!("{action} 未出现在设置页快捷键列表里"));
+                let shown = if is_macos {
+                    entry.keys_macos
+                } else {
+                    entry.keys_other
+                };
+                assert_eq!(
+                    shown, expected,
+                    "{action} 在 is_macos={is_macos} 时设置页展示值与绑定层不一致"
+                );
+            }
+        }
+    }
+
+    /// 三条会话键的 `label_key` 必须真的能在 `locales/main.yml` 里解析出文案。
+    /// 少了词条，`t!` 会把 key 原样吐回界面（用户看到 `Settings.Shortcuts.…`）。
+    #[test]
+    fn ai_chat_session_shortcut_labels_resolve() {
+        use one_core::keybindings::action_id;
+
+        for action in [
+            action_id::AI_CHAT_SESSION_BACK,
+            action_id::AI_CHAT_SESSION_FORWARD,
+            action_id::AI_CHAT_SESSION_SWITCHER,
+        ] {
+            let entry = super::AI_CHAT_SHORTCUTS
+                .iter()
+                .find(|entry| entry.action_id == Some(action))
+                .unwrap_or_else(|| panic!("{action} 未出现在设置页快捷键列表里"));
+            let text = t!(entry.label_key).to_string();
+            assert_ne!(
+                entry.label_key, text,
+                "词条 `{}` 在 locales/main.yml 里缺失",
+                entry.label_key
+            );
+        }
+    }
+
     #[test]
     fn file_log_layer_disables_ansi_escapes() {
         let source = include_str!("setting_tab.rs");
@@ -4245,7 +3949,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_master_key_setting_explicitly_describes_the_recovery_risk() {
+    fn portable_master_key_setting_explicitly_describes_the_storage_boundary() {
         let source = include_str!("setting_tab.rs");
         let locales = include_str!("../locales/main.yml");
 
@@ -4254,9 +3958,46 @@ mod tests {
         let legacy_portable_override =
             ["let val = val || one_core::app_paths::", "is_portable()"].concat();
         assert!(!source.contains(&legacy_portable_override));
-        assert!(locales.contains("Anyone who obtains both the application"));
-        assert!(locales.contains("任何同时获得应用程序和完整 data 目录的人"));
-        assert!(locales.contains("任何同時取得應用程式和完整 data 目錄的人"));
+        // 记住主密钥改为系统凭据库后，文案必须说明「绑定设备/用户」与「无凭据库时的退路」
+        assert!(locales.contains("system credential store"));
+        assert!(locales.contains("系统凭据库"));
+        assert!(locales.contains("系統憑證儲存庫"));
+        assert!(locales.contains("system_key_storage_unavailable"));
+        // 保存位置可切换后，本机文件的风险提示与各平台凭据库名称必须可翻译
+        assert!(source.contains("master_key_storage_select_options"));
+        assert!(source.contains("update_master_key_storage"));
+        assert!(locales.contains("master_key_storage_local_risk"));
+        assert!(locales.contains("master_key_storage_keychain"));
+        assert!(locales.contains("master_key_storage_credential_manager"));
+        assert!(locales.contains("本机文件"));
+        assert!(locales.contains("本機檔案"));
+    }
+
+    #[test]
+    fn master_key_storage_values_round_trip_and_follow_platform_support() {
+        for backend in [
+            MasterKeyStorage::SystemCredentialStore,
+            MasterKeyStorage::LocalFile,
+        ] {
+            assert_eq!(
+                backend,
+                master_key_storage_from_value(master_key_storage_value(backend))
+            );
+        }
+
+        let options = master_key_storage_select_options();
+        let ids: Vec<&str> = options.iter().map(|(id, _)| id.as_ref()).collect();
+        assert!(ids.contains(&"local_file"), "本机文件始终可选");
+        let system_supported = one_core::key_storage::system_storage_supported();
+        assert_eq!(
+            system_supported,
+            ids.contains(&"system_credential_store"),
+            "只有系统凭据库可用的平台才显示系统选项"
+        );
+        assert_eq!(
+            system_supported,
+            default_master_key_storage() == MasterKeyStorage::SystemCredentialStore
+        );
     }
 
     /// 切界面语言必须**叫醒已挂载的扩展页面**。
@@ -4302,15 +4043,6 @@ mod tests {
     }
 
     #[test]
-    fn team_key_rotation_allows_same_passphrase() {
-        assert!(team_key_rotation_inputs_valid(
-            "same secure passphrase",
-            "same secure passphrase"
-        ));
-        assert!(!team_key_rotation_inputs_valid("", "new secure passphrase"));
-    }
-
-    #[test]
     fn global_proxy_settings_build_proxy_url_without_auth() {
         let settings = GlobalProxySettings {
             enabled: true,
@@ -4348,162 +4080,6 @@ mod tests {
         assert_eq!(
             proxy_url.as_str(),
             "http://demo-user:demo-pass@proxy.example.com:8080/"
-        );
-    }
-
-    #[test]
-    fn team_key_refresh_success_message_reports_cached_count() {
-        rust_i18n::set_locale("en");
-
-        assert_eq!(
-            "Team list refreshed. 2 teams cached.",
-            team_key_refresh_success_message(2)
-        );
-    }
-
-    #[test]
-    fn team_key_cache_refresh_only_announces_update_after_success() {
-        let source = include_str!("setting_tab.rs");
-        let refresh = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source exists")
-            .rsplit("fn refresh_team_key_cache_from_settings(")
-            .next()
-            .expect("team key cache refresh exists")
-            .split("fn initialize_team_key_from_settings(")
-            .next()
-            .expect("team key cache refresh has an end marker");
-
-        let result_match = refresh
-            .split("match result")
-            .nth(1)
-            .expect("refresh result is matched");
-        let success = result_match
-            .split("Ok(")
-            .nth(1)
-            .expect("refresh success branch exists")
-            .split("Err(")
-            .next()
-            .expect("refresh success branch has an end marker");
-        assert!(success.contains("ConnectionDataEvent::TeamCacheUpdated"));
-
-        let failure = result_match
-            .split("Err(")
-            .nth(1)
-            .expect("refresh failure branch exists")
-            .split("};")
-            .next()
-            .expect("refresh failure branch has an end marker");
-        assert!(!failure.contains("ConnectionDataEvent::TeamCacheUpdated"));
-    }
-
-    #[test]
-    fn async_team_key_operations_notify_through_the_current_window() {
-        let source = include_str!("setting_tab.rs");
-        for (function, next_function) in [
-            (
-                "fn refresh_team_key_cache_from_settings(",
-                "struct TeamKeySaveRequest",
-            ),
-            (
-                "fn save_or_initialize_team_key_from_settings(",
-                "fn forget_team_key_from_settings(",
-            ),
-            (
-                "fn forget_team_key_from_settings(",
-                "fn team_key_engine_from_settings(",
-            ),
-            (
-                "fn rotate_team_key_from_settings(",
-                "fn team_key_role_can_rotate(",
-            ),
-        ] {
-            let body = source
-                .split(function)
-                .nth(1)
-                .expect("team key operation exists")
-                .split(next_function)
-                .next()
-                .expect("team key operation has an end marker");
-
-            assert!(!body.contains("update_window("), "{function}");
-            assert!(
-                body.contains("cx.update(|window, cx: &mut App|"),
-                "{function}"
-            );
-            assert!(body.contains("window.push_notification(message, cx)"));
-        }
-    }
-
-    #[test]
-    fn successful_team_key_changes_request_runtime_reload() {
-        let source = include_str!("setting_tab.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source exists");
-
-        assert!(production.contains("fn team_key_change_completed("));
-        assert!(production.contains("ConnectionDataEvent::CloudSyncRequested"));
-        let entry_dialog = production
-            .split("fn show_team_key_entry_dialog(")
-            .nth(1)
-            .expect("team key entry dialog exists")
-            .split("fn show_team_key_rotation_dialog(")
-            .next()
-            .expect("team key entry dialog has an end marker");
-        assert!(entry_dialog.contains("save_or_initialize_team_key_from_settings("));
-        for (function, next_function) in [
-            (
-                "fn save_or_initialize_team_key_from_settings(",
-                "fn forget_team_key_from_settings(",
-            ),
-            (
-                "fn forget_team_key_from_settings(",
-                "fn team_key_engine_from_settings(",
-            ),
-            (
-                "fn rotate_team_key_from_settings(",
-                "fn team_key_role_can_rotate(",
-            ),
-        ] {
-            let body = production
-                .split(function)
-                .nth(1)
-                .expect("team key change function exists")
-                .split(next_function)
-                .next()
-                .expect("team key change function has an end marker");
-
-            assert!(body.contains("team_key_change_completed("), "{function}");
-        }
-    }
-
-    #[gpui::test]
-    fn team_key_change_emits_cloud_sync_request(cx: &mut TestAppContext) {
-        let events = Arc::new(Mutex::new(Vec::<ConnectionDataEvent>::new()));
-        let events_for_subscription = events.clone();
-        let _subscription = cx.update(|cx| {
-            one_core::connection_notifier::init(cx);
-            let notifier = get_notifier(cx).expect("connection notifier initialized");
-            let subscription = cx.subscribe(&notifier, move |_, event, _| {
-                events_for_subscription
-                    .lock()
-                    .expect("events lock")
-                    .push(event.clone());
-            });
-            subscription
-        });
-
-        cx.update(|cx| emit_team_key_change_event(cx));
-
-        assert!(
-            events
-                .lock()
-                .expect("events lock")
-                .iter()
-                .any(|event| matches!(event, ConnectionDataEvent::CloudSyncRequested))
         );
     }
 
@@ -4817,28 +4393,6 @@ mod tests {
             .expect("系统字体已并入列表");
         assert!(builtin_first < installed_last);
         assert_eq!(values.len() - 1, installed_last);
-    }
-
-    #[test]
-    fn team_key_settings_page_uses_team_management_feature_gate() {
-        let source = include_str!("setting_tab.rs");
-        let setting_pages = source
-            .split("fn setting_pages(")
-            .nth(1)
-            .expect("setting_pages exists")
-            .split("fn render_personal_sync_path_field")
-            .next()
-            .expect("setting_pages has an end marker");
-
-        assert!(setting_pages.contains("is_feature_enabled(Feature::TeamManagement, cx)"));
-        assert!(setting_pages.contains("pages.remove(TEAM_KEYS_SETTINGS_PAGE_INDEX)"));
-        let render = source
-            .split("impl Render for SettingsPanel")
-            .nth(1)
-            .expect("SettingsPanel render exists");
-        assert!(render.contains("let team_keys_page_hidden"));
-        assert!(render.contains("is_feature_enabled(Feature::TeamManagement, cx)"));
-        assert!(render.contains("page_ix: initial_page_index"));
     }
 
     #[test]

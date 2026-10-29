@@ -1109,6 +1109,8 @@ impl DbTreeView {
                     }
                 }
             }
+            // 数据级事件：表数据被清空不影响树结构，树无需刷新
+            ConnectionDataEvent::TableDataCleared { .. } => {}
             ConnectionDataEvent::CredentialCreated { .. }
             | ConnectionDataEvent::CredentialUpdated { .. }
             | ConnectionDataEvent::CredentialDeleted { .. }
@@ -3412,6 +3414,7 @@ mod tests {
 
     fn build_connection(id: i64, selected_databases: Option<Vec<&str>>) -> StoredConnection {
         StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(id),
             credential_revision: None,
             name: "conn".to_string(),

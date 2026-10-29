@@ -10,9 +10,9 @@ use rust_i18n::t;
 
 use super::drag::DragConnection;
 use super::row_parts::{
-    child_group_button, connection_team_indicator, connection_type_tag, delete_group_button,
-    edit_group_button, tree_chevron, tree_connection_icon_slot, tree_connection_name_with_type_tag,
-    tree_count, tree_label,
+    child_group_button, connection_ai_access_badge, connection_team_indicator, connection_type_tag,
+    delete_group_button, edit_group_button, tree_chevron, tree_connection_icon_slot,
+    tree_connection_name_with_type_tag, tree_count, tree_label,
 };
 use super::tree_model::ConnectionTreeRow;
 use super::{PersistentConnectionSidebar, SidebarPalette};
@@ -36,6 +36,10 @@ impl PersistentConnectionSidebar {
             }
             ConnectionTreeRow::RecentConnection { id, name } => {
                 self.render_connection_row(id, name, 0, None, true, palette, cx)
+            }
+            ConnectionTreeRow::GroupsHeader { count } => self.render_groups_header(count, palette),
+            ConnectionTreeRow::UnassignedHeader { count, expanded } => {
+                self.render_unassigned_header(count, expanded, palette, cx)
             }
             row @ ConnectionTreeRow::Workspace { .. } => {
                 self.render_workspace_row(row, palette, cx)
@@ -86,6 +90,83 @@ impl PersistentConnectionSidebar {
                     .text_color(palette.muted_foreground),
             )
             .child(tree_label(t!("Home.recent_connections").to_string()))
+            .child(tree_count(count, palette))
+            .into_any_element()
+    }
+
+    /// 渲染“分组”分区标题：把最近连接区和下方文件夹区分开。
+    ///
+    /// 不可折叠（“全部折叠/展开”另有入口），也不用 chevron；顶部细边框
+    /// 不占布局高度，保证 uniform_list 的所有行仍然等高。
+    fn render_groups_header(&self, count: usize, palette: SidebarPalette) -> AnyElement {
+        let tree = one_ui::theme_geometry().tree;
+        let row_height = if self.home_embedded {
+            tree.row_height + gpui::px(4.0)
+        } else {
+            tree.row_height
+        };
+        h_flex()
+            .id("home-tree-groups-header")
+            .w_full()
+            .h(row_height)
+            .px(tree.base_padding)
+            .gap_1()
+            .items_center()
+            .border_t_1()
+            .border_color(palette.border.opacity(0.6))
+            // 与相邻分区标题的文字对齐：不画 chevron，但保留同等宽度的占位。
+            .child(div().w(tree.disclosure_size))
+            .child(
+                Icon::new(IconName::FolderOpen)
+                    .mono()
+                    .with_size(IconSize::Default)
+                    .text_color(palette.muted_foreground),
+            )
+            .child(tree_label(t!("Home.groups_section").to_string()))
+            .child(tree_count(count, palette))
+            .into_any_element()
+    }
+
+    /// 渲染“未分组”分区标题：与文件夹区之间用顶部一条细分隔线划出界限，
+    /// 标题本身可折叠，视觉配方与“最近连接”分区标题保持一致。
+    fn render_unassigned_header(
+        &self,
+        count: usize,
+        expanded: bool,
+        palette: SidebarPalette,
+        cx: &gpui::Context<Self>,
+    ) -> AnyElement {
+        let home = self.home_page.clone();
+        let tree = one_ui::theme_geometry().tree;
+        let row_height = if self.home_embedded {
+            tree.row_height + gpui::px(4.0)
+        } else {
+            tree.row_height
+        };
+        h_flex()
+            .id("home-tree-unassigned-header")
+            .w_full()
+            .h(row_height)
+            .px(tree.base_padding)
+            .gap_1()
+            .items_center()
+            .border_t_1()
+            .border_color(palette.border.opacity(0.6))
+            .cursor_pointer()
+            .hover(move |row| row.bg(palette.hover))
+            .on_click(move |_, _, cx| {
+                home.update(cx, |home, cx| {
+                    home.toggle_unassigned_connections(cx);
+                });
+            })
+            .child(tree_chevron(true, expanded, cx))
+            .child(
+                Icon::new(IconName::Inbox)
+                    .mono()
+                    .with_size(IconSize::Default)
+                    .text_color(palette.muted_foreground),
+            )
+            .child(tree_label(t!("Home.unassigned_connections").to_string()))
             .child(tree_count(count, palette))
             .into_any_element()
     }
@@ -244,6 +325,12 @@ impl PersistentConnectionSidebar {
         let team_indicator = connection.as_ref().and_then(|connection| {
             connection_team_indicator(connection, home.read(cx).cached_team_options(), cx)
         });
+        // AI 访问受限时在行尾补一个小徽标；级别来自侧栏缓存的连接字段。
+        let ai_access_badge = connection
+            .as_ref()
+            .and_then(|connection| connection.id)
+            .map(|id| self.ai_access_levels.get(&id).copied().unwrap_or_default())
+            .and_then(|level| connection_ai_access_badge(level, cx));
         let type_tag = connection
             .as_ref()
             .map(|connection| connection_type_tag(connection, cx));
@@ -331,7 +418,7 @@ impl PersistentConnectionSidebar {
                 if batch_mode {
                     let mode = if event.modifiers().shift {
                         ConnectionSelectionMode::Range
-                    } else if event.modifiers().secondary() {
+                    } else if event.modifiers().secondary(cx) {
                         ConnectionSelectionMode::Toggle
                     } else {
                         ConnectionSelectionMode::Replace
@@ -373,6 +460,7 @@ impl PersistentConnectionSidebar {
             .child(tree_connection_icon_slot(icon, palette))
             .child(tree_connection_name_with_type_tag(name, type_tag))
             .when_some(team_indicator, |row, indicator| row.child(indicator))
+            .when_some(ai_access_badge, |row, badge| row.child(badge))
             .into_any_element()
     }
 }
@@ -433,5 +521,43 @@ mod tests {
         assert!(parts.contains("text_color(cx.theme().foreground)"));
         assert!(parts.contains("rounded_full()"));
         assert!(!parts.contains("text_color(accent)"));
+    }
+
+    #[test]
+    fn unassigned_header_separates_loose_connections_from_groups() {
+        let source = include_str!("rows.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+
+        assert!(implementation.contains("ConnectionTreeRow::UnassignedHeader { count, expanded }"));
+        assert!(implementation.contains("home-tree-unassigned-header"));
+        assert!(implementation.contains("Icon::new(IconName::Inbox)"));
+        assert!(implementation.contains("Home.unassigned_connections"));
+        assert!(implementation.contains("toggle_unassigned_connections"));
+        // 用顶部细边框划出与文件夹区的界限；边框不占布局高度，
+        // uniform_list 要求所有行等高，因此不能插入额外的分隔行。
+        assert!(implementation.contains("border_t_1()"));
+    }
+
+    #[test]
+    fn groups_header_separates_recent_connections_from_groups() {
+        let source = include_str!("rows.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        let header = implementation
+            .split("fn render_groups_header")
+            .nth(1)
+            .expect("分组分区标题应存在")
+            .split("fn render_unassigned_header")
+            .next()
+            .unwrap();
+
+        assert!(implementation.contains("ConnectionTreeRow::GroupsHeader { count }"));
+        assert!(header.contains("home-tree-groups-header"));
+        assert!(header.contains("Home.groups_section"));
+        assert!(header.contains("Icon::new(IconName::FolderOpen)"));
+        assert!(header.contains("border_t_1()"));
+        assert!(header.contains("tree_count(count, palette)"));
+        // 分区标题只是标签：不可折叠、不带 chevron。
+        assert!(!header.contains("tree_chevron"));
+        assert!(!header.contains("on_click"));
     }
 }

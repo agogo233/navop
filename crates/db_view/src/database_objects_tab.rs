@@ -326,7 +326,7 @@ impl DatabaseObjects {
 
     /// 行按下：区分单选、多选（Cmd/Ctrl）与 Shift 区间选择，并开启拖选待判定状态。
     fn on_row_mouse_down(&mut self, row_ix: usize, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let additive = event.modifiers.secondary();
+        let additive = event.modifiers.secondary(cx);
         if event.modifiers.shift {
             self.drag_state.cancel();
             self.drag_origin = None;

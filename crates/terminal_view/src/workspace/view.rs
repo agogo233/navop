@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Window};
+use gpui_component::Icon;
 use one_core::storage::models::StoredConnection;
 use terminal::LocalConfig;
 use terminal::terminal::TerminalConnectionKind;
 
 use super::pane_tab_transfer::TerminalPaneTabMetadata;
 use super::resize::WorkspaceSidebarResize;
+use super::split_sizing::TerminalSplitSizing;
 use super::{TerminalPaneId, TerminalSplitTree};
 use crate::view::{
     RecordingPlaybackViewConfig, SessionLogViewConfig, TERMINAL_TOOLS_SIDEBAR_DEFAULT_WIDTH,
@@ -24,6 +26,8 @@ pub struct TerminalWorkspace {
     pub(super) workspace_bounds: gpui::Bounds<gpui::Pixels>,
     pub(super) pane_tab_metadata: HashMap<TerminalPaneId, TerminalPaneTabMetadata>,
     pub(super) pane_subscriptions: HashMap<TerminalPaneId, Vec<Subscription>>,
+    /// 每个拆分分组各自持有的分隔比例,切标签页/重渲染都不丢。
+    pub(super) split_sizing: TerminalSplitSizing,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +50,22 @@ impl TerminalWorkspace {
     ) -> Self {
         let main = cx.new(|cx| {
             TerminalView::new_with_index(config, tab_index, window, cx).with_workspace_pane()
+        });
+        Self::from_pane(main, window, cx)
+    }
+
+    /// 扩展声明的终端型连接:固定标题、连接图标、退出后可重启的本地进程。
+    pub fn new_launched(
+        config: LocalConfig,
+        title: String,
+        connection_icon: Option<Icon>,
+        tab_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let main = cx.new(|cx| {
+            TerminalView::new_launched(config, title, connection_icon, tab_index, window, cx)
+                .with_workspace_pane()
         });
         Self::from_pane(main, window, cx)
     }
@@ -150,6 +170,7 @@ impl TerminalWorkspace {
             workspace_bounds: gpui::Bounds::default(),
             pane_tab_metadata,
             pane_subscriptions: HashMap::new(),
+            split_sizing: TerminalSplitSizing::new(),
         };
         this.subscribe_to_pane(initial_pane_id, pane, window, cx);
         this.set_active_pane_metric_state(cx);

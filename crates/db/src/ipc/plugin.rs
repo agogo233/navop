@@ -1,4 +1,3 @@
-use crate::clickhouse::ClickHousePlugin;
 use crate::connection::{DbConnection, DbError};
 use crate::executor::{QueryResult, SqlResult, SqlSource};
 use crate::import_export::{
@@ -443,12 +442,10 @@ fn compatible_plugin_for(database_type: DatabaseType) -> Option<Box<dyn Database
         DatabaseType::MySQL => Some(Box::new(MySqlPlugin::new())),
         DatabaseType::PostgreSQL => Some(Box::new(PostgresPlugin::new())),
         DatabaseType::SQLite => Some(Box::new(SqlitePlugin::new())),
-        DatabaseType::DuckDB => None,
         DatabaseType::MSSQL => Some(Box::new(MsSqlPlugin::new())),
         DatabaseType::Oracle => Some(Box::new(OraclePlugin::new())),
-        DatabaseType::ClickHouse => Some(Box::new(ClickHousePlugin::new())),
-        // TDengine 原生插件已移除(改由 tdengine IPC 驱动提供),无本地兼容实现。
-        DatabaseType::TDengine => None,
+        // ClickHouse/TDengine 原生插件已移除(改由对应 IPC 驱动提供),无本地兼容实现。
+        DatabaseType::ClickHouse | DatabaseType::DuckDB | DatabaseType::TDengine => None,
         DatabaseType::External { .. } => None,
     }
 }

@@ -13,7 +13,7 @@ use gpui::{
     App, AppContext as _, AsyncApp, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontFallbacks, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Styled, Task,
+    ParentElement, Pixels, Point, Render, ScrollEvent, SharedString, Styled, Task,
     UTF16Selection, Window, actions, canvas, div, px, size,
 };
 use gpui_component::{
@@ -363,7 +363,7 @@ fn init_keybindings(cx: &App) -> Vec<gpui::KeyBinding> {
     keybindings.extend(
         shortcuts_for(cx, action_id::REDIS_CLEAR_OUTPUT, &["ctrl-l"])
             .into_iter()
-            .map(|key| gpui::KeyBinding::new(&key, ClearOutput, Some(REDIS_CLI_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ClearOutput, Some(REDIS_CLI_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -372,7 +372,7 @@ fn init_keybindings(cx: &App) -> Vec<gpui::KeyBinding> {
             &[redis_platform_shortcut("cmd-c", "ctrl-c")],
         )
         .into_iter()
-        .map(|key| gpui::KeyBinding::new(&key, Copy, Some(REDIS_CLI_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, Copy, Some(REDIS_CLI_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -381,7 +381,7 @@ fn init_keybindings(cx: &App) -> Vec<gpui::KeyBinding> {
             &[redis_platform_shortcut("cmd-v", "ctrl-v")],
         )
         .into_iter()
-        .map(|key| gpui::KeyBinding::new(&key, Paste, Some(REDIS_CLI_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, Paste, Some(REDIS_CLI_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(
@@ -390,12 +390,12 @@ fn init_keybindings(cx: &App) -> Vec<gpui::KeyBinding> {
             &[redis_platform_shortcut("cmd-a", "ctrl-a")],
         )
         .into_iter()
-        .map(|key| gpui::KeyBinding::new(&key, SelectAll, Some(REDIS_CLI_CONTEXT))),
+        .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, SelectAll, Some(REDIS_CLI_CONTEXT), cx)),
     );
     keybindings.extend(
         shortcuts_for(cx, action_id::REDIS_CLEAR_SELECTION, &["escape"])
             .into_iter()
-            .map(|key| gpui::KeyBinding::new(&key, ClearSelection, Some(REDIS_CLI_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, ClearSelection, Some(REDIS_CLI_CONTEXT), cx)),
     );
     keybindings.extend([
         // 光标移动
@@ -425,7 +425,7 @@ fn init_keybindings(cx: &App) -> Vec<gpui::KeyBinding> {
     keybindings.extend(
         shortcuts_for(cx, action_id::REDIS_COMPLETE_COMMAND, &["tab"])
             .into_iter()
-            .map(|key| gpui::KeyBinding::new(&key, CompleteCommand, Some(REDIS_CLI_CONTEXT))),
+            .map(|key| one_core::keybindings::load_dynamic_keybinding(&key, CompleteCommand, Some(REDIS_CLI_CONTEXT), cx)),
     );
     keybindings
 }
@@ -1447,7 +1447,7 @@ impl RedisCliView {
     /// 处理滚轮事件
     fn handle_scroll(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2026,7 +2026,7 @@ impl Render for RedisCliView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .flex_1()
             .relative()
-            .on_scroll_wheel(cx.listener(Self::handle_scroll))
+            .on_scroll(cx.listener(Self::handle_scroll))
             .child(
                 // Canvas 用于 IME 输入定位
                 canvas(

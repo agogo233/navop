@@ -33,6 +33,7 @@ fn field_config(
             ResourceConnectionFieldType::Checkbox => DeclarativeFieldType::Checkbox,
             ResourceConnectionFieldType::FilePath => DeclarativeFieldType::FilePath,
             ResourceConnectionFieldType::Auth => DeclarativeFieldType::Auth,
+            ResourceConnectionFieldType::Icon => DeclarativeFieldType::Icon,
         },
         rows: field.rows.unwrap_or(DECLARATIVE_TEXTAREA_DEFAULT_ROWS),
         required: field.required,

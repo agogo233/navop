@@ -47,6 +47,7 @@ pub(super) async fn execute_import_statements(
         transactional: config.use_transaction,
         max_rows: None,
         streaming: false,
+        reconnect_on_lost_connection: false,
     };
     let results = match connection.execute(plugin, &script, options).await {
         Ok(results) => results,

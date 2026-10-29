@@ -36,6 +36,8 @@ use self::selects::{WorkspaceSelectItem, create_workspace_select};
 pub struct RemoteDesktopFormWindowConfig {
     pub protocol: RemoteDesktopProtocol,
     pub editing_connection: Option<StoredConnection>,
+    /// 新建连接向导打开时指定的目标分组：仅新建（非编辑、非复制）时预选，用户仍可修改。
+    pub initial_workspace_id: Option<i64>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
 }
@@ -84,8 +86,15 @@ impl RemoteDesktopFormWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let initial_workspace_id = config.initial_workspace_id;
         let mut form = Self::empty(config, window, cx);
         form.load_editing_connection(window, cx);
+        // 新建连接向导带着目标分组打开时预选该分组（编辑连接已由上面回填）。
+        if !form.is_editing
+            && let Some(workspace_id) = initial_workspace_id
+        {
+            form.select_workspace(workspace_id, window, cx);
+        }
         form.focus_handle.focus(window, cx);
         form
     }
@@ -181,6 +190,13 @@ impl RemoteDesktopFormWindow {
             error: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// 预选目标分组（新建连接向导从某个分组右键进入时使用），用户仍可在下拉里改。
+    fn select_workspace(&mut self, workspace_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_select.update(cx, |state, cx| {
+            state.set_selected_value(&Some(workspace_id), window, cx)
+        });
     }
 
     fn load_editing_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {

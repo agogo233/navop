@@ -184,6 +184,60 @@ pub trait CloudApiClient: Send + Sync {
     ) -> Result<(), CloudApiError>;
 
     // ========================================================================
+    // 团队管理（写操作）
+    // ========================================================================
+
+    /// 创建团队，并把当前用户设为 owner。
+    ///
+    /// 服务端由 `create_team_with_owner` 一次性完成「插入 teams + 插入
+    /// team_members(owner)」，返回新团队 ID。
+    async fn create_team_with_owner(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<String, CloudApiError>;
+
+    /// 更新团队资料（名称 / 描述），返回更新后的团队。
+    ///
+    /// 服务端只允许 owner 修改，越权时是一行都没改到的静默空响应。
+    async fn update_team_profile(
+        &self,
+        team_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Team, CloudApiError>;
+
+    /// 按邮箱把已注册用户加入团队，返回成员记录 ID。
+    async fn add_team_member_by_email(
+        &self,
+        team_id: &str,
+        email: &str,
+        role: TeamRole,
+    ) -> Result<String, CloudApiError>;
+
+    /// 获取带邮箱的团队成员列表。
+    async fn list_team_members_with_email(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<TeamMemberWithEmail>, CloudApiError>;
+
+    /// 修改成员角色。
+    ///
+    /// `team_id` 只用于错误上下文与刷新，权限校验完全由服务端负责。
+    async fn set_team_member_role(
+        &self,
+        team_id: &str,
+        member_id: &str,
+        role: TeamRole,
+    ) -> Result<(), CloudApiError>;
+
+    /// 管理员移除成员（owner 与 admin 都不可被直接移除；RPC 不支持成员自助退出）。
+    ///
+    /// `team_id` 只用于错误上下文与刷新，权限校验完全由服务端负责。
+    async fn remove_team_member(&self, team_id: &str, member_id: &str)
+    -> Result<(), CloudApiError>;
+
+    // ========================================================================
     // AI 聊天
     // ========================================================================
 

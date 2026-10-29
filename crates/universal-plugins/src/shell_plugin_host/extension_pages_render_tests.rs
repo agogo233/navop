@@ -15,7 +15,7 @@
 //! 页面在这个台子里只需要能画出来，`navop.workbench` / `navop.dev` / `navop.log`
 //! 一律用返回空数据的桩替代，所以不需要连接、不需要 catalog。
 //!
-//! 需要 `--features shell-plugins`（`gpui-shell` / `gpui-component-shell` 是可选依赖）：
+//! 需要 `--features shell-plugins`（`gpui-shell` 是可选依赖）：
 //! ```bash
 //! cargo test -p universal-plugins --features shell-plugins -- extension_
 //! ```
@@ -111,8 +111,11 @@ mod tests {
         let workbench = HostModule::new("navop.workbench")
             .function("current", null)
             .function("dispatch", null);
-        // `current` 返回 `Null`:页面全部写成 `context.current()?.connection?...`,
-        // 缺上下文时自己兜底。
+        // 嵌入式工作台页会 `import * as context from "navop.context"` 取当前连接
+        // （契约见 `navop-extensions` 的 `middleware-standard.md`）。这里的台子没有
+        // 真实会话，`current` 返回 `Null` 即可 —— 页面都写成
+        // `context.current()?.connection?...` 自己兜底，落成 `undefined` 会被下面的
+        // PLACEHOLDER_TEXT 抓出来。宿主真正的实现在 `shell_plugin_host/context.rs`。
         let context = HostModule::new("navop.context").function("current", null);
         let dev = HostModule::new("navop.dev")
             .function("list", empty)
@@ -189,9 +192,9 @@ mod tests {
         Rc<gpui_shell::ShellRuntime>,
     ) {
         cx.update(|cx| {
-            gpui_component_shell::init(cx);
+            gpui_shell::components::init(cx);
         });
-        let runtime = gpui_component_shell::new_isolated_runtime().expect("isolated runtime");
+        let runtime = gpui_shell::components::new_isolated_runtime().expect("isolated runtime");
         let options = ViewLoadOptions::new(root.to_path_buf(), entry, extension_policy());
         let window = cx.add_window(|_, _| Empty);
         let mut context = VisualTestContext::from_window(*window.deref(), cx);

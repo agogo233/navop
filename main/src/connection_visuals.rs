@@ -196,23 +196,22 @@ pub(crate) fn stored_connection_icon_with_catalog(
     }
 }
 
-/// 扩展连接图标：按 (extension_id, contribution_id) 从扩展目录取
-/// `contributes.connections[].icon` 指向的 SVG 文件渲染。任一环节缺失
-/// （非扩展连接、目录不可用、贡献不存在、未声明图标）都返回 None，
-/// 由调用方回退到通用扩展图标。
+/// 扩展连接图标:用户在连接表单里的选择 → 扩展 manifest 声明的图标。
+/// 都没有时返回 None,由调用方回退到通用扩展图标。
+///
+/// 解析本身在 `universal_plugins::resolve_extension_connection_icon`,
+/// 标签页用的是同一个函数,所以列表和标签页的图标不会再各算各的。
 fn extension_connection_icon(
     connection: &StoredConnection,
     size: ConnectionVisualSize,
     extension_catalog: Option<&extension_runtime::ExtensionRuntimeCatalog>,
 ) -> Option<Icon> {
     let params = connection.to_extension_params().ok()?;
-    let contribution =
-        extension_catalog?.resource_connection(&params.extension_id, &params.contribution_id)?;
-    let icon_path = contribution.icon_path.as_ref()?;
-    Some(driver_icon_from_file_path(
-        icon_path.clone(),
-        size.icon_size(),
-    ))
+    let contribution = extension_catalog.and_then(|catalog| {
+        catalog.resource_connection(&params.extension_id, &params.contribution_id)
+    });
+    universal_plugins::resolve_extension_connection_icon(connection, contribution)
+        .map(|icon| icon.with_size(size.icon_size()))
 }
 
 /// 便捷读取全局扩展运行时目录（与 connection_forms / connection_type_menu 的
@@ -490,5 +489,56 @@ mod tests {
             extension_connection_icon(&connection, ConnectionVisualSize::List, Some(&catalog))
                 .is_some()
         );
+    }
+
+    fn config(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value
+            .as_object()
+            .cloned()
+            .expect("config must be an object")
+    }
+
+    #[test]
+    fn extension_icon_override_matches_shared_resolver() {
+        // 列表与标签页共用 one_core 的解析,这里只确认接线没有走偏。
+        assert!(
+            one_core::storage::extension_icon_override(&config(
+                serde_json::json!({"icon": {"icon": "ubuntu"}})
+            ))
+            .is_some()
+        );
+        assert!(
+            one_core::storage::extension_icon_override(&config(
+                serde_json::json!({"target": "ubuntu"})
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn extension_icon_override_uses_local_file_only_when_it_exists() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("mine.svg");
+        std::fs::write(&path, "<svg xmlns=\"http://www.w3.org/2000/svg\"/>")
+            .expect("icon should be written");
+        let existing = serde_json::json!({"icon": {"file": path.to_string_lossy()}});
+        assert!(one_core::storage::extension_icon_override(&config(existing)).is_some());
+
+        // 文件被删除后不再命中,回退到调用方的默认图标
+        let missing = serde_json::json!({"icon": {"file": directory.path().join("gone.svg").to_string_lossy()}});
+        assert!(one_core::storage::extension_icon_override(&config(missing)).is_none());
+    }
+
+    #[test]
+    fn extension_connection_icon_prefers_user_selection_without_catalog() {
+        let params = one_core::storage::ExtensionConnectionParams::new(
+            "com.example.demo",
+            "demo",
+            config(serde_json::json!({"icon": {"icon": "cisco"}})),
+            Default::default(),
+        )
+        .expect("extension params should validate");
+        let connection = StoredConnection::new_extension("Demo".to_string(), params, None);
+        assert!(extension_connection_icon(&connection, ConnectionVisualSize::List, None).is_some());
     }
 }

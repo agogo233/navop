@@ -1,4 +1,6 @@
 use super::*;
+use one_core::tab_container::TabContainerEvent;
+use terminal_view::TerminalWorkspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StartupMasterKeyPolicy {
@@ -62,6 +64,27 @@ impl HomePage {
                     }
                 }
                 _ => {}
+            },
+        )
+        .detach();
+
+        // 复制出的终端标签由 TabContainer 内部创建，需在此补上 OpenSftp / SaveAsConnection 的响应。
+        cx.subscribe_in(
+            &tab_container,
+            window,
+            |this, tab_container, event: &TabContainerEvent, window, cx| {
+                let TabContainerEvent::TabDuplicated { id } = event else {
+                    return;
+                };
+                let terminal = tab_container
+                    .read(cx)
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id() == id.as_str())
+                    .and_then(|tab| tab.content().view().downcast::<TerminalWorkspace>().ok());
+                if let Some(terminal) = terminal {
+                    this.subscribe_terminal_workspace_events(&terminal, window, cx);
+                }
             },
         )
         .detach();
@@ -131,6 +154,8 @@ impl HomePage {
             master_key_policy.restore_from_storage && crypto::try_restore_master_key();
         if key_restored {
             tracing::info!("已恢复主密钥");
+            // 恢复出的旧版验证信封在这里顺带迁到 Argon2id（失败不阻塞启动）
+            crate::master_key_flow::run_kdf_upgrade_after_unlock(cx);
         } else if master_key_policy.prompt_for_unlock
             || master_key_policy.restore_from_storage && has_repo_password
         {
@@ -195,9 +220,19 @@ impl HomePage {
                         }
                     }
                     ConnectionDataEvent::WorkspaceCreated { .. }
-                    | ConnectionDataEvent::WorkspaceUpdated { .. }
-                    | ConnectionDataEvent::WorkspaceDeleted { .. } => {
+                    | ConnectionDataEvent::WorkspaceUpdated { .. } => {
                         this.load_workspaces(cx);
+                        // 如果已登录且密钥已解锁，自动触发同步
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
+                            tracing::info!("工作区数据变化，自动触发云同步");
+                            this.trigger_sync(cx);
+                        }
+                    }
+                    ConnectionDataEvent::WorkspaceDeleted { .. } => {
+                        // 分组删除会把直属连接提升一层，连接归属随之变化；只重载
+                        // 分组会让连接继续指向已不存在的工作区，在树里凭空消失。
+                        this.load_workspaces(cx);
+                        this.load_connections(cx);
                         // 如果已登录且密钥已解锁，自动触发同步
                         if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
                             tracing::info!("工作区数据变化，自动触发云同步");
@@ -207,9 +242,11 @@ impl HomePage {
                     ConnectionDataEvent::CredentialCreated { .. }
                     | ConnectionDataEvent::CredentialUpdated { .. }
                     | ConnectionDataEvent::CredentialDeleted { .. }
-                    | ConnectionDataEvent::SchemaChanged { .. } => {
+                    | ConnectionDataEvent::SchemaChanged { .. }
+                    | ConnectionDataEvent::TableDataCleared { .. } => {
                         // 钥匙串增量同步由 personal_sync_runtime 处理；
                         // SchemaChanged 由 db_tree_view 处理，此处无需操作。
+                        // TableDataCleared 属于数据级事件，由表数据页签处理。
                     }
                     ConnectionDataEvent::CloudSyncRequested => {
                         this.trigger_sync(cx);

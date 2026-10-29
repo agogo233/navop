@@ -1,6 +1,6 @@
 [package]
 name = "main"
-version = "0.20.2"
+version = "0.22.0"
 publish.workspace = true
 edition.workspace = true
 
@@ -43,6 +43,7 @@ extension_view = { workspace = true }
 notes = { workspace = true }
 universal-plugins.workspace = true
 resource_view.workspace = true
+workspace_explorer.workspace = true
 json_view = { workspace = true }
 terminal = { workspace = true }
 terminal_view = { workspace = true }

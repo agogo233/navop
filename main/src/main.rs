@@ -44,7 +44,7 @@ mod setting_tab;
 mod settings;
 mod sync_conflict_dialog;
 mod system_tray;
-mod team_management;
+mod team_tab;
 mod toolbox_tab;
 mod update;
 mod window_visibility;
@@ -456,7 +456,7 @@ fn main() {
         tracing::warn!(%error, "failed to enqueue initial startup request");
     }
 
-    if !resolved_paths.is_portable()
+    if resolved_paths.uses_installed_directories()
         && let Err(error) = one_core::app_dirs::migrate_legacy_directories()
     {
         eprintln!("Failed to migrate legacy application directories: {error:#}");
@@ -467,6 +467,17 @@ fn main() {
         eprintln!("Failed to initialize application paths: {error:#}");
         return;
     }
+    // Public MCP 发现文件必须跟着运行模式走：正式版落在数据目录里（与历史位置
+    // 一致），开发/便携版落在各自的数据根下。否则 `cargo run` 起开发版就会把
+    // 正式版的发现文件覆盖成开发实例的 pid/端口，劫持用户已经注册好的 MCP 客户端。
+    if let Some(data_dir) = one_core::app_dirs::data_dir() {
+        let (canonical, legacy) = public_mcp::discovery::public_mcp_discovery_paths_in(&data_dir);
+        public_mcp::discovery::set_public_mcp_discovery_paths(canonical, legacy);
+    }
+    // 客户端配置（~/.claude.json / ~/.codex/config.toml / Claude Desktop）是全局
+    // 共享的单份文件。开发/便携态必须换一套登记名与托管块，否则它会把安装版的
+    // MCP 登记改指向开发实例。
+    public_mcp::client_config::set_client_config_installed_mode(one_core::app_paths::is_installed());
 
     let app = gpui_platform::application()
         .with_assets(AppAssets::new())
@@ -498,7 +509,8 @@ fn main() {
             cx.quit();
             return;
         }
-        if !one_core::app_paths::is_portable() {
+        // 只有正式安装态才注册宿主文件关联；便携版与 debug 开发构建不应改写系统关联。
+        if one_core::app_paths::is_installed() {
             file_association::schedule_registration(cx);
         }
         notes::init(cx);
@@ -893,7 +905,7 @@ mod embedded_cli_removal_tests {
     fn portable_mode_does_not_register_host_file_associations() {
         let source = include_str!("main.rs");
 
-        assert!(source.contains("if !one_core::app_paths::is_portable()"));
+        assert!(source.contains("if one_core::app_paths::is_installed()"));
         assert!(source.contains("file_association::schedule_registration(cx)"));
     }
 

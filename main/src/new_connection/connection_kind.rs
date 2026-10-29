@@ -17,6 +17,9 @@ const MIDDLEWARE_EXTENSION_ID_PREFIX: &str = "com.navop.middleware.";
 /// TDengine 无原生实现,统一经此 driver_id 的 IPC 外部驱动连接
 const TDENGINE_DRIVER_ID: &str = "tdengine";
 
+/// ClickHouse 同样无原生实现,统一经此 driver_id 的 IPC 外部驱动连接
+const CLICKHOUSE_DRIVER_ID: &str = "clickhouse";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NewConnectionCategory {
     All,
@@ -111,10 +114,12 @@ impl NewConnectionKind {
         items.extend(
             DatabaseType::builtin_all()
                 .iter()
-                // TDengine 无原生实现:仅当外部驱动已安装时才出现在新建入口清单
-                .filter(|db_type| {
-                    !matches!(db_type, DatabaseType::TDengine)
-                        || registry.find(TDENGINE_DRIVER_ID).is_some()
+                // TDengine/ClickHouse 无原生实现:仅当对应外部驱动已安装时
+                // 才出现在新建入口清单
+                .filter(|db_type| match db_type {
+                    DatabaseType::TDengine => registry.find(TDENGINE_DRIVER_ID).is_some(),
+                    DatabaseType::ClickHouse => registry.find(CLICKHOUSE_DRIVER_ID).is_some(),
+                    _ => true,
                 })
                 .cloned()
                 .map(Self::Database),
@@ -446,6 +451,24 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_kind_follows_driver_installation() {
+        // ClickHouse 无原生实现:未安装驱动时不出现在新建入口
+        let registry = IpcDriverRegistry::empty();
+        let kinds = NewConnectionKind::all_with_registry(&registry);
+        assert!(!kinds.contains(&NewConnectionKind::Database(DatabaseType::ClickHouse)));
+
+        // 安装 clickhouse 外部驱动后出现在数据库类目
+        let registry =
+            IpcDriverRegistry::from_drivers(vec![manifest(CLICKHOUSE_DRIVER_ID, "ClickHouse")]);
+        let kinds = NewConnectionKind::all_with_registry(&registry);
+        assert!(kinds.contains(&NewConnectionKind::Database(DatabaseType::ClickHouse)));
+        assert_eq!(
+            NewConnectionKind::Database(DatabaseType::ClickHouse).category(),
+            NewConnectionCategory::Database
+        );
+    }
+
+    #[test]
     fn remote_desktop_kinds_are_available_from_new_connection() {
         let registry = IpcDriverRegistry::empty();
         let kinds = NewConnectionKind::all_with_registry(&registry);
@@ -625,6 +648,7 @@ mod tests {
             runtime_id: String::new(),
             resource_type: String::new(),
             shell_view_id: None,
+            terminal: None,
             form: Default::default(),
         }
     }

@@ -63,6 +63,9 @@ pub(crate) fn start_install_update(download_path: PathBuf) -> Result<UpdateInsta
     if one_core::app_paths::is_portable() {
         return Err("便携模式不支持应用内安装更新，请下载新的便携版并保留 data 目录".to_string());
     }
+    if !one_core::app_paths::is_installed() {
+        return Err("开发构建不支持应用内安装更新，请使用正式发布版本".to_string());
+    }
     if !download_path.is_file() {
         return Err(format!("更新归档不存在: {}", download_path.display()));
     }

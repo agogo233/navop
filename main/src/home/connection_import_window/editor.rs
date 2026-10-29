@@ -59,6 +59,7 @@ impl ConnectionImportWindow {
         let (workspaces, ssh_connections, external_driver_registry) =
             self.parent.read(cx).import_editor_context();
         let form_config = ConnectionFormWindowConfig {
+            initial_workspace_id: None,
             db_type: config.database_type.clone(),
             external_driver_id: None,
             external_driver_registry,
@@ -90,6 +91,7 @@ impl ConnectionImportWindow {
         // 复用键按导入草稿行区分：同一行反复编辑复用同一个窗口。
         let reuse_key = format!("connection-form:import-redis:{record_id}");
         let form_config = RedisFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(connection),
             on_saved: Some(self.redis_editor_saved_callback(record_id, cx)),
@@ -116,6 +118,7 @@ impl ConnectionImportWindow {
         // 复用键按导入草稿行区分：同一行反复编辑复用同一个窗口。
         let reuse_key = format!("connection-form:import-mongo:{record_id}");
         let form_config = MongoFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(connection),
             on_saved: Some(self.mongodb_editor_saved_callback(record_id, cx)),
@@ -142,6 +145,7 @@ impl ConnectionImportWindow {
         // 复用键按导入草稿行区分：同一行反复编辑复用同一个窗口。
         let reuse_key = format!("connection-form:import-ssh:{record_id}");
         let form_config = SshFormWindowConfig {
+            initial_workspace_id: None,
             editing_connection: None,
             initial_connection: Some(connection),
             on_saved: Some(self.ssh_editor_saved_callback(record_id, cx)),

@@ -12,7 +12,8 @@ use crate::storage::{
 
 use super::{PersonalSyncItemSnapshot, PersonalSyncLocalSource, SyncStoreError};
 use crate::cloud_sync::workspace_hierarchy::{
-    cloud_parent_links, reconcile_parent_links, sort_ancestors_first,
+    cloud_parent_links, reconcile_connection_workspaces, reconcile_parent_links,
+    sort_ancestors_first,
 };
 
 const CONNECTION_PREFIX: &str = "connection:";
@@ -233,11 +234,24 @@ impl PersonalSyncLocalRepositorySource {
                     )
                     .map_err(repository_error)
             }
-            None => self
-                .connections
-                .insert(&mut conn)
-                .map(|_| ())
-                .map_err(repository_error),
+            None => {
+                let id = self
+                    .connections
+                    .insert(&mut conn)
+                    .map_err(repository_error)?;
+                // `insert` 会把 `updated_at` 改写成写库时刻，看起来像一次本地修改；
+                // 下载落地应当保持远端内容与同步基线一致，否则下一轮会把这条刚下载
+                // 下来的连接判成「本地改过」，把它的分组（很可能还是空的）推回云端。
+                let synced_at = record.updated_at / 1000;
+                self.connections
+                    .update_sync_status_with_updated_at(
+                        id,
+                        Some(record.id.clone()),
+                        Some(synced_at),
+                        synced_at,
+                    )
+                    .map_err(repository_error)
+            }
         }
     }
 
@@ -326,6 +340,48 @@ impl PersonalSyncLocalRepositorySource {
                 .map_err(repository_error)
         }
     }
+
+    /// 把连接所属分组按云端引用对齐
+    ///
+    /// 记录按 `updated_at` 倒序应用，连接完全可能先于它所属的分组落地；
+    /// 那时归属只能写成根节点，这里在所有写入结束后统一收敛回来。
+    fn reconcile_connection_workspace_links(
+        &self,
+        records: &[CloudSyncData],
+        workspaces: &[Workspace],
+    ) -> Result<(), SyncStoreError> {
+        let links: Vec<(String, WorkspaceParentLink)> = records
+            .iter()
+            .filter(|record| {
+                record.data_type == data_type::CONNECTION
+                    && record.deleted_at.is_none()
+                    && record.team_id.is_none()
+            })
+            .filter_map(|record| {
+                let workspace_cloud_id = self.connection_workspace_cloud_id(record)?;
+                Some((
+                    record.id.clone(),
+                    connection_workspace_link(workspace_cloud_id),
+                ))
+            })
+            .collect();
+        if links.is_empty() {
+            return Ok(());
+        }
+
+        let connections = self.connections.list_personal().map_err(repository_error)?;
+        reconcile_connection_workspaces(&self.connections, &connections, workspaces, &links)
+            .map(|_| ())
+            .map_err(sync_error)
+    }
+
+    fn connection_workspace_cloud_id(&self, record: &CloudSyncData) -> Option<Option<String>> {
+        let service = self.service.read().ok()?;
+        service
+            .decrypt_sync_data_connection_with_workspace_cloud_id(record)
+            .ok()
+            .map(|(_, workspace_cloud_id)| workspace_cloud_id)
+    }
 }
 
 #[async_trait]
@@ -409,7 +465,8 @@ impl PersonalSyncLocalSource for PersonalSyncLocalRepositorySource {
         });
         reconcile_parent_links(&self.workspaces, &workspaces, &links)
             .map(|_| ())
-            .map_err(sync_error)
+            .map_err(sync_error)?;
+        self.reconcile_connection_workspace_links(records, &workspaces)
     }
 
     async fn mark_synced(
@@ -540,6 +597,13 @@ fn enrich_credential_references(
                         "credential_cloud_id".to_string(),
                         serde_json::Value::String(cloud_id),
                     );
+                    // 跨设备统一的载荷只保留云端引用。本地整数 ID 在
+                    // 每台设备上都不同，留在载荷里会让同一逻辑连接的
+                    // checksum 永不相等，触发持续的假冲突与来回覆盖。
+                    object.insert(
+                        "credential_id".to_string(),
+                        serde_json::Value::Number(0.into()),
+                    );
                 } else {
                     // 不上传仅在源设备有效的整数 ID，避免目标设备误绑定同号条目。
                     object.insert(
@@ -604,6 +668,17 @@ fn resolve_object_credential_reference(
 
 fn required_id(id: Option<i64>, entity: &str) -> Result<i64, SyncStoreError> {
     id.ok_or_else(|| SyncStoreError::Parse(format!("{entity} has no local id")))
+}
+
+/// 连接载荷里的 `workspace_cloud_id` 还原成分组引用
+///
+/// 连接载荷自诞生就带这个字段，空值表示明确的根节点（旧载荷的语义一致），
+/// 因此不存在分组层级那种「旧版载荷不可判定」的情况。
+fn connection_workspace_link(workspace_cloud_id: Option<String>) -> WorkspaceParentLink {
+    match workspace_cloud_id {
+        Some(cloud_id) if !cloud_id.is_empty() => WorkspaceParentLink::Cloud(cloud_id),
+        _ => WorkspaceParentLink::Root,
+    }
 }
 
 fn repository_error(error: anyhow::Error) -> SyncStoreError {

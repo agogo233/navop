@@ -109,6 +109,11 @@ impl HomePage {
                     cx,
                 ));
             }
+        } else if !AppSettings::global(cx).home_show_recent_connections {
+            // 设置关闭「最近连接」分组后,导航布局与卡片布局保持一致:不渲染该分组。
+            if matching.is_empty() {
+                body = body.child(self.render_empty_home(cx));
+            }
         } else if recent.is_empty() {
             body = body.child(self.render_empty_home(cx));
         } else {
@@ -175,6 +180,8 @@ impl HomePage {
         query: &str,
         cx: &App,
     ) -> Vec<(Option<i64>, String, Vec<StoredConnection>)> {
+        let known_workspace_ids: HashSet<i64> =
+            self.workspaces.iter().filter_map(|ws| ws.id).collect();
         let mut groups: Vec<_> = self
             .workspaces
             .iter()
@@ -186,23 +193,30 @@ impl HomePage {
             })
             .map(|ws| (ws.id, ws.name.clone(), Vec::new()))
             .collect();
-        if self.filtered_workspace_ids.is_empty() {
-            groups.push((
-                None,
-                t!("Home.unassigned_workspace").to_string(),
-                Vec::new(),
-            ));
+        // 「未分组」不受分组过滤影响：它不对应任何分组，过滤掉它就等于让没有分组的
+        // 连接（尤其是刚在过滤状态下新建的那些）从首页凭空消失，而侧栏仍在显示。
+        groups.push((
+            None,
+            t!("Home.unassigned_workspace").to_string(),
+            Vec::new(),
+        ));
+        for connection in &self.connections {
+            if !(self.match_connection_type(connection) && self.match_connection(connection, query))
+            {
+                continue;
+            }
+            let Some(bucket) = crate::home_tab::connection_grouping::connection_bucket(
+                connection.workspace_id,
+                &known_workspace_ids,
+                &self.filtered_workspace_ids,
+            ) else {
+                continue;
+            };
+            if let Some((_, _, connections)) = groups.iter_mut().find(|(id, _, _)| *id == bucket) {
+                connections.push(connection.clone());
+            }
         }
-        for (id, _, connections) in &mut groups {
-            *connections = self
-                .connections
-                .iter()
-                .filter(|conn| conn.workspace_id == *id)
-                .filter(|conn| {
-                    self.match_connection_type(conn) && self.match_connection(conn, query)
-                })
-                .cloned()
-                .collect();
+        for (_, _, connections) in &mut groups {
             crate::connection_sort::sort_connections(
                 connections,
                 AppSettings::global(cx).connection_sort_order,
@@ -251,7 +265,7 @@ impl HomePage {
         if visible_count == 0 {
             body = body.child(self.render_empty_home(cx));
         }
-        if !recent.is_empty() {
+        if !recent.is_empty() && AppSettings::global(cx).home_show_recent_connections {
             body = body.child(self.render_recent_group(recent, selected, layout, card_width, cx));
         }
         for (id, title, connections) in groups {
@@ -406,7 +420,7 @@ impl HomePage {
                     })
                     .on_click(cx.listener(move |home, _, window, cx| {
                         if initial {
-                            home.show_new_connection_dialog(window, cx);
+                            home.show_new_connection_dialog(None, window, cx);
                         } else {
                             home.selected_filter = ConnectionFilter::All;
                             home.clear_workspace_filter(cx);

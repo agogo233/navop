@@ -3870,7 +3870,7 @@ mod tests {
         AppContext, Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px,
         size,
     };
-    use gpui_component::{Root, render_dialog_layer};
+    use gpui_component::Root;
 
     #[gpui::test]
     fn delete_key_confirmation_dialog_opens(cx: &mut TestAppContext) {
@@ -3904,19 +3904,23 @@ mod tests {
         cx.run_until_parked();
 
         assert!(view.read_with(&cx, |view, _| view.current_key.is_some()));
-        assert!(
-            !cx.update(|window, cx| render_dialog_layer(window, cx).is_some()),
-            "confirmation dialog should initially be closed"
-        );
+        // v0.8.1 起对话框层走 Presence 动画，只能在渲染期采样（use_keyed_state
+        // 需要渲染期 current_view），测试改查 WindowState 的活动对话框数。
+        let dialogs_before = dialog_layer_count(&mut cx);
         view.update_in(&mut cx, |view, window, cx| {
             view.show_delete_dialog(window, cx);
         });
         cx.run_until_parked();
 
-        assert!(
-            cx.update(|window, cx| render_dialog_layer(window, cx).is_some()),
+        assert_eq!(
+            dialog_layer_count(&mut cx),
+            dialogs_before + 1,
             "delete confirmation dialog should be registered with the window root"
         );
+    }
+
+    fn dialog_layer_count(cx: &mut VisualTestContext) -> usize {
+        cx.update(|window, cx| gpui_component::active_dialog_count(window, cx))
     }
 
     #[test]

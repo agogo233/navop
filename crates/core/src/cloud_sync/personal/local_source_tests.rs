@@ -121,6 +121,42 @@ async fn local_source_downloads_remote_connection_and_marks_synced() {
 }
 
 #[tokio::test]
+async fn connection_downloaded_before_its_workspace_still_lands_in_the_group() {
+    let fixture = Fixture::new();
+    let workspace_record = fixture.remote_workspace_record("cloud-workspace-1", "group", None);
+    let connection_record = fixture.remote_connection_in_workspace(
+        "cloud-connection-1",
+        "grouped connection",
+        Some("cloud-workspace-1"),
+    );
+
+    // 记录按 updated_at 倒序应用，连接完全可能先于它所属的分组落地。
+    fixture
+        .source
+        .apply_remote(&connection_record, None)
+        .await
+        .expect("connection applied");
+    fixture
+        .source
+        .apply_remote(&workspace_record, None)
+        .await
+        .expect("workspace applied");
+    fixture
+        .source
+        .finalize_pass(&[workspace_record, connection_record])
+        .await
+        .expect("finalize pass");
+
+    let workspace = fixture.workspace_by_cloud_id("cloud-workspace-1");
+    let loaded = fixture
+        .connections
+        .get_by_cloud_id("cloud-connection-1")
+        .expect("query by cloud id")
+        .expect("downloaded connection exists");
+    assert_eq!(workspace.id, loaded.workspace_id);
+}
+
+#[tokio::test]
 async fn local_source_does_not_reenable_disabled_connection_from_remote_history() {
     let fixture = Fixture::new();
     let disabled_id = fixture.insert_connection("disabled local", None, false);
@@ -437,7 +473,7 @@ async fn local_source_uses_stable_credential_cloud_ids_in_exported_connections()
     let synced_reference = synced_config
         .credential_reference
         .expect("synced credential reference");
-    assert_eq!(synced_id, synced_reference.credential_id);
+    assert_eq!(0, synced_reference.credential_id);
     assert_eq!(
         Some("credential-cloud-stable".to_string()),
         synced_reference.credential_cloud_id
@@ -547,11 +583,56 @@ async fn local_source_replaces_stale_credential_cloud_id_during_connection_expor
         .credential_reference
         .expect("exported credential reference");
 
-    assert_eq!(credential_id, exported_reference.credential_id);
+    assert_eq!(0, exported_reference.credential_id);
     assert_eq!(
         Some("credential-cloud-current".to_string()),
         exported_reference.credential_cloud_id
     );
+}
+
+/// 回归测试：同一逻辑连接在两台设备上绑定的本地凭据行号不同，
+/// 导出的明文载荷（进而 checksum）必须完全一致。
+///
+/// 修复前 `enrich_credential_references` 会把源设备的本地整数 ID
+/// 留在载荷里，同一连接跨设备的 checksum 永不相等，触发持续假冲突。
+#[tokio::test(flavor = "current_thread")]
+async fn local_source_export_is_identical_across_local_credential_ids() {
+    let fixture = CredentialFixture::new();
+    let mut device_a_credential = credential("device-a credential", true);
+    device_a_credential.cloud_id = Some("credential-cloud-shared".to_string());
+    let device_a_id = fixture.insert_credential(device_a_credential);
+    let device_a_connection =
+        fixture.insert_connection_with_credential("shared connection", device_a_id);
+
+    let mut device_b_credential = credential("device-b credential", true);
+    device_b_credential.cloud_id = Some("credential-cloud-shared".to_string());
+    let device_b_id = fixture.insert_credential(device_b_credential);
+    let device_b_connection =
+        fixture.insert_connection_with_credential("shared connection", device_b_id);
+
+    let items = fixture.source.list_items().await.expect("items list");
+    let export = |connection_id: i64| {
+        let item = items
+            .iter()
+            .find(|item| item.local_id == format!("connection:{connection_id}"))
+            .unwrap_or_else(|| panic!("connection {connection_id} snapshot exists"));
+        fixture.source.export_item(item)
+    };
+    let record_a = export(device_a_connection).await.expect("device-a export");
+    let record_b = export(device_b_connection).await.expect("device-b export");
+
+    // 本地整数 ID 不同只是各设备数据库的巧合，不代表逻辑内容不同。
+    assert_ne!(device_a_id, device_b_id);
+    assert_eq!(record_a.checksum, record_b.checksum);
+
+    let service = fixture.service.read().expect("service read lock");
+    let payload_a = service
+        .decrypt_sync_data_connection(&record_a)
+        .expect("device-a connection decrypts");
+    let payload_b = service
+        .decrypt_sync_data_connection(&record_b)
+        .expect("device-b connection decrypts");
+    assert_eq!(payload_a.params, payload_b.params);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -735,6 +816,45 @@ impl Fixture {
             .expect("service read lock")
             .prepare_workspace_sync_data_upload(&workspace, parent_link, None, &[])
             .expect("remote workspace record");
+        record.id = cloud_id.to_string();
+        record
+    }
+
+    /// 云端连接记录：`workspace_cloud_id` 指向它所属分组的云端 ID。
+    fn remote_connection_in_workspace(
+        &self,
+        cloud_id: &str,
+        name: &str,
+        workspace_cloud_id: Option<&str>,
+    ) -> CloudSyncData {
+        let config = DbConnectionConfig {
+            id: String::new(),
+            database_type: DatabaseType::SQLite,
+            name: name.to_string(),
+            host: ":memory:".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: Some(":memory:".to_string()),
+            service_name: None,
+            sid: None,
+            workspace_id: None,
+            proxy: None,
+            extra_params: Default::default(),
+            credential_reference: None,
+        };
+        let connection = StoredConnection::new_database(name.to_string(), config, None);
+        let mut record = self
+            .service
+            .read()
+            .expect("service read lock")
+            .prepare_sync_data_upload_with_workspace_cloud_id(
+                &connection,
+                None,
+                &[],
+                workspace_cloud_id.map(str::to_string),
+            )
+            .expect("remote connection record");
         record.id = cloud_id.to_string();
         record
     }

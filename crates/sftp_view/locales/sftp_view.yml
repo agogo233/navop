@@ -159,6 +159,17 @@ Endpoint:
     zh-CN: 左侧远程栏的修改操作暂不可用
     zh-HK: 左側遠端欄的修改操作暫不可用
 
+# 本地磁盘下拉
+Volume:
+  open:
+    en: Choose drive
+    zh-CN: 选择硬盘
+    zh-HK: 選擇硬碟
+  empty:
+    en: No local drive found
+    zh-CN: 没有找到本地硬盘
+    zh-HK: 沒有找到本機硬碟
+
 # 文件操作
 File:
   column_name:
@@ -437,6 +448,22 @@ Conflict:
     en: Overwrite
     zh-CN: 覆盖
     zh-HK: 覆蓋
+  overwrite_warning_title:
+    en: Confirm Overwrite Folder
+    zh-CN: 确认覆盖文件夹
+    zh-HK: 確認覆蓋文件夾
+  overwrite_warning:
+    en: "Overwrite replaces the existing folder at the destination with the local folder as a whole. Files that exist only in the destination folder will be deleted. Choose Merge if you only want to replace files with the same name and keep the rest."
+    zh-CN: "覆盖会用本地文件夹的整体内容替换目标位置的同名文件夹，只存在于目标文件夹里的其它文件会被删除。如果只想替换同名文件、保留目标文件夹里的其它内容，请选择「合并」。"
+    zh-HK: "覆蓋會用本地文件夾的整體內容替換目標位置的同名文件夾，只存在於目標文件夾裡的其它檔案會被刪除。如果只想替換同名檔案、保留目標文件夾裡的其它內容，請選擇「合併」。"
+  overwrite_warning_apply_all:
+    en: "Note: 'Apply to all similar conflicts' is checked, so every similar folder conflict will use overwrite."
+    zh-CN: "注意：已勾选「应用到所有同类冲突」，确认后所有同类的文件夹冲突都会按覆盖处理。"
+    zh-HK: "注意：已勾選「套用到所有同類衝突」，確認後所有同類的文件夾衝突都會按覆蓋處理。"
+  overwrite_confirm:
+    en: Overwrite Anyway
+    zh-CN: 仍然覆盖
+    zh-HK: 仍然覆蓋
   n_files:
     en: "%{name} and %{count} other files"
     zh-CN: "%{name} 等 %{count} 个文件"

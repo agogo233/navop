@@ -162,6 +162,7 @@ fn test_runtime() -> Arc<Runtime> {
 
 fn stored_connection_for_event(id: i64) -> StoredConnection {
     StoredConnection {
+        ai_access_level: Default::default(),
         id: Some(id),
         credential_revision: None,
         name: format!("conn-{id}"),

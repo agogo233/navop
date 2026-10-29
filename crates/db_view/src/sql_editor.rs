@@ -19,9 +19,11 @@ use db::sql_editor::sql_tokenizer::{SqlKeyword, SqlToken, SqlTokenKind, SqlToken
 use db::sql_editor::statement_ranges::{SqlDialect, SqlStatementSnapshot};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, Font, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, Font, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Task,
+    Window, div,
 };
+use gpui_base::input::EditorScrollbarContext;
 use gpui_component::WindowExt as _;
 use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_component::input::{
@@ -29,6 +31,7 @@ use gpui_component::input::{
     GutterLaneOptions, GutterMarker, HoverProvider, Paste, SelectAll, ShowDocumentHandler, TabSize,
 };
 use gpui_component::native_menu::NativeMenu as PlatformNativeMenu;
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle as _, ScrollbarMode};
 use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Rope, RopeExt, Sizable as _, Size};
@@ -2498,6 +2501,29 @@ struct SqlEditorFontCache {
     font: Font,
 }
 
+/// SQL 编辑器的滚动条：内容溢出就常显，不再跟着光标时隐时现。
+///
+/// 主题默认走 `ScrollbarMode::Hover`，而那条规则除了悬停，还会被「刚滚动过」
+/// 唤醒一段时间；不换行的长 SQL 每敲一个字都要把光标滚进可视区，底部横条于是
+/// 反复冒出来又淡下去（issue #477）。编辑器里的滚动位置本来就是随时可读的信息，
+/// 直接常显更稳。
+///
+/// 取值范围与 Base 的默认实现保持一致：`content_size()` 把内边距算进了内容，
+/// 减去同样的内边距差额才是编辑器的真实滚动范围；内容没溢出时滚动条本身不画。
+fn sql_editor_scrollbar(
+    context: EditorScrollbarContext,
+    _window: &mut Window,
+    _cx: &mut App,
+) -> AnyElement {
+    let paddings = context.viewport_bounds().size - context.scroll_viewport_size();
+    Scrollbar::new(&context)
+        .axis(context.axis())
+        .mode(ScrollbarMode::Always)
+        .viewport_bounds(context.viewport_bounds())
+        .scroll_size(context.content_size() - paddings)
+        .into_any_element()
+}
+
 impl SqlEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let default_completion_provider =
@@ -2540,6 +2566,9 @@ impl SqlEditor {
             // mouse-hover trigger: hover details are shown on demand from the
             // context menu (ShowHoverDetails) instead, so pointer movement
             // over identifiers never pops a popover.
+
+            // 底部横条常显（issue #477）：见 `sql_editor_scrollbar` 的说明。
+            editor.set_scrollbar_renderer(Some(Rc::new(sql_editor_scrollbar)));
 
             editor
         });
@@ -3483,14 +3512,11 @@ mod tests {
 
         // Cmd/Ctrl+hover first: gpui-kit only offers an identifier to the
         // definition provider while the secondary modifier is held.
-        visual.simulate_mouse_move(
-            point,
-            Option::<MouseButton>::None,
-            Modifiers::secondary_key(),
-        );
+        let secondary = visual.read(|cx| Modifiers::secondary_key(cx));
+        visual.simulate_mouse_move(point, Option::<MouseButton>::None, secondary);
         settle(visual);
 
-        visual.simulate_mouse_down(point, MouseButton::Left, Modifiers::secondary_key());
+        visual.simulate_mouse_down(point, MouseButton::Left, visual.read(|cx| Modifiers::secondary_key(cx)));
         settle(visual);
         let tabs = visual.read(|cx| details_tabs(&fixture, cx));
         assert_eq!(1, tabs.len(), "Cmd/Ctrl+click opens the details tab");
@@ -3510,7 +3536,7 @@ mod tests {
         });
 
         // Re-resolving the same object must reuse its tab, not stack a copy.
-        visual.simulate_mouse_down(point, MouseButton::Left, Modifiers::secondary_key());
+        visual.simulate_mouse_down(point, MouseButton::Left, visual.read(|cx| Modifiers::secondary_key(cx)));
         settle(visual);
         visual.read(|cx| {
             assert_eq!(1, details_tabs(&fixture, cx).len(), "details tabs reuse");
@@ -3525,11 +3551,8 @@ mod tests {
 
         // Cmd/Ctrl+hover arms the link, but a plain click must only move the
         // caret - opening details on every click would be unusable.
-        visual.simulate_mouse_move(
-            point,
-            Option::<MouseButton>::None,
-            Modifiers::secondary_key(),
-        );
+        let secondary = visual.read(|cx| Modifiers::secondary_key(cx));
+        visual.simulate_mouse_move(point, Option::<MouseButton>::None, secondary);
         settle(visual);
 
         visual.simulate_click(point, Modifiers::default());
@@ -4034,6 +4057,38 @@ mod tests {
         let source = include_str!("sql_editor.rs");
 
         assert!(source.contains("GutterLaneOptions::new(render_sql_gutter_marker)"));
+    }
+
+    /// #477：编辑器底部那条横条要常显，免得跟着光标滚动时隐时现。
+    #[test]
+    fn sql_editor_keeps_its_scrollbar_always_visible() {
+        let source = include_str!("sql_editor.rs");
+
+        assert!(
+            source.contains("editor.set_scrollbar_renderer(Some(Rc::new(sql_editor_scrollbar)))"),
+            "SQL 编辑器要装上自己的滚动条，否则退回主题的 Hover 模式：滚动一下冒出来、过一会儿又淡掉"
+        );
+
+        let renderer = source
+            .split("fn sql_editor_scrollbar(")
+            .nth(1)
+            .expect("滚动条渲染函数存在")
+            .split("impl SqlEditor {")
+            .next()
+            .expect("渲染函数写在 SqlEditor 实现之前");
+
+        assert!(
+            renderer.contains("ScrollbarMode::Always"),
+            "滚动条要常显，而不是跟着滚动时隐时现"
+        );
+        assert!(
+            renderer.contains(".viewport_bounds(context.viewport_bounds())"),
+            "渲染函数要按编辑器的可视区摆放滚动条"
+        );
+        assert!(
+            renderer.contains(".scroll_size(context.content_size() - paddings)"),
+            "滚动范围要扣掉内边距，否则竖条会多滑出一段"
+        );
     }
 
     #[test]

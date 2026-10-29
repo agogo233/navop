@@ -6,6 +6,14 @@ fn context(temp: &tempfile::TempDir) -> AppPathResolutionContext {
         current_dir: temp.path().to_path_buf(),
         portable_environment: None,
         data_dir_environment: None,
+        development_data_dir: None,
+    }
+}
+
+fn development_context(temp: &tempfile::TempDir) -> AppPathResolutionContext {
+    AppPathResolutionContext {
+        development_data_dir: Some(temp.path().join("navop-dev")),
+        ..context(temp)
     }
 }
 
@@ -103,6 +111,7 @@ fn macos_bundle_uses_the_directory_next_to_the_app() {
         current_dir: temp.path().to_path_buf(),
         portable_environment: None,
         data_dir_environment: None,
+        development_data_dir: None,
     };
     let overrides = AppPathOverrides {
         portable: true,
@@ -228,4 +237,106 @@ fn installed_mode_uses_the_existing_startup_lock_setting() {
 
     assert!(!paths.requires_master_key_on_startup(false, false));
     assert!(paths.requires_master_key_on_startup(true, false));
+}
+
+#[test]
+fn debug_build_uses_an_isolated_development_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = resolve_app_paths(&AppPathOverrides::default(), &development_context(&temp))
+        .expect("resolve paths");
+
+    let root = temp.path().join("navop-dev");
+    assert_eq!(
+        &AppRunMode::Development { root: root.clone() },
+        paths.mode()
+    );
+    assert_eq!(root.join("config"), *paths.config_dir());
+    assert_eq!(Some(&root.join("state")), paths.data_dir());
+    assert_eq!(Some(&root.join("cache")), paths.cache_dir());
+    assert!(paths.is_development());
+    assert!(!paths.is_portable());
+    assert!(!paths.uses_installed_directories());
+}
+
+#[test]
+fn explicit_data_dir_overrides_the_development_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let overrides = AppPathOverrides {
+        portable: false,
+        data_dir: Some(PathBuf::from("explicit-data")),
+    };
+
+    let paths = resolve_app_paths(&overrides, &development_context(&temp)).expect("resolve paths");
+
+    assert!(paths.is_portable());
+    assert_eq!(
+        temp.path().join("explicit-data/config"),
+        *paths.config_dir()
+    );
+}
+
+#[test]
+fn environment_data_dir_overrides_the_development_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut context = development_context(&temp);
+    context.data_dir_environment = Some(OsString::from("environment-data"));
+
+    let paths = resolve_app_paths(&AppPathOverrides::default(), &context).expect("resolve paths");
+
+    assert!(paths.is_portable());
+    assert_eq!(
+        temp.path().join("environment-data/config"),
+        *paths.config_dir()
+    );
+}
+
+#[test]
+fn portable_flag_overrides_the_development_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let overrides = AppPathOverrides {
+        portable: true,
+        data_dir: None,
+    };
+
+    let paths = resolve_app_paths(&overrides, &development_context(&temp)).expect("resolve paths");
+
+    assert!(paths.is_portable());
+    assert_eq!(temp.path().join("data/config"), *paths.config_dir());
+}
+
+#[test]
+fn development_mode_keeps_installed_master_key_semantics() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = resolve_app_paths(&AppPathOverrides::default(), &development_context(&temp))
+        .expect("resolve paths");
+
+    assert!(!paths.requires_master_key_on_startup(false, false));
+    assert!(paths.requires_master_key_on_startup(true, false));
+}
+
+#[test]
+fn development_paths_are_created_and_checked_for_writes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("navop-dev");
+    let paths = development_paths(root.clone());
+
+    prepare_paths(&paths).expect("prepare development paths");
+
+    assert!(root.join("config").is_dir());
+    assert!(root.join("state").is_dir());
+    assert!(root.join("cache").is_dir());
+}
+
+#[test]
+fn development_directory_is_derived_from_the_build_profile() {
+    let directory = development_data_dir();
+
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            Some(OsStr::new(DEVELOPMENT_DATA_DIR_NAME)),
+            directory.as_deref().and_then(Path::file_name)
+        );
+    } else {
+        assert!(directory.is_none());
+    }
 }

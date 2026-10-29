@@ -1474,6 +1474,16 @@ impl DbConnection for PostgresDbConnection {
         Ok(results)
     }
 
+    /// tokio-postgres 的请求通道已关 = 连接任务已退出，语句必然尚未发出。
+    /// 这是 PG 侧"发送前断连"唯一可信的信号：执行后的 `connection closed`
+    /// 文案无法区分"请求通道关（未发出）"与"等待响应时连接任务退出（可能已
+    /// 执行）"。锁被长语句占用时返回 `None`，探测退回文案判定。
+    fn connection_closed_locally(&self) -> Option<bool> {
+        let guard = self.client.try_lock().ok()?;
+        let client = guard.as_ref()?;
+        Some(client.is_closed())
+    }
+
     async fn query(&self, query: &str) -> Result<SqlResult, DbError> {
         debug!("[PostgreSQL] query() called");
         let mut guard = self.client.lock().await;

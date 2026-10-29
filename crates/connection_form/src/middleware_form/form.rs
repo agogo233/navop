@@ -33,6 +33,7 @@ use one_core::storage::{
     ConnectionRepository, ConnectionType, GlobalStorageState, StoredConnection, Workspace,
 };
 use rust_i18n::t;
+use tool_runtime::AiAccessLevel;
 
 use super::adapter::{FormSnapshot, MiddlewareFormAdapter};
 use super::declarative::normalized_ssh_auth_type_or_default;
@@ -198,6 +199,9 @@ pub struct MiddlewareConnectionForm {
     editing_extras: HashMap<String, String>,
     /// 是否启用云同步
     sync_enabled: Entity<bool>,
+    /// 连接级 AI 访问策略。保存在 `StoredConnection::ai_access_level` 上，
+    /// 不属于 `StoredConnection` 字段，所以这里按 `AiAccessLevel` 直接持有。
+    ai_access_level: Entity<AiAccessLevel>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -255,6 +259,9 @@ impl MiddlewareConnectionForm {
         // 默认启用云同步,与数据库表单保持一致
         let sync_enabled = cx.new(|_| true);
 
+        // 默认允许 AI 访问,老数据与新建连接都是这个语义
+        let ai_access_level = cx.new(|_| AiAccessLevel::Allowed);
+
         Self {
             adapter,
             config,
@@ -271,6 +278,7 @@ impl MiddlewareConnectionForm {
             editing_connection: None,
             editing_extras: HashMap::new(),
             sync_enabled,
+            ai_access_level,
             _subscriptions: Vec::new(),
         }
     }
@@ -339,6 +347,13 @@ impl MiddlewareConnectionForm {
 
         self.sync_enabled.update(cx, |sync, cx| {
             *sync = connection.sync_enabled;
+            cx.notify();
+        });
+
+        // 回填连接级 AI 访问策略（读连接字段，缺省即「允许」）
+        let ai_access_level = crate::ai_access::stored_level(connection.id, cx);
+        self.ai_access_level.update(cx, |level, cx| {
+            *level = ai_access_level;
             cx.notify();
         });
 
@@ -769,6 +784,7 @@ impl MiddlewareConnectionForm {
         };
 
         let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let ai_access_level = *self.ai_access_level.read(cx);
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let Some(repo) = storage.get::<ConnectionRepository>() else {
@@ -779,6 +795,9 @@ impl MiddlewareConnectionForm {
                 });
                 return;
             };
+            // 策略是连接自己的字段，改动一次就随连接一起写入。
+            let mut stored = stored;
+            stored.ai_access_level = ai_access_level;
             let result = if is_update {
                 repo.update(&stored).map(|_| stored)
             } else {
@@ -792,8 +811,28 @@ impl MiddlewareConnectionForm {
                         // 窗口因为隐藏失败留在屏幕上时（关闭漏斗返回 `Retained`）用户可能
                         // 再点一次「保存」，没有这一步会插出第二条连接。
                         form.editing_connection = Some(saved.clone());
-                        cx.emit(MiddlewareFormEvent::Saved(Box::new(saved)));
+                        cx.notify();
                     });
+                    // 策略写失败时连接其实已经保存，但用户必须看到失败：沿用这个表单
+                    // 既有的错误行 + `SaveError` 事件，让窗口留在屏幕上重试。
+                    let policy_result = match saved.id {
+                        Some(id) => crate::ai_access::write_level(&repo, id, ai_access_level),
+                        None => Err("connection id missing after save".to_string()),
+                    };
+                    match policy_result {
+                        Ok(()) => {
+                            let _ = this.update(cx, |_form, cx| {
+                                cx.emit(MiddlewareFormEvent::Saved(Box::new(saved)));
+                            });
+                        }
+                        Err(error) => {
+                            let message = crate::ai_access::ai_access_save_failed(&error);
+                            let _ = this.update(cx, |form, cx| {
+                                form.set_save_error(message.clone(), cx);
+                                cx.emit(MiddlewareFormEvent::SaveError(message));
+                            });
+                        }
+                    }
                 }
                 Err(error) => {
                     let message = format!("{}: {}", t!("ConnectionForm.save_failed"), error);
@@ -1044,6 +1083,17 @@ impl MiddlewareConnectionForm {
                     ),
             );
         }
+        // 连接级 AI 访问策略(issue #437)：布局与选项由通用组件统一渲染，
+        // 这里只把表单持有的实体交给它。
+        children.push(
+            field()
+                .label(crate::ai_access::ai_access_label())
+                .items_center()
+                .child(crate::ai_access::ai_access_selector(
+                    &self.ai_access_level,
+                    cx,
+                )),
+        );
         Some(
             v_form()
                 .layout(Axis::Horizontal)

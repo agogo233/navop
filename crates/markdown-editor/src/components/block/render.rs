@@ -40,8 +40,8 @@ use super::{
 };
 use crate::BlockRenderKind;
 use crate::components::{
-    Editor, HtmlCssColor, HtmlDocument, HtmlNode, HtmlNodeKind, InlineScript,
-    TableCellInlineImageSegment, TableColumnAlignment, TableColumnLayout, attr_value,
+    Editor, HtmlContainerImage, HtmlCssColor, HtmlDocument, HtmlNode, HtmlNodeKind, InlineLinkHit,
+    InlineScript, TableCellInlineImageSegment, TableColumnAlignment, TableColumnLayout, attr_value,
     display_math_font_size, inline_math_font_size, parse_display_math_source,
     parse_html_image_block, parse_mermaid_fence_source, parse_table_cell_inline_images,
     render_display_math_svg, render_inline_math_svg, resolve_image_source, style_for_node,
@@ -768,6 +768,44 @@ fn html_text_view_style(theme: &Theme) -> TextViewStyle {
     style
 }
 
+/// Extends a run across linked badges separated by one physical newline.
+fn html_badge_run_end(nodes: &[HtmlNode], start: usize) -> Option<usize> {
+    if !matches!(
+        &nodes.get(start)?.kind,
+        HtmlNodeKind::MarkdownImage(HtmlContainerImage {
+            link_target: Some(_),
+            ..
+        })
+    ) {
+        return None;
+    }
+
+    let mut end = start + 1;
+    while let (Some(separator), Some(next)) = (nodes.get(end), nodes.get(end + 1)) {
+        let one_newline = separator.tag_name == "#text"
+            && separator.raw_source.trim().is_empty()
+            && separator
+                .raw_source
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                == 1;
+        if !one_newline
+            || !matches!(
+                &next.kind,
+                HtmlNodeKind::MarkdownImage(HtmlContainerImage {
+                    link_target: Some(_),
+                    ..
+                })
+            )
+        {
+            break;
+        }
+        end += 2;
+    }
+    Some(end)
+}
+
 impl Block {
     fn on_html_details_toggle_mouse_down(
         &mut self,
@@ -1118,6 +1156,7 @@ impl Block {
         // Velotype native renderer on the UI thread.
         div()
             .w_full()
+            .font(crate::fonts::FontSettings::code_font(cx))
             .rounded_sm()
             .bg(c.source_mode_block_bg)
             .px(px(d.block_padding_x))
@@ -1420,6 +1459,7 @@ impl Block {
         }
         if span.style.code {
             element = element
+                .font(crate::fonts::FontSettings::code_font(cx))
                 .rounded(px(theme.dimensions.code_bg_radius))
                 .px(px(theme.dimensions.code_bg_pad_x))
                 .py(px(theme.dimensions.code_bg_pad_y))
@@ -1450,7 +1490,7 @@ impl Block {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |block, event: &MouseUpEvent, _window, cx| {
-                        if event.modifiers.secondary() {
+                        if event.modifiers.secondary(cx) {
                             block.open_rendered_link(&link, cx);
                         }
                     }),
@@ -1711,6 +1751,43 @@ impl Block {
                 .into_any_element();
         }
 
+        if let HtmlNodeKind::MarkdownImage(image) = &node.kind {
+            if let Some(runtime) = self.image_runtime_for_syntax(image.syntax.clone()) {
+                return self.render_image_content(
+                    &runtime,
+                    Length::Definite(relative(1.0)),
+                    px(d.image_root_max_height),
+                    px(d.image_root_placeholder_height),
+                    theme,
+                );
+            }
+            return div()
+                .text_size(px(inherited_style.font_size))
+                .text_color(inherited_style.color)
+                .child(SharedString::from(node.raw_source.clone()))
+                .into_any_element();
+        }
+
+        if let HtmlNodeKind::MarkdownInline(tree) = &node.kind {
+            return div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .text_size(px(inherited_style.font_size))
+                .line_height(rems(t.text_line_height))
+                .children(self.render_inline_tree_children(
+                    tree,
+                    theme,
+                    inherited_style.color,
+                    inherited_style.font_size,
+                    FontWeight::NORMAL,
+                    cx,
+                ))
+                .into_any_element();
+        }
+
         if node.tag_name == "#text" {
             return div()
                 .min_w(px(0.0))
@@ -1736,6 +1813,7 @@ impl Block {
                 let mut element =
                     div()
                         .flex()
+                        .font(crate::fonts::FontSettings::code_font(cx))
                         .rounded(px(4.0))
                         .px(px(4.0))
                         .text_size(px(node_style.computed.font_size))
@@ -1768,6 +1846,32 @@ impl Block {
                 element.into_any_element()
             }
             "br" => div().child("\n").into_any_element(),
+            "div" => {
+                let has_markdown_children = node.children.iter().any(|child| {
+                    matches!(
+                        child.kind,
+                        HtmlNodeKind::MarkdownImage(_) | HtmlNodeKind::MarkdownInline(_)
+                    )
+                });
+                let mut element = div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(if has_markdown_children { d.block_gap } else { 0.0 }))
+                    .text_size(px(node_style.computed.font_size))
+                    .text_color(node_style.computed.color)
+                    .children(self.render_html_div_children(
+                        node,
+                        theme,
+                        node_style.computed,
+                        has_markdown_children,
+                        cx,
+                    ));
+                if let Some(bg) = node_style.background {
+                    element = element.bg(bg);
+                }
+                element.into_any_element()
+            }
             "hr" => div()
                 .w_full()
                 .h(px(d.separator_thickness))
@@ -1795,6 +1899,7 @@ impl Block {
             "pre" => {
                 let mut element = div()
                     .w_full()
+                    .font(crate::fonts::FontSettings::code_font(cx))
                     .rounded_sm()
                     .px(px(d.code_block_padding_x))
                     .py(px(d.code_block_padding_y))
@@ -1913,6 +2018,96 @@ impl Block {
                 element.into_any_element()
             }
         }
+    }
+
+    /// Renders `div` children, grouping linked badges into one wrapping row.
+    fn render_html_div_children(
+        &self,
+        node: &HtmlNode,
+        theme: &Theme,
+        inherited_style: HtmlComputedStyle,
+        has_markdown_children: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut children = Vec::new();
+        let mut index = 0;
+        while index < node.children.len() {
+            if let Some(end) = html_badge_run_end(&node.children, index) {
+                let badges = node.children[index..end].iter().filter_map(|child| {
+                    let HtmlNodeKind::MarkdownImage(image) = &child.kind else {
+                        return None;
+                    };
+                    Some(self.render_html_badge_image(image, &child.raw_source, theme, cx))
+                });
+                children.push(
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(theme.dimensions.image_caption_gap))
+                        .children(badges)
+                        .into_any_element(),
+                );
+                index = end;
+                continue;
+            }
+
+            let child = &node.children[index];
+            if !has_markdown_children
+                || child.tag_name != "#text"
+                || !child.raw_source.trim().is_empty()
+            {
+                children.push(self.render_html_node(child, theme, inherited_style, cx));
+            }
+            index += 1;
+        }
+        children
+    }
+
+    /// Uses the existing image loader and link prompt for a compact badge.
+    fn render_html_badge_image(
+        &self,
+        image: &HtmlContainerImage,
+        source: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(runtime) = self.image_runtime_for_syntax(image.syntax.clone()) else {
+            return div()
+                .child(SharedString::from(source.to_string()))
+                .into_any_element();
+        };
+        let content = self.render_inline_image_content(&runtime, theme);
+        let Some(target) = &image.link_target else {
+            return content;
+        };
+        let hit = InlineLinkHit {
+            prompt_target: target.clone(),
+            open_target: target.clone(),
+        };
+        let badge = div()
+            .flex()
+            .items_center()
+            .child(content)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::on_rendered_link_mouse_down),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |block, event: &MouseUpEvent, _window, cx| {
+                    if event.modifiers.secondary(cx) {
+                        block.open_rendered_link(&hit, cx);
+                    }
+                }),
+            );
+        LinkFollowCursor {
+            child: badge.into_any_element(),
+        }
+        .into_any_element()
     }
 
     fn render_html_inline_container(
@@ -2383,6 +2578,12 @@ impl Render for Block {
                 .text_size(px(t.text_size))
                 .text_color(c.text_default)
                 .line_height(rems(t.text_line_height));
+
+            let source_base = if self.kind().is_code_block() {
+                source_base.font(crate::fonts::FontSettings::code_font(cx))
+            } else {
+                source_base
+            };
 
             let source_base = if self.kind() == BlockKind::Comment {
                 source_base.bg(c.comment_bg).rounded_sm()
@@ -2952,6 +3153,7 @@ impl Render for Block {
                 // above a permanently mounted source surface.
                 focused_base
                     .overflow_hidden()
+                    .font(crate::fonts::FontSettings::code_font(cx))
                     .rounded(px(d.code_language_input_radius))
                     .border(px(1.0))
                     .border_color(c.code_language_input_border)
@@ -2972,6 +3174,7 @@ impl Render for Block {
                         div()
                             .min_w(px(0.0))
                             .w_full()
+                            .font(crate::fonts::FontSettings::code_font(cx))
                             .text_size(px(t.code_size))
                             .text_color(c.code_text)
                             .line_height(rems(t.text_line_height))
@@ -2981,22 +3184,27 @@ impl Render for Block {
             }
             BlockKind::Table => {
                 let Some(runtime) = self.table_runtime.clone() else {
-                    return focused_base
-                        .text_size(px(t.text_size))
-                        .text_color(c.text_default)
-                        .line_height(rems(t.text_line_height))
-                        .child(self.render_text_or_mixed_inline_visuals(
-                            &theme,
-                            focused,
-                            is_placeholder,
-                            None,
-                            None,
-                            c.text_default,
-                            t.text_size,
-                            FontWeight::NORMAL,
-                            cx,
-                        ))
-                        .into_any_element();
+                    // 表格记录还没解析出来时退回纯文本渲染，此时块有可见文本，
+                    // 选中高亮由文本层负责，走统一的收尾流程即可。
+                    return self.finish_block_content(
+                        focused_base
+                            .text_size(px(t.text_size))
+                            .text_color(c.text_default)
+                            .line_height(rems(t.text_line_height))
+                            .child(self.render_text_or_mixed_inline_visuals(
+                                &theme,
+                                focused,
+                                is_placeholder,
+                                None,
+                                None,
+                                c.text_default,
+                                t.text_size,
+                                FontWeight::NORMAL,
+                                cx,
+                            ))
+                            .into_any_element(),
+                        &theme,
+                    );
                 };
 
                 let viewport_width = f32::from(window.viewport_size().width.max(px(1.0)));
@@ -3005,7 +3213,15 @@ impl Render for Block {
                     .record
                     .table
                     .as_ref()
-                    .map(|table| TableColumnLayout::measure(table, table_width, window, &theme))
+                    .map(|table| {
+                        TableColumnLayout::measure(
+                            table,
+                            table_width,
+                            window,
+                            &theme,
+                            &crate::fonts::FontSettings::code_font(cx),
+                        )
+                    })
                     .unwrap_or_else(|| TableColumnLayout::equal(runtime.header.len()));
                 let body_row_count = runtime.rows.len();
                 let current_visual_rows = body_row_count + 1;
@@ -3189,7 +3405,7 @@ impl Render for Block {
                             ))
                     });
 
-                    div()
+                    let table_root = div()
                         .id(block_id)
                         .debug_selector(|| "table-root".to_string())
                         .w_full()
@@ -3202,8 +3418,18 @@ impl Render for Block {
                         .flex_col()
                         .gap(px(0.0))
                         .children(rows)
-                        .children(table_toolbar)
-                        .into_any_element()
+                        .children(table_toolbar);
+
+                    // 表格被跨块选择整块覆盖时补一层选中色（表格不渲染文本元素，
+                    // 文本层画不出高亮）。覆盖层放进表格根 div，避免把上方给浮动
+                    // 工具栏预留的那圈外边距也涂上色。
+                    if self.cross_block_selection_covers_atomic_block() {
+                        table_root
+                            .child(Self::cross_block_selection_overlay(&theme))
+                            .into_any_element()
+                    } else {
+                        table_root.into_any_element()
+                    }
                 }
             }
             BlockKind::HtmlBlock => {
@@ -3286,7 +3512,60 @@ impl Render for Block {
                 .into_any_element(),
         };
 
-        wrap_with_quote_guides(content, visible_quote_guides(self), &theme)
+        self.finish_block_content(content, &theme)
+    }
+}
+
+impl Block {
+    /// 收尾块的渲染内容：自绘原子块（表格、分隔线）被跨块选择整块覆盖时先
+    /// 补一层选中色，再按引用层级补引号竖线。
+    ///
+    /// 这类块不渲染 `BlockTextElement`，文本层画不出跨块选择的高亮，所以
+    /// 只能在这里补覆盖色，让拖选覆盖到它们时也显示为选中（复制/剪切本来
+    /// 就已包含整块内容）。
+    fn finish_block_content(&self, content: AnyElement, theme: &Theme) -> AnyElement {
+        let content = if self.needs_outer_selection_overlay() {
+            div()
+                .relative()
+                .w_full()
+                .child(content)
+                .child(Self::cross_block_selection_overlay(theme))
+                .into_any_element()
+        } else {
+            content
+        };
+
+        wrap_with_quote_guides(content, visible_quote_guides(self), theme)
+    }
+
+    /// 是否要在块内容外层包一层选中色覆盖层。
+    ///
+    /// 表格在自己的根 div 里画（那里带了工具栏预留外边距，包在外层会把边距也
+    /// 涂上），分隔线这类块的内容边界就是块边界，直接在外层包。
+    fn needs_outer_selection_overlay(&self) -> bool {
+        self.cross_block_selection_covers_atomic_block() && !matches!(self.kind(), BlockKind::Table)
+    }
+
+    /// 跨块选择覆盖层：整块宽高的选中色，覆盖在被选中的自绘原子块上。
+    ///
+    /// 文字选中色是垫在字形下面画的，这里只能盖在自绘内容上面，所以把不透明度
+    /// 压到 0.55：暗色主题的选中色本身不透明，原样盖上去会把表格内容糊成一块。
+    fn cross_block_selection_overlay(theme: &Theme) -> Div {
+        let mut color = theme.colors.selection;
+        color.a = color.a.min(0.55);
+        div().absolute().inset_0().bg(color)
+    }
+
+    /// 跨块选择是否整块覆盖了当前这个自绘原子块（表格、分隔线）。
+    ///
+    /// 零可见长度的块在 `sync_cross_block_selection_visuals` 里会被打上
+    /// `editor_selection_range = Some(0..0)` 的「整块被选中」标记；文本层
+    /// 会把空区间过滤掉，因此只能由块渲染层自己画高亮。空段落同样是零长度，
+    /// 但它是空行分隔符，不在 `paints_own_atomic_content` 之列。
+    pub(crate) fn cross_block_selection_covers_atomic_block(&self) -> bool {
+        self.editor_selection_range.is_some()
+            && self.visible_len() == 0
+            && self.kind().paints_own_atomic_content()
     }
 }
 
@@ -3360,7 +3639,7 @@ impl Element for LinkFollowCursor {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if hitbox.is_hovered(window) && window.modifiers().secondary() {
+        if hitbox.is_hovered(window) && window.modifiers().secondary(cx) {
             // The editor root repaints on follow-modifier toggles, so the hand
             // cursor re-evaluates here even while the pointer stays still.
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);

@@ -1,6 +1,3 @@
-mod acp_agent_provider;
-#[cfg(test)]
-mod acp_agent_provider_tests;
 mod composite_provider;
 mod database_driver_provider;
 mod kind;
@@ -11,10 +8,6 @@ mod provider;
 mod remote_desktop_provider;
 mod summary;
 
-pub use acp_agent_provider::{
-    AcpAgentExtensionAgent, AcpAgentExtensionAuth, AcpAgentExtensionAuthMethod,
-    AcpAgentExtensionProvider, AcpAgentExtensionTimeouts, AcpAgentExtensionTransport,
-};
 pub use composite_provider::CompositeExtensionProvider;
 pub use database_driver_provider::DatabaseDriverExtensionProvider;
 pub use kind::ExtensionKind;
@@ -53,7 +46,6 @@ pub fn builtin_registry(extensions_root: PathBuf) -> ExtensionRegistry {
     registry.register_provider(Arc::new(LanguageBundleExtensionProvider));
     registry.register_provider(Arc::new(DatabaseDriverExtensionProvider));
     registry.register_provider(Arc::new(RemoteDesktopProviderExtensionProvider));
-    registry.register_provider(Arc::new(AcpAgentExtensionProvider));
     registry.register_provider(Arc::new(CompositeExtensionProvider));
     registry
 }

@@ -4,6 +4,7 @@
 //! parent editor via `BlockEvent` emissions.
 
 use gpui::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::CollapsedCaretAffinity;
 use super::{
@@ -858,9 +859,30 @@ impl Block {
         let offset = self.index_for_mouse_position(event.position);
         let was_focused = self.focus_handle.is_focused(window);
 
+        // Double click to select a word
+        if event.button == MouseButton::Left && event.click_count == 2 {
+            let text = self.display_text();
+
+            let range = text
+                .split_word_bound_indices()
+                .find(|(start, segment)| {
+                    let end = start + segment.len();
+                    *start <= offset && offset < end
+                })
+                .map(|(start, segment)| start..start + segment.len());
+
+            if let Some(range) = range {
+                self.selected_range = range;
+            }
+
+            cx.notify();
+
+            return;
+        }
+
         // Cmd/Ctrl+click follows a rendered link instead of editing it, so the
         // block is neither focused nor selected; the link opens on mouse-up.
-        if event.modifiers.secondary() && self.pointer_link_hit(event.position).is_some() {
+        if event.modifiers.secondary(cx) && self.pointer_link_hit(event.position).is_some() {
             self.is_selecting = false;
             cx.stop_propagation();
             return;
@@ -910,7 +932,7 @@ impl Block {
     ) {
         // Only Cmd/Ctrl+click follows the link; a plain click falls through so
         // the block focuses for editing like any other inline text.
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             cx.stop_propagation();
         }
     }
@@ -938,7 +960,7 @@ impl Block {
 
         // Cmd/Ctrl+click follows a rendered link, using the same open-link
         // prompt as the double-click gesture below.
-        if event.modifiers.secondary()
+        if event.modifiers.secondary(cx)
             && let Some(link) = self.pointer_link_hit(event.position)
         {
             self.open_rendered_link(&link, cx);

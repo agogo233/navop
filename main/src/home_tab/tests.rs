@@ -7,6 +7,7 @@ mod local_terminal;
 mod rendering;
 mod sync;
 mod titles;
+mod workspace;
 
 fn stored_external_connection(driver_id: &str) -> StoredConnection {
     StoredConnection::new_database(

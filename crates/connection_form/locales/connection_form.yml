@@ -1,6 +1,22 @@
 _version: 2
 
 ConnectionForm:
+  icon_auto:
+    en: Auto
+    zh-CN: 自动
+    zh-HK: 自動
+  icon_hint:
+    en: Pick a built-in icon or a local image for this connection
+    zh-CN: 选择内置图标或本地图片作为该连接的图标
+    zh-HK: 選擇內置圖標或本機圖片作為該連線的圖標
+  icon_local:
+    en: Local image
+    zh-CN: 本地图片
+    zh-HK: 本機圖片
+  icon_select_file:
+    en: Select a local connection icon
+    zh-CN: 选择本地连接图标
+    zh-HK: 選擇本機連線圖標
   ssh_tunnel_enabled:
     en: Enable SSH Tunnel
     zh-CN: 启用 SSH 隧道
@@ -109,6 +125,38 @@ ConnectionForm:
     en: Include this connection in end-to-end encrypted sync
     zh-CN: 参与端到端加密同步
     zh-HK: 參與端對端加密同步
+  ai_access:
+    en: AI Access
+    zh-CN: AI 访问
+    zh-HK: AI 存取
+  ai_access_allowed:
+    en: Allowed
+    zh-CN: 允许
+    zh-HK: 允許
+  ai_access_read_only:
+    en: Read only
+    zh-CN: 只读
+    zh-HK: 唯讀
+  ai_access_denied:
+    en: Denied
+    zh-CN: 禁止
+    zh-HK: 禁止
+  ai_access_allowed_hint:
+    en: AI can read this connection and run operations
+    zh-CN: AI 可以读取此连接并执行操作
+    zh-HK: AI 可以讀取此連線並執行操作
+  ai_access_read_only_hint:
+    en: AI can read but cannot modify data or run commands
+    zh-CN: AI 只能读取，不能修改数据或执行命令
+    zh-HK: AI 只能讀取，不能修改資料或執行命令
+  ai_access_denied_hint:
+    en: AI cannot see or operate this connection
+    zh-CN: AI 看不到此连接，也不能操作
+    zh-HK: AI 看不到此連線，也不能操作
+  ai_access_save_failed:
+    en: "Connection saved, but the AI access policy was not saved: %{error}"
+    zh-CN: "连接已保存，但 AI 访问策略保存失败：%{error}"
+    zh-HK: "連線已儲存，但 AI 存取策略儲存失敗：%{error}"
   tab_notes:
     en: Notes
     zh-CN: 备注
