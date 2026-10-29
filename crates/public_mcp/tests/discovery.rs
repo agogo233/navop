@@ -75,6 +75,39 @@ fn discovery_paths_prefer_new_navop_brand_and_retain_legacy_path() {
     );
 }
 
+#[test]
+fn discovery_paths_follow_the_run_mode_data_dir() {
+    use public_mcp::discovery::public_mcp_discovery_paths_in;
+
+    // 正式安装态：数据目录是 `~/Library/Application Support/navop`，
+    // 推导结果必须与历史位置逐字一致，避免升级后客户端找不到文件。
+    let installed = std::path::Path::new("/Users/example/Library/Application Support/navop");
+    let (canonical, legacy) = public_mcp_discovery_paths_in(installed);
+    assert_eq!(
+        installed.join("public-mcp.json"),
+        canonical,
+        "canonical 发现文件必须落在数据目录内"
+    );
+    assert_eq!(
+        std::path::Path::new("/Users/example/Library/Application Support/onetcli/public-mcp.json"),
+        legacy,
+        "legacy 发现文件必须保持历史兼容位置"
+    );
+
+    // 开发/便携态：数据根不同，两个文件都必须落在自己的根下。
+    let dev = std::path::Path::new("/Users/example/.navop-dev/state");
+    let (dev_canonical, dev_legacy) = public_mcp_discovery_paths_in(dev);
+    assert_eq!(dev.join("public-mcp.json"), dev_canonical);
+    assert_eq!(
+        std::path::Path::new("/Users/example/.navop-dev/onetcli/public-mcp.json"),
+        dev_legacy
+    );
+    assert_ne!(
+        canonical, dev_canonical,
+        "开发版与安装版的发现文件绝不能是同一个文件"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn discovery_file_is_user_only_on_unix() {

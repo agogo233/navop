@@ -630,10 +630,19 @@ fn inactive_session_count(group: &WorkspaceGroup) -> usize {
 
 /// 在系统文件管理器里显示工作区目录（macOS Finder / Windows 资源管理器 /
 /// Linux xdg-open）。失败静默——这是顺手功能，不值得打扰用户。
+///
+/// **必须离开主线程**：`Command::spawn` 会在调用线程里同步 fork+exec，并阻塞读
+/// 子进程的 exec 错误管道。macOS 上 fork 出来的子进程要先跑一遍 atfork 处理器，
+/// 一旦与别的线程持有的 notify/objc 内部锁互等，子进程永远 exec 不了、父线程就
+/// 永远读不到 EOF —— 卡在 GPUI 主线程上就是整窗冻结（0.22.0 卡死事故）。顺手
+/// 功能不值得冒这个风险：交给 [`process_util::spawn_detached`] 在独立线程里做，
+/// UI 线程只负责把活交出去。
 fn reveal_in_file_manager(root: &str) {
-    let spawned = reveal_command(root).and_then(|mut command| command.spawn().ok());
-    if spawned.is_none() {
-        tracing::warn!(root, "failed to reveal workspace in file manager");
+    let Some(command) = reveal_command(root) else {
+        return;
+    };
+    if let Err(error) = process_util::spawn_detached(command, "reveal-in-file-manager") {
+        tracing::warn!(root, %error, "failed to reveal workspace in file manager");
     }
 }
 

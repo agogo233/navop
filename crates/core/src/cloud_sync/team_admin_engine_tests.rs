@@ -287,8 +287,14 @@ fn team(name: &str) -> Team {
 }
 
 fn test_engine(client: FakeTeamClient) -> (SyncEngine, StorageManager) {
+    // 纳秒时间戳在 macOS 上步进仅 1µs，12 个测试线程同时启动时极易取到
+    // 同一时刻 → 同名 db 文件 → 两个连接对同一文件并发跑迁移，撞
+    // `_migrations` 主键（UNIQUE constraint failed）。 AtomicUsize 计数器
+    // 保证文件名在进程内绝对唯一（与 usage_history_tests 等处同款模式）。
+    static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let counter = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let db_path = std::env::temp_dir().join(format!(
-        "onetcli-team-admin-engine-{}-{}.db",
+        "onetcli-team-admin-engine-{}-{}-{counter}.db",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

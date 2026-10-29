@@ -467,6 +467,17 @@ fn main() {
         eprintln!("Failed to initialize application paths: {error:#}");
         return;
     }
+    // Public MCP 发现文件必须跟着运行模式走：正式版落在数据目录里（与历史位置
+    // 一致），开发/便携版落在各自的数据根下。否则 `cargo run` 起开发版就会把
+    // 正式版的发现文件覆盖成开发实例的 pid/端口，劫持用户已经注册好的 MCP 客户端。
+    if let Some(data_dir) = one_core::app_dirs::data_dir() {
+        let (canonical, legacy) = public_mcp::discovery::public_mcp_discovery_paths_in(&data_dir);
+        public_mcp::discovery::set_public_mcp_discovery_paths(canonical, legacy);
+    }
+    // 客户端配置（~/.claude.json / ~/.codex/config.toml / Claude Desktop）是全局
+    // 共享的单份文件。开发/便携态必须换一套登记名与托管块，否则它会把安装版的
+    // MCP 登记改指向开发实例。
+    public_mcp::client_config::set_client_config_installed_mode(one_core::app_paths::is_installed());
 
     let app = gpui_platform::application()
         .with_assets(AppAssets::new())

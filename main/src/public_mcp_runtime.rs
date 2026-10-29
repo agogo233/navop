@@ -46,8 +46,8 @@ impl Global for GlobalPublicMcpRuntime {}
 impl Drop for GlobalPublicMcpRuntime {
     fn drop(&mut self) {
         if self.runtime.is_some() {
-            let _ = remove_discovery(&public_mcp_discovery_path());
-            let _ = remove_discovery(&legacy_public_mcp_discovery_path());
+            remove_own_discovery(&public_mcp_discovery_path());
+            remove_own_discovery(&legacy_public_mcp_discovery_path());
             tracing::debug!("Public MCP runtime stopped");
         }
     }
@@ -55,8 +55,8 @@ impl Drop for GlobalPublicMcpRuntime {
 
 pub fn init(cx: &mut App) {
     let discovery_path = public_mcp_discovery_path();
-    let _ = remove_discovery(&discovery_path);
-    let _ = remove_discovery(&legacy_public_mcp_discovery_path());
+    remove_own_discovery(&discovery_path);
+    remove_own_discovery(&legacy_public_mcp_discovery_path());
     ai_chat_view::set_plan_tool_registry_provider(cx, agent_runtime_tool_registry);
     ai_chat_view::set_acp_tool_mode_provider(
         cx,
@@ -322,8 +322,8 @@ fn next_generation(cx: &mut App) -> u64 {
     state.runtime = None;
     state.active_config = None;
     state.status = state.status.clone().starting(state.generation);
-    let _ = remove_discovery(&public_mcp_discovery_path());
-    let _ = remove_discovery(&legacy_public_mcp_discovery_path());
+    remove_own_discovery(&public_mcp_discovery_path());
+    remove_own_discovery(&legacy_public_mcp_discovery_path());
     state.generation
 }
 
@@ -370,8 +370,28 @@ fn stop_runtime(cx: &mut App) {
     state.runtime = None;
     state.active_config = None;
     state.status = state.status.clone().disabled();
-    let _ = remove_discovery(&public_mcp_discovery_path());
-    let _ = remove_discovery(&legacy_public_mcp_discovery_path());
+    remove_own_discovery(&public_mcp_discovery_path());
+    remove_own_discovery(&legacy_public_mcp_discovery_path());
+}
+
+/// 只清理属于本进程（或已损坏的）发现文件。
+///
+/// 发现文件里有 pid：另一个实例（例如已经装好的正式版）正在运行时，删掉它的
+/// 文档会让它的 MCP 客户端全部报「discovery file is missing」。开发版与正式版
+/// 现在各写各的目录，这里再加一道护栏，避免任何路径配置失误重新造成串台。
+fn remove_own_discovery(path: &std::path::Path) {
+    match read_discovery(path) {
+        Ok(document) if document.pid != std::process::id() => {
+            tracing::debug!(
+                path = %path.display(),
+                pid = document.pid,
+                "保留其他实例发布的 Public MCP 发现文件"
+            );
+        }
+        _ => {
+            let _ = remove_discovery(path);
+        }
+    }
 }
 
 fn publish_runtime_discovery(runtime: &PublicMcpRuntime) -> anyhow::Result<()> {
@@ -390,6 +410,11 @@ fn publish_discovery_documents(
     let document = read_discovery(source)?;
     write_discovery(canonical, &document)?;
     write_discovery(legacy, &document.legacy_compatible())?;
+    // 发布成功后立刻清掉中转文件：以前每次启动都会在目录里留下一个
+    // `public-mcp-<generation>.staging.json`，一直没人清理。
+    if let Err(error) = std::fs::remove_file(source) {
+        tracing::debug!(path = %source.display(), error = %error, "清理中转的发现文件失败");
+    }
     Ok(())
 }
 
@@ -401,7 +426,7 @@ fn staged_discovery_path(generation: u64) -> PathBuf {
 mod tests {
     use super::{
         GlobalPublicMcpRuntime, PublicMcpRuntimeStatus, mcp_permission_mode_for_tool_execution,
-        next_generation, publish_discovery_documents, staged_discovery_path,
+        next_generation, publish_discovery_documents, remove_own_discovery, staged_discovery_path,
         tool_execution_mode_for_permission,
     };
     use agent_runtime::ToolExecutionMode;
@@ -452,6 +477,41 @@ mod tests {
         assert_eq!("onetcli", old.app);
         assert_eq!(current.port, old.port);
         assert_eq!(current.token, old.token);
+    }
+
+    #[test]
+    fn removal_guard_keeps_discovery_owned_by_another_instance() {
+        use public_mcp::discovery::{DiscoveryDocument, PublicMcpMode, write_discovery};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join("foreign.json");
+        let own = dir.path().join("own.json");
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152);
+        let token = "a".repeat(64);
+        write_discovery(
+            &foreign,
+            &DiscoveryDocument::new(
+                std::process::id() + 1,
+                addr,
+                token.clone(),
+                PublicMcpMode::Persistent,
+            ),
+        )
+        .unwrap();
+        write_discovery(
+            &own,
+            &DiscoveryDocument::new(std::process::id(), addr, token, PublicMcpMode::Persistent),
+        )
+        .unwrap();
+
+        remove_own_discovery(&foreign);
+        remove_own_discovery(&own);
+
+        // 另一个实例（例如已安装版）发布的文档必须保留：删了它，对方的
+        // MCP 客户端会全部报 discovery file is missing。
+        assert!(foreign.exists());
+        assert!(!own.exists());
     }
 
     #[test]

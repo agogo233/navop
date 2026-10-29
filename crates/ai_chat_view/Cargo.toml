@@ -25,6 +25,7 @@ one-core.workspace = true
 agent_runtime = { path = "../agent_runtime" }
 tool_runtime.workspace = true
 html-preview.workspace = true
+process-util.workspace = true
 agent-client-protocol.workspace = true
 llm-connector = { workspace = true, features = ["streaming"] }
 async-trait.workspace = true

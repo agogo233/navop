@@ -6,9 +6,17 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const SERVER_NAME: &str = "navop";
 const LEGACY_SERVER_NAME: &str = "onetcli";
+/// 开发 / 便携运行模式在客户端配置里登记的名字。
+///
+/// 客户端配置（`~/.claude.json`、`~/.codex/config.toml`、Claude Desktop 配置）
+/// 是全局共享的单份文件：开发版和安装版都写 `navop` 时，后启动的那个会把前者
+/// 的登记覆盖成自己的发现文件路径，安装版在用的 MCP 客户端就被劫持到开发实例。
+/// 开发态改用独立名字与独立托管块，两边各自登记、互不覆盖。
+const DEVELOPMENT_SERVER_NAME: &str = "navop-dev";
 const PACKAGE_NAME: &str = "@navop/mcp";
 const NPX_COMMAND: &str = "npx";
 /// npm distribution tag used for the external MCP stdio launcher.
@@ -16,8 +24,56 @@ const NPX_COMMAND: &str = "npx";
 pub const NAVOP_MCP_CLIENT_TAG: &str = "latest";
 const CODEX_BEGIN: &str = "# BEGIN NAVOP MCP";
 const CODEX_END: &str = "# END NAVOP MCP";
+const DEV_CODEX_BEGIN: &str = "# BEGIN NAVOP MCP (DEV)";
+const DEV_CODEX_END: &str = "# END NAVOP MCP (DEV)";
 const LEGACY_CODEX_BEGIN: &str = "# BEGIN ONETCLI PUBLIC MCP";
 const LEGACY_CODEX_END: &str = "# END ONETCLI PUBLIC MCP";
+
+/// 宿主注入的运行模式；默认按正式安装态处理，保持历史行为。
+static RUNS_INSTALLED: OnceLock<bool> = OnceLock::new();
+
+/// 注入当前进程是否为正式安装态。只在启动早期调用一次，重复调用返回 `false`。
+pub fn set_client_config_installed_mode(installed: bool) -> bool {
+    RUNS_INSTALLED.set(installed).is_ok()
+}
+
+fn runs_installed() -> bool {
+    RUNS_INSTALLED.get().copied().unwrap_or(true)
+}
+
+fn server_name_for(installed: bool) -> &'static str {
+    if installed {
+        SERVER_NAME
+    } else {
+        DEVELOPMENT_SERVER_NAME
+    }
+}
+
+fn codex_markers_for(installed: bool) -> (&'static str, &'static str) {
+    if installed {
+        (CODEX_BEGIN, CODEX_END)
+    } else {
+        (DEV_CODEX_BEGIN, DEV_CODEX_END)
+    }
+}
+
+/// 旧品牌 `onetcli` 的登记只由正式版负责清理：开发版删掉它，安装版就失去了
+/// 自己的迁移来源。
+fn legacy_cleanup_for(installed: bool) -> bool {
+    installed
+}
+
+fn server_name() -> &'static str {
+    server_name_for(runs_installed())
+}
+
+fn codex_markers() -> (&'static str, &'static str) {
+    codex_markers_for(runs_installed())
+}
+
+fn legacy_cleanup_enabled() -> bool {
+    legacy_cleanup_for(runs_installed())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpLaunchSpec {
@@ -141,15 +197,19 @@ fn install_json_mcp_servers_config(path: &Path, install: &ClientConfigInstall) -
     let Value::Object(servers) = servers else {
         bail!("Claude config field `mcpServers` must be a JSON object");
     };
-    servers.remove(LEGACY_SERVER_NAME);
-    servers.insert(SERVER_NAME.into(), expected_server_config(install));
+    if legacy_cleanup_enabled() {
+        servers.remove(LEGACY_SERVER_NAME);
+    }
+    servers.insert(server_name().into(), expected_server_config(install));
     write_user_only_file(path, serde_json::to_vec_pretty(&Value::Object(root))?)
 }
 
 pub fn agent_mcp_config_json(install: &ClientConfigInstall) -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "mcpServers": { SERVER_NAME: expected_server_config(install) }
-    }))?)
+    let mut servers = serde_json::Map::new();
+    servers.insert(server_name().to_string(), expected_server_config(install));
+    Ok(serde_json::to_string_pretty(
+        &json!({ "mcpServers": Value::Object(servers) }),
+    )?)
 }
 
 pub fn inspect_codex_config(
@@ -160,10 +220,13 @@ pub fn inspect_codex_config(
         return Ok(health);
     }
     let text = read_optional_text(path)?;
-    if text.contains(LEGACY_CODEX_BEGIN) || text.contains("[mcp_servers.onetcli]") {
+    if legacy_cleanup_enabled()
+        && (text.contains(LEGACY_CODEX_BEGIN) || text.contains("[mcp_servers.onetcli]"))
+    {
         return Ok(ClientConfigHealth::NeedsMigration);
     }
-    if !text.contains(CODEX_BEGIN) {
+    let (begin, _end) = codex_markers();
+    if !text.contains(begin) {
         return Ok(ClientConfigHealth::NotInstalled);
     }
     classify_config_match(text.contains(&codex_managed_block(install)), &text)
@@ -194,10 +257,10 @@ fn inspect_json_mcp_servers_config(
     let Some(servers) = root.get("mcpServers").and_then(Value::as_object) else {
         return Ok(ClientConfigHealth::NotInstalled);
     };
-    if servers.contains_key(LEGACY_SERVER_NAME) {
+    if legacy_cleanup_enabled() && servers.contains_key(LEGACY_SERVER_NAME) {
         return Ok(ClientConfigHealth::NeedsMigration);
     }
-    let Some(server) = servers.get(SERVER_NAME) else {
+    let Some(server) = servers.get(server_name()) else {
         return Ok(ClientConfigHealth::NotInstalled);
     };
     classify_config_match(
@@ -226,8 +289,10 @@ fn codex_managed_block(install: &ClientConfigInstall) -> String {
         .map(|arg| serde_json::to_string(arg).unwrap())
         .collect::<Vec<_>>()
         .join(", ");
+    let (begin, end) = codex_markers();
     format!(
-        "{CODEX_BEGIN}\n[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [{args}]\n{CODEX_END}\n",
+        "{begin}\n[mcp_servers.{}]\ncommand = {}\nargs = [{args}]\n{end}\n",
+        server_name(),
         serde_json::to_string(&install.launch_spec.command).unwrap()
     )
 }
@@ -284,8 +349,10 @@ pub fn uninstall_claude_code_config(path: &Path) -> Result<()> {
 fn uninstall_json_mcp_servers_config(path: &Path) -> Result<()> {
     let mut root = read_optional_json_object(path)?;
     if let Some(Value::Object(servers)) = root.get_mut("mcpServers") {
-        servers.remove(SERVER_NAME);
-        servers.remove(LEGACY_SERVER_NAME);
+        servers.remove(server_name());
+        if legacy_cleanup_enabled() {
+            servers.remove(LEGACY_SERVER_NAME);
+        }
         if servers.is_empty() {
             root.remove("mcpServers");
         }
@@ -313,11 +380,12 @@ fn helper_is_executable(_metadata: &fs::Metadata) -> bool {
 }
 
 fn remove_managed_blocks(text: &str) -> String {
-    remove_block(
-        &remove_block(text, CODEX_BEGIN, CODEX_END),
-        LEGACY_CODEX_BEGIN,
-        LEGACY_CODEX_END,
-    )
+    let (begin, end) = codex_markers();
+    let cleaned = remove_block(text, begin, end);
+    if legacy_cleanup_enabled() {
+        return remove_block(&cleaned, LEGACY_CODEX_BEGIN, LEGACY_CODEX_END);
+    }
+    cleaned
 }
 
 fn remove_block(text: &str, begin: &str, end: &str) -> String {
@@ -338,4 +406,37 @@ fn remove_block(text: &str, begin: &str, end: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CODEX_BEGIN, CODEX_END, DEVELOPMENT_SERVER_NAME, DEV_CODEX_BEGIN, DEV_CODEX_END,
+        SERVER_NAME, codex_markers_for, legacy_cleanup_for, server_name_for,
+    };
+
+    #[test]
+    fn installed_runs_keep_the_historical_client_registration() {
+        assert_eq!("navop", server_name_for(true));
+        assert_eq!((CODEX_BEGIN, CODEX_END), codex_markers_for(true));
+        assert!(
+            legacy_cleanup_for(true),
+            "正式版必须继续清理旧品牌 onetcli 的登记"
+        );
+    }
+
+    #[test]
+    fn development_runs_never_reuse_the_installed_registration() {
+        assert_eq!("navop-dev", server_name_for(false));
+        assert_eq!(
+            "navop-dev", DEVELOPMENT_SERVER_NAME,
+            "开发态名字必须带后缀，避免覆盖安装版"
+        );
+        assert_eq!((DEV_CODEX_BEGIN, DEV_CODEX_END), codex_markers_for(false));
+        assert_ne!(SERVER_NAME, server_name_for(false));
+        assert!(
+            !legacy_cleanup_for(false),
+            "开发版不能删安装版的 onetcli 迁移来源"
+        );
+    }
 }

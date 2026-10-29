@@ -47,10 +47,33 @@ const MIN_ENCRYPTED_LENGTH: usize = NONCE_LENGTH + AUTH_TAG_LENGTH;
 const LOCAL_STORAGE_FIXED_KEY: &[u8; 32] = b"onehub-local-dev-key-2025-fixed!";
 
 /// 系统凭据库中的服务名与账户名
-#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 const KEYRING_SERVICE: &str = "com.navop.desktop";
+/// 开发 / 便携运行模式使用的独立服务名。
+///
+/// 正式版与开发版共用一条钥匙串记录时，开发版保存的主密钥会覆盖正式版的那条，
+/// 正式版下次启动就会拿着错误的密钥去校验（2026-10-26 主密钥事故与 2026-10-28
+/// 的配置串台都出在这条记录上）。只要不是正式安装态，就换用这个后缀。
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+const DEVELOPMENT_KEYRING_SERVICE: &str = "com.navop.desktop.dev";
 #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 const KEYRING_USER: &str = "master-key";
+
+/// 按运行模式挑选系统凭据库服务名。
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+fn keyring_service_for(installed: bool) -> &'static str {
+    if installed {
+        KEYRING_SERVICE
+    } else {
+        DEVELOPMENT_KEYRING_SERVICE
+    }
+}
+
+/// 当前进程应使用的系统凭据库服务名。
+#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+fn keyring_service() -> &'static str {
+    keyring_service_for(crate::app_paths::is_installed())
+}
 
 /// 全局密钥存储后端
 static KEY_STORAGE: RwLock<Option<Arc<dyn KeyStorage>>> = RwLock::new(None);
@@ -291,7 +314,7 @@ fn delete_system_secret() -> Result<(), String> {
 
 #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 fn read_system_secret() -> Result<Option<String>, String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|error| error.to_string())?;
+    let entry = Entry::new(keyring_service(), KEYRING_USER).map_err(|error| error.to_string())?;
     match entry.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -301,7 +324,7 @@ fn read_system_secret() -> Result<Option<String>, String> {
 
 #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 fn write_system_secret(master_key: &str) -> Result<(), String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|error| error.to_string())?;
+    let entry = Entry::new(keyring_service(), KEYRING_USER).map_err(|error| error.to_string())?;
     entry
         .set_password(master_key)
         .map_err(|error| error.to_string())
@@ -309,7 +332,7 @@ fn write_system_secret(master_key: &str) -> Result<(), String> {
 
 #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 fn delete_system_secret() -> Result<(), String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|error| error.to_string())?;
+    let entry = Entry::new(keyring_service(), KEYRING_USER).map_err(|error| error.to_string())?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
@@ -586,8 +609,17 @@ fn persistent_storage_allowed() -> bool {
 mod tests {
     use super::{
         KeyStorage, LocalFileStorage, SystemKeyStorage, delete_master_key_at_path,
-        load_master_key_from_path, save_master_key_to_path, with_test_data_dir,
+        keyring_service_for, load_master_key_from_path, save_master_key_to_path,
+        with_test_data_dir,
     };
+
+    #[test]
+    fn keyring_service_is_separated_from_installed_runs() {
+        // 正式安装态沿用历史服务名，升级后仍能读到已保存的主密钥。
+        assert_eq!("com.navop.desktop", keyring_service_for(true));
+        // 开发 / 便携态必须换一条记录，否则会覆盖正式版保存的主密钥。
+        assert_eq!("com.navop.desktop.dev", keyring_service_for(false));
+    }
 
     #[test]
     fn local_file_storage_round_trips_without_writing_plaintext() {
