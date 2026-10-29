@@ -1,4 +1,6 @@
 use super::*;
+use one_core::tab_container::TabContainerEvent;
+use terminal_view::TerminalWorkspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StartupMasterKeyPolicy {
@@ -62,6 +64,27 @@ impl HomePage {
                     }
                 }
                 _ => {}
+            },
+        )
+        .detach();
+
+        // 复制出的终端标签由 TabContainer 内部创建，需在此补上 OpenSftp / SaveAsConnection 的响应。
+        cx.subscribe_in(
+            &tab_container,
+            window,
+            |this, tab_container, event: &TabContainerEvent, window, cx| {
+                let TabContainerEvent::TabDuplicated { id } = event else {
+                    return;
+                };
+                let terminal = tab_container
+                    .read(cx)
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id() == id.as_str())
+                    .and_then(|tab| tab.content().view().downcast::<TerminalWorkspace>().ok());
+                if let Some(terminal) = terminal {
+                    this.subscribe_terminal_workspace_events(&terminal, window, cx);
+                }
             },
         )
         .detach();
