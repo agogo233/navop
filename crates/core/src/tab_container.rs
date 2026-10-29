@@ -298,6 +298,9 @@ pub enum TabContainerEvent {
     TabClosed { id: String },
     /// The application navigation sidebar visibility was toggled.
     NavigationSidebarToggled { expanded: bool },
+    /// A tab was created by duplicating another tab. Emitted after the copy is
+    /// inserted so the host can attach content-specific event handling.
+    TabDuplicated { id: String },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2612,6 +2615,14 @@ impl TabContainer {
         cx.notify();
     }
 
+    /// Duplicates the active tab (what the tab menu does); pinned tabs are not duplicable.
+    pub fn duplicate_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_pinned_tab_active() {
+            return;
+        }
+        self.duplicate_tab(self.active_index, window, cx);
+    }
+
     fn duplicate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
@@ -2657,6 +2668,7 @@ impl TabContainer {
         }
         self.tabs.insert(insert_index, duplicate);
         self.set_active_index(insert_index, window, cx);
+        cx.emit(TabContainerEvent::TabDuplicated { id: duplicate_id });
     }
 
     pub fn dump(&self, cx: &App) -> TabContainerState {
@@ -5665,7 +5677,8 @@ mod tests {
                             format!("activated:{index}:{id}")
                         }
                         TabContainerEvent::LayoutChanged => "layout".to_string(),
-                        TabContainerEvent::NavigationSidebarToggled { .. } => return,
+                        TabContainerEvent::NavigationSidebarToggled { .. }
+                        | TabContainerEvent::TabDuplicated { .. } => return,
                     };
                     events_for_subscription
                         .lock()
