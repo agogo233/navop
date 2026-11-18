@@ -379,14 +379,10 @@ mod tests {
     #[test]
     fn secondary_windows_never_destroy_themselves() {
         // include_str! 用的是相对于本文件的路径，所以从 crates/core/src 往上退三级。
-        let sources: [(&str, &str); 15] = [
+        let sources: [(&str, &str); 14] = [
             (
-                "main/src/new_connection/connection_window.rs",
-                include_str!("../../../main/src/new_connection/connection_window.rs"),
-            ),
-            (
-                "main/src/credential_vault/form_window.rs",
-                include_str!("../../../main/src/credential_vault/form_window.rs"),
+                "crates/navop_app/src/credential_vault/form_window.rs",
+                include_str!("../../../crates/navop_app/src/credential_vault/form_window.rs"),
             ),
             (
                 "crates/db_view/src/connection_form_window.rs",
@@ -415,8 +411,8 @@ mod tests {
                 ),
             ),
             (
-                "crates/terminal_view/src/ssh_form_window.rs",
-                include_str!("../../../crates/terminal_view/src/ssh_form_window.rs"),
+                "crates/ssh_form/src/ssh_form_window.rs",
+                include_str!("../../../crates/ssh_form/src/ssh_form_window.rs"),
             ),
             (
                 "crates/terminal_view/src/ftp_form_window.rs",
@@ -485,8 +481,8 @@ mod tests {
     fn save_flows_close_through_the_save_aware_funnel() {
         let sources: [(&str, &str); 12] = [
             (
-                "main/src/credential_vault/form_window.rs",
-                include_str!("../../../main/src/credential_vault/form_window.rs"),
+                "crates/navop_app/src/credential_vault/form_window.rs",
+                include_str!("../../../crates/navop_app/src/credential_vault/form_window.rs"),
             ),
             (
                 "crates/connection_form/src/middleware_form/window.rs",
@@ -521,8 +517,8 @@ mod tests {
                 include_str!("../../../crates/terminal_view/src/serial_form_window.rs"),
             ),
             (
-                "crates/terminal_view/src/ssh_form_window.rs",
-                include_str!("../../../crates/terminal_view/src/ssh_form_window.rs"),
+                "crates/ssh_form/src/ssh_form_window.rs",
+                include_str!("../../../crates/ssh_form/src/ssh_form_window.rs"),
             ),
             (
                 "crates/terminal_view/src/telnet_form_window.rs",
@@ -553,13 +549,13 @@ mod tests {
         // 标记写的是各表单翻转状态的那行代码（`mark_saved` / 写回编辑中的连接）。
         let sources: [(&str, &str, &str); 13] = [
             (
-                "main/src/credential_vault/form.rs",
-                include_str!("../../../main/src/credential_vault/form.rs"),
+                "crates/navop_app/src/credential_vault/form.rs",
+                include_str!("../../../crates/navop_app/src/credential_vault/form.rs"),
                 "fn mark_saved(&mut self, entry: CredentialEntry)",
             ),
             (
-                "main/src/credential_vault/form_window.rs",
-                include_str!("../../../main/src/credential_vault/form_window.rs"),
+                "crates/navop_app/src/credential_vault/form_window.rs",
+                include_str!("../../../crates/navop_app/src/credential_vault/form_window.rs"),
                 "self.editing = true;",
             ),
             (
@@ -603,8 +599,8 @@ mod tests {
                 "fn mark_saved(&mut self, saved: &StoredConnection",
             ),
             (
-                "crates/terminal_view/src/ssh_form_window.rs",
-                include_str!("../../../crates/terminal_view/src/ssh_form_window.rs"),
+                "crates/ssh_form/src/ssh_form_window.rs",
+                include_str!("../../../crates/ssh_form/src/ssh_form_window.rs"),
                 "fn mark_saved(&mut self, saved: &StoredConnection",
             ),
             (

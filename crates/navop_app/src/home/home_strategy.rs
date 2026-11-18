@@ -1,0 +1,473 @@
+use crate::home_tab::HomePage;
+use extension_view::{ExtensionViewHost, MarketplaceInstallOutcome};
+use gpui::{
+    App, AppContext, AsyncApp, ClickEvent, Context, ParentElement, SharedString, Styled, Window,
+};
+use gpui_component::{WindowExt, notification::Notification};
+use one_core::storage::{ConnectionType, ExtensionConnectionParams, StoredConnection, Workspace};
+// `TabItem` 只在开 `shell` 的路径上用（终端型连接、nsh 页面 tab），
+// 32 位 Windows 那种「无 nsh-host」构建同样要编译这一段。
+#[cfg(feature = "shell")]
+use one_core::tab_container::TabItem;
+use one_core::tab_container::TabOpenMode;
+use std::sync::Arc;
+
+pub(crate) trait ConnectionOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    );
+}
+
+pub(crate) fn build_connection_open_strategy(
+    connection: StoredConnection,
+    _workspace: Option<Workspace>,
+) -> Box<dyn ConnectionOpenStrategy> {
+    // 领域连接不再由公共壳按类型分派：扩展连接仍走扩展运行时，
+    // 其余类型交给对应产品注册的 `ConnectionOpener`。
+    match connection.connection_type {
+        ConnectionType::Mqtt => Box::new(MiddlewareExtensionOpenStrategy { connection }),
+        ConnectionType::Extension => Box::new(ExtensionOpenStrategy { connection }),
+        _ => Box::new(RegistryOpenStrategy { connection }),
+    }
+}
+
+/// 通过领域注册表打开连接；当前产品没有对应领域时给出明确提示。
+struct RegistryOpenStrategy {
+    connection: StoredConnection,
+}
+
+impl ConnectionOpenStrategy for RegistryOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        if !app_kit::registry().open_connection(&self.connection, mode, home, window, cx) {
+            window.push_notification(
+                format!(
+                    "当前产品不支持打开该连接：{}（{}）",
+                    self.connection.name, self.connection.connection_type
+                ),
+                cx,
+            );
+        }
+    }
+}
+
+struct ExtensionOpenStrategy {
+    connection: StoredConnection,
+}
+
+#[cfg(not(feature = "nsh-host"))]
+impl ConnectionOpenStrategy for ExtensionOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        _home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        let Ok(params) = self.connection.to_extension_params() else {
+            window.push_notification("Extension connection data is invalid", cx);
+            return;
+        };
+        let Some(service) = cx
+            .try_global::<universal_plugins::GlobalUniversalPluginService>()
+            .map(|global| global.service())
+        else {
+            window.push_notification("Extension runtime is unavailable", cx);
+            return;
+        };
+        let Some(contribution) =
+            service.resource_connection(&params.extension_id, &params.contribution_id)
+        else {
+            window.push_notification("This extension contribution is unavailable", cx);
+            return;
+        };
+        // 终端型连接不需要提供者进程,也不依赖 nsh 构建。
+        if contribution.terminal.is_some() {
+            open_extension_terminal_connection(self.connection, &contribution, mode, window, cx);
+            return;
+        }
+        // 扩展连接现在只有一种 UI：扩展自己的页面 —— 它跑在 nsh 宿主里，
+        // 所以没有 nsh 构建时这些连接没有界面。
+        let _ = (service, contribution, mode);
+        window.push_notification("This extension connection requires the nsh build", cx);
+    }
+}
+
+#[cfg(feature = "nsh-host")]
+impl ConnectionOpenStrategy for ExtensionOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        _home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        let Ok(params) = self.connection.to_extension_params() else {
+            window.push_notification("Extension connection data is invalid", cx);
+            return;
+        };
+        let Some(host) = cx.try_global::<universal_plugins::NshHost>().cloned() else {
+            window.push_notification("Extension runtime is unavailable", cx);
+            return;
+        };
+        let Some(contribution) =
+            host.resource_connection(&params.extension_id, &params.contribution_id)
+        else {
+            window.push_notification(
+                format!(
+                    "Extension {} is missing or no longer provides connection {}",
+                    params.extension_id, params.contribution_id
+                ),
+                cx,
+            );
+            return;
+        };
+        if contribution.terminal.is_some() {
+            open_extension_terminal_connection(self.connection, &contribution, mode, window, cx);
+            return;
+        }
+        // 一条连接就是一个页面：不再有"声明了工作台就走原生 UI"的分支。
+        // 页面自己决定长什么样，宿主只负责给上下文和借来的资源句柄。
+        if let Err(error) = host.open_connection(
+            universal_plugins::ConnectionPageOpen {
+                connection: self.connection,
+                contribution,
+                mode,
+            },
+            window,
+            cx,
+        ) {
+            window.push_notification(format!("Failed to open extension connection: {error}"), cx);
+        }
+    }
+}
+
+/// 打开终端型扩展连接:宿主直接以本地进程启动一个终端标签,不经过提供者进程。
+///
+/// 启动参数由 manifest 的 `terminal` 模板与连接里保存的字段值合成;
+/// 值的合法性(选项注入等)由 [`extension_runtime::extension::manifest::ResourceConnectionTerminal::resolve`] 把关,
+/// 校验不过时只提示错误、不启动任何进程。
+fn open_extension_terminal_connection(
+    connection: StoredConnection,
+    contribution: &extension_runtime::RegisteredResourceConnectionContribution,
+    mode: TabOpenMode,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    #[cfg(not(feature = "shell"))]
+    {
+        let _ = (connection, contribution, mode, window, cx);
+    }
+    #[cfg(feature = "shell")]
+    open_extension_terminal_connection_shell(connection, contribution, mode, window, cx);
+}
+
+/// shell 领域下的终端型扩展连接启动实现。
+#[cfg(feature = "shell")]
+fn open_extension_terminal_connection_shell(
+    connection: StoredConnection,
+    contribution: &extension_runtime::RegisteredResourceConnectionContribution,
+    mode: TabOpenMode,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(terminal) = contribution.terminal.as_ref() else {
+        return;
+    };
+    let Ok(params) = connection.to_extension_params() else {
+        window.push_notification("Extension connection data is invalid", cx);
+        return;
+    };
+    let launch = match terminal.resolve(&params.config) {
+        Ok(launch) => launch,
+        Err(error) => {
+            window.push_notification(format!("Failed to open extension connection: {error}"), cx);
+            return;
+        }
+    };
+    let title = launch.title.unwrap_or_else(|| connection.name.clone());
+    let config = terminal::LocalConfig {
+        shell: Some(launch.command),
+        args: launch.args,
+        working_dir: None,
+        env: launch.env,
+    };
+    let connection_id = connection.id.unwrap_or(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let prefix = format!("extension-terminal-{connection_id}-");
+    let tab_id = format!("{prefix}{timestamp}");
+    let tabs = cx
+        .global::<one_core::tab_container::GlobalTabContainer>()
+        .primary_pane();
+    let existing = tabs
+        .read(cx)
+        .tabs()
+        .iter()
+        .filter(|tab| tab.id().starts_with(&prefix))
+        .count();
+    let tab_index = (existing > 0).then_some(existing + 1);
+    // 标签图标与「打开连接」列表走同一个解析:用户选择 → manifest 图标 → 通用扩展图标。
+    // 终端型连接打开的是本地终端,没有 `StoredConnection`,图标必须在这里解析后传进去。
+    let connection_icon = Some(universal_plugins::extension_connection_icon_or_default(
+        &connection,
+        Some(contribution),
+    ));
+    // 与其他终端标签一致:把创建与容器更新移出 HomePage 租约。
+    #[cfg(feature = "shell")]
+    window.defer(cx, move |window, cx| {
+        let view = cx.new(|cx| {
+            terminal_view::TerminalWorkspace::new_launched(
+                config,
+                title,
+                connection_icon,
+                tab_index,
+                window,
+                cx,
+            )
+        });
+        tabs.update(cx, |tabs, cx| {
+            let tab = TabItem::new(tab_id, "terminal", view);
+            tabs.add_tab_with_mode(tab, mode, window, cx);
+        });
+    });
+}
+
+struct MiddlewareExtensionOpenStrategy {
+    connection: StoredConnection,
+}
+
+/// 旧内置 MQTT 连接(ConnectionType::Mqtt)在扩展化改造后按需下载扩展再打开。
+///
+/// 优先把历史连接参数迁移为扩展连接形态(com.navop.middleware.mqtt);若对应
+/// 扩展尚未安装,则先从扩展市场下载安装,安装完成后打开连接。
+impl ConnectionOpenStrategy for MiddlewareExtensionOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        _home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        let mut connection = self.connection;
+        if !connection.try_migrate_legacy_middleware_connection() {
+            window.push_notification("MQTT connection data is invalid", cx);
+            return;
+        }
+        let Ok(params) = connection.to_extension_params() else {
+            window.push_notification("MQTT connection data is invalid", cx);
+            return;
+        };
+        if extension_connection_is_registered(&params, cx) {
+            open_extension_connection_now(connection, mode, window, cx);
+        } else {
+            install_middleware_extension(connection, params, mode, window, cx);
+        }
+    }
+}
+
+/// 扩展是否已安装并注册了对应连接贡献项。
+fn extension_connection_is_registered(params: &ExtensionConnectionParams, cx: &App) -> bool {
+    #[cfg(feature = "nsh-host")]
+    {
+        cx.try_global::<universal_plugins::NshHost>()
+            .map(|host| {
+                host.resource_connection(&params.extension_id, &params.contribution_id)
+                    .is_some()
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "nsh-host"))]
+    {
+        cx.try_global::<universal_plugins::GlobalUniversalPluginService>()
+            .map(|global| {
+                global
+                    .service()
+                    .resource_connection(&params.extension_id, &params.contribution_id)
+                    .is_some()
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// 从扩展市场下载并安装缺失的中间件扩展,完成后打开连接。
+fn install_middleware_extension(
+    connection: StoredConnection,
+    params: ExtensionConnectionParams,
+    mode: TabOpenMode,
+    window: &mut Window,
+    cx: &mut Context<HomePage>,
+) {
+    let extension_id = params.extension_id.clone();
+    let window_handle = window.window_handle();
+    let host: Arc<dyn ExtensionViewHost> = Arc::new(extension_runtime::MainExtensionViewHost);
+    let http_client = cx.http_client();
+    window.push_notification(
+        Notification::info(format!("Downloading extension {extension_id}...")).autohide(true),
+        cx,
+    );
+    let install_host = host.clone();
+    let task = cx.background_spawn(async move {
+        let entries = install_host
+            .load_marketplace_entries(http_client.clone())
+            .await?;
+        let entry = entries
+            .into_iter()
+            .find(|entry| extension_view::marketplace_entry_install_id(entry) == extension_id)
+            .ok_or_else(|| anyhow::anyhow!("marketplace entry `{extension_id}` not found"))?;
+        install_host
+            .review_marketplace_entry(http_client, entry)
+            .await
+    });
+    cx.spawn(async move |_home, cx: &mut AsyncApp| {
+        let outcome = task.await;
+        let _ = cx.update_window(window_handle, |_, window, cx| match outcome {
+            Ok(MarketplaceInstallOutcome::Installed(summary)) => {
+                host.refresh_after_extension_change(summary.kind, cx);
+                open_extension_connection_now(connection, mode, window, cx);
+            }
+            Ok(MarketplaceInstallOutcome::NeedsPermission(downloaded)) => {
+                prompt_middleware_extension_install(
+                    downloaded,
+                    connection,
+                    mode,
+                    host.clone(),
+                    window,
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Failed to download extension: {error}"))
+                        .autohide(true),
+                    cx,
+                );
+            }
+        });
+    })
+    .detach();
+}
+
+/// 扩展需要权限确认时弹出确认框,确认后安装并打开连接。
+fn prompt_middleware_extension_install(
+    downloaded: extension_view::DownloadedMarketplaceExtension,
+    connection: StoredConnection,
+    mode: TabOpenMode,
+    host: Arc<dyn ExtensionViewHost>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let review_summary = SharedString::from(downloaded.review.summary.clone());
+    let staging = downloaded.staging.clone();
+    let entry_name = downloaded.entry.name.clone();
+    window.open_dialog(cx, move |dialog, _window, _cx| {
+        let host = host.clone();
+        let staging = staging.clone();
+        let connection = connection.clone();
+        dialog
+            .title(SharedString::from(format!(
+                "Install extension {entry_name}"
+            )))
+            .child(
+                gpui::div()
+                    .child(review_summary.clone())
+                    .max_w(gpui::px(480.0)),
+            )
+            .confirm()
+            .on_ok(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                match host.install_confirmed_staging(staging.clone()) {
+                    Ok(summary) => {
+                        host.refresh_after_extension_change(summary.kind, cx);
+                        open_extension_connection_now(connection.clone(), mode, window, cx);
+                    }
+                    Err(error) => window.push_notification(
+                        Notification::error(format!("Failed to install extension: {error}")),
+                        cx,
+                    ),
+                }
+                true
+            })
+    });
+}
+
+/// 打开已注册的扩展连接(不依赖 HomePage,便于安装完成后在回调中复用)。
+#[cfg(not(feature = "nsh-host"))]
+fn open_extension_connection_now(
+    connection: StoredConnection,
+    mode: TabOpenMode,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Ok(params) = connection.to_extension_params() else {
+        window.push_notification("Extension connection data is invalid", cx);
+        return;
+    };
+    let Some(service) = cx
+        .try_global::<universal_plugins::GlobalUniversalPluginService>()
+        .map(|global| global.service())
+    else {
+        window.push_notification("Extension runtime is unavailable", cx);
+        return;
+    };
+    let Some(contribution) =
+        service.resource_connection(&params.extension_id, &params.contribution_id)
+    else {
+        window.push_notification("This extension contribution is unavailable", cx);
+        return;
+    };
+    // 扩展连接现在只有一种 UI：扩展自己的页面（跑在 nsh 宿主里）。
+    let _ = (contribution, mode);
+    window.push_notification("This extension connection requires the nsh build", cx);
+}
+
+#[cfg(feature = "nsh-host")]
+fn open_extension_connection_now(
+    connection: StoredConnection,
+    mode: TabOpenMode,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Ok(params) = connection.to_extension_params() else {
+        window.push_notification("Extension connection data is invalid", cx);
+        return;
+    };
+    let Some(host) = cx.try_global::<universal_plugins::NshHost>().cloned() else {
+        window.push_notification("Extension runtime is unavailable", cx);
+        return;
+    };
+    let Some(contribution) =
+        host.resource_connection(&params.extension_id, &params.contribution_id)
+    else {
+        window.push_notification(
+            format!(
+                "Extension {} is missing or no longer provides connection {}",
+                params.extension_id, params.contribution_id
+            ),
+            cx,
+        );
+        return;
+    };
+    // 一条连接就是一个页面（同 ExtensionOpenStrategy::open）。
+    if let Err(error) = host.open_connection(
+        universal_plugins::ConnectionPageOpen {
+            connection,
+            contribution,
+            mode,
+        },
+        window,
+        cx,
+    ) {
+        window.push_notification(format!("Failed to open extension connection: {error}"), cx);
+    }
+}

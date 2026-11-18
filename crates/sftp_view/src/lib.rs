@@ -32,7 +32,7 @@ use gpui::{
     Render, SharedString, Styled, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, Sizable, Size, WindowExt,
+    ActiveTheme, Disableable, Icon, Selectable, Sizable, Size, WindowExt,
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants},
     dialog::{DialogButtonProps, DialogFooter},
@@ -1098,12 +1098,11 @@ fn should_apply_local_listing(
 }
 
 fn is_valid_entry_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
+    sftp::is_valid_remote_entry_name(name)
+}
+
+fn safe_local_download_path(local_root: &std::path::Path, remote_name: &str) -> Option<PathBuf> {
+    is_valid_entry_name(remote_name).then(|| local_root.join(remote_name))
 }
 
 fn breadcrumb_item_min_width(label: &str) -> f32 {
@@ -3145,6 +3144,11 @@ impl SftpView {
             ),
             view: cx.entity().clone(),
         };
+        let trigger_label = menu
+            .current_index
+            .and_then(|index| menu.volumes.get(index))
+            .map(|volume| volume.label().to_string())
+            .unwrap_or_else(|| t!("Volume.open").to_string());
 
         Popover::new("local_volume_popover")
             .open(open)
@@ -3159,13 +3163,16 @@ impl SftpView {
             .trigger(
                 Button::new("local_volume_button")
                     .icon(IconName::HardDrive)
+                    .label(trigger_label)
                     .ghost()
-                    .xsmall()
+                    .small()
                     .compact()
+                    .flex_shrink_0()
+                    .selected(open)
                     .dropdown_caret(true)
                     .tooltip(t!("Volume.open").to_string())
                     .on_click(cx.listener(|_, _, _, cx| {
-                        // 地址栏整条是「点击进入编辑」，这里不能被它接管。
+                        // 盘符菜单是独立控件，不能再触发路径编辑。
                         cx.stop_propagation();
                     })),
             )
@@ -3958,37 +3965,37 @@ impl SftpView {
         };
         let view = cx.entity().clone();
         let apply_all = Arc::new(AtomicBool::new(false));
+        let prompt = FileConflictPrompt::entity(
+            cx,
+            FileConflictPromptSpec {
+                name: current.transfer.name.clone().into(),
+                is_directory: current.transfer.is_dir,
+                show_apply_all: position.1 > 1,
+                apply_all: apply_all.clone(),
+                labels: upload_conflict_prompt_labels(position),
+            },
+            move |choice, apply_all, window, cx| {
+                window.close_dialog(cx);
+                let uploads = resolve_upload_conflicts(&session, (choice, apply_all));
+                let has_next = session.resolver.borrow().current().is_some();
+                let _ = view.update(cx, |this, cx| {
+                    if this.close_state.is_closing()
+                        || !this.is_current_connection_generation(session.connection_generation)
+                    {
+                        return;
+                    }
+                    this.execute_upload_decisions(uploads, cx);
+                    if has_next {
+                        this.show_next_upload_conflict(session.clone(), window, cx);
+                    }
+                });
+            },
+        );
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let session = session.clone();
-            let view = view.clone();
             dialog
                 .title(t!("Dialog.file_conflict").to_string())
                 .w(px(480.))
-                .child(FileConflictPrompt::new(
-                    FileConflictPromptSpec {
-                        name: current.transfer.name.clone().into(),
-                        is_directory: current.transfer.is_dir,
-                        apply_all: apply_all.clone(),
-                        labels: upload_conflict_prompt_labels(position),
-                    },
-                    move |choice, apply_all, window, cx| {
-                        window.close_dialog(cx);
-                        let uploads = resolve_upload_conflicts(&session, (choice, apply_all));
-                        let has_next = session.resolver.borrow().current().is_some();
-                        let _ = view.update(cx, |this, cx| {
-                            if this.close_state.is_closing()
-                                || !this
-                                    .is_current_connection_generation(session.connection_generation)
-                            {
-                                return;
-                            }
-                            this.execute_upload_decisions(uploads, cx);
-                            if has_next {
-                                this.show_next_upload_conflict(session.clone(), window, cx);
-                            }
-                        });
-                    },
-                ))
+                .child(prompt.clone())
                 .overlay_closable(false)
                 .close_button(true)
         });
@@ -4867,6 +4874,10 @@ impl SftpView {
         let mut has_conflict = false;
 
         for entry in &selected_entries {
+            let Some(local_path) = safe_local_download_path(&local_path, &entry.name) else {
+                window.push_notification(Notification::error(t!("Error.invalid_name")), cx);
+                return;
+            };
             let conflict = local_names.contains(&entry.name);
             if conflict {
                 has_conflict = true;
@@ -4874,7 +4885,7 @@ impl SftpView {
 
             pending_transfers.push(PendingTransfer {
                 name: entry.name.clone(),
-                local_path: local_path.join(&entry.name),
+                local_path,
                 remote_path: join_remote_path(&remote_path, &entry.name),
                 is_dir: entry.is_dir,
                 has_conflict: conflict,
@@ -6054,6 +6065,10 @@ impl SftpView {
         let mut has_conflict = false;
 
         for item in &dragged.items {
+            let Some(download_path) = safe_local_download_path(&local_path, &item.name) else {
+                window.push_notification(Notification::error(t!("Error.invalid_name")), cx);
+                return;
+            };
             let conflict = local_names.contains(&item.name);
             if conflict {
                 has_conflict = true;
@@ -6061,7 +6076,7 @@ impl SftpView {
 
             pending_transfers.push(PendingTransfer {
                 name: item.name.clone(),
-                local_path: local_path.join(&item.name),
+                local_path: download_path,
                 remote_path: item.full_path.clone(),
                 is_dir: item.is_dir,
                 has_conflict: conflict,
@@ -6816,6 +6831,7 @@ impl SftpView {
             .left_remote
             .as_ref()
             .is_none_or(|endpoint| endpoint.state == LeftRemoteConnectionState::Connected);
+        let show_hidden = self.local_panel.read(cx).show_hidden();
         let can_paste = endpoint_ready && self.can_paste_file_clipboard(clipboard_endpoint);
         let left_endpoint_title = self.left_endpoint_title();
         let local_actions_view = cx.entity();
@@ -6891,6 +6907,10 @@ impl SftpView {
                                     })),
                             ),
                     )
+                    .when(
+                        !is_left_remote && local_volume::volume_menu_enabled(),
+                        |bar| bar.child(self.render_local_volume_menu(cx)),
+                    )
                     .child(if is_editing {
                         h_flex()
                             .flex_1()
@@ -6922,10 +6942,6 @@ impl SftpView {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.start_local_path_editing(window, cx);
                             }))
-                            .when(
-                                !is_left_remote && local_volume::volume_menu_enabled(),
-                                |bar| bar.child(self.render_local_volume_menu(cx)),
-                            )
                             .child(breadcrumb.flex_1().min_w(px(0.)).overflow_hidden())
                             .into_any_element()
                     })
@@ -6969,6 +6985,28 @@ impl SftpView {
                                             this.refresh_local_dir_with_window(window, cx);
                                         }
                                     })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    "local_toggle_hidden",
+                                    if show_hidden {
+                                        IconName::Eye
+                                    } else {
+                                        IconName::EyeOff
+                                    },
+                                )
+                                .role(IconButtonRole::Toolbar)
+                                .selected(show_hidden)
+                                .tooltip(t!("File.toggle_hidden"))
+                                .disabled(!endpoint_ready)
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.local_panel.update(cx, |panel, cx| {
+                                            panel.toggle_show_hidden(cx);
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
                             )
                             .when(is_left_remote, |toolbar| {
                                 toolbar.child(
@@ -7230,6 +7268,7 @@ impl SftpView {
         let can_go_forward = self.can_go_forward_remote();
         let is_favorite = self.is_current_remote_path_favorite();
         let favorite_paths = self.remote_favorite_paths();
+        let show_hidden = self.remote_panel.read(cx).show_hidden();
         let paste_target_dir = self.remote_current_path.clone();
         let can_paste =
             is_connected && self.can_paste_file_clipboard(ClipboardEndpoint::RemoteRight);
@@ -7341,6 +7380,28 @@ impl SftpView {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.refresh_remote_dir_with_window(window, cx);
                                     })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    "remote_toggle_hidden",
+                                    if show_hidden {
+                                        IconName::Eye
+                                    } else {
+                                        IconName::EyeOff
+                                    },
+                                )
+                                .role(IconButtonRole::Toolbar)
+                                .selected(show_hidden)
+                                .tooltip(t!("File.toggle_hidden"))
+                                .disabled(!is_connected)
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.remote_panel.update(cx, |panel, cx| {
+                                            panel.toggle_show_hidden(cx);
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
                             )
                             .child(
                                 IconButton::new("remote_download", transfer_icon)
@@ -7859,9 +7920,10 @@ mod tests {
         mark_server_copy_directory_replacements, prepare_global_download,
         prepare_global_remote_delete, prepare_global_upload, reconcile_global_transfer_snapshot,
         release_transfer_client, remote_path_parent, resolve_upload_conflict,
-        resolve_upload_conflicts, server_copy_conflict_flags, should_apply_local_listing,
-        should_apply_remote_listing, should_refresh_transfer_target, tab_connection_status,
-        transfer_error_summary, transfer_task_state_from_global, upload_directory_conflict_policy,
+        resolve_upload_conflicts, safe_local_download_path, server_copy_conflict_flags,
+        should_apply_local_listing, should_apply_remote_listing, should_refresh_transfer_target,
+        tab_connection_status, transfer_error_summary, transfer_task_state_from_global,
+        upload_directory_conflict_policy,
     };
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
@@ -8116,7 +8178,7 @@ mod tests {
     fn test_stored_connection() -> StoredConnection {
         StoredConnection::new_ssh(
             "SFTP entity test".to_string(),
-            SshParams {
+            SshParams { otp: None,
                 remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
@@ -9525,6 +9587,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_download_targets_reject_traversal_and_absolute_names() {
+        let root = std::path::Path::new("/chosen-download");
+        assert_eq!(
+            Some(root.join("notes.txt")),
+            safe_local_download_path(root, "notes.txt")
+        );
+        assert_eq!(None, safe_local_download_path(root, "../outside.txt"));
+        assert_eq!(None, safe_local_download_path(root, "/tmp/outside.txt"));
+        assert_eq!(None, safe_local_download_path(root, "..\\outside.txt"));
+    }
+
+    #[test]
     fn archive_kind_detects_supported_remote_archives() {
         assert_eq!(
             Some(super::ArchiveKind::Zip),
@@ -9887,9 +9961,71 @@ mod local_volume_wiring_tests {
             body.contains("local_volume::local_volumes()"),
             "打开下拉时重新枚举卷，插拔磁盘要能看到"
         );
+        assert!(body.contains("dropdown_caret"), "触发按钮要带下拉指示");
         assert!(
-            body.contains("dropdown_caret"),
-            "触发按钮要带下拉指示"
+            body.contains("current_index")
+                && body.contains("volume.label()")
+                && body.contains(".label(trigger_label)"),
+            "触发按钮必须显示当前盘符，不能只显示一个硬盘图标"
+        );
+    }
+
+    #[test]
+    fn local_volume_menu_is_a_separate_toolbar_control() {
+        let source = include_str!("lib.rs");
+        let body = method_body(source, "render_local_panel");
+        let volume_menu = body.find("render_local_volume_menu").expect("volume menu");
+        let path_bar = body.find("\"local-path-bar\"").expect("path bar");
+        assert!(
+            volume_menu < path_bar,
+            "盘符切换器必须放在地址栏外，不能藏在点击即编辑的路径框里"
+        );
+    }
+
+    #[test]
+    fn both_sftp_toolbars_expose_hidden_files_toggles() {
+        let source = include_str!("lib.rs");
+        let local = method_body(source, "render_local_panel");
+        let remote = method_body(source, "render_remote_panel");
+
+        for (side, body, id) in [
+            ("左侧", local, "local_toggle_hidden"),
+            ("右侧", remote, "remote_toggle_hidden"),
+        ] {
+            assert!(
+                body.contains(id),
+                "{side}顶部工具栏必须直接提供隐藏文件开关，而不是只放在文件行右键菜单里"
+            );
+            assert!(
+                body.contains("toggle_show_hidden"),
+                "{side}开关必须复用 FileListPanel 的隐藏文件切换逻辑"
+            );
+            assert!(
+                body.contains("File.toggle_hidden"),
+                "{side}开关必须有可发现的本地化提示"
+            );
+        }
+    }
+
+    #[test]
+    fn file_list_surfaces_open_a_directory_context_menu() {
+        let source = include_str!("file_list_panel.rs");
+        let render = source
+            .split("impl Render for FileListPanel")
+            .nth(1)
+            .expect("FileListPanel render implementation");
+
+        assert!(
+            source.contains("fn build_directory_context_menu("),
+            "空白文件区需要独立的目录级菜单构建器"
+        );
+        assert!(
+            render.contains("build_directory_context_menu"),
+            "空白文件区和空目录必须真正挂上目录级右键菜单"
+        );
+        assert!(
+            render.contains(".context_menu("),
+            "目录级菜单必须接在文件列表容器上才能覆盖空白区域"
         );
     }
 

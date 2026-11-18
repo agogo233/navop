@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+#[cfg(feature = "database")]
 use db_view::extension_menu::DbTreeExtensionMenuItem;
 use one_core::{
     command_registry::{CommandDescriptor, CommandHandler, CommandRegistryError},
@@ -12,18 +13,16 @@ use crate::extension::manifest::{CommandContrib, RemoteFileEditorLaunchMode, Was
 
 #[path = "types/shell.rs"]
 mod shell;
-pub use shell::RegisteredShellViewContribution;
+pub use shell::RegisteredShellAppContribution;
+#[path = "types/panels.rs"]
+mod panels;
+pub use panels::RegisteredPanelContribution;
 #[path = "types/resource_connection.rs"]
 mod resource_connection;
 pub use resource_connection::RegisteredResourceConnectionContribution;
-#[path = "types/resource_workbench.rs"]
-mod resource_workbench;
-pub use resource_workbench::RegisteredResourceWorkbenchContribution;
-#[path = "types/workbench_operation_catalog.rs"]
-mod workbench_operation_catalog;
-pub use workbench_operation_catalog::{
-    WorkbenchOperationCatalog, WorkbenchOperationEntry, WorkbenchOperationParam,
-};
+#[path = "types/tools.rs"]
+mod tools;
+pub use tools::RegisteredToolContribution;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredRemoteFileEditorContribution {
@@ -56,6 +55,7 @@ pub struct RegisteredKeybindingContribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "database")]
 pub(super) struct RegisteredDbTreeMenuContribution {
     pub position: String,
     pub item: DbTreeExtensionMenuItem,
@@ -114,6 +114,7 @@ pub struct RegisteredIpcRuntimeBinding {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "database"), allow(dead_code))]
 pub struct WasmRuntimeBinding {
     #[cfg(feature = "wasm-components")]
     pub extension_id: String,
@@ -151,14 +152,16 @@ pub enum ExtensionRuntimeError {
     UnsupportedCommand { command_id: String },
     #[error("invalid remote file editor `{editor_id}`: {reason}")]
     InvalidRemoteFileEditor { editor_id: String, reason: String },
-    #[error("invalid shell view manifest field {field}: {reason}")]
-    InvalidShellView { field: String, reason: String },
-    #[error("duplicate shell view key: {view_key}")]
-    DuplicateShellView { view_key: String },
+    #[error("invalid shell app manifest field {field}: {reason}")]
+    InvalidShellApp { field: String, reason: String },
+    #[error("duplicate shell app for extension `{extension_id}`")]
+    DuplicateShellApp { extension_id: String },
     #[error("invalid resource connection: {0}")]
     InvalidResourceConnection(String),
-    #[error("invalid resource workbench: {0}")]
-    InvalidResourceWorkbench(String),
+    #[error("invalid tool `{tool_id}`: {reason}")]
+    InvalidTool { tool_id: String, reason: String },
+    #[error("invalid panel manifest field {field}: {reason}")]
+    InvalidPanel { field: String, reason: String },
     #[error("invalid declarative layout: {reason}")]
     InvalidLayout { reason: String },
 }
@@ -173,12 +176,17 @@ pub(super) fn command_descriptor(
     runtime_id: String,
     function: String,
 ) -> CommandDescriptor {
-    let mut descriptor = CommandDescriptor::wasm(
-        command.id.clone(),
-        command.title.clone(),
-        CommandHandler::wasm(runtime_id, function),
-    )
-    .with_extension(extension_id.to_string());
+    // wasm 与 nsh 两种 handler 共用 runtime_id / function 参数：
+    // wasm 用它们定位 component；nsh 忽略两者，只用 handler.route。
+    let handler = match command.handler.kind.as_str() {
+        "nsh" => CommandHandler::Nsh {
+            route: command.handler.route.clone(),
+        },
+        _ => CommandHandler::wasm(runtime_id, function),
+    };
+    let mut descriptor =
+        CommandDescriptor::wasm(command.id.clone(), command.title.clone(), handler)
+            .with_extension(extension_id.to_string());
     if !command.category.is_empty() {
         descriptor = descriptor.with_category(command.category.clone());
     }

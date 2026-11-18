@@ -6,7 +6,11 @@ use gpui::prelude::*;
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, Keystroke, ListSizingBehavior, MouseButton, ParentElement,
-    Render, SharedString, Styled, UniformListScrollHandle, Window, div, uniform_list,
+    Render, RenderOnce, SharedString, Styled, UniformListScrollHandle, Window, div, px,
+    uniform_list,
+};
+use gpui_base::input::{
+    DiagnosticColors, Input as BaseInput, InputEditorStyle, Textarea as BaseTextarea,
 };
 use gpui_component::{
     ActiveTheme, Icon, Sizable, Size, WindowExt,
@@ -14,7 +18,7 @@ use gpui_component::{
     checkbox::Checkbox,
     dialog::DialogButtonProps,
     h_flex,
-    input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{Input, InputEvent, InputState, TextareaState},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     notification::Notification,
     radio::{Radio, RadioGroup},
@@ -31,9 +35,12 @@ use one_ui::{IconButton, IconButtonRole};
 use rust_i18n::t;
 use std::{ops::Range, sync::Arc};
 
+use crate::quick_command_parameters::prompt_for_quick_command_parameters;
 use crate::quick_command_sync::emit_quick_commands_changed;
 use crate::theme::TerminalColors;
 use crate::view::quick_command_executes_on_click;
+
+const QUICK_COMMAND_ROW_HEIGHT: f32 = 52.0;
 
 /// 快捷命令面板事件
 #[derive(Clone, Debug)]
@@ -345,6 +352,108 @@ fn quick_command_dialog_button_variants(
         .hover(colors.border)
         .active(colors.border.opacity(0.82));
     (ButtonVariant::Custom(ok), ButtonVariant::Custom(cancel))
+}
+
+fn quick_command_input_editor_style(colors: &TerminalColors, cx: &App) -> InputEditorStyle {
+    InputEditorStyle {
+        foreground: colors.foreground,
+        muted_foreground: colors.muted_foreground,
+        background: colors.muted,
+        border: colors.border,
+        selection: colors.accent.opacity(0.35),
+        caret: colors.foreground,
+        diagnostics: DiagnosticColors::default(),
+        highlight_styles: cx.theme().highlight_theme.clone(),
+        editor_invisible: None,
+        editor_active_line: None,
+        editor_gutter_background: Some(colors.muted),
+        fold_icon_renderer: None,
+    }
+}
+
+fn quick_command_input_frame(colors: &TerminalColors, focused: bool) -> gpui::Div {
+    div()
+        .relative()
+        .w_full()
+        .overflow_hidden()
+        .rounded_md()
+        .border_1()
+        .border_color(if focused {
+            colors.accent
+        } else {
+            colors.border
+        })
+        .bg(colors.muted)
+}
+
+#[derive(IntoElement)]
+struct TerminalSingleLineInput {
+    state: Entity<InputState>,
+    colors: TerminalColors,
+}
+
+impl TerminalSingleLineInput {
+    fn new(state: &Entity<InputState>, colors: TerminalColors) -> Self {
+        Self {
+            state: state.clone(),
+            colors,
+        }
+    }
+}
+
+impl RenderOnce for TerminalSingleLineInput {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let style = quick_command_input_editor_style(&self.colors, cx);
+        self.state
+            .update(cx, |state, _| state.set_editor_style(style));
+        let focused = self.state.read(cx).focus_handle(cx).is_focused(window);
+        let state_for_click = self.state.clone();
+
+        quick_command_input_frame(&self.colors, focused)
+            .h(px(32.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                state_for_click.update(cx, |state, cx| state.focus(window, cx));
+            })
+            .child(BaseInput::new(&self.state))
+    }
+}
+
+#[derive(IntoElement)]
+struct TerminalTextarea {
+    state: Entity<TextareaState>,
+    colors: TerminalColors,
+    height: gpui::Pixels,
+}
+
+impl TerminalTextarea {
+    fn new(state: &Entity<TextareaState>, colors: TerminalColors, height: gpui::Pixels) -> Self {
+        Self {
+            state: state.clone(),
+            colors,
+            height,
+        }
+    }
+}
+
+impl RenderOnce for TerminalTextarea {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let style = quick_command_input_editor_style(&self.colors, cx);
+        self.state
+            .update(cx, |state, _| state.set_editor_style(style));
+        let focused = self.state.read(cx).focus_handle(cx).is_focused(window);
+        let state_for_click = self.state.clone();
+
+        quick_command_input_frame(&self.colors, focused)
+            .h(self.height)
+            .p_2()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                state_for_click.update(cx, |state, cx| state.focus(window, cx));
+            })
+            .child(BaseTextarea::new(&self.state))
+    }
 }
 
 struct QuickCommandEditorState {
@@ -687,6 +796,60 @@ impl QuickCommandPanel {
         self.open_command_editor(None, Some(command), window, cx);
     }
 
+    pub(crate) fn open_add_command_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_command_editor(None, None, window, cx);
+    }
+
+    pub(crate) fn open_edit_command_dialog(
+        &mut self,
+        command: QuickCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_command_editor(Some(command), None, window, cx);
+    }
+
+    pub(crate) fn open_delete_command_dialog(
+        &mut self,
+        id: i64,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_delete_command(id, command, window, cx);
+    }
+
+    pub(crate) fn toggle_command_pin(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.toggle_pin(id, cx);
+    }
+
+    pub(crate) fn copy_command_to_clipboard(
+        &self,
+        command: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_command(command, window, cx);
+    }
+
+    pub(crate) fn group_context_menu_for(
+        panel: Entity<Self>,
+        group_name: String,
+        color: Option<String>,
+        menu: PopupMenu,
+        colors: TerminalColors,
+    ) -> PopupMenu {
+        Self::group_context_menu(
+            panel,
+            QuickCommandGroupChip {
+                filter: QuickCommandGroupFilter::Group(group_name),
+                color,
+            },
+            menu,
+            colors,
+        )
+    }
+
     fn save_new_command(
         &mut self,
         mut command: QuickCommand,
@@ -855,11 +1018,10 @@ impl QuickCommandPanel {
                                         .text_color(colors.muted_foreground)
                                         .child(t!("QuickCommand.name").to_string()),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .child(Input::new(&name_state).small().w_full()),
-                                ),
+                                .child(div().flex_1().child(TerminalSingleLineInput::new(
+                                    &name_state,
+                                    colors.clone(),
+                                ))),
                         )
                         .child(
                             h_flex()
@@ -874,12 +1036,11 @@ impl QuickCommandPanel {
                                         .text_color(colors.muted_foreground)
                                         .child(t!("QuickCommand.description").to_string()),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .h(gpui::px(64.0))
-                                        .child(Textarea::new(&description_state).w_full().h_full()),
-                                ),
+                                .child(div().flex_1().child(TerminalTextarea::new(
+                                    &description_state,
+                                    colors.clone(),
+                                    gpui::px(64.0),
+                                ))),
                         )
                         .child(
                             h_flex()
@@ -894,11 +1055,10 @@ impl QuickCommandPanel {
                                         .text_color(colors.muted_foreground)
                                         .child(t!("QuickCommand.group").to_string()),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .child(Input::new(&group_state).small().w_full()),
-                                )
+                                .child(div().flex_1().child(TerminalSingleLineInput::new(
+                                    &group_state,
+                                    colors.clone(),
+                                )))
                                 .child(
                                     div()
                                         .w(gpui::px(84.0))
@@ -927,12 +1087,11 @@ impl QuickCommandPanel {
                                         .text_color(colors.muted_foreground)
                                         .child(t!("QuickCommand.command").to_string()),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .h(gpui::px(108.0))
-                                        .child(Textarea::new(&command_state).w_full().h_full()),
-                                ),
+                                .child(div().flex_1().child(TerminalTextarea::new(
+                                    &command_state,
+                                    colors.clone(),
+                                    gpui::px(108.0),
+                                ))),
                         )
                         .child(editor_state.clone())
                         .into_any_element(),
@@ -1320,6 +1479,28 @@ impl QuickCommandPanel {
         cx.emit(QuickCommandPanelEvent::ExecuteCommand(command));
     }
 
+    fn execute_command_with_parameters(
+        &self,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.entity();
+        let muted_foreground = self.colors.muted_foreground;
+        if prompt_for_quick_command_parameters(
+            &command,
+            muted_foreground,
+            window,
+            cx,
+            move |command, _, cx| {
+                panel.update(cx, |panel, cx| panel.paste_command(command, cx));
+            },
+        ) {
+            return;
+        }
+        self.paste_command(command, cx);
+    }
+
     fn command_tooltip(command: &QuickCommand) -> String {
         let mut lines = Vec::new();
         if let Some(name) = command.name.as_ref().filter(|name| !name.trim().is_empty()) {
@@ -1557,7 +1738,8 @@ impl QuickCommandPanel {
             .as_ref()
             .filter(|name| !name.trim().is_empty())
             .cloned()
-            .unwrap_or_else(|| value.clone());
+            .unwrap_or_else(|| value.clone())
+            .replace(['\r', '\n'], " ↵ ");
         let pin_color = cx.theme().warning;
         let muted_bg = self.colors.muted;
 
@@ -1565,6 +1747,7 @@ impl QuickCommandPanel {
             .id(SharedString::from(format!("quick-cmd-item-{index}")))
             .group(item_group.clone())
             .w_full()
+            .h(px(QUICK_COMMAND_ROW_HEIGHT))
             .px_3()
             .py_2()
             .rounded_md()
@@ -1572,7 +1755,9 @@ impl QuickCommandPanel {
             .hover(|style| style.bg(muted_bg))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.paste_command(value_for_row.clone(), cx)),
+                cx.listener(move |this, _, window, cx| {
+                    this.execute_command_with_parameters(value_for_row.clone(), window, cx)
+                }),
             )
             .child(
                 h_flex()
@@ -1600,6 +1785,7 @@ impl QuickCommandPanel {
                                     .text_sm()
                                     .overflow_hidden()
                                     .text_ellipsis()
+                                    .whitespace_nowrap()
                                     .tooltip(move |window, cx| {
                                         Tooltip::new(tooltip.clone()).build(window, cx)
                                     })
@@ -1694,8 +1880,12 @@ impl QuickCommandPanel {
                                 .role(IconButtonRole::Compact)
                                 .tooltip(t!("QuickCommand.paste_tooltip").to_string())
                                 .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.paste_command(value_for_paste.clone(), cx);
+                                    move |this, _, window, cx| {
+                                        this.execute_command_with_parameters(
+                                            value_for_paste.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     },
                                 )),
                             ),
@@ -1827,9 +2017,10 @@ mod tests {
         apply_auto_run_marker, capture_quick_command_shortcut, command_matches_group_filter,
         connection_id_for_scope, new_command_group_defaults, normalize_group_fields,
         normalize_quick_command_value, quick_command_group_chip_label,
-        quick_command_group_color_items, quick_command_groups, shortcut_capture_label,
-        validated_quick_command_shortcut,
+        quick_command_group_color_items, quick_command_groups, quick_command_input_editor_style,
+        shortcut_capture_label, validated_quick_command_shortcut,
     };
+    use crate::theme::TerminalColors;
     use gpui::Keystroke;
     use one_core::storage::QuickCommand;
 
@@ -1857,6 +2048,17 @@ mod tests {
         // 多行命令内部的换行不受影响
         assert_eq!("cd /tmp\nls", apply_auto_run_marker("cd /tmp\nls\n", false));
         assert_eq!("cd /tmp\nls\n", apply_auto_run_marker("cd /tmp\nls", true));
+    }
+
+    #[test]
+    fn quick_command_rows_use_a_stable_single_line_height() {
+        let source = include_str!("quick_command_panel.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        assert!(implementation.contains("const QUICK_COMMAND_ROW_HEIGHT: f32 = 52.0"));
+        assert!(implementation.contains(".h(px(QUICK_COMMAND_ROW_HEIGHT))"));
+        assert!(implementation.contains(".replace(['\\r', '\\n'], \" ↵ \")"));
+        assert!(implementation.contains(".whitespace_nowrap()"));
+        assert!(implementation.contains("prompt_for_quick_command_parameters"));
     }
 
     #[test]
@@ -2163,6 +2365,45 @@ mod tests {
         assert!(editor.contains(".id(\"quick-command-primary-fields-row\")"));
         assert!(editor.contains(".id(\"quick-command-group-fields-row\")"));
         assert!(editor.contains(".width(gpui::px(640.0))"));
+    }
+
+    #[gpui::test]
+    fn quick_command_dialog_inputs_use_terminal_theme_colors(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(gpui_component::Theme::default());
+        });
+        let colors = TerminalColors {
+            background: gpui::rgb(0x111827).into(),
+            foreground: gpui::rgb(0xf9fafb).into(),
+            muted: gpui::rgb(0x1f2937).into(),
+            muted_foreground: gpui::rgb(0x9ca3af).into(),
+            border: gpui::rgb(0x374151).into(),
+            accent: gpui::rgb(0x2563eb).into(),
+            accent_foreground: gpui::rgb(0xffffff).into(),
+        };
+
+        cx.update(|cx| {
+            let style = quick_command_input_editor_style(&colors, cx);
+            assert_eq!(style.foreground, colors.foreground);
+            assert_eq!(style.muted_foreground, colors.muted_foreground);
+            assert_eq!(style.background, colors.muted);
+            assert_eq!(style.border, colors.border);
+            assert_eq!(style.caret, colors.foreground);
+        });
+
+        let source = include_str!("quick_command_panel.rs");
+        let editor = source
+            .split_once("fn open_command_editor(")
+            .expect("quick command editor implementation")
+            .1
+            .split_once("\n    fn ")
+            .expect("quick command editor boundary")
+            .0;
+        assert!(editor.contains("TerminalSingleLineInput::new"));
+        assert!(editor.contains("TerminalTextarea::new"));
+        assert!(!editor.contains("Input::new(&name_state)"));
+        assert!(!editor.contains("Textarea::new(&command_state)"));
     }
 
     #[test]

@@ -1,0 +1,104 @@
+use super::*;
+use one_ui::IconSize;
+
+impl HomePage {
+    pub(super) fn render_connection_list_actions(
+        &self,
+        conn: &StoredConnection,
+        can_edit: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sftp_connection = conn.clone();
+        let edit_connection = conn.clone();
+        let delete_connection_id = conn.id;
+        let delete_connection_name = conn.name.clone();
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "conn-list-actions-{}",
+                conn.id.unwrap_or(0)
+            )))
+            .gap_1()
+            .w(HOME_CONNECTION_LIST_ACTIONS_WIDTH)
+            .flex_shrink_0()
+            .justify_end()
+            .p_0p5()
+            .rounded(px(8.0))
+            .group_hover("", |style| style.opacity(1.0))
+            .opacity(0.0)
+            .when(
+                matches!(
+                    conn.connection_type,
+                    ConnectionType::SshSftp | ConnectionType::Ftp
+                ),
+                |this| {
+                    this.child(
+                        IconButton::new(
+                            SharedString::from(format!("sftp-list-conn-{}", conn.id.unwrap_or(0))),
+                            Icon::new(IconName::FolderOpen)
+                                .mono()
+                                .with_size(IconSize::Small),
+                        )
+                        .role(IconButtonRole::Compact)
+                        .tooltip(t!("Home.open_sftp"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if !app_kit::registry().open_sftp(
+                                    &sftp_connection,
+                                    this,
+                                    window,
+                                    cx,
+                                ) {
+                                    window.push_notification(
+                                        Notification::error(format!(
+                                            "当前产品不支持 SFTP：{}",
+                                            sftp_connection.name
+                                        )),
+                                        cx,
+                                    );
+                                }
+                            },
+                        )),
+                    )
+                },
+            )
+            .when(can_edit, |this| {
+                this.child(
+                    IconButton::new(
+                        SharedString::from(format!("edit-list-conn-{}", conn.id.unwrap_or(0))),
+                        Icon::new(IconName::Edit).mono().with_size(IconSize::Small),
+                    )
+                    .role(IconButtonRole::Compact)
+                    .tooltip(t!("Home.edit_connection"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_connection(edit_connection.clone(), window, cx);
+                    })),
+                )
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("delete-list-conn-{}", conn.id.unwrap_or(0))),
+                        Icon::new(IconName::Remove)
+                            .mono()
+                            .with_size(IconSize::Small),
+                    )
+                    .role(IconButtonRole::Compact)
+                    .text_color(cx.theme().danger)
+                    .tooltip(t!("Home.delete_connection"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(connection_id) = delete_connection_id {
+                            this.confirm_delete_connection(
+                                connection_id,
+                                delete_connection_name.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    })),
+                )
+            })
+            .into_any_element()
+    }
+}

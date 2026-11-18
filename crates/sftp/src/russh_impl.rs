@@ -1,10 +1,11 @@
 use crate::server_copy::CopyFileRequest;
 use crate::upload_batch::{
-    MAX_CONCURRENT_SMALL_FILE_UPLOADS, ProgressHighWater, job_weight, run_bounded,
+    MAX_CONCURRENT_SMALL_FILE_TRANSFERS, ProgressHighWater, job_weight, run_bounded,
 };
 use crate::{
     DirectoryConflictPolicy, FileEntry, PathMetadata, ProgressCallback, RemoteFileClient,
-    SftpClient, TransferCancelled, TransferProgress, validate_read_size,
+    SftpClient, TransferCancelled, TransferProgress, is_valid_remote_entry_name,
+    validate_read_size,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -26,7 +27,7 @@ use ssh::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,15 +64,48 @@ const SFTP_MAX_WRITE_PACKET_LEN: u32 = SFTP_MAX_PACKET_LEN;
 /// 所以不能太长；但 fsync（flush 阶段）在慢速网络存储上合法耗时可能到几十秒，
 /// 满载服务器也可能延迟应答，所以保留 60s 余量而不用更激进的 30s。
 const SFTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+/// 借用交互会话的连接上允许的在飞写字节：2 × 128 KiB = 256 KiB。
+///
+/// `russh-sftp` 的写窗口就是"最多有多少字节已交给传输层、还没等来服务端确认"，
+/// 也就是用户按键最多要排多少数据。侧边栏文件管理器与终端共用同一条 TCP，
+/// 独占连接那套 16 MiB 窗口在上行 1 MB/s 的链路上等于十几秒的按键延迟，
+/// 所以共享连接压到 256 KiB，独占连接继续用大窗口换吞吐。
+const SHARED_MAX_CONCURRENT_WRITES: usize = 2;
+const SHARED_MAX_WRITE_PACKET_LEN: u32 = 128 * 1024;
+/// 共享连接上的读取窗口同样收窄：SFTP 通道把终端连接的 SSH 窗口占满时，
+/// 服务端连回声都塞不进来。
+const SHARED_MAX_CONCURRENT_READS: usize = 8;
 const OWNER_LOOKUP_BATCH_SIZE: usize = 128;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn sftp_session_config() -> SftpConfig {
+/// SFTP 会话独占这条 SSH 连接，还是与交互终端共用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SftpTransport {
+    /// 整条连接只跑 SFTP（独立 SFTP 标签页、服务器间复制）。
+    Owned,
+    /// 借用交互会话的连接（侧边栏文件管理器的上传/下载）。
+    Shared,
+}
+
+fn sftp_session_config(transport: SftpTransport) -> SftpConfig {
+    let (max_concurrent_reads, max_concurrent_writes, max_write_packet_len) = match transport {
+        SftpTransport::Owned => (
+            SFTP_MAX_CONCURRENT_READS,
+            MAX_INFLIGHT_REQUESTS,
+            SFTP_MAX_WRITE_PACKET_LEN,
+        ),
+        SftpTransport::Shared => (
+            SHARED_MAX_CONCURRENT_READS,
+            SHARED_MAX_CONCURRENT_WRITES,
+            SHARED_MAX_WRITE_PACKET_LEN,
+        ),
+    };
+
     SftpConfig {
         max_packet_len: SFTP_MAX_PACKET_LEN,
-        max_concurrent_reads: SFTP_MAX_CONCURRENT_READS,
-        max_concurrent_writes: MAX_INFLIGHT_REQUESTS,
-        max_write_packet_len: SFTP_MAX_WRITE_PACKET_LEN,
+        max_concurrent_reads,
+        max_concurrent_writes,
+        max_write_packet_len,
         request_timeout_secs: SFTP_REQUEST_TIMEOUT_SECS,
     }
 }
@@ -148,6 +182,147 @@ impl Drop for LocalDownloadTemp {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+fn remote_download_root(remote_path: &str) -> &str {
+    let trimmed = remote_path.trim_end_matches('/');
+    if trimmed.is_empty() && remote_path.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// Convert an SFTP entry path into a relative local path made only from
+/// validated single-component names. `strip_prefix` is deliberately followed
+/// by a component check because it is lexical and does not resolve `..`.
+fn remote_download_relative_path(base_remote: &str, entry_path: &str) -> Result<PathBuf> {
+    let relative = strip_remote_download_root(base_remote, entry_path)?;
+    if relative.is_empty() {
+        return Ok(PathBuf::new());
+    }
+
+    let mut safe_path = PathBuf::new();
+    for component in relative.split('/') {
+        if component.is_empty() || !is_valid_remote_entry_name(component) {
+            return Err(anyhow!(
+                "Refusing unsafe remote entry path: {:?}",
+                entry_path
+            ));
+        }
+        safe_path.push(component);
+    }
+    Ok(safe_path)
+}
+
+fn strip_remote_download_root<'a>(base_remote: &str, entry_path: &'a str) -> Result<&'a str> {
+    let relative = if base_remote == "/" {
+        entry_path.strip_prefix('/').ok_or_else(|| {
+            anyhow!(
+                "Refusing remote path outside the download root: {:?}",
+                entry_path
+            )
+        })?
+    } else if base_remote.is_empty() {
+        entry_path
+    } else {
+        let relative = entry_path.strip_prefix(base_remote).ok_or_else(|| {
+            anyhow!(
+                "Refusing remote path outside the download root: {:?}",
+                entry_path
+            )
+        })?;
+        if !relative.is_empty() && !relative.starts_with('/') {
+            return Err(anyhow!(
+                "Refusing remote path outside the download root: {:?}",
+                entry_path
+            ));
+        }
+        relative
+    };
+
+    Ok(relative.trim_start_matches('/'))
+}
+
+/// Create the requested relative directory below `root` without following
+/// symlinks (or Windows junctions) that resolve outside the chosen root.
+async fn ensure_safe_local_directory(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(anyhow!(
+                "Refusing unsafe local download path component: {:?}",
+                relative
+            ));
+        };
+        current.push(name);
+        let metadata = local_download_directory_metadata(&current).await?;
+        validate_local_download_directory(&current, &metadata)?;
+        current = canonical_local_download_directory(&current, root).await?;
+    }
+    Ok(current)
+}
+
+async fn local_download_directory_metadata(path: &Path) -> Result<std::fs::Metadata> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_local_download_directory(path).await?;
+            fs::symlink_metadata(path)
+                .await
+                .map_err(|error| anyhow!("Failed to inspect local directory {:?}: {}", path, error))
+        }
+        Err(error) => Err(anyhow!(
+            "Failed to inspect local directory {:?}: {}",
+            path,
+            error
+        )),
+    }
+}
+
+async fn create_local_download_directory(path: &Path) -> Result<()> {
+    match fs::create_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(anyhow!(
+            "Failed to create local directory {:?}: {}",
+            path,
+            error
+        )),
+    }
+}
+
+fn validate_local_download_directory(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "Refusing to traverse local symlink: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "Local download path is not a directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+async fn canonical_local_download_directory(path: &Path, root: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path).await.map_err(|error| {
+        anyhow!(
+            "Failed to resolve local download directory {:?}: {}",
+            path,
+            error
+        )
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(anyhow!(
+            "Refusing local directory outside download root: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 /// A remote upload is staged beside its destination and published with one
@@ -1203,6 +1378,7 @@ fn sftp_auth_failure_messages() -> AuthFailureMessages {
         agent_no_identities: t!("Sftp.auth_agent_no_identities").to_string(),
         agent_auth_failed: t!("Sftp.auth_agent_failed").to_string(),
         auto_publickey_failed: t!("Sftp.auth_auto_publickey_failed").to_string(),
+        none_failed: t!("Sftp.auth_none_failed").to_string(),
         no_local_identity: t!("Sftp.auth_no_local_identity").to_string(),
         auto_publickey_next_step: t!("Sftp.auth_auto_publickey_next_step").to_string(),
         keyboard_interactive_required: t!("Sftp.auth_keyboard_interactive_required").to_string(),
@@ -1342,6 +1518,8 @@ enum SessionOwner {
     Shared {
         client: Arc<Mutex<RusshClient>>,
     },
+    #[cfg(test)]
+    Test,
 }
 
 struct OwnerLookupChannel(Option<russh::Channel<client::Msg>>);
@@ -1387,14 +1565,29 @@ pub struct RusshSftpClient {
 }
 
 impl RusshSftpClient {
+    #[cfg(test)]
+    fn for_test(sftp: SftpSession, raw_sftp: Option<Arc<RawSftpSession>>) -> Self {
+        Self {
+            sftp,
+            owner: SessionOwner::Test,
+            accepted_server_public_key: None,
+            raw_sftp,
+            owner_names: BTreeMap::new(),
+            owner_lookup_disabled: false,
+        }
+    }
+
     pub async fn connect_with_client(client: Arc<Mutex<RusshClient>>) -> Result<Self> {
         let channel = {
             let mut guard = client.lock().await;
             guard.open_raw_channel().await?
         };
         channel.request_subsystem(true, "sftp").await?;
-        let sftp =
-            SftpSession::new_with_config(channel.into_stream(), sftp_session_config()).await?;
+        let sftp = SftpSession::new_with_config(
+            channel.into_stream(),
+            sftp_session_config(SftpTransport::Shared),
+        )
+        .await?;
 
         Ok(Self {
             sftp,
@@ -1408,6 +1601,31 @@ impl RusshSftpClient {
 
     pub(crate) fn accepted_server_public_key(&self) -> Option<&str> {
         self.accepted_server_public_key.as_deref()
+    }
+
+    /// 这条客户端是否借用交互会话的连接（终端所在会话）。
+    ///
+    /// 共享连接上的批量写入要给用户按键让路：SFTP 不怕慢几十毫秒，
+    /// 终端输入怕。
+    fn shares_interactive_transport(&self) -> bool {
+        matches!(self.owner, SessionOwner::Shared { .. })
+    }
+
+    /// 共享连接写下一块前的让路点；独占连接没有交互流量，直接返回。
+    async fn wait_for_interactive_input(&self) {
+        if self.shares_interactive_transport() {
+            ssh::yield_to_user_input().await;
+        }
+    }
+
+    /// 流水线下载的并发读上限：独占连接用满预算，共享连接收窄到与写窗口
+    /// 同量级，避免 SFTP 通道把终端连接的 SSH 窗口占满。
+    fn pipeline_read_limit(&self) -> usize {
+        if self.shares_interactive_transport() {
+            SHARED_MAX_CONCURRENT_READS
+        } else {
+            MAX_INFLIGHT_REQUESTS
+        }
     }
 
     pub(crate) async fn ensure_copy_directory(&mut self, path: &str) -> Result<()> {
@@ -1548,6 +1766,10 @@ impl RusshSftpClient {
                     let mut guard = client.lock().await;
                     guard.open_raw_channel().await?
                 }
+                #[cfg(test)]
+                SessionOwner::Test => {
+                    anyhow::bail!("test SFTP client does not own an SSH transport")
+                }
             };
             let mut channel = OwnerLookupChannel::new(channel);
 
@@ -1616,6 +1838,10 @@ impl RusshSftpClient {
                 channel.request_subsystem(true, "sftp").await?;
                 channel
             }
+            #[cfg(test)]
+            SessionOwner::Test => {
+                anyhow::bail!("test SFTP client does not own an SSH transport")
+            }
         };
 
         let mut raw = RawSftpSession::new(channel.into_stream());
@@ -1642,6 +1868,7 @@ impl RusshSftpClient {
         raw_session: Arc<RawSftpSession>,
         remote_path: &str,
         total_size: u64,
+        max_in_flight: usize,
         cancelled: &AtomicBool,
         writer: &mut BufWriter<File>,
         mut on_progress: F,
@@ -1669,7 +1896,7 @@ impl RusshSftpClient {
                 break;
             }
 
-            while next_request < total_chunks && reads.len() < MAX_INFLIGHT_REQUESTS {
+            while next_request < total_chunks && reads.len() < max_in_flight {
                 let offset = next_request * chunk_size;
                 let expected_len = expected_chunk_len(offset, total_size)?;
                 let raw = Arc::clone(&raw_session);
@@ -1772,6 +1999,7 @@ impl RusshSftpClient {
         remote_path: &str,
         local_path: &str,
         total_size: u64,
+        max_in_flight: usize,
         cancelled: &AtomicBool,
         progress: &(dyn Fn(TransferProgress) + Send + Sync),
     ) -> Result<()> {
@@ -1785,6 +2013,7 @@ impl RusshSftpClient {
             raw_session,
             remote_path,
             total_size,
+            max_in_flight,
             cancelled,
             &mut writer,
             |transferred| {
@@ -1839,33 +2068,40 @@ impl RusshSftpClient {
         total_size: u64,
         file_name: &str,
         file_total: u64,
-        dir_transferred: &mut u64,
         dir_total: u64,
         start_time: Instant,
+        max_in_flight: usize,
+        transferred_total: &AtomicU64,
+        published: &ProgressHighWater,
         cancelled: &AtomicBool,
         progress: &(dyn Fn(TransferProgress) + Send + Sync),
     ) -> Result<()> {
         let target = Path::new(local_path);
         let (temporary, local_file) = LocalDownloadTemp::create(target).await?;
         let mut writer = BufWriter::with_capacity(BUFFER_SIZE, local_file);
-        let base_transferred = *dir_transferred;
         let mut current_file_transferred = 0u64;
+        let mut reported_file_transferred = 0u64;
 
         let result = Self::pipelined_read_into_writer(
             raw_session,
             remote_path,
             total_size,
+            max_in_flight,
             cancelled,
             &mut writer,
             |transferred| {
                 current_file_transferred = transferred;
-                let total_transferred = base_transferred + transferred;
+                let delta = transferred.saturating_sub(reported_file_transferred);
+                reported_file_transferred = transferred;
+                let total_transferred =
+                    transferred_total.fetch_add(delta, Ordering::Relaxed) + delta;
+                let displayed_transferred = published.publish(total_transferred);
                 let elapsed = start_time.elapsed().as_secs_f64();
                 progress(TransferProgress {
-                    transferred: total_transferred,
+                    transferred: displayed_transferred,
                     total: dir_total,
                     speed: if elapsed > 0.0 {
-                        total_transferred as f64 / elapsed
+                        displayed_transferred as f64 / elapsed
                     } else {
                         0.0
                     },
@@ -1877,7 +2113,7 @@ impl RusshSftpClient {
         )
         .await;
 
-        let transferred = result?;
+        result?;
         writer
             .flush()
             .await
@@ -1888,7 +2124,6 @@ impl RusshSftpClient {
             .await
             .map_err(|error| anyhow!("Failed to sync local file: {}", error))?;
         temporary.commit(target).await?;
-        *dir_transferred = base_transferred + transferred;
         Ok(())
     }
 
@@ -2028,6 +2263,8 @@ impl RusshSftpClient {
             .unwrap_or(request.source_path)
             .to_string();
         let started_at = Instant::now();
+        // 服务器间复制的目标连接同样可能是侧边栏借用的交互连接。
+        let target_shares_interactive = target.shares_interactive_transport();
         let result = with_remote_replace(
             &target.sftp,
             &target_path,
@@ -2044,6 +2281,9 @@ impl RusshSftpClient {
                         .map_err(|error| anyhow!("Failed to read {}: {}", source_path, error))?;
                     if read == 0 {
                         break;
+                    }
+                    if target_shares_interactive {
+                        ssh::yield_to_user_input().await;
                     }
                     target_file
                         .write_all(&buffer[..read])
@@ -2225,8 +2465,11 @@ impl SftpClient for RusshSftpClient {
         let channel = session.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
 
-        let sftp =
-            SftpSession::new_with_config(channel.into_stream(), sftp_session_config()).await?;
+        let sftp = SftpSession::new_with_config(
+            channel.into_stream(),
+            sftp_session_config(SftpTransport::Owned),
+        )
+        .await?;
         let accepted_server_public_key = accepted_server_public_key
             .lock()
             .map_err(|_| anyhow!("SFTP server host key capture lock was poisoned"))?
@@ -2265,6 +2508,13 @@ impl RemoteFileClient for RusshSftpClient {
 
             if file_name == "." || file_name == ".." {
                 continue;
+            }
+            if !is_valid_remote_entry_name(&file_name) {
+                return Err(anyhow!(
+                    "Refusing unsafe SFTP directory entry name in {}: {:?}",
+                    path,
+                    file_name
+                ));
             }
 
             let metadata = entry.metadata();
@@ -2369,11 +2619,13 @@ impl RemoteFileClient for RusshSftpClient {
                 }
             };
 
+            let max_in_flight = self.pipeline_read_limit();
             let result = Self::pipelined_download(
                 raw_session,
                 remote_path,
                 local_path,
                 total_size,
+                max_in_flight,
                 &cancelled,
                 &progress,
             )
@@ -2410,60 +2662,71 @@ impl RemoteFileClient for RusshSftpClient {
         let total_size = metadata.len();
 
         let mut local_file = BufReader::with_capacity(BUFFER_SIZE, local_file);
+        // 共享连接（侧边栏与终端同一条 SSH）要在每块写入前给用户按键让路。
+        let shares_interactive = self.shares_interactive_transport();
 
         let result = race_with_cancel(
             &cancelled,
-            with_remote_replace(&self.sftp, remote_path, total_size, |mut remote_file| async {
-                let mut buffer = vec![0u8; BUFFER_SIZE];
-                let mut transferred = 0u64;
-                let started_at = Instant::now();
-                let mut last_update = Instant::now();
+            with_remote_replace(
+                &self.sftp,
+                remote_path,
+                total_size,
+                |mut remote_file| async {
+                    let mut buffer = vec![0u8; BUFFER_SIZE];
+                    let mut transferred = 0u64;
+                    let started_at = Instant::now();
+                    let mut last_update = Instant::now();
 
-                loop {
+                    loop {
+                        ensure_not_cancelled(&cancelled)?;
+                        let bytes_read = local_file
+                            .read(&mut buffer)
+                            .await
+                            .map_err(|e| anyhow!("Failed to read from local file: {}", e))?;
+
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        if shares_interactive {
+                            ssh::yield_to_user_input().await;
+                        }
+
+                        remote_file
+                            .write_all(&buffer[..bytes_read])
+                            .await
+                            .map_err(|e| anyhow!("Failed to write to remote file: {}", e))?;
+
+                        transferred += bytes_read as u64;
+
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(last_update).as_secs_f64();
+
+                        if elapsed >= 0.1 {
+                            let total_elapsed = started_at.elapsed().as_secs_f64();
+                            let speed = if total_elapsed > 0.0 {
+                                transferred as f64 / total_elapsed
+                            } else {
+                                0.0
+                            };
+
+                            progress(TransferProgress {
+                                transferred,
+                                total: total_size,
+                                speed,
+                                current_file: None,
+                                current_file_transferred: 0,
+                                current_file_total: 0,
+                            });
+
+                            last_update = now;
+                        }
+                    }
+
                     ensure_not_cancelled(&cancelled)?;
-                    let bytes_read = local_file
-                        .read(&mut buffer)
-                        .await
-                        .map_err(|e| anyhow!("Failed to read from local file: {}", e))?;
-
-                    if bytes_read == 0 {
-                        break;
-                    }
-
-                    remote_file
-                        .write_all(&buffer[..bytes_read])
-                        .await
-                        .map_err(|e| anyhow!("Failed to write to remote file: {}", e))?;
-
-                    transferred += bytes_read as u64;
-
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_update).as_secs_f64();
-
-                    if elapsed >= 0.1 {
-                        let total_elapsed = started_at.elapsed().as_secs_f64();
-                        let speed = if total_elapsed > 0.0 {
-                            transferred as f64 / total_elapsed
-                        } else {
-                            0.0
-                        };
-
-                        progress(TransferProgress {
-                            transferred,
-                            total: total_size,
-                            speed,
-                            current_file: None,
-                            current_file_transferred: 0,
-                            current_file_total: 0,
-                        });
-
-                        last_update = now;
-                    }
-                }
-
-                ensure_not_cancelled(&cancelled)?;
-                Ok((remote_file, transferred))
-            }),
+                    Ok((remote_file, transferred))
+                },
+            ),
         )
         .await;
 
@@ -2673,6 +2936,7 @@ impl RemoteFileClient for RusshSftpClient {
     }
 
     async fn write_file(&mut self, path: &str, content: &[u8]) -> Result<()> {
+        self.wait_for_interactive_input().await;
         with_remote_replace(
             &self.sftp,
             path,
@@ -2713,6 +2977,13 @@ impl RemoteFileClient for RusshSftpClient {
 
             for entry in entries {
                 ensure_not_cancelled(&cancelled)?;
+                if !is_valid_remote_entry_name(&entry.name) {
+                    return Err(anyhow!(
+                        "Refusing unsafe SFTP directory entry name in {}: {:?}",
+                        current_dir,
+                        entry.name
+                    ));
+                }
                 let full_path = if current_dir == "/" {
                     format!("/{}", entry.name)
                 } else {
@@ -2753,176 +3024,221 @@ impl RemoteFileClient for RusshSftpClient {
             .await?;
 
         let total_size: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
-        let mut transferred: u64 = 0;
 
-        let base_remote = remote_path.trim_end_matches('/');
+        let base_remote = remote_download_root(remote_path);
         let base_local = std::path::Path::new(local_path);
 
-        std::fs::create_dir_all(base_local)
+        fs::create_dir_all(base_local)
+            .await
             .map_err(|e| anyhow!("Failed to create local directory {}: {}", local_path, e))?;
+        let base_local = fs::canonicalize(base_local)
+            .await
+            .map_err(|e| anyhow!("Failed to resolve local directory {}: {}", local_path, e))?;
 
         let mut dirs: Vec<&FileEntry> = entries.iter().filter(|e| e.is_dir).collect();
         dirs.sort_by_key(|dir| dir.path.len());
         for dir_entry in dirs {
             ensure_not_cancelled(&cancelled)?;
-            let relative = dir_entry
-                .path
-                .strip_prefix(base_remote)
-                .unwrap_or(&dir_entry.path);
-            let relative = relative.trim_start_matches('/');
-            if relative.is_empty() {
+            let relative = remote_download_relative_path(base_remote, &dir_entry.path)?;
+            if relative.as_os_str().is_empty() {
                 continue;
             }
-            let local_dir = base_local.join(relative);
-            std::fs::create_dir_all(&local_dir)
-                .map_err(|e| anyhow!("Failed to create directory {:?}: {}", local_dir, e))?;
+            ensure_safe_local_directory(&base_local, &relative).await?;
         }
 
         let files: Vec<&FileEntry> = entries.iter().filter(|e| !e.is_dir).collect();
         let start_time = Instant::now();
+        // 共享连接上流水线下载要收窄并发，别把终端连接的 SSH 窗口占满。
+        let max_in_flight = self.pipeline_read_limit();
+        let directory_concurrency = files.len().clamp(1, MAX_CONCURRENT_SMALL_FILE_TRANSFERS);
+        let small_file_in_flight = (max_in_flight / directory_concurrency).max(1);
+        let transferred = AtomicU64::new(0);
+        let published = ProgressHighWater::new();
 
-        // 检查是否有大文件需要流水线下载
-        let has_large_files = files.iter().any(|f| f.size > PIPELINE_THRESHOLD);
-        let raw_session = if has_large_files {
+        // 目录下载统一复用一个 raw session：小文件按目录并发数分摊读窗口，
+        // 大文件独占窗口。这样不会让每个小文件各自填满 64 个请求。
+        let raw_session = if files.is_empty() {
+            None
+        } else {
             match self.get_or_create_raw_session().await {
                 Ok(raw) => Some(raw),
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to create raw SFTP session, falling back to serial: {}",
+                        "Failed to create raw SFTP session, falling back to high-level reads: {}",
                         e
                     );
                     self.raw_sftp = None;
                     None
                 }
             }
-        } else {
-            None
         };
+        let raw_session_failed = AtomicBool::new(false);
+        let sftp = &self.sftp;
+        let cancelled_ref = &cancelled;
+        let progress_ref = &progress;
+        let transferred_ref = &transferred;
+        let published_ref = &published;
+        let raw_session_ref = &raw_session;
+        let raw_session_failed_ref = &raw_session_failed;
+        let base_local_ref = &base_local;
 
-        for file_entry in files {
-            ensure_not_cancelled(&cancelled)?;
-            let relative = file_entry
-                .path
-                .strip_prefix(base_remote)
-                .unwrap_or(&file_entry.path);
-            let relative = relative.trim_start_matches('/');
-            let local_file = base_local.join(relative);
+        let result: Result<(), anyhow::Error> = run_bounded(
+            files,
+            MAX_CONCURRENT_SMALL_FILE_TRANSFERS,
+            |file_entry| job_weight(file_entry.size, MAX_CONCURRENT_SMALL_FILE_TRANSFERS),
+            |file_entry| {
+                let raw_session = raw_session_ref.clone();
+                async move {
+                    ensure_not_cancelled(cancelled_ref)?;
+                    let relative =
+                        remote_download_relative_path(base_remote, &file_entry.path)?;
+                    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+                    let local_parent =
+                        ensure_safe_local_directory(base_local_ref, parent_relative).await?;
+                    let file_name = relative.file_name().ok_or_else(|| {
+                        anyhow!(
+                            "Refusing empty remote file path for {:?}",
+                            file_entry.path
+                        )
+                    })?;
+                    let local_file = local_parent.join(file_name);
 
-            let current_file_name = file_entry.name.clone();
-            let current_file_total = file_entry.size;
+                    let local_file_str = local_file.to_string_lossy().to_string();
+                    let current_file_name = file_entry.name.clone();
+                    let current_file_total = file_entry.size;
 
-            if let Some(parent) = local_file.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow!("Failed to create parent directory {:?}: {}", parent, e)
-                })?;
-            }
-
-            let local_file_str = local_file.to_string_lossy().to_string();
-
-            // 大文件走流水线
-            if file_entry.size > PIPELINE_THRESHOLD {
-                if let Some(ref raw) = raw_session {
-                    let result = Self::pipelined_download_with_file_progress(
-                        Arc::clone(raw),
-                        &file_entry.path,
-                        &local_file_str,
-                        file_entry.size,
-                        &current_file_name,
-                        current_file_total,
-                        &mut transferred,
-                        total_size,
-                        start_time,
-                        &cancelled,
-                        &progress,
-                    )
-                    .await;
-
-                    if result.is_err() {
-                        self.raw_sftp = None;
+                    // raw session 可用时统一走流水线；小文件按目录并发数分摊
+                    // 读窗口，raw session 不可用时才回退到高层 File。
+                    if let Some(raw) = raw_session {
+                        let file_in_flight = if file_entry.size > PIPELINE_THRESHOLD {
+                            max_in_flight
+                        } else {
+                            small_file_in_flight
+                        };
+                        let result = Self::pipelined_download_with_file_progress(
+                            raw,
+                            &file_entry.path,
+                            &local_file_str,
+                            file_entry.size,
+                            &current_file_name,
+                            current_file_total,
+                            total_size,
+                            start_time,
+                            file_in_flight,
+                            transferred_ref,
+                            published_ref,
+                            cancelled_ref,
+                            progress_ref,
+                        )
+                        .await;
+                        if result.is_err() {
+                            raw_session_failed_ref.store(true, Ordering::Relaxed);
+                        }
                         return result;
                     }
-                    continue;
+
+                    let mut remote_file = sftp
+                        .open_with_flags(&file_entry.path, OpenFlags::READ)
+                        .await
+                        .map_err(|error| {
+                            anyhow!(
+                                "Failed to open remote file {}: {}",
+                                file_entry.path,
+                                error
+                            )
+                        })?;
+                    let (temporary, local_file_handle) =
+                        LocalDownloadTemp::create(&local_file).await?;
+                    let mut local_file_handle =
+                        BufWriter::with_capacity(BUFFER_SIZE, local_file_handle);
+                    let mut buffer = vec![0u8; BUFFER_SIZE];
+                    let mut current_file_transferred = 0u64;
+                    let mut reported_file_transferred = 0u64;
+
+                    loop {
+                        ensure_not_cancelled(cancelled_ref)?;
+                        let bytes_read = remote_file
+                            .read(&mut buffer)
+                            .await
+                            .map_err(|error| {
+                                anyhow!("Failed to read from remote file: {}", error)
+                            })?;
+
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        let remaining = file_entry.size.saturating_sub(current_file_transferred);
+                        if bytes_read as u64 > remaining {
+                            return Err(anyhow!(
+                                "Remote file {} changed during download: received bytes beyond expected size {}",
+                                file_entry.path,
+                                file_entry.size
+                            ));
+                        }
+
+                        local_file_handle
+                            .write_all(&buffer[..bytes_read])
+                            .await
+                            .map_err(|error| {
+                                anyhow!("Failed to write to local file: {}", error)
+                            })?;
+
+                        current_file_transferred += bytes_read as u64;
+                        let delta = current_file_transferred.saturating_sub(
+                            reported_file_transferred,
+                        );
+                        reported_file_transferred = current_file_transferred;
+                        let total_transferred =
+                            transferred_ref.fetch_add(delta, Ordering::Relaxed) + delta;
+                        let displayed_transferred = published_ref.publish(total_transferred);
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        progress_ref(TransferProgress {
+                            transferred: displayed_transferred,
+                            total: total_size,
+                            speed: if elapsed > 0.0 {
+                                displayed_transferred as f64 / elapsed
+                            } else {
+                                0.0
+                            },
+                            current_file: Some(current_file_name.clone()),
+                            current_file_transferred,
+                            current_file_total,
+                        });
+                    }
+
+                    if current_file_transferred != file_entry.size {
+                        return Err(anyhow!(
+                            "Unexpected EOF while downloading {}: received {} of {} bytes",
+                            file_entry.path,
+                            current_file_transferred,
+                            file_entry.size
+                        ));
+                    }
+
+                    remote_file.shutdown().await.map_err(|error| {
+                        anyhow!("Failed to close remote file {}: {}", file_entry.path, error)
+                    })?;
+                    local_file_handle.flush().await.map_err(|error| {
+                        anyhow!("Failed to flush local file: {}", error)
+                    })?;
+                    local_file_handle
+                        .into_inner()
+                        .sync_all()
+                        .await
+                        .map_err(|error| anyhow!("Failed to sync local file: {}", error))?;
+                    temporary.commit(&local_file).await
                 }
-            }
+            },
+        )
+        .await;
 
-            // 小文件或没有 raw session 时走串行下载
-            let mut remote_file = self
-                .sftp
-                .open_with_flags(&file_entry.path, OpenFlags::READ)
-                .await
-                .map_err(|e| anyhow!("Failed to open remote file {}: {}", file_entry.path, e))?;
-
-            let (temporary, local_file_handle) = LocalDownloadTemp::create(&local_file).await?;
-            let mut local_file_handle = BufWriter::with_capacity(BUFFER_SIZE, local_file_handle);
-
-            let mut buffer = vec![0u8; BUFFER_SIZE];
-            let mut current_file_transferred: u64 = 0;
-
-            loop {
-                ensure_not_cancelled(&cancelled)?;
-                let bytes_read = remote_file
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| anyhow!("Failed to read from remote file: {}", e))?;
-
-                if bytes_read == 0 {
-                    break;
-                }
-
-                let remaining = file_entry.size.saturating_sub(current_file_transferred);
-                if bytes_read as u64 > remaining {
-                    return Err(anyhow!(
-                        "Remote file {} changed during download: received bytes beyond expected size {}",
-                        file_entry.path,
-                        file_entry.size
-                    ));
-                }
-
-                local_file_handle
-                    .write_all(&buffer[..bytes_read])
-                    .await
-                    .map_err(|e| anyhow!("Failed to write to local file: {}", e))?;
-
-                transferred += bytes_read as u64;
-                current_file_transferred += bytes_read as u64;
-
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    transferred as f64 / elapsed
-                } else {
-                    0.0
-                };
-
-                progress(TransferProgress {
-                    transferred,
-                    total: total_size,
-                    speed,
-                    current_file: Some(current_file_name.clone()),
-                    current_file_transferred,
-                    current_file_total,
-                });
-            }
-
-            if current_file_transferred != file_entry.size {
-                return Err(anyhow!(
-                    "Unexpected EOF while downloading {}: received {} of {} bytes",
-                    file_entry.path,
-                    current_file_transferred,
-                    file_entry.size
-                ));
-            }
-
-            local_file_handle
-                .flush()
-                .await
-                .map_err(|e| anyhow!("Failed to flush local file: {}", e))?;
-            local_file_handle
-                .into_inner()
-                .sync_all()
-                .await
-                .map_err(|e| anyhow!("Failed to sync local file: {}", e))?;
-            temporary.commit(&local_file).await?;
+        if raw_session_failed.load(Ordering::Relaxed) {
+            self.raw_sftp = None;
         }
+        result?;
+
+        let transferred = transferred.load(Ordering::Relaxed);
 
         progress(TransferProgress {
             transferred,
@@ -2957,10 +3273,7 @@ impl RemoteFileClient for RusshSftpClient {
             .map(|(_, _, size)| size)
             .sum();
         let mut replacement = if conflict_policy == DirectoryConflictPolicy::Replace {
-            Some(
-                race_with_cancel(&cancelled, self.begin_directory_replace(remote_path))
-                    .await?,
-            )
+            Some(race_with_cancel(&cancelled, self.begin_directory_replace(remote_path)).await?)
         } else {
             race_with_cancel(&cancelled, self.ensure_copy_directory(remote_path)).await?;
             None
@@ -3007,6 +3320,7 @@ impl RemoteFileClient for RusshSftpClient {
             let cancelled = &cancelled;
             let progress = &progress;
             let upload_root = upload_root.as_str();
+            let shares_interactive = self.shares_interactive_transport();
             let written = AtomicU64::new(0);
             let written = &written;
             let published = ProgressHighWater::new();
@@ -3014,9 +3328,9 @@ impl RemoteFileClient for RusshSftpClient {
 
             let job_result: Result<(), anyhow::Error> = run_bounded(
                 files,
-                MAX_CONCURRENT_SMALL_FILE_UPLOADS,
+                MAX_CONCURRENT_SMALL_FILE_TRANSFERS,
                 |entry: &(PathBuf, bool, u64)| {
-                    job_weight(entry.2, MAX_CONCURRENT_SMALL_FILE_UPLOADS)
+                    job_weight(entry.2, MAX_CONCURRENT_SMALL_FILE_TRANSFERS)
                 },
                 |(file_path, _, file_size)| async move {
                     ensure_not_cancelled(cancelled)?;
@@ -3047,12 +3361,17 @@ impl RemoteFileClient for RusshSftpClient {
 
                                 loop {
                                     ensure_not_cancelled(cancelled)?;
-                                    let bytes_read = local_file.read(&mut buffer).await.map_err(
-                                        |e| anyhow!("Failed to read from local file: {}", e),
-                                    )?;
+                                    let bytes_read =
+                                        local_file.read(&mut buffer).await.map_err(|e| {
+                                            anyhow!("Failed to read from local file: {}", e)
+                                        })?;
 
                                     if bytes_read == 0 {
                                         break;
+                                    }
+
+                                    if shares_interactive {
+                                        ssh::yield_to_user_input().await;
                                     }
 
                                     remote_file.write_all(&buffer[..bytes_read]).await.map_err(
@@ -3220,8 +3539,7 @@ mod tests {
     #[tokio::test]
     async fn race_with_cancel_passes_through_completed_request() {
         let cancelled = AtomicBool::new(false);
-        let result: Result<u64> =
-            race_with_cancel(&cancelled, async { Ok(42u64) }).await;
+        let result: Result<u64> = race_with_cancel(&cancelled, async { Ok(42u64) }).await;
         assert_eq!(result.expect("must pass through"), 42);
     }
 
@@ -3291,15 +3609,13 @@ mod tests {
         assert!(!names.iter().any(|name| name == "broken_link"));
 
         let find = |name: &str| {
-            entries
-                .iter()
-                .find(|(path, _, _)| {
-                    path.strip_prefix(base)
-                        .expect("strip prefix")
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                        == name
-                })
+            entries.iter().find(|(path, _, _)| {
+                path.strip_prefix(base)
+                    .expect("strip prefix")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    == name
+            })
         };
 
         let regular = find("regular.txt").expect("regular.txt should be present");
@@ -3612,7 +3928,7 @@ mod tests {
 
     #[test]
     fn sftp_session_config_uses_bounded_large_transfer_window_and_timeout() {
-        let config = sftp_session_config();
+        let config = sftp_session_config(SftpTransport::Owned);
 
         assert_eq!(config.max_packet_len, SFTP_MAX_PACKET_LEN);
         assert_eq!(config.max_concurrent_reads, SFTP_MAX_CONCURRENT_READS);
@@ -3642,6 +3958,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_transport_config_keeps_the_write_window_small_enough_for_typing() {
+        let owned = sftp_session_config(SftpTransport::Owned);
+        let shared = sftp_session_config(SftpTransport::Shared);
+
+        // 借用交互连接时，按键最多排这么多字节，直接决定输入延迟：
+        // 256 KiB 在 1 MB/s 的上行链路上约 0.25s，16 MiB 则是十几秒。
+        let shared_write_window =
+            shared.max_write_packet_len as usize * shared.max_concurrent_writes;
+        assert_eq!(
+            shared_write_window,
+            SHARED_MAX_WRITE_PACKET_LEN as usize * SHARED_MAX_CONCURRENT_WRITES
+        );
+        assert_eq!(shared_write_window, 256 * 1024);
+        assert!(
+            shared_write_window * 16
+                <= owned.max_write_packet_len as usize * owned.max_concurrent_writes,
+            "共享连接必须显著小于独占连接的写窗口"
+        );
+
+        // 读取侧同理：SFTP 通道不能把终端连接的 SSH 窗口占满。
+        assert!(shared.max_concurrent_reads < owned.max_concurrent_reads);
+        assert!(
+            shared.max_concurrent_reads * (shared.max_packet_len as usize)
+                < owned.max_concurrent_reads * (owned.max_packet_len as usize)
+        );
+
+        // 共享连接也要保持分钟级请求超时，避免一条卡死请求占住传输车道。
+        assert_eq!(shared.request_timeout_secs, SFTP_REQUEST_TIMEOUT_SECS);
+        // 单次 WRITE 仍然要能装下 header + 句柄。
+        assert!(shared.max_write_packet_len > 25 + 255);
+    }
+
+    #[test]
     fn sftp_transfer_window_matches_ssh_channel_window() {
         let identity = HostKeyIdentity::new("host.example", 22, ssh::HostKeyRoute::Direct);
         let ssh_config = SshConnectConfig {
@@ -3664,7 +4013,7 @@ mod tests {
 
         let transport =
             build_sftp_russh_config(&ssh_config, &identity).expect("SFTP config should build");
-        let config = sftp_session_config();
+        let config = sftp_session_config(SftpTransport::Owned);
 
         // Each direction must be able to fill the SSH channel window: a packet
         // ceiling times the concurrent request budget that falls short of
@@ -3677,6 +4026,12 @@ mod tests {
         assert_eq!(
             config.max_packet_len as usize * config.max_concurrent_writes,
             transport.window_size as usize
+        );
+        // 共享连接故意小于 SSH 窗口：它要和终端的交互通道抢同一条传输。
+        let shared = sftp_session_config(SftpTransport::Shared);
+        assert!(
+            shared.max_packet_len as usize * shared.max_concurrent_writes
+                < transport.window_size as usize
         );
     }
 
@@ -4274,6 +4629,54 @@ mod tests {
         assert!(operations.entries().is_empty());
     }
 
+    #[test]
+    fn remote_download_relative_path_rejects_parent_components() {
+        assert_eq!(
+            PathBuf::from("nested/file.txt"),
+            remote_download_relative_path("/root", "/root/nested/file.txt")
+                .expect("normal descendants must remain accepted")
+        );
+        assert_eq!(
+            PathBuf::from("file.txt"),
+            remote_download_relative_path("/", "/file.txt")
+                .expect("entries under a root download must remain accepted")
+        );
+        assert!(
+            remote_download_relative_path("/root", "/root/../outside.txt").is_err(),
+            "parent components must be rejected even if caller validation regresses"
+        );
+        assert!(
+            remote_download_relative_path("/root", "/other/file.txt").is_err(),
+            "paths outside the selected remote root must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn safe_local_directory_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let root = directory.path().join("chosen");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&root)
+            .await
+            .expect("download root must be created");
+        fs::create_dir(&outside)
+            .await
+            .expect("outside directory must be created");
+        symlink(&outside, root.join("link")).expect("escape symlink must be created");
+        let canonical_root = fs::canonicalize(&root)
+            .await
+            .expect("download root must resolve");
+
+        let error = ensure_safe_local_directory(&canonical_root, Path::new("link/nested"))
+            .await
+            .expect_err("a symlink under the chosen root must not be traversed");
+
+        assert!(error.to_string().contains("symlink"));
+    }
+
     #[tokio::test]
     async fn local_download_temp_preserves_target_until_commit() {
         let directory = tempfile::tempdir().expect("temporary directory must be created");
@@ -4443,3 +4846,7 @@ mod tests {
 #[cfg(test)]
 #[path = "russh_impl_short_read_tests.rs"]
 mod short_read_tests;
+
+#[cfg(test)]
+#[path = "russh_impl_directory_concurrency_tests.rs"]
+mod directory_concurrency_tests;

@@ -7,6 +7,7 @@ use gpui::Global;
 use gpui_component::Size::Large;
 use gpui_component::{Icon, Sizable};
 use one_assets::IconName;
+use otp::OtpSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -443,11 +444,53 @@ pub struct SshAccountExpect {
     pub username: TerminalExpectSend,
     #[serde(default, skip_serializing_if = "TerminalExpectSend::is_empty")]
     pub password: TerminalExpectSend,
+    /// 会话内 `su` / `sudo` 密码提示的自动应答配置。
+    #[serde(default, skip_serializing_if = "SshElevationExpect::is_empty")]
+    pub elevation: SshElevationExpect,
 }
 
 impl SshAccountExpect {
     pub fn is_empty(&self) -> bool {
-        self.username.is_empty() && self.password.is_empty()
+        self.username.is_empty() && self.password.is_empty() && self.elevation.is_empty()
+    }
+}
+
+/// SSH 会话内提权（`su` / `sudo`）密码提示的自动应答配置。
+///
+/// 与 [`SshAccountExpect`] 的登录期望不同，提权提示会在会话中反复出现，
+/// 因此这里只保留「是否自动应答」和可选的提权密码，判定交给终端后端。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshElevationExpect {
+    /// 是否自动应答会话内的 `su` / `sudo` 密码提示。
+    ///
+    /// 默认关闭：`None` 与 `Some(false)` 都按关闭处理，只有用户在 SSH 表单里
+    /// 手动勾选（落库为 `Some(true)`）才会自动填入，避免把密码交给远端伪造的提示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_fill: Option<bool>,
+    /// 提权密码；为空时使用本次连接的登录密码。
+    ///
+    /// `su root` 要求输入 root 的密码，常与登录用户密码不同，因此单独保留一个字段。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+}
+
+impl SshElevationExpect {
+    pub fn is_empty(&self) -> bool {
+        self.auto_fill.is_none() && self.password.is_empty()
+    }
+
+    /// 解析本次连接的生效配置：返回「是否自动应答」与「实际使用的密码」。
+    ///
+    /// 自动应答默认关闭，只有显式开启（`auto_fill == Some(true)`）才生效。
+    /// `login_password` 仅是提权密码为空时的取值来源，不再影响开关。
+    pub fn resolve(&self, login_password: Option<&str>) -> (bool, Option<String>) {
+        let password = if self.password.is_empty() {
+            login_password.map(str::to_string)
+        } else {
+            Some(self.password.clone())
+        };
+        let enabled = self.auto_fill.unwrap_or(false);
+        (enabled && password.is_some(), password)
     }
 }
 
@@ -487,6 +530,12 @@ pub struct SshParams {
     /// 旧连接没有该字段时保持历史行为：允许 keyboard-interactive。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_interactive: Option<bool>,
+    /// 主机的一次性验证码（TOTP）密钥。
+    ///
+    /// 配置后 keyboard-interactive 认证中 `Verification code:` 这类提示由客户端
+    /// 本地生成验证码自动应答，不再弹输入框；`None` 表示该主机不需要 OTP。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otp: Option<OtpSecret>,
     /// SSH 终端文本编码；旧连接缺少此字段时保持 UTF-8。
     #[serde(default, skip_serializing_if = "StoredTerminalEncoding::is_utf8")]
     pub terminal_encoding: StoredTerminalEncoding,
@@ -820,6 +869,8 @@ pub enum SshAuthMethod {
     Agent,
     Pageant,
     AutoPublicKey,
+    /// 服务端允许无认证登录（RFC 4252 `none`）。
+    None,
     /// 多因素认证：服务器要求依次通过多个因素（例如 `AuthenticationMethods password,publickey`）。
     ///
     /// 列表只声明「客户端持有哪些因素」，实际提交顺序由服务器返回的
@@ -895,6 +946,7 @@ fn tunnel_auth_fields(auth: &SshAuthMethod) -> TunnelAuthFields {
         SshAuthMethod::Agent => empty("agent"),
         SshAuthMethod::Pageant => empty("pageant"),
         SshAuthMethod::AutoPublicKey => empty("auto_publickey"),
+        SshAuthMethod::None => empty("none"),
         SshAuthMethod::Chain(steps) => {
             let mut fields = empty("password_and_private_key");
             for step in steps {
@@ -2909,6 +2961,7 @@ mod tests {
         let mut connection = StoredConnection::new_ssh(
             "prod-bastion".to_string(),
             SshParams {
+                otp: None,
                 remote_file: None,
                 disabled_jump_server: None,
                 sftp_default_directory: None,
@@ -3107,6 +3160,7 @@ mod tests {
         );
 
         let ssh = SshParams {
+            otp: None,
             remote_file: None,
             disabled_jump_server: None,
             sftp_default_directory: None,
@@ -3573,6 +3627,137 @@ fn decrypt_json_passwords(json_str: &str) -> String {
         }
         Err(_) => json_str.to_string(),
     }
+}
+
+/// 导出迁移包时脱敏 `params`：把敏感字段的值替换为空串。
+///
+/// 迁移包里的可见参数只用于展示与排重，真正的密码/密钥会另行用导出密码加密
+/// 后放在包内的独立密文里。扩展连接的敏感字段名由扩展自定义，统一收敛在
+/// `secrets` 对象里，因此整组脱敏；其余连接按 [`is_sensitive_field`] 递归处理。
+/// 只替换字符串值，布尔/数字等普通配置保持原样。
+pub fn redact_sensitive_params(json_str: &str) -> String {
+    match serde_json::from_str::<Value>(json_str) {
+        Ok(mut value) => {
+            redact_sensitive_value(&mut value);
+            serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
+        }
+        Err(_) => json_str.to_string(),
+    }
+}
+
+fn redact_sensitive_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_sensitive_field(key) {
+                    if matches!(val, Value::String(_)) {
+                        *val = Value::String(String::new());
+                    }
+                } else if key == "secrets" && val.is_object() {
+                    if let Value::Object(secrets) = val {
+                        for secret in secrets.values_mut() {
+                            if matches!(secret, Value::String(_)) {
+                                *secret = Value::String(String::new());
+                            }
+                        }
+                    }
+                } else {
+                    redact_sensitive_value(val);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_sensitive_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 判断 `params` 里是否还有用主密钥加密的敏感字段。
+///
+/// 全量产品数据库直读时用它决定是否需要向用户索取源环境主密钥；扩展连接的
+/// 敏感字段统一在 `secrets` 对象里，因此整组检查。
+pub fn has_encrypted_sensitive_fields(json_str: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(json_str) else {
+        return false;
+    };
+    encrypted_sensitive_value(&value)
+}
+
+fn encrypted_sensitive_value(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            if key == "secrets" && value.is_object() {
+                value
+                    .as_object()
+                    .is_some_and(|secrets| secrets.values().any(encrypted_sensitive_string))
+            } else if is_sensitive_field(key) {
+                encrypted_sensitive_string(value)
+            } else {
+                encrypted_sensitive_value(value)
+            }
+        }),
+        Value::Array(values) => values.iter().any(encrypted_sensitive_value),
+        _ => false,
+    }
+}
+
+fn encrypted_sensitive_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.starts_with("ENC:"))
+}
+
+/// 用显式主密钥解密 `params` 里的敏感字段，供全量产品环境迁移使用。
+///
+/// 与 [`StoredConnection::decrypt_params`] 不同，这里不依赖当前会话的主密钥，
+/// 因此可以解开从另一套环境拷贝过来的数据库；普通字段原样保留。
+pub fn decrypt_sensitive_params_with_key(
+    json_str: &str,
+    master_key: &str,
+) -> anyhow::Result<String> {
+    let mut value: Value = serde_json::from_str(json_str)?;
+    decrypt_sensitive_value_with_key(&mut value, master_key)?;
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn decrypt_sensitive_value_with_key(value: &mut Value, master_key: &str) -> anyhow::Result<()> {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if key == "secrets" && value.is_object() {
+                    if let Some(secrets) = value.as_object_mut() {
+                        for secret in secrets.values_mut() {
+                            decrypt_sensitive_string_with_key(secret, master_key)?;
+                        }
+                    }
+                } else if is_sensitive_field(key) {
+                    decrypt_sensitive_string_with_key(value, master_key)?;
+                } else {
+                    decrypt_sensitive_value_with_key(value, master_key)?;
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                decrypt_sensitive_value_with_key(value, master_key)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn decrypt_sensitive_string_with_key(value: &mut Value, master_key: &str) -> anyhow::Result<()> {
+    let Value::String(secret) = value else {
+        return Ok(());
+    };
+    if !secret.starts_with("ENC:") {
+        return Ok(());
+    }
+    *secret = crypto::decrypt_with_key(secret, master_key)
+        .map_err(|error| anyhow::anyhow!("敏感字段解密失败：{error}"))?;
+    Ok(())
 }
 
 pub(crate) fn re_encrypt_sensitive_json(
@@ -4102,6 +4287,15 @@ mod serial_tests {
     }
 
     #[test]
+    fn ssh_auth_method_none_serialize_deserialize() {
+        let auth = SshAuthMethod::None;
+        let json = serde_json::to_string(&auth).expect("无认证方式应可序列化");
+        assert_eq!(json, "\"None\"");
+        let parsed: SshAuthMethod = serde_json::from_str(&json).expect("无认证方式应可反序列化");
+        assert!(matches!(parsed, SshAuthMethod::None));
+    }
+
+    #[test]
     fn ssh_os_icon_maps_known_distros_and_defaults_to_penguin() {
         use super::ssh_os_icon;
 
@@ -4159,6 +4353,7 @@ mod serial_tests {
     #[test]
     fn ssh_params_os_id_round_trips_through_json() {
         let mut params = SshParams {
+            otp: None,
             remote_file: None,
             disabled_jump_server: None,
             sftp_default_directory: None,
@@ -4442,6 +4637,7 @@ mod serial_tests {
         let mut connection = StoredConnection::new_ssh(
             "example".to_string(),
             SshParams {
+                otp: None,
                 remote_file: None,
                 disabled_jump_server: None,
                 sftp_default_directory: None,
@@ -4781,6 +4977,7 @@ mod serial_tests {
 
     fn ssh_params_for_remote_file_tests() -> SshParams {
         SshParams {
+            otp: None,
             remote_file: None,
             host: "ssh.example.com".to_string(),
             port: 22,
@@ -5019,6 +5216,7 @@ mod serial_tests {
         let ssh = StoredConnection::new_ssh(
             "ssh".to_string(),
             SshParams {
+                otp: None,
                 remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
@@ -5088,5 +5286,161 @@ mod serial_tests {
         assert!(value.get("preferred_open_mode").is_none());
         let restored: StoredConnection = serde_json::from_str(&legacy).expect("deserialize");
         assert_eq!(restored.effective_open_mode(), PreferredOpenMode::DualPane);
+    }
+
+    #[test]
+    fn elevation_expect_is_disabled_by_default() {
+        let default = SshElevationExpect::default();
+        assert!(default.is_empty(), "默认配置不携带任何信息");
+        // 默认关闭：即使登录方式本身知道密码，也要用户显式开启才会自动应答。
+        assert_eq!(
+            default.resolve(Some("login-pass")),
+            (false, Some("login-pass".into()))
+        );
+        assert_eq!(default.resolve(None), (false, None));
+        assert_eq!(default.resolve(Some("")), (false, Some(String::new())));
+    }
+
+    #[test]
+    fn elevation_expect_password_alone_does_not_enable_auto_fill() {
+        let elevation = SshElevationExpect {
+            auto_fill: None,
+            password: "root-pass".into(),
+        };
+        assert_eq!(
+            elevation.resolve(Some("login-pass")),
+            (false, Some("root-pass".into()))
+        );
+    }
+
+    #[test]
+    fn elevation_expect_prefers_its_own_password() {
+        let elevation = SshElevationExpect {
+            auto_fill: Some(true),
+            password: "root-pass".into(),
+        };
+        assert_eq!(
+            elevation.resolve(Some("login-pass")),
+            (true, Some("root-pass".into()))
+        );
+        assert_eq!(elevation.resolve(None), (true, Some("root-pass".into())));
+    }
+
+    #[test]
+    fn elevation_expect_respects_an_explicit_opt_out() {
+        let elevation = SshElevationExpect {
+            auto_fill: Some(false),
+            password: String::new(),
+        };
+        assert_eq!(
+            elevation.resolve(Some("login-pass")),
+            (false, Some("login-pass".into()))
+        );
+        assert!(
+            !SshAccountExpect {
+                elevation,
+                ..SshAccountExpect::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn elevation_expect_keeps_the_stored_json_compact() {
+        let default = SshAccountExpect::default();
+        assert_eq!(
+            serde_json::to_value(&default).unwrap(),
+            serde_json::json!({})
+        );
+
+        let elevation = SshAccountExpect {
+            elevation: SshElevationExpect {
+                auto_fill: Some(true),
+                password: "root-pass".into(),
+            },
+            ..SshAccountExpect::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&elevation).unwrap(),
+            serde_json::json!({
+                "elevation": { "auto_fill": true, "password": "root-pass" }
+            })
+        );
+    }
+
+    #[test]
+    fn redact_sensitive_params_hides_secrets_but_keeps_readable_fields() {
+        let params = serde_json::json!({
+            "host": "db.internal",
+            "port": 5432,
+            "password": "p@ss",
+            "nested": { "private_key": "key", "passphrase": "phrase" },
+            "login_script": [{ "send": "enable-pass" }],
+            "api_password": "token",
+            "secrets": { "api_key": "extension-secret", "region": "cn" },
+            "save_password": true
+        })
+        .to_string();
+
+        let redacted = redact_sensitive_params(&params);
+        let value: Value = serde_json::from_str(&redacted).unwrap();
+
+        assert_eq!(value["host"], "db.internal");
+        assert_eq!(value["port"], 5432);
+        assert_eq!(value["save_password"], true, "非字符串配置不应被改写");
+        for (pointer, expected) in [
+            ("/password", ""),
+            ("/nested/private_key", ""),
+            ("/nested/passphrase", ""),
+            ("/login_script/0/send", ""),
+            ("/api_password", ""),
+            ("/secrets/api_key", ""),
+            ("/secrets/region", ""),
+        ] {
+            assert_eq!(
+                value.pointer(pointer).and_then(Value::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn redact_sensitive_params_keeps_invalid_json_unchanged() {
+        assert_eq!(redact_sensitive_params("{not json"), "{not json");
+    }
+
+    #[test]
+    fn decrypt_sensitive_params_with_explicit_key_restores_only_secrets() {
+        let params = serde_json::json!({
+            "host": "db.internal",
+            "password": crypto::encrypt_with_key("p@ss", "source-master"),
+            "nested": {"private_key_content": crypto::encrypt_with_key("key", "source-master")},
+            "save_password": true
+        })
+        .to_string();
+        assert!(has_encrypted_sensitive_fields(&params));
+
+        let decrypted =
+            decrypt_sensitive_params_with_key(&params, "source-master").expect("应能解密");
+        let value: Value = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(value["host"], "db.internal");
+        assert_eq!(value["password"], "p@ss");
+        assert_eq!(value["nested"]["private_key_content"], "key");
+        assert_eq!(value["save_password"], true);
+        assert!(!has_encrypted_sensitive_fields(&decrypted));
+
+        let error = decrypt_sensitive_params_with_key(&params, "wrong-master").unwrap_err();
+        assert!(error.to_string().contains("解密失败"), "{error}");
+    }
+
+    #[test]
+    fn decrypt_sensitive_params_keeps_plaintext_and_invalid_json() {
+        let params = r#"{"host":"127.0.0.1","password":"plain"}"#;
+        assert!(!has_encrypted_sensitive_fields(params));
+        assert_eq!(
+            decrypt_sensitive_params_with_key(params, "unused").unwrap(),
+            params
+        );
+        assert!(decrypt_sensitive_params_with_key("{not json", "unused").is_err());
     }
 }

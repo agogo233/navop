@@ -34,6 +34,7 @@ use gpui_component::{
 use one_assets::IconName;
 use one_core::background_tasks::{BackgroundTaskHandle, BackgroundTaskSpec};
 use one_core::gpui_tokio::Tokio;
+use one_core::notification_throttle::NotificationThrottle;
 use one_core::sidebar_contribution::SidebarPlacement;
 use one_core::storage::models::{ConnectionType, StoredConnection};
 use one_core::storage::{
@@ -227,6 +228,14 @@ enum TransferCancelTarget {
 struct GlobalDeleteView {
     remote_dir: String,
 }
+
+/// 传输终态提示的稳定通知类型（配合 `Notification::id1`）。
+///
+/// 同一连接可以同时开多路终端分屏，每路分屏的侧栏文件管理器面板都会收到
+/// 同一笔传输的终态事件；若各自用随机 id 弹提示，一次上传就会叠出多条
+/// 「上传完成」（issue #499）。用传输 id 作通知 id 后，重复 push 只会替换
+/// 上一条，最终每个窗口只留一条。
+struct TransferFinishNotification;
 
 #[derive(Clone, Copy)]
 enum TransferProgressState {
@@ -449,6 +458,60 @@ struct RetryResetPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NavigationRecoveryPlan {
     fallback_path: String,
+}
+
+/// 读目录失败后允许自动回退的次数上限。
+///
+/// 会话断开时每次 `list_dir` 都会立刻失败；若失败后无条件「回退 + 刷新」，就会
+/// 形成「失败 → 回退 → 刷新 → 失败」的无限循环（issue #534：3 分钟 2000 万条
+/// 错误日志、一晚 214 GB）。额度用完后必须停下等用户点重试。
+const NAVIGATION_RECOVERY_MAX_ATTEMPTS: u32 = 2;
+
+/// 同一条「读目录失败」通知的最短间隔。
+const NAVIGATION_FAILURE_NOTICE_WINDOW: Duration = Duration::from_secs(8);
+
+/// 自动回退的额度与已尝试路径。
+///
+/// 两个维度都要记：只数次数挡不住 A → B → A 的历史回退环路，只记路径又挡不住
+/// 无限次数的来回刷新。任何一次成功列出目录或用户主动导航都会 `reset`。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct NavigationRecovery {
+    attempts: u32,
+    tried_paths: Vec<String>,
+}
+
+impl NavigationRecovery {
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.tried_paths.clear();
+    }
+
+    /// 规划一次自动回退；`None` 表示必须停下等用户（额度用尽或没有新路径）。
+    fn next_fallback(
+        &mut self,
+        failed_path: &str,
+        working_dir: Option<&str>,
+        history: &[String],
+        history_index: usize,
+    ) -> Option<String> {
+        if self.attempts >= NAVIGATION_RECOVERY_MAX_ATTEMPTS {
+            return None;
+        }
+
+        let plan = build_navigation_recovery_plan(failed_path, working_dir, history, history_index);
+        if plan.fallback_path == failed_path
+            || self
+                .tried_paths
+                .iter()
+                .any(|path| path == &plan.fallback_path)
+        {
+            return None;
+        }
+
+        self.attempts += 1;
+        self.tried_paths.push(plan.fallback_path.clone());
+        Some(plan.fallback_path)
+    }
 }
 
 fn build_retry_reset_plan(current_path: &str, working_dir: Option<String>) -> RetryResetPlan {
@@ -1221,6 +1284,9 @@ fn download_targets_for_selection(
         .filter_map(|filtered_ix| {
             let real_ix = *filtered_indices.get(filtered_ix)?;
             let item = items.get(real_ix)?;
+            if !sftp::is_valid_remote_entry_name(&item.name) {
+                return None;
+            }
             Some(DownloadTarget {
                 name: item.name.clone(),
                 path: join_remote_path(current_path, &item.name),
@@ -1402,6 +1468,10 @@ pub struct FileManagerPanel {
     focus_handle: FocusHandle,
     /// 是否正在加载目录
     loading: bool,
+    /// 读目录失败后的自动回退额度
+    navigation_recovery: NavigationRecovery,
+    /// 读目录失败通知的节流（同一条错误短时间内只弹一次）
+    navigation_failure_notice: NotificationThrottle,
     /// 文件复制/剪切缓冲区
     file_clipboard: Option<RemoteFileClipboard>,
     favorite_paths: Vec<String>,
@@ -1565,6 +1635,8 @@ impl FileManagerPanel {
             scroll_handle: UniformListScrollHandle::new(),
             focus_handle,
             loading: false,
+            navigation_recovery: NavigationRecovery::default(),
+            navigation_failure_notice: NotificationThrottle::new(NAVIGATION_FAILURE_NOTICE_WINDOW),
             file_clipboard: None,
             favorite_paths,
             favorite_connection_id,
@@ -1680,6 +1752,7 @@ impl FileManagerPanel {
                     }
                     this.sftp_client = Some(Arc::new(Mutex::new(Box::new(client))));
                     this.connection_state = ConnectionState::Connected;
+                    this.navigation_recovery.reset();
                     let real_path = normalize_remote_path(&real_path);
                     this.current_path = real_path.clone();
                     this.working_dir_hint = Some(real_path.clone());
@@ -1726,6 +1799,7 @@ impl FileManagerPanel {
     }
 
     fn apply_retry_reset_plan(&mut self, plan: RetryResetPlan) {
+        self.navigation_recovery.reset();
         self.connection_state = plan.next_state;
         self.working_dir_hint = plan.initial_working_dir;
         self.sftp_client = None;
@@ -1771,28 +1845,56 @@ impl FileManagerPanel {
     }
 
     fn recover_from_navigation_error(&mut self, message: String, cx: &mut Context<Self>) {
-        if let Some(window) = cx.active_window() {
-            let notification =
-                Notification::error(t!("FileManager.read_dir_failed_recovered", error = message))
-                    .autohide(true);
-            let _ = window.update(cx, |_, window, cx| {
-                window.push_notification(notification, cx);
-            });
-        }
-
-        let plan = build_navigation_recovery_plan(
+        self.loading = false;
+        let fallback_path = self.navigation_recovery.next_fallback(
             &self.current_path,
             self.working_dir_hint.as_deref(),
             &self.history,
             self.history_index,
         );
-        let failed_path = self.current_path.clone();
 
+        let Some(fallback_path) = fallback_path else {
+            // 已经自动回退过：再刷新只会重新撞同一面墙。停下来把错误交给用户，
+            // 由面板上的重试按钮显式重连（issue #534 的无限弹窗正是缺了这一步）。
+            tracing::error!(
+                path = %self.current_path,
+                attempts = self.navigation_recovery.attempts,
+                error = %message,
+                "读目录失败，已停止自动回退"
+            );
+            self.connection_state = ConnectionState::Error(
+                t!("FileManager.read_dir_failed", error = message).to_string(),
+            );
+            clear_remote_listing_state(
+                &mut self.items,
+                &mut self.filtered_indices,
+                &mut self.selected_indices,
+            );
+            cx.notify();
+            return;
+        };
+
+        self.push_navigation_failure_notice(message, cx);
+        let failed_path = self.current_path.clone();
         self.connection_state = ConnectionState::Connected;
-        self.loading = false;
-        self.current_path = plan.fallback_path.clone();
-        self.repair_history_after_navigation_failure(&failed_path, &plan.fallback_path);
+        self.current_path = fallback_path.clone();
+        self.repair_history_after_navigation_failure(&failed_path, &fallback_path);
         self.refresh_dir(cx);
+    }
+
+    /// 推送「已返回上一级」提示，同一文案在时间窗内只弹一次。
+    fn push_navigation_failure_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        let notice = t!("FileManager.read_dir_failed_recovered", error = message).to_string();
+        if !self.navigation_failure_notice.should_show(&notice) {
+            tracing::debug!("抑制重复的读目录失败通知");
+            return;
+        }
+        if let Some(window) = cx.active_window() {
+            let notification = Notification::error(notice).autohide(true);
+            let _ = window.update(cx, |_, window, cx| {
+                window.push_notification(notification, cx);
+            });
+        }
     }
 
     pub fn reconnect_with_working_dir(
@@ -2366,6 +2468,7 @@ impl FileManagerPanel {
 
                 match result {
                     Ok(Ok(entries)) => {
+                        this.navigation_recovery.reset();
                         this.items = entries
                             .into_iter()
                             .filter(|e| e.name != "." && e.name != "..")
@@ -2403,6 +2506,8 @@ impl FileManagerPanel {
 
     /// 导航到指定路径
     fn navigate_to(&mut self, path: String, cx: &mut Context<Self>) {
+        // 用户主动导航意味着「重新开始」：清掉上一次失败留下的回退额度。
+        self.navigation_recovery.reset();
         let path = resolve_remote_path(&self.current_path, &path);
         if path == self.current_path {
             self.refresh_dir(cx);
@@ -2425,6 +2530,7 @@ impl FileManagerPanel {
     /// 后退
     fn go_back(&mut self, cx: &mut Context<Self>) {
         if self.history_index > 0 {
+            self.navigation_recovery.reset();
             self.history_index -= 1;
             self.current_path = self.history[self.history_index].clone();
             self.scroll_handle = UniformListScrollHandle::new();
@@ -2869,11 +2975,11 @@ impl FileManagerPanel {
         let file_name = Some(snapshot.display_name.as_str());
         match snapshot.state {
             SftpTransferState::Succeeded => {
-                self.notify_transfer_finish(action, file_name, None, cx);
+                self.notify_transfer_finish(action, snapshot.id, file_name, None, cx);
             }
             SftpTransferState::Failed => {
                 let error = snapshot.error.as_deref().unwrap_or_default();
-                self.notify_transfer_finish(action, file_name, Some(error), cx);
+                self.notify_transfer_finish(action, snapshot.id, file_name, Some(error), cx);
             }
             // 进行中与用户主动取消都不打扰。
             SftpTransferState::Queued
@@ -2887,14 +2993,20 @@ impl FileManagerPanel {
     ///
     /// 传输回调里只有 `cx`、拿不到 `&mut Window`，所以走构造时记下的窗口句柄；
     /// 窗口已关闭时静默放弃（终态在后台任务面板里依然可见）。
+    ///
+    /// 通知 id 由传输 id 固定（见 [`TransferFinishNotification`]）：同一连接的多个
+    /// 终端分屏都会收到同一条终态事件，后到的 push 替换先到的，最终只留一条提示。
     fn notify_transfer_finish(
         &self,
         action: TransferAction,
+        transfer_id: SftpTransferId,
         file_name: Option<&str>,
         error: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let notification = transfer_finish_notification(action, file_name, error);
+        let notification =
+            transfer_finish_notification(action, file_name, error)
+                .id1::<TransferFinishNotification>(("sftp-transfer-finish", transfer_id.as_u64()));
         let _ = self.window_handle.update(cx, |_root, window, cx| {
             window.push_notification(notification, cx);
         });
@@ -3341,37 +3453,38 @@ impl FileManagerPanel {
         };
         let view = cx.entity().clone();
         let apply_all = Arc::new(AtomicBool::new(false));
+        let prompt = FileConflictPrompt::entity(
+            cx,
+            FileConflictPromptSpec {
+                name: current.name.clone().into(),
+                is_directory: current.is_dir,
+                show_apply_all: position.1 > 1,
+                apply_all: apply_all.clone(),
+                labels: upload_conflict_prompt_labels(position),
+            },
+            move |choice, apply_all, window, cx| {
+                window.close_dialog(cx);
+                let uploads = resolve_upload_conflicts(&session, (choice, apply_all));
+                let has_next = session.resolver.borrow().current().is_some();
+                view.update(cx, |this, cx| {
+                    if !is_current_generation(
+                        this.connection_generation,
+                        session.connection_generation,
+                    ) {
+                        return;
+                    }
+                    this.enqueue_pending_uploads(uploads, cx);
+                    if has_next {
+                        this.show_next_upload_conflict(session.clone(), window, cx);
+                    }
+                });
+            },
+        );
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let session = session.clone();
-            let view = view.clone();
             dialog
                 .title(t!("Dialog.file_conflict").to_string())
                 .w(px(480.))
-                .child(FileConflictPrompt::new(
-                    FileConflictPromptSpec {
-                        name: current.name.clone().into(),
-                        is_directory: current.is_dir,
-                        apply_all: apply_all.clone(),
-                        labels: upload_conflict_prompt_labels(position),
-                    },
-                    move |choice, apply_all, window, cx| {
-                        window.close_dialog(cx);
-                        let uploads = resolve_upload_conflicts(&session, (choice, apply_all));
-                        let has_next = session.resolver.borrow().current().is_some();
-                        view.update(cx, |this, cx| {
-                            if !is_current_generation(
-                                this.connection_generation,
-                                session.connection_generation,
-                            ) {
-                                return;
-                            }
-                            this.enqueue_pending_uploads(uploads, cx);
-                            if has_next {
-                                this.show_next_upload_conflict(session.clone(), window, cx);
-                            }
-                        });
-                    },
-                ))
+                .child(prompt.clone())
                 .overlay_closable(false)
                 .close_button(true)
         });
@@ -4153,6 +4266,10 @@ impl FileManagerPanel {
             .next()
             .unwrap_or(&remote_path)
             .to_string();
+        if !sftp::is_valid_remote_entry_name(&remote_name) {
+            window.push_notification(Notification::error(t!("FileManager.invalid_name")), cx);
+            return;
+        }
 
         self.download_targets(
             vec![DownloadTarget {
@@ -4655,6 +4772,8 @@ impl FileManagerPanel {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
+                                    // 手动刷新是用户显式重试，重新给予回退额度。
+                                    this.navigation_recovery.reset();
                                     this.refresh_dir(cx);
                                 }),
                             )
@@ -5651,6 +5770,148 @@ impl FileManagerPanel {
         menu
     }
 
+    /// 文件列表空白处的目录级菜单。
+    ///
+    /// 重命名、编辑、下载、删除、属性等动作都依赖具体文件项，空白区域没有
+    /// 可作用的目标，因此这里只保留当前目录可执行的动作。
+    fn build_directory_context_menu(
+        menu: PopupMenu,
+        view: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let (current_path, is_connected, can_paste, show_hidden) = {
+            let state = view.read(cx);
+            let is_connected = state.connection_state == ConnectionState::Connected;
+            (
+                state.current_path.clone(),
+                is_connected,
+                can_paste_remote_file_clipboard(state.file_clipboard.as_ref(), is_connected),
+                state.show_hidden,
+            )
+        };
+
+        let view_paste = view.clone();
+        let view_new_file = view.clone();
+        let view_new_folder = view.clone();
+        let view_upload_file = view.clone();
+        let view_upload_folder = view.clone();
+        let view_favorite = view.clone();
+        let view_cd = view.clone();
+        let view_copy_path = view.clone();
+        let view_refresh = view.clone();
+        let view_toggle_hidden = view.clone();
+        let paste_target = current_path.clone();
+        let favorite_path = current_path.clone();
+        let terminal_path = current_path.clone();
+        let copied_path = current_path;
+
+        menu.min_w(px(190.0))
+            .item(
+                PopupMenuItem::new(t!("FileManager.paste"))
+                    .icon(IconName::Paste)
+                    .disabled(!can_paste)
+                    .on_click(
+                        window.listener_for(&view_paste, move |this, _, window, cx| {
+                            this.paste_remote_file_clipboard(paste_target.clone(), window, cx);
+                        }),
+                    ),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("FileManager.new_file"))
+                    .icon(IconName::File)
+                    .disabled(!is_connected)
+                    .on_click(
+                        window.listener_for(&view_new_file, move |this, _, window, cx| {
+                            this.show_new_file_dialog(window, cx);
+                        }),
+                    ),
+            )
+            .item(
+                PopupMenuItem::new(t!("FileManager.new_folder"))
+                    .icon(IconName::NewFolder)
+                    .disabled(!is_connected)
+                    .on_click(
+                        window.listener_for(&view_new_folder, move |this, _, window, cx| {
+                            this.show_new_folder_dialog(window, cx);
+                        }),
+                    ),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("FileManager.upload_file"))
+                    .icon(IconName::Upload)
+                    .disabled(!is_connected)
+                    .on_click(window.listener_for(
+                        &view_upload_file,
+                        move |this, _, window, cx| {
+                            this.select_and_upload_files(window, cx);
+                        },
+                    )),
+            )
+            .item(
+                PopupMenuItem::new(t!("FileManager.upload_folder"))
+                    .icon(IconName::Upload)
+                    .disabled(!is_connected)
+                    .on_click(window.listener_for(
+                        &view_upload_folder,
+                        move |this, _, window, cx| {
+                            this.select_and_upload_folder(window, cx);
+                        },
+                    )),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("FileManager.favorite_add_path"))
+                    .icon(IconName::Star)
+                    .disabled(!is_connected)
+                    .on_click(
+                        window.listener_for(&view_favorite, move |this, _, window, cx| {
+                            this.add_favorite_path(&favorite_path, window, cx);
+                        }),
+                    ),
+            )
+            .item(
+                PopupMenuItem::new(t!("FileManager.cd_to_terminal"))
+                    .icon(IconName::SquareTerminal)
+                    .disabled(!is_connected)
+                    .on_click(window.listener_for(&view_cd, move |_this, _, _, cx| {
+                        cx.emit(FileManagerPanelEvent::CdToTerminal(terminal_path.clone()));
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(t!("FileManager.copy_path"))
+                    .icon(IconName::Copy)
+                    .on_click(
+                        window.listener_for(&view_copy_path, move |_this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copied_path.clone()));
+                        }),
+                    ),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("FileManager.refresh"))
+                    .icon(IconName::Refresh)
+                    .on_click(window.listener_for(&view_refresh, move |this, _, _, cx| {
+                        this.refresh_dir(cx);
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(t!("FileManager.toggle_hidden"))
+                    .icon(IconName::Eye)
+                    .checked(show_hidden)
+                    .on_click(
+                        window.listener_for(&view_toggle_hidden, move |this, _, _, cx| {
+                            this.show_hidden = !this.show_hidden;
+                            this.apply_filter();
+                            this.clear_selection();
+                            cx.notify();
+                        }),
+                    ),
+            )
+    }
+
     /// 渲染底部传输进度条（紧凑型，适合侧边栏窄宽度）
     fn render_transfer_progress(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self
@@ -5971,6 +6232,7 @@ impl FileManagerPanel {
         let background = self.colors.background;
         let foreground = self.colors.foreground;
         let hover = self.colors.muted.opacity(0.72);
+        let directory_menu_view = cx.entity();
 
         v_flex()
             .size_full()
@@ -6126,7 +6388,15 @@ impl FileManagerPanel {
                             foreground,
                             cx.theme().drop_target,
                             cx.theme().drag_border,
-                        )),
+                        ))
+                        .context_menu(move |menu, window, cx| {
+                            Self::build_directory_context_menu(
+                                menu,
+                                &directory_menu_view,
+                                window,
+                                cx,
+                            )
+                        }),
                 )
             })
             // 底部传输进度条
@@ -6224,15 +6494,15 @@ impl Render for FileManagerPanel {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionState, FileConflictChoice, NavigationRecoveryPlan, PendingUpload,
-        RemoteClipboardEntry, RemoteClipboardKind, RemoteFileClipboard, ReportedHostDecision,
-        ReportedHostTracker, ReportedWorkingDir, SharedProgress, TerminalColors,
-        TransferCancelTarget, TransferOperation, TransferQueue, TransferTask, TransferTaskState,
-        build_navigation_recovery_plan, build_retry_reset_plan, can_paste_remote_file_clipboard,
-        classify_reported_host, clear_remote_listing_state, frame_move_options,
-        global_transfer_action, is_file_browsable_connection, resolve_upload_conflict,
-        should_apply_directory_result, should_refresh_after_delete, should_refresh_after_upload,
-        toggle_icon_color, transfer_progress_display_label,
+        ConnectionState, FileConflictChoice, NAVIGATION_RECOVERY_MAX_ATTEMPTS, NavigationRecovery,
+        NavigationRecoveryPlan, PendingUpload, RemoteClipboardEntry, RemoteClipboardKind,
+        RemoteFileClipboard, ReportedHostDecision, ReportedHostTracker, ReportedWorkingDir,
+        SharedProgress, TerminalColors, TransferCancelTarget, TransferOperation, TransferQueue,
+        TransferTask, TransferTaskState, build_navigation_recovery_plan, build_retry_reset_plan,
+        can_paste_remote_file_clipboard, classify_reported_host, clear_remote_listing_state,
+        frame_move_options, global_transfer_action, is_file_browsable_connection,
+        resolve_upload_conflict, should_apply_directory_result, should_refresh_after_delete,
+        should_refresh_after_upload, toggle_icon_color, transfer_progress_display_label,
     };
     use crate::transfer_notice::TransferAction;
     use anyhow::{Result, anyhow};
@@ -6304,6 +6574,7 @@ mod tests {
         let mut connection = one_core::storage::models::StoredConnection::new_ssh(
             "Terminal file manager test".to_string(),
             SshParams {
+                otp: None,
                 remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
@@ -6345,6 +6616,7 @@ mod tests {
         let mut connection = one_core::storage::models::StoredConnection::new_ssh(
             "Terminal file manager ftp test".to_string(),
             SshParams {
+                otp: None,
                 remote_file: Some(one_core::storage::models::RemoteFileParams {
                     protocol: one_core::storage::models::RemoteFileProtocol::Ftp,
                     ftp: Some(one_core::storage::models::FtpParams {
@@ -6400,6 +6672,7 @@ mod tests {
         let mut connection = one_core::storage::models::StoredConnection::new_ssh(
             "主机 B".to_string(),
             SshParams {
+                otp: None,
                 remote_file: None,
                 sftp_default_directory: None,
                 disabled_jump_server: None,
@@ -6912,6 +7185,59 @@ mod tests {
         });
     }
 
+    /// 同一连接的每个终端分屏都有一个文件管理器面板，都会收到同一笔传输的终态；
+    /// 完成提示必须只留一条，不能每个面板各弹一条（issue #499）。
+    #[gpui::test]
+    fn duplicate_panels_collapse_finish_toast_into_one(mut cx: &mut TestAppContext) {
+        use gpui_component::WindowExt;
+
+        let temp_dir = tempfile::TempDir::new().expect("create fixture temp dir");
+        let (provider, _executor, panel, window) = file_manager_fixture(&mut cx, &temp_dir);
+        // 直接用 AnyWindowHandle 更新窗口：不占用 Root 的更新状态，通知列表才可读。
+        let window_handle: gpui::AnyWindowHandle = window.into();
+
+        // 第二个面板模拟同一连接的另一路终端分屏：它和首个面板订阅同一个全局执行器。
+        let _extra_panel = window_handle
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    super::FileManagerPanel::new(
+                        test_stored_connection(),
+                        test_session_manager(),
+                        TerminalColors {
+                            background: gpui::black(),
+                            foreground: gpui::white(),
+                            muted: gpui::black(),
+                            muted_foreground: gpui::black(),
+                            border: gpui::black(),
+                            accent: gpui::black(),
+                            accent_foreground: gpui::white(),
+                        },
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("window should stay open");
+
+        let local_path = temp_dir.path().join("report.txt");
+        let id = submit_download(&mut cx, &panel, local_path);
+        wait_until(&mut cx, |_| {
+            provider.operation(id) == Some(FileManagerTestOperation::Download)
+        });
+        provider.complete(id, Ok(()));
+        wait_until(&mut cx, |cx| {
+            executor_state(cx, &panel, id) == Some(SftpTransferState::Succeeded)
+        });
+
+        let notification_count = window_handle
+            .update(cx, |_, window, cx| window.notifications(cx).len())
+            .expect("window should stay open");
+        assert_eq!(
+            notification_count, 1,
+            "同一笔传输的完成提示应只保留一条，不能每个面板各弹一条"
+        );
+    }
+
     #[gpui::test]
     fn ftp_endpoint_panel_uses_independent_ftp_connection(mut cx: &mut TestAppContext) {
         let temp_dir = tempfile::TempDir::new().expect("create fixture temp dir");
@@ -7009,6 +7335,58 @@ mod tests {
                 }],
             )
         );
+    }
+
+    #[gpui::test]
+    fn read_dir_failure_still_recovers_once(mut cx: &mut TestAppContext) {
+        let temp_dir = tempfile::TempDir::new().expect("create fixture temp dir");
+        let (_provider, _executor, panel, _window) = file_manager_fixture(&mut cx, &temp_dir);
+
+        let refresh_count = Arc::new(AtomicU64::new(0));
+        panel.update(cx, |this, cx| {
+            this.set_test_refresh_count(refresh_count.clone());
+            this.recover_from_navigation_error("session closed".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            refresh_count.load(Ordering::Relaxed),
+            1,
+            "第一次失败应回退到历史路径并只刷新一次"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.current_path, "/");
+            assert!(!matches!(panel.connection_state, ConnectionState::Error(_)));
+        });
+    }
+
+    #[gpui::test]
+    fn read_dir_failure_stops_auto_refresh_after_the_budget(mut cx: &mut TestAppContext) {
+        let temp_dir = tempfile::TempDir::new().expect("create fixture temp dir");
+        let (_provider, _executor, panel, _window) = file_manager_fixture(&mut cx, &temp_dir);
+
+        let refresh_count = Arc::new(AtomicU64::new(0));
+        panel.update(cx, |this, cx| {
+            this.set_test_refresh_count(refresh_count.clone());
+            // 会话断开后的典型形态：回退额度已经耗尽，列表依然失败。
+            this.navigation_recovery.attempts = NAVIGATION_RECOVERY_MAX_ATTEMPTS;
+            this.navigation_recovery.tried_paths = vec!["/".to_string()];
+            this.recover_from_navigation_error("session closed".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            refresh_count.load(Ordering::Relaxed),
+            0,
+            "额度用尽后不得再自行刷新，否则就是 issue #534 的无限循环"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(panel.connection_state, ConnectionState::Error(_)),
+                "停下后必须显示错误态，让用户手动重试"
+            );
+            assert!(panel.items.is_empty());
+        });
     }
 
     #[gpui::test]
@@ -7399,6 +7777,31 @@ mod tests {
     }
 
     #[test]
+    fn blank_file_list_surface_opens_a_directory_context_menu() {
+        let source = include_str!("file_manager_panel.rs");
+        assert!(
+            source.contains("fn build_directory_context_menu("),
+            "文件列表空白处需要独立的目录级菜单"
+        );
+        let render_start = source
+            .find("fn render_file_list")
+            .expect("render_file_list definition");
+        let render_tail = &source[render_start..];
+        let render = render_tail
+            .split("\n}\n\nfn render_file_drop_overlay")
+            .next()
+            .expect("render_file_list body");
+        assert!(
+            render.contains("build_directory_context_menu"),
+            "文件列表容器必须挂上目录级右键菜单"
+        );
+        assert!(
+            render.contains(".context_menu("),
+            "只有把菜单接在容器上，空白区域才能响应右键"
+        );
+    }
+
+    #[test]
     fn toggle_icon_color_separates_on_from_off() {
         let colors = TerminalColors {
             background: gpui::black(),
@@ -7564,6 +7967,64 @@ mod tests {
             NavigationRecoveryPlan {
                 fallback_path: "/srv/home".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn navigation_recovery_stops_after_the_attempt_budget() {
+        let mut recovery = NavigationRecovery::default();
+
+        assert_eq!(
+            recovery.next_fallback("/a", Some("/b"), &[], 0).as_deref(),
+            Some("/b")
+        );
+        assert_eq!(
+            recovery.next_fallback("/b", Some("/c"), &[], 0).as_deref(),
+            Some("/c")
+        );
+        assert_eq!(
+            recovery.next_fallback("/c", Some("/d"), &[], 0),
+            None,
+            "额度用尽后必须停下（issue #534：无限回退 + 无限刷新）"
+        );
+        assert_eq!(recovery.attempts, NAVIGATION_RECOVERY_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn navigation_recovery_refuses_repeating_a_failed_path() {
+        let mut recovery = NavigationRecovery::default();
+        let history = vec!["/srv/home".to_string(), "/srv/invalid".to_string()];
+
+        assert_eq!(
+            recovery
+                .next_fallback("/srv/invalid", None, &history, 1)
+                .as_deref(),
+            Some("/srv/home")
+        );
+        // 回到已经试过的路径（A → B → A 环路）必须拒绝。
+        assert_eq!(
+            recovery.next_fallback("/srv/other", Some("/srv/home"), &history, 0),
+            None
+        );
+
+        // 根目录没有可回退的上级，回落目标就是它自己：再刷新只会重复失败。
+        let mut at_root = NavigationRecovery::default();
+        assert_eq!(at_root.next_fallback("/", None, &[], 0), None);
+    }
+
+    #[test]
+    fn navigation_recovery_reset_restores_the_budget() {
+        let mut recovery = NavigationRecovery::default();
+        assert!(recovery.next_fallback("/a", Some("/b"), &[], 0).is_some());
+        assert!(recovery.next_fallback("/b", Some("/c"), &[], 0).is_some());
+        assert!(recovery.next_fallback("/c", Some("/d"), &[], 0).is_none());
+
+        recovery.reset();
+
+        assert_eq!(
+            recovery.next_fallback("/c", Some("/d"), &[], 0).as_deref(),
+            Some("/d"),
+            "用户主动导航或成功列出目录后应重新获得回退额度"
         );
     }
 
@@ -7782,6 +8243,41 @@ mod tests {
             ],
             targets
         );
+    }
+
+    #[test]
+    fn download_targets_skip_server_names_that_are_not_single_components() {
+        let items = vec![
+            super::RemoteFileItem {
+                name: "../outside.txt".to_string(),
+                size: 10,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: false,
+                permissions: String::new(),
+                owner: None,
+                directory_size: super::DirectorySizeState::Unknown,
+            },
+            super::RemoteFileItem {
+                name: "safe.txt".to_string(),
+                size: 10,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: false,
+                permissions: String::new(),
+                owner: None,
+                directory_size: super::DirectorySizeState::Unknown,
+            },
+        ];
+
+        let targets = super::download_targets_for_selection(
+            "/srv/app",
+            &items,
+            &[0, 1],
+            &HashSet::from([0usize, 1usize]),
+        );
+
+        assert_eq!(1, targets.len());
+        assert_eq!("safe.txt", targets[0].name);
+        assert_eq!("/srv/app/safe.txt", targets[0].path);
     }
 
     #[test]

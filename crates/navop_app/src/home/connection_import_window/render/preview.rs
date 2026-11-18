@@ -1,0 +1,222 @@
+use gpui::prelude::FluentBuilder;
+use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, Styled, div, px};
+use gpui_component::{
+    ActiveTheme, Disableable, Sizable,
+    button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
+    h_flex, v_flex,
+};
+use one_assets::IconName;
+use rust_i18n::t;
+
+use super::super::{ConnectionImportWindow, is_save_candidate};
+use crate::home::connection_import_draft::{
+    EditableImportDraft, ImportDraftKind, normalized_ssh_group_path,
+};
+use crate::home::connection_import_model::{ImportPreviewRow, ImportRowSaveStatus};
+
+pub(super) fn render_preview_row(
+    row: &ImportPreviewRow,
+    cx: &mut Context<ConnectionImportWindow>,
+) -> AnyElement {
+    let record_id = row.record_id().to_string();
+    h_flex()
+        .items_center()
+        .gap_3()
+        .p_3()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(px(6.0))
+        .child(
+            Checkbox::new(format!("import-row-{record_id}"))
+                .checked(row.selected)
+                .disabled(!is_save_candidate(&row.save_status))
+                .on_click(cx.listener({
+                    let record_id = record_id.clone();
+                    move |this, _, _, cx| {
+                        this.model.toggle_row(&record_id);
+                        cx.notify();
+                    }
+                })),
+        )
+        .child(row.draft.icon())
+        .child(render_row_text(row, cx))
+        .child(render_row_status(row, cx))
+        .child(render_row_actions(row, &record_id, cx))
+        .into_any_element()
+}
+
+fn render_row_actions(
+    row: &ImportPreviewRow,
+    record_id: &str,
+    cx: &mut Context<ConnectionImportWindow>,
+) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .when(
+            !matches!(
+                row.draft.kind(),
+                ImportDraftKind::QuickCommand | ImportDraftKind::Workspace
+            ),
+            |this| {
+                this.child(
+                    Button::new(format!("edit-import-{record_id}"))
+                        .xsmall()
+                        .icon(IconName::Edit)
+                        .disabled(matches!(row.save_status, ImportRowSaveStatus::Saving))
+                        .on_click(cx.listener({
+                            let record_id = record_id.to_string();
+                            move |this, _, window, cx| this.edit_row(record_id.clone(), window, cx)
+                        })),
+                )
+            },
+        )
+        .child(
+            Button::new(format!("save-import-{record_id}"))
+                .xsmall()
+                .primary()
+                .icon(IconName::Upload)
+                .label(t!("Common.save").to_string())
+                .disabled(!is_save_candidate(&row.save_status))
+                .on_click(cx.listener({
+                    let record_id = record_id.to_string();
+                    move |this, _, _, cx| this.save_row(record_id.clone(), cx)
+                })),
+        )
+}
+
+fn render_row_text(
+    row: &ImportPreviewRow,
+    cx: &mut Context<ConnectionImportWindow>,
+) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(row.draft.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(kind_text(row.draft.kind())),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(row_detail_text(&row.draft)),
+        )
+        .when_some(row.draft.warning_text(), |this, warning| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(warning),
+            )
+        })
+}
+
+fn row_detail_text(draft: &EditableImportDraft) -> String {
+    let mut parts = vec![draft.source_name().to_string()];
+    if matches!(draft.kind(), ImportDraftKind::QuickCommand) {
+        parts.push(draft.quick_command_detail_text());
+        return parts.join(" · ");
+    }
+    if matches!(draft.kind(), ImportDraftKind::Workspace) {
+        if let Some(path) = draft.workspace_path() {
+            parts.push(t!("Home.ConnectionImport.workspace", path = path).to_string());
+        }
+        return parts.join(" · ");
+    }
+    if let Some(endpoint) = endpoint_text(draft) {
+        parts.push(endpoint);
+    }
+    if let Some(group) = normalized_ssh_group_path(&draft.ssh_group_path) {
+        parts.push(t!("Home.ConnectionImport.workspace", path = group).to_string());
+    }
+    if let Some(username) = trimmed_text(&draft.username) {
+        parts.push(username);
+    }
+    parts.push(draft.password_status_text().to_string());
+    parts.join(" · ")
+}
+
+fn endpoint_text(draft: &EditableImportDraft) -> Option<String> {
+    let host = trimmed_text(&draft.host)?;
+    Some(match trimmed_text(&draft.port) {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+fn trimmed_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn render_row_status(
+    row: &ImportPreviewRow,
+    cx: &mut Context<ConnectionImportWindow>,
+) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(status_color(&row.save_status, cx))
+        .child(status_text(&row.save_status))
+}
+
+fn kind_text(kind: ImportDraftKind) -> String {
+    match kind {
+        ImportDraftKind::Database => t!("Home.ConnectionImport.kind_database").to_string(),
+        ImportDraftKind::Ssh => "SSH".to_string(),
+        ImportDraftKind::Telnet => "Telnet".to_string(),
+        ImportDraftKind::QuickCommand => t!("Home.ConnectionImport.kind_quick_command").to_string(),
+        ImportDraftKind::Workspace => t!("Home.ConnectionImport.kind_workspace").to_string(),
+        ImportDraftKind::Unsupported => t!("Home.ConnectionImport.kind_unsupported").to_string(),
+    }
+}
+
+fn status_text(status: &ImportRowSaveStatus) -> String {
+    match status {
+        ImportRowSaveStatus::Pending => t!("Home.ConnectionImport.status_pending").to_string(),
+        ImportRowSaveStatus::Saving => t!("Home.ConnectionImport.status_saving").to_string(),
+        ImportRowSaveStatus::Saved { .. } => t!("Home.ConnectionImport.status_saved").to_string(),
+        ImportRowSaveStatus::Failed { message } => {
+            t!("Home.ConnectionImport.status_failed", error = message).to_string()
+        }
+        ImportRowSaveStatus::SkippedDuplicate { existing_name } => t!(
+            "Home.ConnectionImport.status_duplicate",
+            name = existing_name
+        )
+        .to_string(),
+    }
+}
+
+fn status_color(
+    status: &ImportRowSaveStatus,
+    cx: &mut Context<ConnectionImportWindow>,
+) -> gpui::Hsla {
+    match status {
+        ImportRowSaveStatus::Saved { .. } => cx.theme().success,
+        ImportRowSaveStatus::Failed { .. } => cx.theme().danger,
+        ImportRowSaveStatus::SkippedDuplicate { .. } => cx.theme().warning,
+        ImportRowSaveStatus::Pending | ImportRowSaveStatus::Saving => cx.theme().muted_foreground,
+    }
+}

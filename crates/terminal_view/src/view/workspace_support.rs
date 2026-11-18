@@ -20,6 +20,8 @@ pub(super) enum TerminalRenderMode {
 #[derive(Clone)]
 pub(crate) struct TerminalWorkspaceSidebarSnapshot {
     pub(crate) layout: TerminalToolDockLayout,
+    /// 扩展面板在内建面板未占用的边上补位（与内嵌模式同一套合并规则）。
+    pub(crate) extension_layout: one_core::dock::ToolDockLayout<SharedString>,
     pub(crate) sidebar: Entity<TerminalSidebar>,
     pub(crate) toolbar: Entity<TerminalSidebarToolbar>,
     pub(crate) panels: HashMap<SidebarPanel, Entity<TerminalSidebarToolPanel>>,
@@ -80,9 +82,11 @@ impl TerminalView {
             TerminalDuplicateSource::Local(config) => {
                 Self::new_with_index(config, None, window, cx)
             }
-            TerminalDuplicateSource::Launched { config, title, icon } => {
-                Self::new_launched(config, title, icon, None, window, cx)
-            }
+            TerminalDuplicateSource::Launched {
+                config,
+                title,
+                icon,
+            } => Self::new_launched(config, title, icon, None, window, cx),
             TerminalDuplicateSource::Serial(connection) => {
                 Self::new_serial_with_index(connection, None, window, cx)
             }
@@ -128,6 +132,7 @@ impl TerminalView {
     pub(crate) fn workspace_sidebar_snapshot(&self, cx: &App) -> TerminalWorkspaceSidebarSnapshot {
         TerminalWorkspaceSidebarSnapshot {
             layout: self.terminal_tool_layout(cx),
+            extension_layout: self.extension_tool_layout(cx),
             sidebar: self.sidebar.clone(),
             toolbar: self.sidebar_toolbar.clone(),
             panels: self.sidebar_tool_panels.clone(),
@@ -161,6 +166,22 @@ impl TerminalView {
             terminal.connection_state(),
             ConnectionState::Disconnected { .. }
         ) || terminal.child_exited().is_some()
+    }
+
+    pub(crate) fn terminal_can_disconnect(&self, cx: &App) -> bool {
+        self.terminal.read(cx).live_connection_kind() == Some(TerminalConnectionKind::Ssh)
+            && !self.terminal_is_disconnected(cx)
+    }
+
+    pub(crate) fn disconnect_terminal(&mut self, cx: &mut Context<Self>) -> bool {
+        let disconnected = self
+            .terminal
+            .update(cx, |terminal, cx| terminal.disconnect(cx));
+        if disconnected {
+            self.release_active_connection(cx);
+            cx.notify();
+        }
+        disconnected
     }
 
     pub(crate) fn terminal_connection_status(

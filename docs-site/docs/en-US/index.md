@@ -1,35 +1,51 @@
 # Navop Usage Guide
 
-Navop is the dev and ops workspace for the AI era, bringing databases, Redis, MongoDB, SSH, SFTP, terminals, remote desktops, Notes, AI, and team sync into one native workspace.
+Navop is a desktop workspace **built natively with Rust and GPUI** — no WebView, no Electron. The interface, terminals, tables, and charts are GPU-rendered. It brings databases, servers, remote desktops, and AI agents into one window, covering connection management, SQL development, file transfer, and remote troubleshooting.
 
-## Current release: v0.19.5
+## Why Navop
 
-Download the latest stable release from the [official Download Center](https://navop.dev/en-US/extensions).
+- **Native performance.** GPUI paints the interface directly, so many live connections, split terminals, and large result sets stay responsive instead of waiting on browser layout.
+- **Rust end to end.** Database drivers, SSH/SFTP, terminal emulation, the AI runtime, and the UI share one Rust codebase.
+- **One window for the work.** Keep SQL workspaces, terminals, file managers, remote desktops, and the AI sidebar side by side instead of switching tools.
+- **Extensible.** Database drivers, remote desktop providers, document renderers, and resource workbenches install as WASM extensions without restarting the app.
+- **Consistent across platforms.** macOS (arm64/x64), Windows (x64/win32), and Linux (x64/arm64) share the same interface and capabilities.
 
-- Personal sync gains a WebDAV backend next to "Folder" and "Git": enter the server URL, user name and password and it works, with the password sealed to disk rather than stored in the clear. The protocol uses only GET / PUT / DELETE plus Basic auth and never probes with PROPFIND, so it fits Jianguoyun, Synology, Nextcloud and self-hosted servers; a collection is created with MKCOL before the first write, and a 409 is reported as "directory unavailable" instead of a bogus version conflict. The settings page shows only the items of the selected backend, the password field can be revealed, and since WebDAV has no local directory to watch, a 60-second scan drives syncing.
-- SSH agent forwarding: a key credential can be marked "Forward this key through ssh-agent", and a connection has its own "SSH Agent Forwarding" (ForwardAgent) switch. With the local ssh-agent forwarded to the remote host, that host (a jump host, for example) can authenticate onward to deeper hosts with your local key; it applies to newly opened terminal sessions.
-- The table structure designer gains "Refresh table structure", which reloads the latest columns, indexes and table info; with unsaved edits it warns first and confirms with "Discard and refresh".
-- The terminal's paste confirmation dialog now offers "Open settings" and "Don't ask again": multi-line paste, high-risk command and large paste prompts all link to the matching setting. Large paste is a hard threshold and offers no "don't ask again".
-- External drivers now time out per call category, with a per-connection override: user operations (query, exec, cursor, import/export) default to 30 minutes while metadata and structure browsing keep 30 seconds, and advanced connection settings gain a "Request timeout (seconds)" field (empty follows the category defaults, 0 means unlimited), so large queries and imports on slow databases are no longer cut off by a single 30-second cap.
-- The commit and rollback buttons of the SQL editor's manual transaction and "Commit changes" in the table data page show a loading indicator while the write is in flight, making it clear which step is still running; the other button is only disabled and does not spin.
-- Fixed the crash when typing Chinese into the WHERE / ORDER BY filters (#326) and the filter-bar inputs sitting one line taller than before the migration (40px → 20px); fixed an AI chat turn being marked as failed after cancelling a reply, and stale column comments after editing them on dialects such as Dameng.
-- Fixed every in-app quit ending in SIGABRT with a core file on Linux (Arch + Hyprland / Wayland, #336); the macOS Touch Bar crash on window close is closed out by upstream zed#65186, so the "hide on close" experiment switch is gone and both macOS architectures, Windows and Linux are back to destroying on close.
+## What Navop supports
+
+- **Databases:** MySQL, PostgreSQL, MariaDB, SQLite, DuckDB, SQL Server, Oracle, ClickHouse, TDengine, plus extension drivers for Dameng, KingbaseES, GBase, OceanBase, openGauss, IoTDB, Oscar, and more.
+- **Data tools:** object browsing, SQL editor with execution plans, import/export, schema and data comparison, ER diagrams, batch table editing.
+- **Redis / MongoDB / MQTT:** key and value management, collection and document queries, subscribe and publish.
+- **SSH and terminals:** local and remote terminals, native split panes, broadcast input, quick commands, shell integration, session recording/replay, and searchable logs.
+- **File transfer:** SFTP, FTP, and FTPS with drag-and-drop, remote file editing, ZMODEM, and server-to-server copy.
+- **Remote access:** local/remote/SOCKS port forwarding, X11, RDP, VNC, serial, Telnet, host-key management, and SecureCRT import.
+- **AI and automation:** SQL generation and explanation, result analysis, charts, terminal assistance, ACP agents (Codex / Claude Code / OpenCode), and Agent Hub.
+- **Collaboration and extensibility:** Notes, teams and shared connections, encrypted sync, extension marketplace, Public MCP, Navop CLI, and Agent Skill.
+
+## Install and versions
+
+Get the latest builds from the [official Download Center](https://navop.dev/en-US/extensions), [GitHub Releases](https://github.com/feigeCode/navop/releases), or [CNB](https://cnb.cool/navop-dev/navop/-/releases). Packages follow `navop-<version>-<label>.<ext>` and cover macOS, Windows, and Linux; every release includes checksums.
+
+The same source also builds two smaller editions: **Navop Shell** (SSH, terminals, and remote desktop) and **Navop Data** (databases and data browsing). They share Navop's native shell, AI, sync, and extension system and are intended for narrower workflows; most users can start with Navop itself.
+
+See [Installation and updates](./guide/install-update) for the package matrix, platform differences, and upgrade notes.
 
 ## Start here
 
-- [Quick start](./guide/quick-start)
-- [Installation and updates](./guide/install-update)
+- [Quick start: finish a first connection and task](./guide/quick-start)
+- [Installation and updates: packages, platforms, and data directories](./guide/install-update)
 - [Home, workspaces, and connections](./guide/workspace-connections)
 
 ## Find a workflow
 
-- [Database connections, SQL, import/export, and schema tools](./guide/database-connections)
-- [SQL editor, transactions, and query results](./guide/sql-editor)
-- [SSH, SFTP, port forwarding, and Agent Hub](./guide/ssh-terminal)
-- [FTP and FTPS remote files](./guide/ftp-remote-files)
-- [Remote desktop, serial, and server monitoring](./guide/remote-access)
-- [Native resource workbench (Docker and more)](./guide/resource-workbench)
-- [Notes Markdown preview and source editing](./guide/notes)
-- [AI Workbench, Navop Skill, and Public MCP](./guide/ai-workbench)
-- [Team sync and security](./guide/teams-sync-security)
-- [Settings and troubleshooting](./guide/settings-shortcuts)
+- Database connections, SQL, import/export, and schema tools: [Database connections](./guide/database-connections)
+- SQL editor, transactions, and query results: [SQL editor](./guide/sql-editor)
+- SSH, SFTP, port forwarding, and Agent Hub: [SSH and terminals](./guide/ssh-terminal)
+- FTP and FTPS remote files: [FTP and remote files](./guide/ftp-remote-files)
+- Remote desktop, serial, and server monitoring: [Remote access](./guide/remote-access)
+- Native resource workbench such as Docker: [Resource workbench](./guide/resource-workbench)
+- Notes Markdown preview and source editing: [Notes](./guide/notes)
+- AI Workbench, Navop Skill, and Public MCP: [AI and MCP](./guide/ai-workbench)
+- Team sync and security: [Team sync](./guide/teams-sync-security)
+- Settings and troubleshooting: [Settings and troubleshooting](./guide/settings-shortcuts)
+
+This guide is updated as Navop evolves. Before working with production databases, remote servers, write SQL, file overwrites, or bulk sync, confirm the current environment and scope.

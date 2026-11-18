@@ -69,13 +69,21 @@ fn fetch_manifest_url_parses_marketplace_manifest() {
 #[cfg(not(feature = "github-marketplace"))]
 #[test]
 fn missing_extension_manifest_env_uses_current_then_legacy_github() {
-    assert_eq!(
-        vec![
-            GITHUB_EXTENSION_MANIFEST_URL.to_string(),
-            LEGACY_GITHUB_EXTENSION_MANIFEST_URL.to_string(),
-        ],
-        manifest_urls_for_configured_url(None)
+    // 镜像偏好是进程级全局，这里只断言候选集合与首尾，不锁死中间顺序。
+    let urls = manifest_urls_for_configured_url(None);
+    assert!(
+        urls.contains(&crate::mirror::GITHUB_MARKETPLACE_MANIFEST_RELEASE_URL.to_string()),
+        "市场清单应优先使用 Release 快照: {urls:?}"
     );
+    assert!(
+        urls.contains(&crate::mirror::CNB_MARKETPLACE_MANIFEST_URL.to_string()),
+        "市场清单应包含 CNB 镜像候选: {urls:?}"
+    );
+    assert!(
+        urls.contains(&GITHUB_EXTENSION_MANIFEST_URL.to_string()),
+        "raw 文件应保留为最后的兜底: {urls:?}"
+    );
+    assert_eq!(LEGACY_GITHUB_EXTENSION_MANIFEST_URL, urls[urls.len() - 1]);
 }
 
 #[cfg(not(feature = "github-marketplace"))]
@@ -96,13 +104,15 @@ fn configured_manifest_urls_use_injected_github_fallback() {
 #[cfg(feature = "github-marketplace")]
 #[test]
 fn github_marketplace_feature_points_to_github_manifest() {
+    // GitHub 侧同样读固定 tag `manifest` 的 Release 快照，与 CNB 镜像同内容。
     assert_eq!(
-        "https://raw.githubusercontent.com/feigeCode/navop-extensions/main/manifest.json",
+        "https://github.com/feigeCode/navop-extensions/releases/download/manifest/manifest.json",
         DEFAULT_EXTENSION_MANIFEST_URL
     );
     assert_eq!(
         vec![
             DEFAULT_EXTENSION_MANIFEST_URL.to_string(),
+            crate::extension_downloader::GITHUB_EXTENSION_MANIFEST_URL.to_string(),
             crate::extension_downloader::LEGACY_GITHUB_EXTENSION_MANIFEST_URL.to_string(),
         ],
         crate::extension_downloader::manifest_urls_for_configured_url(None)
@@ -147,10 +157,8 @@ fn fetch_default_manifest_url_falls_back_to_github_when_r2_fails() {
         "https://onetcli.test.cn/extensions/manifest.json",
         requests[0].uri
     );
-    assert_eq!(
-        "https://raw.githubusercontent.com/feigeCode/navop-extensions/main/manifest.json",
-        requests[1].uri
-    );
+    // 自动模式下 CNB 镜像先于 GitHub 尝试（与应用更新侧的回退顺序对齐）。
+    assert_eq!(crate::mirror::CNB_MARKETPLACE_MANIFEST_URL, requests[1].uri);
 }
 
 #[cfg(not(feature = "github-marketplace"))]
@@ -159,7 +167,9 @@ fn fetch_default_manifest_url_falls_back_to_legacy_github_source() {
     let r2_manifest_url = "https://onetcli.test.cn/extensions/manifest.json".to_string();
     let client = Arc::new(FakeHttpClient::new(vec![
         Err(anyhow::anyhow!("r2 unavailable")),
-        Err(anyhow::anyhow!("current GitHub unavailable")),
+        Err(anyhow::anyhow!("current GitHub snapshot unavailable")),
+        Err(anyhow::anyhow!("cnb mirror unavailable")),
+        Err(anyhow::anyhow!("raw GitHub unavailable")),
         FakeHttpClient::response(
             200,
             r#"{
@@ -202,8 +212,14 @@ fn fetch_default_manifest_url_falls_back_to_legacy_github_source() {
         "https://onetcli.test.cn/extensions/manifest.json",
         requests[0].uri
     );
-    assert_eq!(GITHUB_EXTENSION_MANIFEST_URL, requests[1].uri);
-    assert_eq!(LEGACY_GITHUB_EXTENSION_MANIFEST_URL, requests[2].uri);
+    // 自动模式下 CNB 镜像先于 GitHub 尝试（与应用更新侧的回退顺序对齐）。
+    assert_eq!(crate::mirror::CNB_MARKETPLACE_MANIFEST_URL, requests[1].uri);
+    assert_eq!(
+        crate::mirror::GITHUB_MARKETPLACE_MANIFEST_RELEASE_URL,
+        requests[2].uri
+    );
+    assert_eq!(GITHUB_EXTENSION_MANIFEST_URL, requests[3].uri);
+    assert_eq!(LEGACY_GITHUB_EXTENSION_MANIFEST_URL, requests[4].uri);
 }
 
 #[cfg(not(feature = "github-marketplace"))]
@@ -242,7 +258,9 @@ fn legacy_github_manifest_keeps_extension_manifest_and_artifact_fallbacks_on_leg
     );
     let client = Arc::new(FakeHttpClient::new(vec![
         Err(anyhow::anyhow!("r2 unavailable")),
-        Err(anyhow::anyhow!("current GitHub unavailable")),
+        Err(anyhow::anyhow!("current GitHub snapshot unavailable")),
+        Err(anyhow::anyhow!("cnb mirror unavailable")),
+        Err(anyhow::anyhow!("raw GitHub unavailable")),
         FakeHttpClient::response(200, marketplace_manifest),
         Err(anyhow::anyhow!(
             "legacy relative extension manifest unavailable"
@@ -266,18 +284,25 @@ fn legacy_github_manifest_keeps_extension_manifest_and_artifact_fallbacks_on_leg
 
     assert!(staging.join("driver.json").exists());
     let requests = client.take_requests();
-    assert_eq!(LEGACY_GITHUB_EXTENSION_MANIFEST_URL, requests[2].uri);
+    // 自动模式下顺序：R2 → CNB → GitHub → raw → legacy。
+    assert_eq!(crate::mirror::CNB_MARKETPLACE_MANIFEST_URL, requests[1].uri);
+    assert_eq!(
+        crate::mirror::GITHUB_MARKETPLACE_MANIFEST_RELEASE_URL,
+        requests[2].uri
+    );
+    assert_eq!(GITHUB_EXTENSION_MANIFEST_URL, requests[3].uri);
+    assert_eq!(LEGACY_GITHUB_EXTENSION_MANIFEST_URL, requests[4].uri);
     assert_eq!(
         "https://raw.githubusercontent.com/feigeCode/onetcli-extensions/main/fake_pg/manifest.json",
-        requests[3].uri
+        requests[5].uri
     );
     assert_eq!(
         "https://github.com/feigeCode/onetcli-extensions/releases/download/fake_pg-v1.2.3/extension-manifest.json",
-        requests[4].uri
+        requests[6].uri
     );
     assert_eq!(
         "https://github.com/feigeCode/onetcli-extensions/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
-        requests[5].uri
+        requests[7].uri
     );
     fs::remove_dir_all(staging).unwrap();
 }
@@ -504,8 +529,9 @@ fn download_marketplace_entry_to_staging_resolves_v2_primary_url_from_manifest_p
         "https://onetcli.test.cn/extensions/fake_pg/1.2.3/fake_pg-driver-universal.tar.gz",
         requests[1].uri
     );
+    // 自动模式下资产回退顺序：CNB 镜像先于 GitHub。
     assert_eq!(
-        "https://github.com/feigeCode/navop-extensions/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
+        "https://cnb.cool/navop-dev/navop-extensions/-/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
         requests[2].uri
     );
     fs::remove_dir_all(staging).unwrap();
@@ -577,8 +603,9 @@ fn download_marketplace_entry_to_staging_resolves_v2_artifact_and_host_github_fa
         "https://onetcli.test.cn/extensions/fake_pg/1.2.3/fake_pg-driver-universal.tar.gz",
         requests[2].uri
     );
+    // 自动模式下资产回退顺序：CNB 镜像先于 GitHub。
     assert_eq!(
-        "https://github.com/feigeCode/navop-extensions/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
+        "https://cnb.cool/navop-dev/navop-extensions/-/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
         requests[3].uri
     );
     fs::remove_dir_all(staging).unwrap();
@@ -643,12 +670,13 @@ fn download_marketplace_entry_to_staging_falls_back_to_github_extension_manifest
         "https://onetcli.test.cn/extensions/fake_pg/manifest.json",
         requests[1].uri
     );
+    // 自动模式下清单与资产回退顺序：CNB 镜像先于 GitHub。
     assert_eq!(
-        "https://github.com/feigeCode/navop-extensions/releases/download/fake_pg-v1.2.3/extension-manifest.json",
+        "https://cnb.cool/navop-dev/navop-extensions/-/releases/download/fake_pg-v1.2.3/extension-manifest.json",
         requests[2].uri
     );
     assert_eq!(
-        "https://github.com/feigeCode/navop-extensions/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
+        "https://cnb.cool/navop-dev/navop-extensions/-/releases/download/fake_pg-v1.2.3/fake_pg-driver-universal.tar.gz",
         requests[3].uri
     );
     fs::remove_dir_all(staging).unwrap();

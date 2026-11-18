@@ -168,6 +168,111 @@ mod tests {
         );
     }
 
+    /// 回归：oh-my-posh / starship / p10k 在每个 precmd 里重写 `PS1`，会把注入时
+    /// 补上的 OSC 133;B 冲掉，导航端因此永远等不到 prompt-end 标记、握手卡满看门狗
+    /// （表现为「连上后要等 30 秒才能输入」）。trailer 钩子必须注册在 PROMPT_COMMAND
+    /// 末尾（即提示符框架之后），并在每轮按需把标记补回去、且不重复追加。
+    #[test]
+    fn bash_prompt_trailer_restores_prompt_end_marker_after_framework_rewrite() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+
+        let script_path = sourceable_script_for_test("prompt-trailer");
+        // 先把「提示符框架」的 hook 注册进 PROMPT_COMMAND，再 source 集成脚本，
+        // 复刻真实顺序：登录 rc 里的框架先注册，navop 之后才注入。
+        let output = Command::new("/bin/bash")
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
+            .arg(format!(
+                "__fake_posh_hook() {{ PS1='$ '; }}; \
+                 PROMPT_COMMAND=__fake_posh_hook; \
+                 source '{}'; trap - DEBUG; \
+                 case \"$PROMPT_COMMAND\" in \
+                   *__fake_posh_hook*__onetcli_prompt_trailer_bash*) echo ORDER=ok ;; \
+                   *) echo \"ORDER=bad:$PROMPT_COMMAND\" ;; \
+                 esac; \
+                 PS1='$ '; eval \"$PROMPT_COMMAND\"; \
+                 case \"$PS1\" in \
+                   *$'\\033]133;B\\007'*) echo MARKER=ok ;; \
+                   *) echo \"MARKER=missing:$PS1\" ;; \
+                 esac; \
+                 PS1='$ '; eval \"$PROMPT_COMMAND\"; rest=$PS1; count=0; \
+                 while [[ $rest == *$'\\033]133;B\\007'* ]]; do \
+                   rest=${{rest#*$'\\033]133;B\\007'}}; count=$((count + 1)); \
+                 done; \
+                 echo \"COUNT=$count\"",
+                script_path.display()
+            ))
+            .output()
+            .expect("run bash");
+        let _ = std::fs::remove_file(&script_path);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ORDER=ok"),
+            "trailer 钩子应排在提示符框架之后，否则标记会被框架再次冲掉，stdout: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("MARKER=ok"),
+            "框架重写 PS1 后应补回 OSC 133;B，stdout: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("COUNT=1"),
+            "每轮提示符只应有一个 OSC 133;B，不能重复追加，stdout: {stdout:?}"
+        );
+    }
+
+    /// 远端 rc 常把 PROMPT_COMMAND 写成以分号结尾的字符串（例如 `history -a;`）。
+    /// 追加 trailer 时若继续无条件加 `; `，会生成 `history -a;; ...`，bash 会在
+    /// 提示符阶段报 `syntax error near unexpected token ';'`。
+    #[test]
+    fn bash_prompt_trailer_handles_existing_trailing_semicolon() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+
+        let script_path = sourceable_script_for_test("prompt-trailer-semicolon");
+        let output = Command::new("/bin/bash")
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
+            .arg(format!(
+                "HISTFILE=/dev/null; PROMPT_COMMAND='history -a;'; \
+                 source '{}'; trap - DEBUG; printf '%s' \"$PROMPT_COMMAND\"",
+                script_path.display()
+            ))
+            .output()
+            .expect("run bash");
+        let _ = std::fs::remove_file(&script_path);
+
+        assert!(
+            output.status.success(),
+            "source integration script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let prompt_command = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            !prompt_command.contains("; ;") && !prompt_command.contains(";;"),
+            "existing trailing semicolon must not produce an empty command: {prompt_command:?}"
+        );
+
+        let parse = Command::new("/bin/bash")
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-n")
+            .arg("-c")
+            .arg(&prompt_command)
+            .output()
+            .expect("parse PROMPT_COMMAND");
+        assert!(
+            parse.status.success(),
+            "PROMPT_COMMAND is not valid bash: {}; value: {prompt_command:?}",
+            String::from_utf8_lossy(&parse.stderr)
+        );
+    }
+
     #[test]
     fn repeated_same_command_emits_record_each_time() {
         let bash = std::path::Path::new("/bin/bash");

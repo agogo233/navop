@@ -1,0 +1,283 @@
+use gpui::App;
+use gpui_component::setting::{SettingField, SettingGroup, SettingItem};
+use one_core::settings::{AppSettings, ToolExposureSettings, ToolExposureToolsetSettings};
+use rust_i18n::t;
+
+pub fn mcp_tool_exposure_setting_group(default_settings: &ToolExposureSettings) -> SettingGroup {
+    tool_exposure_group(ToolExposureSurface::Mcp, &default_settings.mcp)
+}
+
+pub fn agent_tool_exposure_setting_group(default_settings: &ToolExposureSettings) -> SettingGroup {
+    tool_exposure_group(ToolExposureSurface::Agent, &default_settings.agent)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolExposureSurface {
+    Mcp,
+    Agent,
+}
+
+impl ToolExposureSurface {
+    fn title_key(self) -> &'static str {
+        match self {
+            Self::Mcp => "Settings.General.ToolExposure.mcp_group_title",
+            Self::Agent => "Settings.General.ToolExposure.agent_group_title",
+        }
+    }
+
+    fn visible_items(self) -> &'static [ToolExposureItem] {
+        match self {
+            Self::Mcp => &ToolExposureItem::MCP_VISIBLE,
+            Self::Agent => &ToolExposureItem::AGENT_VISIBLE,
+        }
+    }
+
+    fn description_key(self) -> &'static str {
+        match self {
+            Self::Mcp => "Settings.General.ToolExposure.mcp_group_desc",
+            Self::Agent => "Settings.General.ToolExposure.agent_group_desc",
+        }
+    }
+
+    fn current<'a>(self, settings: &'a AppSettings) -> &'a ToolExposureToolsetSettings {
+        match self {
+            Self::Mcp => &settings.tool_exposure.mcp,
+            Self::Agent => &settings.tool_exposure.agent,
+        }
+    }
+
+    fn current_mut<'a>(self, settings: &'a mut AppSettings) -> &'a mut ToolExposureToolsetSettings {
+        match self {
+            Self::Mcp => &mut settings.tool_exposure.mcp,
+            Self::Agent => &mut settings.tool_exposure.agent,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolExposureItem {
+    Terminal,
+    TerminalSshExec,
+    TerminalExec,
+    Connections,
+    Sftp,
+    Redis,
+    Mongo,
+    Database,
+    Notes,
+    InternalFunctions,
+    Extensions,
+}
+
+impl ToolExposureItem {
+    const MCP_VISIBLE: [Self; 11] = [
+        Self::Terminal,
+        Self::TerminalSshExec,
+        Self::TerminalExec,
+        Self::Connections,
+        Self::Sftp,
+        Self::Redis,
+        Self::Mongo,
+        Self::Database,
+        Self::Notes,
+        Self::InternalFunctions,
+        Self::Extensions,
+    ];
+    const AGENT_VISIBLE: [Self; 11] = [
+        Self::Terminal,
+        Self::TerminalSshExec,
+        Self::TerminalExec,
+        Self::Connections,
+        Self::Sftp,
+        Self::Redis,
+        Self::Mongo,
+        Self::Database,
+        Self::Notes,
+        Self::InternalFunctions,
+        Self::Extensions,
+    ];
+
+    #[cfg(test)]
+    fn id(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::TerminalSshExec => "terminal_ssh_exec",
+            Self::TerminalExec => "terminal_exec",
+            Self::Connections => "connections",
+            Self::Sftp => "sftp",
+            Self::Redis => "redis",
+            Self::Mongo => "mongo",
+            Self::Database => "database",
+            Self::Notes => "notes",
+            Self::InternalFunctions => "internal_functions",
+            Self::Extensions => "extensions",
+        }
+    }
+
+    fn title_key(self) -> &'static str {
+        match self {
+            Self::Terminal => "Settings.General.ToolExposure.terminal",
+            Self::TerminalSshExec => "Settings.General.ToolExposure.terminal_ssh_exec",
+            Self::TerminalExec => "Settings.General.ToolExposure.terminal_exec",
+            Self::Connections => "Settings.General.ToolExposure.connections",
+            Self::Sftp => "Settings.General.ToolExposure.sftp",
+            Self::Redis => "Settings.General.ToolExposure.redis",
+            Self::Mongo => "Settings.General.ToolExposure.mongo",
+            Self::Database => "Settings.General.ToolExposure.database",
+            Self::Notes => "Settings.General.ToolExposure.notes",
+            Self::InternalFunctions => "Settings.General.ToolExposure.internal_functions",
+            Self::Extensions => "Settings.General.ToolExposure.extensions",
+        }
+    }
+
+    fn description_key(self) -> &'static str {
+        match self {
+            Self::Terminal => "Settings.General.ToolExposure.terminal_desc",
+            Self::TerminalSshExec => "Settings.General.ToolExposure.terminal_ssh_exec_desc",
+            Self::TerminalExec => "Settings.General.ToolExposure.terminal_exec_desc",
+            Self::Connections => "Settings.General.ToolExposure.connections_desc",
+            Self::Sftp => "Settings.General.ToolExposure.sftp_desc",
+            Self::Redis => "Settings.General.ToolExposure.redis_desc",
+            Self::Mongo => "Settings.General.ToolExposure.mongo_desc",
+            Self::Database => "Settings.General.ToolExposure.database_desc",
+            Self::Notes => "Settings.General.ToolExposure.notes_desc",
+            Self::InternalFunctions => "Settings.General.ToolExposure.internal_functions_desc",
+            Self::Extensions => "Settings.General.ToolExposure.extensions_desc",
+        }
+    }
+
+    fn get(self, settings: &ToolExposureToolsetSettings) -> bool {
+        match self {
+            Self::Terminal => settings.terminal,
+            Self::TerminalSshExec => settings.terminal_ssh_exec,
+            Self::TerminalExec => settings.terminal_exec,
+            Self::Connections => settings.connections,
+            Self::Sftp => settings.sftp,
+            Self::Redis => settings.redis,
+            Self::Mongo => settings.mongo,
+            Self::Database => settings.database,
+            Self::Notes => settings.notes,
+            Self::InternalFunctions => settings.internal_functions,
+            Self::Extensions => settings.extensions,
+        }
+    }
+
+    fn set(self, settings: &mut ToolExposureToolsetSettings, enabled: bool) {
+        match self {
+            Self::Terminal => settings.terminal = enabled,
+            Self::TerminalSshExec => settings.terminal_ssh_exec = enabled,
+            Self::TerminalExec => settings.terminal_exec = enabled,
+            Self::Connections => settings.connections = enabled,
+            Self::Sftp => settings.sftp = enabled,
+            Self::Redis => settings.redis = enabled,
+            Self::Mongo => settings.mongo = enabled,
+            Self::Database => settings.database = enabled,
+            Self::Notes => settings.notes = enabled,
+            Self::InternalFunctions => settings.internal_functions = enabled,
+            Self::Extensions => settings.extensions = enabled,
+        }
+    }
+}
+
+fn tool_exposure_group(
+    surface: ToolExposureSurface,
+    default_settings: &ToolExposureToolsetSettings,
+) -> SettingGroup {
+    SettingGroup::new()
+        .title(t!(surface.title_key()))
+        .description(t!(surface.description_key()))
+        .items(tool_exposure_items(surface, default_settings))
+}
+
+fn tool_exposure_items(
+    surface: ToolExposureSurface,
+    default_settings: &ToolExposureToolsetSettings,
+) -> Vec<SettingItem> {
+    surface
+        .visible_items()
+        .iter()
+        // 没有 nsh 宿主时扩展工具集不存在，不展示只会保存无效开关的「扩展」项。
+        .filter(|item| crate::nsh_ui_available() || **item != ToolExposureItem::Extensions)
+        .map(|item| tool_exposure_item(surface, *item, default_settings))
+        .collect()
+}
+
+fn tool_exposure_item(
+    surface: ToolExposureSurface,
+    item: ToolExposureItem,
+    default_settings: &ToolExposureToolsetSettings,
+) -> SettingItem {
+    SettingItem::new(
+        t!(item.title_key()),
+        SettingField::checkbox(
+            move |cx: &App| item.get(surface.current(AppSettings::global(cx))),
+            move |val: bool, cx: &mut App| {
+                AppSettings::update_and_save(cx, |settings| {
+                    item.set(surface.current_mut(settings), val);
+                });
+                if surface == ToolExposureSurface::Agent {
+                    ai_chat_view::emit_agent_tool_config_changed(cx);
+                }
+            },
+        )
+        .default_value(item.get(default_settings)),
+    )
+    .description(t!(item.description_key()).to_string())
+}
+
+#[cfg(test)]
+fn mcp_tool_exposure_item_ids() -> Vec<&'static str> {
+    ToolExposureSurface::Mcp
+        .visible_items()
+        .iter()
+        .map(|item| item.id())
+        .collect()
+}
+
+#[cfg(test)]
+fn agent_tool_exposure_item_ids() -> Vec<&'static str> {
+    ToolExposureSurface::Agent
+        .visible_items()
+        .iter()
+        .map(|item| item.id())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expected_item_ids() -> Vec<&'static str> {
+        let mut ids = vec![
+            "terminal",
+            "terminal_ssh_exec",
+            "terminal_exec",
+            "connections",
+            "sftp",
+            "redis",
+            "mongo",
+            "database",
+            "notes",
+            "internal_functions",
+            "extensions",
+        ];
+        if !crate::nsh_ui_available() {
+            ids.pop();
+        }
+        ids
+    }
+
+    #[test]
+    fn mcp_tool_exposure_items_include_public_toolsets_and_terminal_flavors() {
+        let ids = mcp_tool_exposure_item_ids();
+
+        assert_eq!(expected_item_ids(), ids);
+    }
+
+    #[test]
+    fn agent_tool_exposure_items_include_internal_agent_toolsets() {
+        let ids = agent_tool_exposure_item_ids();
+
+        assert_eq!(expected_item_ids(), ids);
+    }
+}

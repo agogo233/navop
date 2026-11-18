@@ -485,6 +485,26 @@ pub trait TabContent: EventEmitter<TabContentEvent> + Render + Focusable {
         None
     }
 
+    /// Whether the tab can open the same connection in the SFTP dual-pane view.
+    fn can_open_sftp(&self, cx: &App) -> bool {
+        false
+    }
+
+    /// Open the tab's connection in the SFTP dual-pane view.
+    fn open_sftp(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        false
+    }
+
+    /// Whether this tab can disconnect its live connection without closing.
+    fn can_disconnect(&self, cx: &App) -> bool {
+        false
+    }
+
+    /// Disconnect the tab's live connection while keeping the tab open.
+    fn disconnect(&mut self, cx: &mut Context<Self>) -> bool {
+        false
+    }
+
     /// Build a new content view for a duplicated tab.
     fn duplicate(
         &mut self,
@@ -587,6 +607,10 @@ pub trait TabContentView: 'static + Send + Sync {
     fn can_duplicate(&self, cx: &App) -> bool;
     fn duplicate(&self, window: &mut Window, cx: &mut App) -> Option<Arc<dyn TabContentView>>;
     fn copy_label(&self, cx: &App) -> Option<String>;
+    fn can_open_sftp(&self, cx: &App) -> bool;
+    fn open_sftp(&self, window: &mut Window, cx: &mut App) -> bool;
+    fn can_disconnect(&self, cx: &App) -> bool;
+    fn disconnect(&self, cx: &mut App) -> bool;
     fn on_activate(&self, window: &mut Window, cx: &mut App);
     fn on_deactivate(&self, window: &mut Window, cx: &mut App);
     fn set_presentation_obscured(&self, obscured: bool, cx: &mut App);
@@ -670,6 +694,22 @@ impl<T: TabContent> TabContentView for Entity<T> {
 
     fn copy_label(&self, cx: &App) -> Option<String> {
         self.read(cx).copy_label(cx)
+    }
+
+    fn can_open_sftp(&self, cx: &App) -> bool {
+        self.read(cx).can_open_sftp(cx)
+    }
+
+    fn open_sftp(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| this.open_sftp(window, cx))
+    }
+
+    fn can_disconnect(&self, cx: &App) -> bool {
+        self.read(cx).can_disconnect(cx)
+    }
+
+    fn disconnect(&self, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| this.disconnect(cx))
     }
 
     fn duplicate(&self, window: &mut Window, cx: &mut App) -> Option<Arc<dyn TabContentView>> {
@@ -797,6 +837,20 @@ impl TabItem {
             from: SharedString::from(from.into()),
             metadata: HashMap::new(),
             content: Arc::new(content),
+        }
+    }
+
+    /// 用已擦除的 `TabContentView` 构造 tab，供领域注册表按 `TabIntent` 返回。
+    pub fn from_dyn(
+        id: impl Into<String>,
+        from: impl Into<String>,
+        content: Arc<dyn TabContentView>,
+    ) -> Self {
+        Self {
+            id: SharedString::from(id.into()),
+            from: SharedString::from(from.into()),
+            metadata: HashMap::new(),
+            content,
         }
     }
 
@@ -1646,6 +1700,20 @@ impl TabContainer {
         cx.notify();
     }
 
+    /// 按 id 激活已有 Tab；不存在时返回 false，由调用方决定是否新建。
+    pub fn activate_tab_by_id(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id() == id) else {
+            return false;
+        };
+        self.set_active_index(index, window, cx);
+        true
+    }
+
     pub fn add_tab_with_mode(
         &mut self,
         tab: TabItem,
@@ -1765,8 +1833,8 @@ impl TabContainer {
     /// 背后是空白页，切回该标签页还是空白。这个布尔量要表达的只有「GPUI 主内容真的盖住了
     /// 呈现」，浮层让位不该走撤销会话这条路。
     fn recompute_active_presentation_obscured(&mut self, cx: &mut Context<Self>) {
-        let obscured =
-            self.presentation_obscured_by_main_content || self.presentation_obscured_by_legacy_caller;
+        let obscured = self.presentation_obscured_by_main_content
+            || self.presentation_obscured_by_legacy_caller;
         if self.presentation_obscured == obscured {
             return;
         }
@@ -2675,6 +2743,24 @@ impl TabContainer {
         self.tabs.insert(insert_index, duplicate);
         self.set_active_index(insert_index, window, cx);
         cx.emit(TabContainerEvent::TabDuplicated { id: duplicate_id });
+    }
+
+    fn open_sftp_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !tab.content().open_sftp(window, cx) {
+            tracing::warn!("当前标签页无法打开 SFTP 文件视图");
+        }
+    }
+
+    fn disconnect_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !tab.content().disconnect(cx) {
+            tracing::warn!("当前标签页无法断开连接");
+        }
     }
 
     pub fn dump(&self, cx: &App) -> TabContainerState {
@@ -4426,6 +4512,18 @@ impl TabContainer {
                                     .get(idx)
                                     .map(|tab| tab.content().can_duplicate(cx))
                                     .unwrap_or(false);
+                                let can_open_sftp = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().can_open_sftp(cx))
+                                    .unwrap_or(false);
+                                let can_disconnect = view_for_menu
+                                    .read(cx)
+                                    .tabs
+                                    .get(idx)
+                                    .map(|tab| tab.content().can_disconnect(cx))
+                                    .unwrap_or(false);
                                 let closeable = view_for_menu
                                     .read(cx)
                                     .tabs
@@ -4483,6 +4581,40 @@ impl TabContainer {
                                         ),
                                     ),
                                 )
+                                .map(|menu| {
+                                    if !can_open_sftp {
+                                        return menu;
+                                    }
+                                    menu.item(
+                                        PopupMenuItem::new(
+                                            t!("TabContextMenu.open_sftp").to_string(),
+                                        )
+                                        .icon(IconName::FolderOpen)
+                                        .on_click(window.listener_for(
+                                            &view_for_menu,
+                                            move |this, _, window, cx| {
+                                                this.open_sftp_tab(idx, window, cx);
+                                            },
+                                        )),
+                                    )
+                                })
+                                .map(|menu| {
+                                    if !can_disconnect {
+                                        return menu;
+                                    }
+                                    menu.item(
+                                        PopupMenuItem::new(
+                                            t!("TabContextMenu.disconnect_session").to_string(),
+                                        )
+                                        .icon(IconName::StatusDisconnected)
+                                        .on_click(window.listener_for(
+                                            &view_for_menu,
+                                            move |this, _, _window, cx| {
+                                                this.disconnect_tab(idx, cx);
+                                            },
+                                        )),
+                                    )
+                                })
                                 .map(|menu| match copy_label {
                                     Some(label) => menu.item(
                                         PopupMenuItem::new(t!("TabContextMenu.copy_label", label = label.as_str()).to_string())
@@ -4630,6 +4762,28 @@ impl TabContainer {
                                         .on_click(move |_, window, cx| on_add_tab(window, cx)),
                                 ))
                             }))
+                    }),
+            )
+            .child(
+                div()
+                    .id("tab-bar-actions-drag")
+                    .debug_selector(|| "tab-bar-actions-drag".to_owned())
+                    .w(px(16.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .when(enable_titlebar_interactions, |this| {
+                        with_tab_bar_window_drag(this, &drag_state, window)
+                    })
+                    .when(enable_titlebar_interactions, |this| {
+                        this.when(is_linux, |this| {
+                            this.on_double_click(|_, window, _| window.zoom_window())
+                        })
+                        .when(is_macos, |this| {
+                            this.on_double_click(|_, window, _| window.titlebar_double_click())
+                        })
+                    })
+                    .when(show_window_controls, |this| {
+                        this.window_control_area(WindowControlArea::Drag)
                     }),
             )
             .child(
@@ -5420,6 +5574,19 @@ mod tests {
     }
 
     #[test]
+    fn tab_context_menu_opens_sftp_only_for_capable_tabs() {
+        let source = include_str!("tab_container.rs");
+        let implementation = source.split("mod tests").next().unwrap();
+        assert!(implementation.contains("fn can_open_sftp(&self, cx: &App) -> bool"));
+        assert!(implementation.contains("tab.content().can_open_sftp(cx)"));
+        assert!(implementation.contains("TabContextMenu.open_sftp"));
+        assert!(implementation.contains("this.open_sftp_tab(idx, window, cx)"));
+        assert!(implementation.contains("fn can_disconnect(&self, cx: &App) -> bool"));
+        assert!(implementation.contains("TabContextMenu.disconnect_session"));
+        assert!(implementation.contains("this.disconnect_tab(idx, cx)"));
+    }
+
+    #[test]
     fn core_locales_only_use_rust_i18n_percent_placeholders() {
         // rust-i18n 只替换 `%{name}`；写成 `{{name}}` 会原样渲染到界面上。
         let locales = include_str!("../locales/core.yml");
@@ -5472,6 +5639,18 @@ mod tests {
             (TAB_RENAME_MIN_WIDTH, px(320.0)),
             tab_width_bounds(px(320.0), true)
         );
+    }
+
+    #[gpui::test]
+    fn tab_item_from_dyn_wraps_erased_tab_content(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let tab = cx.new(|cx| TestTab::new("dyn", cx));
+            let item = TabItem::from_dyn("dyn-tab", "test", Arc::new(tab));
+
+            assert_eq!("dyn-tab", item.id().as_ref());
+            assert_eq!("test", item.from().as_ref());
+            assert_eq!("TestTab", item.content().content_key(cx));
+        });
     }
 
     #[gpui::test]

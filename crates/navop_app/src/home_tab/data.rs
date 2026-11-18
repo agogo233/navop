@@ -1,0 +1,216 @@
+use super::*;
+
+impl HomePage {
+    pub(super) fn load_workspaces(&mut self, cx: &mut Context<Self>) {
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let load_task = cx.background_spawn(async move {
+            (|| {
+                let repo = storage
+                    .get::<WorkspaceRepository>()
+                    .ok_or_else(|| anyhow::anyhow!("WorkspaceRepository not found"))?;
+                repo.list()
+            })()
+        });
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| match load_task.await {
+            Ok(mut workspaces) => {
+                sort_workspaces(&mut workspaces);
+                _ = this.update(cx, |this, cx| {
+                    this.workspaces = workspaces;
+                    cx.notify();
+                });
+            }
+            Err(e) => {
+                tracing::error!("Task join error: {}", e);
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn load_connections(&mut self, cx: &mut Context<Self>) {
+        if self.saved_connections_locked() {
+            tracing::warn!("主密钥未解锁，暂缓加载本地连接，避免将加密密码解密为空");
+            self.connections.clear();
+            cx.notify();
+            return;
+        }
+
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let load_task = cx.background_spawn(async move {
+            (|| {
+                let repo = storage
+                    .get::<ConnectionRepository>()
+                    .ok_or_else(|| anyhow::anyhow!("ConnectionRepository not found"))?;
+                Ok::<_, anyhow::Error>((repo.list()?, ()))
+            })()
+        });
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = load_task.await;
+            match result {
+                Ok((connections, ())) => {
+                    _ = this.update(cx, |this, cx| {
+                        this.connections = connections;
+                        this.prune_connection_selection();
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("Task join error: {}", e);
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn load_team_options(&mut self, cx: &mut Context<Self>) {
+        let Some(requested_user_id) = self.team_permissions.user_id().map(str::to_owned) else {
+            return;
+        };
+        let scope = CloudAccountScope::new(
+            self.auth_service.cloud_client().environment_id(),
+            requested_user_id.clone(),
+        );
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        let load_task = cx.background_spawn(async move {
+            get_cached_team_display_options_for_scope(&storage, &scope)
+        });
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let teams = load_task.await;
+            _ = this.update(cx, |this, cx| {
+                if this
+                    .team_permissions
+                    .replace_teams_for(&requested_user_id, teams)
+                {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn reorder_workspace_by_id(
+        &mut self,
+        source_id: i64,
+        target_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if source_id == target_id {
+            return;
+        }
+        let from = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == Some(source_id));
+        let to = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == Some(target_id));
+        if let (Some(from), Some(to)) = (from, to) {
+            self.reorder_workspaces(from, to, cx);
+        }
+    }
+
+    pub(super) fn reorder_workspaces(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.workspaces.len() || to >= self.workspaces.len() || from == to {
+            return;
+        }
+        let moved_workspace_id = self.workspaces[from].id;
+        let workspace = self.workspaces.remove(from);
+        self.workspaces.insert(to, workspace);
+
+        let orders: Vec<(i64, i32)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| workspace.id.map(|id| (id, index as i32)))
+            .collect();
+        for (index, workspace) in self.workspaces.iter_mut().enumerate() {
+            workspace.sort_order = Some(index as i32);
+        }
+
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        cx.spawn(async move |this, cx| {
+            let result = storage
+                .get::<WorkspaceRepository>()
+                .ok_or_else(|| anyhow::anyhow!("WorkspaceRepository not found"))
+                .and_then(|repo| repo.update_sort_orders(&orders));
+
+            _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Some(workspace_id) = moved_workspace_id {
+                            emit_connection_event(
+                                ConnectionDataEvent::WorkspaceUpdated { workspace_id },
+                                cx,
+                            );
+                        }
+                        if should_auto_onet_cloud_sync(cx, this.current_user.is_some()) {
+                            tracing::info!("工作区排序变化，自动触发云同步");
+                            this.trigger_sync(cx);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!("更新工作区排序失败: {error}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_local_home_data(&mut self, cx: &mut Context<Self>) {
+        self.load_workspaces(cx);
+        self.load_connections(cx);
+    }
+}
+
+pub(super) fn sort_workspaces(workspaces: &mut [Workspace]) {
+    workspaces.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then_with(|| crate::connection_sort::connection_name_cmp(&left.name, &right.name))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace(name: &str, sort_order: Option<i32>) -> Workspace {
+        let mut workspace = Workspace::new(name.to_string());
+        workspace.sort_order = sort_order;
+        workspace
+    }
+
+    #[test]
+    fn workspace_reload_preserves_drag_order() {
+        let mut workspaces = vec![
+            workspace("alpha", Some(2)),
+            workspace("zulu", Some(0)),
+            workspace("middle", Some(1)),
+        ];
+        sort_workspaces(&mut workspaces);
+        assert_eq!(
+            vec!["zulu", "middle", "alpha"],
+            workspaces
+                .iter()
+                .map(|ws| ws.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        sort_workspaces(&mut workspaces);
+        assert_eq!(Some(0), workspaces[0].sort_order);
+    }
+
+    #[test]
+    fn workspace_equal_orders_use_natural_names() {
+        for order in [None, Some(0)] {
+            let mut workspaces = vec![workspace("group-10", order), workspace("group-2", order)];
+            sort_workspaces(&mut workspaces);
+            assert_eq!("group-2", workspaces[0].name);
+        }
+    }
+}

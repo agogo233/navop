@@ -26,7 +26,7 @@ A Linux launch failing with "Failed to create surface" means the host lacks the 
 
 For models, check Provider state, API key, base URL, model, network, and quota. Missing tools can come from mode, resources, or permissions. ACP authorization does not remove Public MCP approval.
 
-For Public MCP, check running Navop, server mode, Node.js 20+, `npx`, client configuration, discovery permissions, Tool Exposure, and live schema. Reconnect after endpoint restart and never guess resource IDs.
+For Public MCP, check that the current app is running, server mode, Node.js 20+, `npx`, client configuration, discovery permissions, Tool Exposure, and live schema. Reconnect after endpoint restart and never guess resource IDs.
 
 ## Diagnose sync and update
 

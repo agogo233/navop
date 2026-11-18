@@ -1,0 +1,338 @@
+use std::path::PathBuf;
+
+use connection_import_protocol::ImporterDescriptor;
+use gpui::{
+    App, AppContext, AsyncApp, Context, FocusHandle, Focusable, PathPromptOptions, WeakEntity,
+    Window,
+};
+use one_core::gpui_tokio::Tokio;
+use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
+use rust_i18n::t;
+
+use super::connection_import_actions::{
+    ImportSaveResult, preview_import_records, preview_import_records_from_files, save_import_draft,
+    scan_import_sources,
+};
+use super::connection_import_model::{ImportRowSaveStatus, previewable_source_ids_after_scan};
+
+mod editor;
+mod model;
+mod render;
+
+pub(crate) use model::ConnectionImportWindowModel;
+
+pub(crate) struct ConnectionImportWindow {
+    focus_handle: FocusHandle,
+    model: ConnectionImportWindowModel,
+    loading_sources: bool,
+    scanning: bool,
+    status_message: Option<String>,
+}
+
+pub(crate) fn show_connection_import_window(window: &mut Window, cx: &mut App) {
+    // 导入窗口全局只有一个：所有入口共用同一个原生窗口。
+    open_reusable_popup_window(
+        PopupWindowOptions::new(t!("Home.import").to_string()).size(1040.0, 720.0),
+        "connection-import-window",
+        move |window, cx| cx.new(|cx| ConnectionImportWindow::new(window, cx)),
+        Some(window),
+        cx,
+    );
+}
+
+impl ConnectionImportWindow {
+    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+        let (descriptors, status_message) = load_importer_descriptors();
+        Self {
+            focus_handle,
+            model: ConnectionImportWindowModel::new(descriptors),
+            loading_sources: false,
+            scanning: false,
+            status_message,
+        }
+    }
+
+    fn refresh_sources(&mut self, cx: &mut Context<Self>) {
+        let (descriptors, status_message) = load_importer_descriptors();
+        self.model = ConnectionImportWindowModel::new(descriptors);
+        self.status_message = status_message;
+        self.loading_sources = false;
+        cx.notify();
+    }
+
+    fn scan_selected(&mut self, cx: &mut Context<Self>) {
+        let importer_ids = self.model.selected_source_ids();
+        if importer_ids.is_empty() || self.scanning {
+            return;
+        }
+        self.scanning = true;
+        self.status_message = None;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let scan_result = {
+                let ids = importer_ids.clone();
+                let task = Tokio::spawn(cx, async move { scan_import_sources(ids).await });
+                task.await.unwrap_or_else(|error| {
+                    Err(t!("Home.ConnectionImport.scan_task_failed", error = error).to_string())
+                })
+            };
+            let reports = match scan_result {
+                Ok(reports) => reports,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.scanning = false;
+                        this.status_message = Some(error);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let preview_ids = previewable_source_ids_after_scan(&importer_ids, &reports);
+            if this
+                .update(cx, |this, cx| {
+                    this.model.apply_scan_reports(reports);
+                    this.status_message = None;
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            let preview_result = {
+                let ids = preview_ids.clone();
+                let task = Tokio::spawn(cx, async move { preview_import_records(ids, true).await });
+                task.await.unwrap_or_else(|error| {
+                    Err(t!("Home.ConnectionImport.scan_task_failed", error = error).to_string())
+                })
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.scanning = false;
+                match preview_result {
+                    Ok(preview) => {
+                        this.model.apply_preview_records(preview.records);
+                        this.model
+                            .apply_preview_errors(&preview_ids, preview.errors);
+                        this.status_message = None;
+                    }
+                    Err(error) => {
+                        this.status_message = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn import_source_file(
+        &mut self,
+        importer_id: String,
+        prompt: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.scanning {
+            return;
+        }
+        let future = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(prompt.into()),
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let Ok(Ok(Some(paths))) = future.await else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.scanning = true;
+                this.status_message = None;
+                cx.notify();
+            });
+            let result = {
+                let id = importer_id.clone();
+                let selected_paths: Vec<PathBuf> = paths.into_iter().collect();
+                let task = Tokio::spawn(cx, async move {
+                    preview_import_records_from_files(id, selected_paths, true).await
+                });
+                task.await.unwrap_or_else(|error| {
+                    Err(t!(
+                        "Home.ConnectionImport.file_parse_task_failed",
+                        error = error
+                    )
+                    .to_string())
+                })
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.scanning = false;
+                match result {
+                    Ok(preview) => {
+                        let is_empty = preview.records.is_empty() && preview.errors.is_empty();
+                        let error_message =
+                            preview.errors.first().map(|error| error.message.clone());
+                        this.model.apply_preview_records(preview.records);
+                        this.model.apply_preview_errors(
+                            std::slice::from_ref(&importer_id),
+                            preview.errors,
+                        );
+                        this.status_message = error_message.or_else(|| {
+                            is_empty.then(|| {
+                                t!("Home.ConnectionImport.no_importable_connections").to_string()
+                            })
+                        });
+                    }
+                    Err(error) => this.status_message = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn import_source_directory(
+        &mut self,
+        importer_id: String,
+        prompt: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.scanning {
+            return;
+        }
+        let future = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some(prompt.into()),
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let Ok(Ok(Some(paths))) = future.await else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.scanning = true;
+                this.status_message = None;
+                cx.notify();
+            });
+            let result = {
+                let id = importer_id.clone();
+                let selected_paths: Vec<PathBuf> = paths.into_iter().collect();
+                let task = Tokio::spawn(cx, async move {
+                    preview_import_records_from_files(id, selected_paths, true).await
+                });
+                task.await.unwrap_or_else(|error| {
+                    Err(t!(
+                        "Home.ConnectionImport.directory_scan_task_failed",
+                        error = error
+                    )
+                    .to_string())
+                })
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.scanning = false;
+                match result {
+                    Ok(preview) => {
+                        let is_empty = preview.records.is_empty() && preview.errors.is_empty();
+                        let error_message =
+                            preview.errors.first().map(|error| error.message.clone());
+                        this.model.apply_preview_records(preview.records);
+                        this.model.apply_preview_errors(
+                            std::slice::from_ref(&importer_id),
+                            preview.errors,
+                        );
+                        this.status_message = error_message.or_else(|| {
+                            is_empty.then(|| {
+                                t!("Home.ConnectionImport.no_importable_connections").to_string()
+                            })
+                        });
+                    }
+                    Err(error) => this.status_message = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn save_row(&mut self, record_id: String, cx: &mut Context<Self>) {
+        let Some(draft) = self.model.draft(&record_id) else {
+            return;
+        };
+        self.model.mark_saving(&record_id);
+        match save_import_draft(&draft, cx) {
+            Ok(ImportSaveResult::Saved { connection_id }) => {
+                self.model.mark_saved(&record_id, connection_id);
+            }
+            Ok(ImportSaveResult::SkippedDuplicate { existing_name }) => {
+                self.model.mark_duplicate(&record_id, existing_name);
+            }
+            Err(error) => self.model.mark_failed(&record_id, error),
+        }
+        cx.notify();
+    }
+
+    fn save_selected(&mut self, cx: &mut Context<Self>) {
+        let row_ids = self.model.batch_save_row_ids();
+        for row_id in row_ids {
+            self.save_row(row_id, cx);
+        }
+    }
+}
+
+impl Focusable for ConnectionImportWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+fn load_importer_descriptors() -> (Vec<ImporterDescriptor>, Option<String>) {
+    let Some(root) = extension_runtime::extension::extensions_root() else {
+        return (
+            Vec::new(),
+            Some(t!("Home.ConnectionImport.extension_directory_unavailable").to_string()),
+        );
+    };
+    let composite_root =
+        root.join(extension_runtime::extension::ExtensionKind::Composite.dir_name());
+    match extension_runtime::connection_import_provider::list_manifest_connection_importers(
+        &composite_root,
+    ) {
+        Ok(importers) if importers.is_empty() => (
+            Vec::new(),
+            Some(t!("Home.ConnectionImport.no_import_extensions").to_string()),
+        ),
+        Ok(importers) => (
+            importers
+                .into_iter()
+                .map(|importer| importer.descriptor)
+                .collect(),
+            None,
+        ),
+        Err(error) => (
+            Vec::new(),
+            Some(
+                t!(
+                    "Home.ConnectionImport.load_extensions_failed",
+                    error = error
+                )
+                .to_string(),
+            ),
+        ),
+    }
+}
+
+fn is_save_candidate(status: &ImportRowSaveStatus) -> bool {
+    matches!(
+        status,
+        ImportRowSaveStatus::Pending | ImportRowSaveStatus::Failed { .. }
+    )
+}

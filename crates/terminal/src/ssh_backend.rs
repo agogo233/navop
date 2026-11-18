@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::Sleep;
@@ -14,7 +14,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
 use one_core::storage::SshAccountExpect;
 
-use ssh::{ChannelEvent, PtyConfig, SshChannel, SshClient, SshSessionManager};
+use ssh::{ChannelEvent, PtyConfig, SshChannel, SshClient, SshSessionManager, note_user_input};
 
 use crate::encoding::{TerminalEncoding, TerminalOutputDecoder, encode_terminal_input};
 use crate::exec_supervisor::{ExecEffect, ExecPhase, ExecSupervisor, TerminalInputSource};
@@ -23,6 +23,7 @@ use crate::osc::extract_osc_events;
 use crate::osc::{OscEvent, OscStreamParser};
 use crate::pty_backend::{GpuiEventProxy, TerminalEvent};
 use crate::recording::RecordingTap;
+use crate::session_password::SessionPasswordExpect;
 use crate::ssh_expect::SshLoginExpect;
 use crate::ssh_ingress::{SshActorInput, SshParserIngress, next_ssh_actor_input};
 use crate::ssh_shell_integration::{
@@ -50,10 +51,10 @@ const SHELL_INTEGRATION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DEGRADED_RECONNECT_BACKOFFS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
 /// 运行时注入必须快速完成；超时后中断内部命令并降级为裸终端。
 const SHELL_INTEGRATION_RUNTIME_TIMEOUT: Duration = Duration::from_secs(5);
-/// 就绪握手（等待首个输出 / 注入回显 / 首个 OSC 133;B）的看门狗。
+/// 就绪握手（等待首个输出 / 注入回显 / ready marker）的看门狗。
 ///
 /// 握手期间 actor 会暂存用户输入，等待远端输出把状态机推到可输入态。远端一旦
-/// 长时间不再产生输出（登录 expect 永不完成、shell 不回 prompt 结束标记等），
+/// 长时间不再产生输出（登录 expect 永不完成、注入脚本不回 ready marker 等），
 /// 握手就会永久停在暂存态，用户键盘输入被静默吞掉（Issue #206）。看门狗到期
 /// 后强制降级为裸终端并放行暂存输入，保证输入路径不会无限期失效。
 const SHELL_INTEGRATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -109,11 +110,12 @@ async fn wait_for_shell_integration_handshake(
 /// 只有仍会暂存用户输入的握手态才需要看门狗。
 ///
 /// 注意 `bool::then` 是「为真才取」，这里必须在 `accepts_terminal_input() == false`
-/// （即 `WaitingForFirstOutput` / `Injecting` / `AwaitingPrompt` /
-/// `PlainAwaitingOutput`）时武装；写成 `accepts_terminal_input().then(..)` 会正好
-/// 反过来，让看门狗只在不需要它的会话里到期。
+/// （即 `WaitingForFirstOutput` / `Bootstrapping` / `BootstrapReady` /
+/// `Injecting`）时武装；写成 `accepts_terminal_input().then(..)` 会正好反过来，
+/// 让看门狗只在不需要它的会话里到期。
 ///
-/// 状态机推进是单向的（可输入态不会再退回握手态），因此启动时判定一次即可。
+/// 状态机推进是单向的（可输入态不会再退回握手态）；收到 ready marker 后
+/// 状态机会直接进入 `Integrated`，看门狗随即撤销。
 fn arm_shell_integration_handshake_watchdog(
     shell_integration: &RuntimeShellIntegration,
 ) -> Option<ShellIntegrationHandshakeWatchdog> {
@@ -824,6 +826,29 @@ impl SshBackend {
             expect_password.as_deref(),
         )
         .context("invalid SSH account expect configuration")?;
+        // 会话内的 su / sudo 提示会反复出现，和一次性的登录期望分开处理。
+        let mut session_password = SessionPasswordExpect::new(
+            &account_expect.elevation,
+            expect_password.as_deref(),
+            init_commands.as_deref(),
+        );
+        // 一行 info 记录提权自动填入在本会话里的实际状态：用户反馈「没触发」时，
+        // 从日志就能看出是配置没开还是拿不到密码，不用再猜。
+        if session_password.is_enabled() {
+            tracing::info!(
+                target: "terminal.ssh.setup",
+                "本次会话已启用提权（su/sudo）密码自动填入"
+            );
+        } else {
+            tracing::info!(
+                target: "terminal.ssh.setup",
+                auto_fill = ?account_expect.elevation.auto_fill,
+                has_elevation_password = !account_expect.elevation.password.is_empty(),
+                has_login_password = expect_password.is_some(),
+                "本次会话未启用提权密码自动填入（未开启或没有可用密码）"
+            );
+        }
+        let setup_started_at = Instant::now();
         let (client, mut channel, shell_integration_requested) = Self::establish_channel(
             &session_manager,
             &pty_config,
@@ -832,6 +857,12 @@ impl SshBackend {
         )
         .await
         .map_err(add_connect_error_context)?;
+        tracing::debug!(
+            target: "terminal.ssh.setup",
+            connection_id,
+            elapsed_ms = setup_started_at.elapsed().as_millis() as u64,
+            "SSH 连接与交互通道建立完成"
+        );
         // Keep the exact transport generation with the actor so any late
         // failure report cannot invalidate a replacement published by another
         // shared consumer.
@@ -869,6 +900,7 @@ impl SshBackend {
             let mut zmodem_probe_flush = None;
             let mut shell_integration = RuntimeShellIntegration::new(shell_integration_requested);
             let mut shell_integration_timeout = None;
+            let mut shell_integration_injected_at: Option<Instant> = None;
             // 只有在握手态（输入被暂存）才需要看门狗；已可输入的会话不额外养定时器。
             let mut shell_integration_handshake =
                 arm_shell_integration_handshake_watchdog(&shell_integration);
@@ -937,6 +969,11 @@ impl SshBackend {
                         let (source, data) = pending_terminal_input
                             .pop()
                             .expect("pending terminal input should contain a chunk");
+                        if source == TerminalInputSource::User {
+                            // 侧边栏 SFTP 借用这条 SSH 连接时靠这个时钟让路；
+                            // 必须在发送前记录：发送本身也可能排在共享连接的上行队列里。
+                            note_user_input();
+                        }
                         if let Err(error) = send_terminal_data(&mut channel, &data)
                             .await
                             .context("failed to send terminal input over SSH")
@@ -952,11 +989,24 @@ impl SshBackend {
                     }
                     SshRuntimeInput::ShellIntegrationTimeout => {
                         shell_integration_timeout.take();
+                        let elapsed_ms = shell_integration_injected_at
+                            .take()
+                            .map(|started_at| started_at.elapsed().as_millis() as u64);
+                        let suppressed_bytes = shell_integration.suppressed_output().len();
+                        let saw_injection_echo = shell_integration.saw_injection_echo();
+                        let suppressed_snapshot = shell_integration.suppressed_output().to_vec();
+                        let phase_at_timeout = shell_integration.phase_name();
                         if shell_integration.on_timeout() {
+                            let tail_start = suppressed_snapshot.len().saturating_sub(400);
                             tracing::warn!(
                                 target: "terminal.ssh.setup",
                                 connection_id,
-                                "运行时 Shell Integration 注入超时，发送 Ctrl+C 并降级为裸终端"
+                                elapsed_ms,
+                                suppressed_bytes,
+                                saw_injection_echo,
+                                phase = phase_at_timeout,
+                                tail = %String::from_utf8_lossy(&suppressed_snapshot[tail_start..]).escape_debug(),
+                                "运行时 Shell Integration 初始化超时，发送 Ctrl+C 并降级为裸终端"
                             );
                             if let Err(error) = send_terminal_data(&mut channel, &[0x03])
                                 .await
@@ -965,6 +1015,10 @@ impl SshBackend {
                                 disconnect_error = Some(error);
                                 break;
                             }
+                            // 已发送 Ctrl+C 并切到 Plain，立即放行用户输入；
+                            // 不再等下一段输出才解除 deferred 队列。
+                            shell_ready = true;
+                            shell_integration_handshake.take();
                         }
                     }
                     SshRuntimeInput::ShellIntegrationHandshakeTimeout => {
@@ -1034,58 +1088,20 @@ impl SshBackend {
                                                     .context("failed to send Ctrl-C over SSH")
                                                 {
                                                     Ok(()) => {
-                                                        let _ = result.send(
-                                                            Ok(TerminalControlOutput {
+                                                        let _ = result.send(Ok(
+                                                            TerminalControlOutput {
                                                                 action: request.action,
                                                                 sent: true,
                                                                 readiness_before: Some(
                                                                     readiness_before,
                                                                 ),
-                                                            }),
-                                                        );
+                                                            },
+                                                        ));
                                                     }
                                                     Err(error) => {
-                                                        let _ = result.send(
-                                                            Err(TerminalControlError::Disconnected),
-                                                        );
-                                                        disconnect_error = Some(error);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                let _ = result.send(Err(error));
-                                            }
-                                        }
-                                    }
-                                    TerminalControlAction::Reintegrate => {
-                                        // 嵌套 shell（sudo -i / su）丢失 integration 后，
-                                        // readiness 卡死在瞬态。注入运行时集成脚本：
-                                        // 新提示符的 OSC InputStart 会无条件把 readiness
-                                        // 翻回 Ready，supervisor 状态自愈。
-                                        match exec_supervisor.reintegrate_shell() {
-                                            Ok(()) => {
-                                                let command = crate::ssh_shell_integration::
-                                                    runtime_shell_integration_command();
-                                                match send_terminal_data(&mut channel, &command)
-                                                    .await
-                                                    .context(
-                                                        "failed to inject shell integration over SSH",
-                                                    )
-                                                {
-                                                    Ok(()) => {
-                                                        let _ = result.send(
-                                                            Ok(TerminalControlOutput {
-                                                                action: request.action,
-                                                                sent: true,
-                                                                readiness_before: None,
-                                                            }),
-                                                        );
-                                                    }
-                                                    Err(error) => {
-                                                        let _ = result.send(
-                                                            Err(TerminalControlError::Disconnected),
-                                                        );
+                                                        let _ = result.send(Err(
+                                                            TerminalControlError::Disconnected,
+                                                        ));
                                                         disconnect_error = Some(error);
                                                         break;
                                                     }
@@ -1303,16 +1319,83 @@ impl SshBackend {
                         break 'actor;
                     }
                 }
+                if session_password.is_enabled() {
+                    let observed = String::from_utf8_lossy(&data);
+                    if let Some(send) =
+                        session_password.observe(&observed, std::time::Instant::now())
+                    {
+                        if let Err(error) = send_terminal_data(&mut channel, &send)
+                            .await
+                            .context("failed to send SSH session password response")
+                        {
+                            disconnect_error = Some(error);
+                            break 'actor;
+                        }
+                    }
+                }
                 let was_injecting = shell_integration.is_injecting();
                 let (data, integration_ready) = match shell_integration.filter_output(data) {
                     FilteredShellOutput::Suppressed => continue,
+                    FilteredShellOutput::BootstrapReady => {
+                        shell_integration_timeout.take();
+                        if let Err(error) =
+                            send_terminal_data(&mut channel, shell_integration.injection_command())
+                                .await
+                                .context("failed to inject runtime shell integration")
+                        {
+                            disconnect_error = Some(error);
+                            break 'actor;
+                        }
+                        shell_integration.begin_injection();
+                        tracing::debug!(
+                            target: "terminal.ssh.setup",
+                            connection_id,
+                            elapsed_ms = setup_started_at.elapsed().as_millis() as u64,
+                            injection_len = shell_integration.injection_command().len(),
+                            "已发送运行时 Shell Integration 注入命令"
+                        );
+                        shell_integration_injected_at = Some(Instant::now());
+                        shell_integration_timeout = Some(Box::pin(tokio::time::sleep(
+                            SHELL_INTEGRATION_RUNTIME_TIMEOUT,
+                        )));
+                        continue;
+                    }
                     FilteredShellOutput::Forward { data, ready } => (data, ready),
                 };
                 if was_injecting && !shell_integration.is_injecting() {
                     shell_integration_timeout.take();
                 }
-                if integration_ready == ShellIntegrationReady::Plain {
-                    shell_ready = true;
+                match integration_ready {
+                    ShellIntegrationReady::Integrated => {
+                        if let Some(started_at) = shell_integration_injected_at.take() {
+                            tracing::debug!(
+                                target: "terminal.ssh.setup",
+                                connection_id,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                total_ms = setup_started_at.elapsed().as_millis() as u64,
+                                "运行时 Shell Integration 已就绪"
+                            );
+                        }
+                        shell_ready = true;
+                        shell_integration_handshake.take();
+                    }
+                    ShellIntegrationReady::Failed => {
+                        if let Some(started_at) = shell_integration_injected_at.take() {
+                            tracing::warn!(
+                                target: "terminal.ssh.setup",
+                                connection_id,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                "运行时 Shell Integration 注入命令执行失败，立即降级为裸终端"
+                            );
+                        }
+                        shell_ready = true;
+                        shell_integration_handshake.take();
+                    }
+                    ShellIntegrationReady::Plain => {
+                        shell_ready = true;
+                        shell_integration_handshake.take();
+                    }
+                    ShellIntegrationReady::None => {}
                 }
                 if data.is_empty() {
                     continue;
@@ -1346,9 +1429,11 @@ impl SshBackend {
                         }
                         OscEvent::InputStart => {
                             let _ = event_tx.send(TerminalEvent::InputStart);
-                            // 133;B: prompt 渲染完，用户可以输入了
-                            // 第一次收到时发送 init_commands
+                            // 133;B: prompt 已渲染。运行时注入会在 ready marker
+                            // 时更早放行输入，这里仍负责 legacy 检测与 init_commands。
                             shell_integration.on_input_start();
+                            // 已经可以输入，握手看门狗没必要留着了。
+                            shell_integration_handshake.take();
                             if !shell_ready {
                                 shell_ready = true;
                             }
@@ -1374,14 +1459,15 @@ impl SshBackend {
                     expect_responded,
                 ) {
                     if let Err(error) =
-                        send_terminal_data(&mut channel, shell_integration.injection_command())
+                        send_terminal_data(&mut channel, shell_integration.bootstrap_command())
                             .await
-                            .context("failed to inject runtime shell integration")
+                            .context("failed to bootstrap runtime shell integration")
                     {
                         disconnect_error = Some(error);
                         break 'actor;
                     }
-                    shell_integration.begin_injection();
+                    shell_integration.begin_bootstrap();
+                    shell_integration_injected_at = Some(Instant::now());
                     shell_integration_timeout = Some(Box::pin(tokio::time::sleep(
                         SHELL_INTEGRATION_RUNTIME_TIMEOUT,
                     )));

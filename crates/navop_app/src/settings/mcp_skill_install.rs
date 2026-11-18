@@ -1,0 +1,269 @@
+use gpui::{App, AppContext, ParentElement, Styled, Window, div};
+use gpui_component::{
+    ActiveTheme, Disableable, WindowExt,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    notification::Notification,
+    setting::{SettingField, SettingItem},
+    v_flex,
+};
+use public_mcp::client_config::ClientConfigInstall;
+use rust_i18n::t;
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillTarget {
+    Codex,
+    Agents,
+}
+
+const NAVOP_CLI_PACKAGE: &str = "@navop/cli@latest";
+
+impl SkillTarget {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Agents => "agents",
+        }
+    }
+
+    fn button_id(self) -> &'static str {
+        match self {
+            Self::Codex => "mcp-install-codex-skill",
+            Self::Agents => "mcp-install-agents-skill",
+        }
+    }
+
+    fn title_key(self) -> &'static str {
+        match self {
+            Self::Codex => "Settings.General.Mcp.install_codex_skill",
+            Self::Agents => "Settings.General.Mcp.install_agents_skill",
+        }
+    }
+
+    fn user_path(self) -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        Some(match self {
+            Self::Codex => home.join(".codex/skills/navop"),
+            Self::Agents => home.join(".agents/skills/navop"),
+        })
+    }
+}
+
+pub(crate) fn mcp_skill_install_items() -> Vec<SettingItem> {
+    [SkillTarget::Codex, SkillTarget::Agents]
+        .into_iter()
+        .map(mcp_skill_install_item)
+        .collect()
+}
+
+fn mcp_skill_install_item(target: SkillTarget) -> SettingItem {
+    SettingItem::new(
+        t!(target.title_key()),
+        SettingField::render(move |_, _, cx| {
+            let path = target.user_path();
+            let installed = path
+                .as_ref()
+                .is_some_and(|path| path.join("SKILL.md").is_file());
+            let status = match path.as_ref() {
+                Some(path) if installed => t!(
+                    "Settings.General.Mcp.skill_status_installed",
+                    path = path.display().to_string()
+                )
+                .to_string(),
+                Some(path) => t!(
+                    "Settings.General.Mcp.skill_status_not_installed",
+                    path = path.display().to_string()
+                )
+                .to_string(),
+                None => t!("Settings.General.Mcp.skill_status_home_unavailable").to_string(),
+            };
+            let label = if installed {
+                t!("Settings.General.Mcp.update_skill")
+            } else {
+                t!("Settings.General.Mcp.install_skill")
+            };
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex().child(
+                        Button::new(target.button_id())
+                            .primary()
+                            .label(label.to_string())
+                            .disabled(path.is_none())
+                            .on_click(move |_, window, cx| {
+                                install_skill(target, installed, window, cx)
+                            }),
+                    ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                )
+        }),
+    )
+    .description(t!("Settings.General.Mcp.install_skill_desc").to_string())
+}
+
+fn skill_install_args(target: SkillTarget, force: bool) -> Vec<String> {
+    let mut args = vec![
+        "-y".to_string(),
+        NAVOP_CLI_PACKAGE.to_string(),
+        "skill".to_string(),
+        "install".to_string(),
+        "--target".to_string(),
+        target.id().to_string(),
+        "--scope".to_string(),
+        "user".to_string(),
+        "--json".to_string(),
+    ];
+    if force {
+        args.push("--force".to_string());
+    }
+    args
+}
+
+/// 安装动作的两类失败：启动器缺失要给可操作提示，其余走通用错误。
+enum SkillInstallFailure {
+    LauncherMissing,
+    Spawn(std::io::Error),
+}
+
+fn install_skill(target: SkillTarget, force: bool, window: &mut Window, cx: &mut App) {
+    // 目标目录是跨应用的全局目录（~/.codex、~/.agents），没有按构建模式区分的隔离位。
+    // 开发构建一旦安装，就会把开发版内容写进正式用户在用的 Skill 目录；因此开发态直接跳过。
+    if !one_core::app_paths::is_installed() {
+        tracing::info!(
+            target = target.id(),
+            "Skipping Navop Skill installation: development build"
+        );
+        window.push_notification(
+            Notification::warning(
+                t!("Settings.General.Mcp.skill_install_skipped_in_development").to_string(),
+            )
+            .autohide(true),
+            cx,
+        );
+        window.refresh();
+        return;
+    }
+
+    let install = ClientConfigInstall::from_current_app();
+    let launcher = install.launch_spec.command;
+    let launcher_name = launcher.clone();
+    let args = skill_install_args(target, force);
+    let target_window = window.window_handle();
+    let task = cx.background_spawn(smol::unblock(move || {
+        // macOS 上从 Finder / Dock 启动的进程只继承最小 PATH，Homebrew、nvm 等目录
+        // 都不在其中；直接 spawn `npx` 会以 ENOENT 失败。解析真实路径并补全子进程
+        // PATH（`npx` 的 shebang 是 `#!/usr/bin/env node`）后再执行。
+        let Some(mut command) = process_util::build_command(&launcher, &args) else {
+            return Err(SkillInstallFailure::LauncherMissing);
+        };
+        // `npx` / `node` 这类启动器是控制台程序：无控制台的 GUI 进程直接 spawn
+        // 会在 Windows 上闪一个控制台窗口，统一走后台子进程约定隐藏。
+        process_util::configure_background_child(&mut command);
+        command.output().map_err(SkillInstallFailure::Spawn)
+    }));
+
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            let _ = cx.update_window(target_window, |_, window, cx| {
+                let notification = match result {
+                    Ok(output) if output.status.success() => Notification::success(
+                        t!("Settings.General.Mcp.install_skill_success").to_string(),
+                    ),
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let error = if stderr.is_empty() {
+                            String::from_utf8_lossy(&output.stdout).trim().to_string()
+                        } else {
+                            stderr
+                        };
+                        Notification::error(
+                            t!("Settings.General.Mcp.install_skill_failed", error = error)
+                                .to_string(),
+                        )
+                    }
+                    Err(SkillInstallFailure::LauncherMissing) => Notification::error(
+                        t!(
+                            "Settings.General.Mcp.skill_install_launcher_missing",
+                            command = launcher_name
+                        )
+                        .to_string(),
+                    ),
+                    Err(SkillInstallFailure::Spawn(error)) => Notification::error(
+                        t!(
+                            "Settings.General.Mcp.install_skill_failed",
+                            error = error.to_string()
+                        )
+                        .to_string(),
+                    ),
+                };
+                window.push_notification(notification.autohide(true), cx);
+                window.refresh();
+            });
+        })
+        .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_install_uses_latest_cli_package_without_a_shell() {
+        let args = skill_install_args(SkillTarget::Codex, false);
+
+        assert_eq!("-y", args[0]);
+        assert_eq!(NAVOP_CLI_PACKAGE, args[1]);
+        assert_eq!(
+            vec![
+                "skill", "install", "--target", "codex", "--scope", "user", "--json"
+            ],
+            args[2..]
+        );
+        assert!(!args.iter().any(|arg| arg == "--force"));
+    }
+
+    #[test]
+    fn updating_an_existing_skill_requires_explicit_force() {
+        let args = skill_install_args(SkillTarget::Agents, true);
+
+        assert!(args.iter().any(|arg| arg == "--force"));
+        assert!(args.windows(2).any(|args| args == ["--target", "agents"]));
+    }
+
+    /// 结构契约：安装技能前必须解析启动器的真实路径。
+    ///
+    /// macOS 从 Finder / Dock 启动的 GUI 进程 PATH 只有
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`，裸 `npx` 会以 ENOENT 失败。
+    #[test]
+    fn skill_install_resolves_the_launcher_before_spawning() {
+        let source = include_str!("mcp_skill_install.rs");
+
+        assert!(source.contains("process_util::build_command(&launcher, &args)"));
+        assert!(source.contains("SkillInstallFailure::LauncherMissing"));
+
+        // 只看测试模块之前的生产代码：本测试自身就含有这些字面量。
+        let production = source
+            .split("mod tests")
+            .next()
+            .expect("source contains a production section");
+        assert!(!production.contains("Command::new(launcher)"));
+    }
+
+    /// 结构契约：安装技能的外部启动器必须隐藏控制台窗口。
+    ///
+    /// `npx` / `node` 这类控制台程序被无控制台的 GUI 进程直接 spawn 时，Windows
+    /// 会新建一个控制台窗口。
+    #[test]
+    fn skill_install_hides_the_background_console() {
+        let source = include_str!("mcp_skill_install.rs");
+
+        assert!(source.contains("process_util::configure_background_child(&mut command)"));
+    }
+}

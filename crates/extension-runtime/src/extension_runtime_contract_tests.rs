@@ -9,16 +9,8 @@ use crate::{
         DocumentExporterContrib, Engines, HtmlPreviewTransformContrib, IpcEntry, IpcRuntime,
         IpcTransport, Manifest, MenuCommandRef, MenuContrib, ResourceConnectionContrib,
         ResourceConnectionFieldType, ResourceConnectionForm, ResourceConnectionFormField,
-        ResourceConnectionFormTab, ResourceConnectionTerminal, ResourceWorkbenchBinding,
-        ResourceWorkbenchBindingSource, ResourceWorkbenchColumn, ResourceWorkbenchColumnStyle,
-        ResourceWorkbenchColumnType, ResourceWorkbenchContrib, ResourceWorkbenchEffect,
-        ResourceWorkbenchOpen, ResourceWorkbenchOperation, ResourceWorkbenchOperationMode,
-        ResourceWorkbenchPage, ResourceWorkbenchPagination, ResourceWorkbenchPaginationKind,
-        ResourceWorkbenchPrimitive, ResourceWorkbenchRenderer, ResourceWorkbenchRendererKind,
-        ResourceWorkbenchRowAction, ResourceWorkbenchTable, ResourceWorkbenchTerminal,
-        ResourceWorkbenchTerminalOperation, ResourceWorkbenchValueType, ResourceWorkbenchViewer,
-        ResourceWorkbenchViewerFormat, RuntimeSection, ShellHostModule, ShellSurface,
-        ShellViewContrib, WasmRuntime, WasmRuntimeKind,
+        ResourceConnectionFormTab, ResourceConnectionTerminal, RuntimeSection, ShellAppContrib,
+        ShellHostModule, WasmRuntime, WasmRuntimeKind,
         contributes::{
             RemoteFileEditorCommandContrib, RemoteFileEditorContrib, RemoteFileEditorLaunchMode,
         },
@@ -72,6 +64,130 @@ fn runtime_catalog_rejects_wasm_command_with_missing_runtime() {
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
 
     assert!(error.to_string().contains("unknown runtime_id"));
+}
+
+#[test]
+fn runtime_catalog_registers_nsh_command_with_shell_app() {
+    // kind == "nsh" 的命令：注册进 CommandRegistry，handler 带 route，
+    // `nsh_command` 能查出 (extension_id, route)。
+    let mut manifest = shell_manifest();
+    manifest.contributes.shell_app = Some(shell_app("ui/explorer.js"));
+    manifest.contributes.commands.push(CommandContrib {
+        id: "example.open_explorer".to_string(),
+        title: "打开资源浏览器".to_string(),
+        category: String::new(),
+        icon: None,
+        enablement_when: None,
+        handler: CommandHandlerContrib {
+            kind: "nsh".to_string(),
+            runtime_id: String::new(),
+            function: None,
+            route: Some("tables".to_string()),
+        },
+    });
+
+    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
+
+    assert_eq!(
+        Some(("com.example.tools".to_string(), Some("tables".to_string()))),
+        catalog.nsh_command("example.open_explorer")
+    );
+    // nsh 命令不能走 wasm 绑定：component_binding 路径应报 UnsupportedCommand。
+    assert!(
+        catalog
+            .component_permissions_for_command("example.open_explorer")
+            .is_err()
+    );
+    // wasm 命令不会被误判为 nsh。
+    assert_eq!(None, catalog.nsh_command("example.does_not_exist"));
+}
+
+#[test]
+fn runtime_catalog_rejects_nsh_command_without_shell_app() {
+    // kind == "nsh" 但扩展没有 shellApp：安装期报 InvalidShellApp。
+    let mut manifest = base_manifest();
+    manifest.contributes.commands.push(CommandContrib {
+        id: "example.open_missing".to_string(),
+        title: "打开不存在的 app".to_string(),
+        category: String::new(),
+        icon: None,
+        enablement_when: None,
+        handler: CommandHandlerContrib {
+            kind: "nsh".to_string(),
+            runtime_id: String::new(),
+            function: None,
+            route: None,
+        },
+    });
+
+    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
+
+    assert!(error.to_string().contains("handler kind `nsh`"));
+    assert!(error.to_string().contains("shellApp"));
+}
+
+#[test]
+fn runtime_catalog_registers_panels_with_shell_app() {
+    // contributes.panels：注册进 catalog，anchor 过滤 + order 排序。
+    use crate::extension::manifest::PanelContrib;
+
+    let mut manifest = shell_manifest();
+    manifest.contributes.shell_app = Some(shell_app("ui/explorer.js"));
+    manifest.contributes.panels = vec![
+        PanelContrib {
+            id: "example.monitor".to_string(),
+            title: Some("监控".to_string()),
+            icon: None,
+            anchor: "terminal-sidebar".to_string(),
+            order: 10,
+            when: None,
+        },
+        PanelContrib {
+            id: "example.quick".to_string(),
+            title: Some("快捷".to_string()),
+            icon: None,
+            anchor: "terminal-sidebar".to_string(),
+            order: -5,
+            when: Some("".to_string()),
+        },
+    ];
+
+    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
+
+    // anchor 过滤 + order 排序（quick 在前）。
+    let panels = catalog.panels_for_anchor("terminal-sidebar");
+    assert_eq!(2, panels.len());
+    assert_eq!("example.quick", panels[0].id);
+    assert_eq!("example.monitor", panels[1].id);
+    // 精确查询。
+    let monitor = catalog
+        .panel("com.example.tools", "example.monitor")
+        .expect("面板应能按 (extension, panel) 查到");
+    assert_eq!("监控", monitor.title);
+    // entry 继承 shellApp.entry。
+    assert!(monitor.entry_path.ends_with("ui/explorer.js"));
+    // 不存在的 anchor 查不到。
+    assert!(catalog.panels_for_anchor("main-sidebar").is_empty());
+}
+
+#[test]
+fn runtime_catalog_rejects_panels_without_shell_app() {
+    // 声明 panels 但没有 shellApp：安装期报 InvalidPanel。
+    use crate::extension::manifest::PanelContrib;
+
+    let mut manifest = base_manifest();
+    manifest.contributes.panels = vec![PanelContrib {
+        id: "example.orphan".to_string(),
+        title: Some("孤儿面板".to_string()),
+        icon: None,
+        anchor: "terminal-sidebar".to_string(),
+        order: 0,
+        when: None,
+    }];
+
+    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
+
+    assert!(error.to_string().contains("shellApp"), "错误信息：{error}");
 }
 
 #[test]
@@ -192,43 +308,36 @@ fn runtime_catalog_registers_remote_file_editors() {
 }
 
 #[test]
-fn runtime_catalog_registers_shell_view_with_resolved_backend() {
+fn runtime_catalog_registers_shell_app_with_resolved_backend() {
     let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
+    manifest.contributes.shell_app = Some(shell_app("ui/explorer.js"));
 
     let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
-    let contribution = catalog.shell_view("com.example.tools", "explorer").unwrap();
+    let app = catalog.shell_app("com.example.tools").unwrap();
 
-    assert_eq!("com.example.tools::explorer", contribution.view_key);
-    assert_eq!("Example Explorer", contribution.title);
+    assert_eq!("Example Explorer", app.title);
     assert_eq!(
         PathBuf::from("/tmp/com.example.tools/ui/explorer.js"),
-        contribution.entry_path
+        app.entry_path
     );
     assert_eq!(
         Some("com.example.tools::provider"),
-        contribution.backends.get("search").map(String::as_str)
+        app.backends.get("search").map(String::as_str)
     );
     assert_eq!(
-        vec![ShellHostModule::Context, ShellHostModule::Resource],
-        contribution.modules.iter().copied().collect::<Vec<_>>()
+        vec![ShellHostModule::Resource],
+        app.modules.iter().copied().collect::<Vec<_>>()
     );
     assert_eq!(
         vec!["shell:exec", "spawn:./bin/provider", "secrets:read:self.*"],
-        contribution.permissions
+        app.permissions
     );
 }
 
 #[test]
-fn runtime_catalog_registers_extension_connection_with_optional_shell_view() {
+fn runtime_catalog_registers_extension_connection_with_optional_route() {
     let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
+    manifest.contributes.shell_app = Some(shell_app("ui/explorer.js"));
     manifest.contributes.connections.push(resource_connection());
 
     let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
@@ -238,7 +347,7 @@ fn runtime_catalog_registers_extension_connection_with_optional_shell_view() {
 
     assert_eq!("com.example.tools::provider", connection.runtime_id);
     assert_eq!("elasticsearch", connection.resource_type);
-    assert_eq!(Some("explorer"), connection.shell_view_id.as_deref());
+    assert_eq!(Some("explorer"), connection.route.as_deref());
     assert_eq!(2, connection.form.tabs[0].fields.len());
 }
 
@@ -246,7 +355,7 @@ fn runtime_catalog_registers_extension_connection_with_optional_shell_view() {
 fn runtime_catalog_registers_headless_extension_connection() {
     let mut manifest = shell_manifest();
     let mut connection = resource_connection();
-    connection.shell_view_id = None;
+    connection.route = None;
     manifest.contributes.connections.push(connection);
 
     let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
@@ -255,7 +364,7 @@ fn runtime_catalog_registers_headless_extension_connection() {
         catalog
             .resource_connection("com.example.tools", "search")
             .unwrap()
-            .shell_view_id
+            .route
             .is_none()
     );
 }
@@ -272,7 +381,7 @@ fn runtime_catalog_registers_terminal_connection_without_provider_runtime() {
         .unwrap();
 
     assert_eq!("", connection.runtime_id);
-    assert!(connection.shell_view_id.is_none());
+    assert!(connection.route.is_none());
     let terminal = connection.terminal.as_ref().unwrap();
     assert_eq!("tsh", terminal.command);
     assert_eq!(vec!["ssh", "{{target}}"], terminal.args);
@@ -282,7 +391,7 @@ fn runtime_catalog_registers_terminal_connection_without_provider_runtime() {
 fn runtime_catalog_accepts_single_icon_field() {
     let mut manifest = shell_manifest();
     let mut connection = resource_connection();
-    connection.shell_view_id = None;
+    connection.route = None;
     connection.form.tabs[0].fields.push(icon_field());
     manifest.contributes.connections.push(connection);
 
@@ -293,7 +402,7 @@ fn runtime_catalog_accepts_single_icon_field() {
 fn runtime_catalog_rejects_second_icon_field_and_icon_options() {
     let mut manifest = shell_manifest();
     let mut connection = resource_connection();
-    connection.shell_view_id = None;
+    connection.route = None;
     connection.form.tabs[0].fields.push(icon_field());
     let mut duplicate = icon_field();
     duplicate.id = "icon2".into();
@@ -307,7 +416,7 @@ fn runtime_catalog_rejects_second_icon_field_and_icon_options() {
 
     let mut manifest = shell_manifest();
     let mut connection = resource_connection();
-    connection.shell_view_id = None;
+    connection.route = None;
     let mut field = icon_field();
     field
         .options
@@ -346,7 +455,7 @@ fn runtime_catalog_rejects_terminal_connection_with_provider_fields() {
     for mutate in [
         (|c: &mut ResourceConnectionContrib| c.runtime_id = "provider".into()) as fn(&mut _),
         |c| c.resource_type = "tsh".into(),
-        |c| c.shell_view_id = Some("explorer".into()),
+        |c| c.route = Some("explorer".into()),
     ] {
         let mut manifest = base_manifest();
         let mut connection = terminal_connection();
@@ -358,7 +467,7 @@ fn runtime_catalog_rejects_terminal_connection_with_provider_fields() {
         assert!(
             error
                 .to_string()
-                .contains("must not declare runtimeId, resourceType or shellViewId"),
+                .contains("must not declare runtimeId, resourceType or route"),
             "{error}"
         );
     }
@@ -424,29 +533,13 @@ fn runtime_catalog_rejects_terminal_connection_with_secret_field_or_placeholder_
 }
 
 #[test]
-fn runtime_catalog_rejects_workbench_bound_to_terminal_connection() {
-    let mut manifest = shell_manifest();
-    manifest.contributes.connections.push(terminal_connection());
-    let mut workbench = resource_workbench();
-    workbench.connection_ids = vec!["tsh".into()];
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error.to_string().contains("cannot be bound to a workbench"),
-        "{error}"
-    );
-}
-
-#[test]
 fn runtime_catalog_rejects_connection_secret_without_self_permission() {
     let mut manifest = shell_manifest();
     manifest
         .permissions
         .retain(|permission| permission != "secrets:read:self.*");
     let mut connection = resource_connection();
-    connection.shell_view_id = None;
+    connection.route = None;
     manifest.contributes.connections.push(connection);
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
@@ -455,26 +548,26 @@ fn runtime_catalog_rejects_connection_secret_without_self_permission() {
 }
 
 #[test]
-fn runtime_catalog_rejects_singleton_connection_shell_view() {
+fn runtime_catalog_rejects_connection_route_without_resource_module() {
+    let mut app = shell_app("ui/explorer.js");
+    app.modules = vec![ShellHostModule::Log];
     let mut manifest = shell_manifest();
-    let mut view = shell_view("ui/explorer.js");
-    view.singleton = true;
-    manifest.contributes.shell_views.push(view);
+    manifest.contributes.shell_app = Some(app);
     manifest.contributes.connections.push(resource_connection());
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
 
     assert!(
-        error.to_string().contains("must not be singleton"),
+        error.to_string().contains("requires the resource module"),
         "{error}"
     );
 }
 
 #[test]
-fn runtime_catalog_rejects_connection_view_without_connection_runtime() {
+fn runtime_catalog_rejects_connection_app_without_connection_runtime() {
+    let mut app = shell_app("ui/explorer.js");
+    app.backends.insert("search".into(), "other".into());
     let mut manifest = shell_manifest();
-    let mut view = shell_view("ui/explorer.js");
-    view.backends.insert("search".into(), "other".into());
     manifest.runtime.ipc.push(IpcRuntime {
         id: "other".into(),
         entry: IpcEntry {
@@ -488,11 +581,10 @@ fn runtime_catalog_rejects_connection_view_without_connection_runtime() {
         max_restart_attempts: 3,
         shutdown_grace_ms: 1_000,
     });
-    manifest.contributes.shell_views.push(view);
+    manifest.contributes.shell_app = Some(app);
     manifest.contributes.connections.push(resource_connection());
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
     assert!(error.to_string().contains("connection runtime"), "{error}");
 }
 
@@ -500,7 +592,7 @@ fn runtime_catalog_rejects_connection_view_without_connection_runtime() {
 fn runtime_catalog_rejects_unknown_visibility_field() {
     let mut manifest = shell_manifest();
     let mut connection = resource_connection();
-    connection.shell_view_id = None;
+    connection.route = None;
     connection.form.tabs[0].fields[0].visible_when.push(
         crate::extension::manifest::ResourceConnectionVisibilityRule {
             field: "missing".into(),
@@ -517,384 +609,6 @@ fn runtime_catalog_rejects_unknown_visibility_field() {
     );
 }
 
-#[test]
-fn runtime_catalog_registers_resource_workbench_for_connection() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-    manifest
-        .contributes
-        .resource_workbenches
-        .push(resource_workbench());
-
-    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
-    let workbench = catalog
-        .resource_workbench_for_connection("com.example.tools", "search")
-        .unwrap();
-
-    assert_eq!("search-workbench", workbench.id);
-    assert_eq!("overview", workbench.default_page);
-}
-
-/// 万物可连验证:不同 resourceType(docker/mq/nacos)的工作台声明
-/// 走同一套注册与查询,不引入领域分支。
-#[test]
-fn runtime_catalog_supports_workbenches_across_resource_types() {
-    for resource_type in ["docker", "mq", "nacos"] {
-        let mut manifest = shell_manifest();
-        manifest
-            .contributes
-            .shell_views
-            .push(shell_view("ui/explorer.js"));
-        let mut connection = resource_connection();
-        connection.resource_type = resource_type.into();
-        manifest.contributes.connections.push(connection);
-        let mut workbench = resource_workbench();
-        workbench.resource_type = resource_type.into();
-        manifest.contributes.resource_workbenches.push(workbench);
-
-        let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
-        let registered = catalog
-            .resource_workbench_for_connection("com.example.tools", "search")
-            .unwrap_or_else(|| panic!("workbench for {resource_type} must resolve"));
-        assert_eq!(resource_type, registered.resource_type);
-    }
-}
-
-/// 同连接被两个工作台绑定时必须被拒绝(一对一绑定约束)。
-#[test]
-fn runtime_catalog_rejects_second_workbench_on_same_connection() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-    manifest
-        .contributes
-        .resource_workbenches
-        .push(resource_workbench());
-    let mut duplicate = resource_workbench();
-    duplicate.id = "second-workbench".into();
-    manifest.contributes.resource_workbenches.push(duplicate);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error.to_string().contains("more than one workbench"),
-        "{error}"
-    );
-}
-
-/// 跨扩展 connectionIds 引用必须被拒绝。
-#[test]
-fn runtime_catalog_rejects_workbench_with_unknown_connection() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .resource_workbenches
-        .push(resource_workbench());
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(error.to_string().contains("unknown connection"), "{error}");
-}
-
-#[test]
-fn runtime_catalog_rejects_embedded_shell_with_raw_provider_modules() {
-    let mut manifest = shell_manifest();
-    let mut connection = resource_connection();
-    connection.shell_view_id = None;
-    manifest.contributes.connections.push(connection);
-
-    let mut view = shell_view("ui/search-editor.js");
-    view.modules = vec![
-        ShellHostModule::Context,
-        ShellHostModule::Workbench,
-        ShellHostModule::Resource,
-    ];
-    manifest.contributes.shell_views.push(view);
-
-    let mut workbench = resource_workbench();
-    workbench.pages[0].renderer.kind = ResourceWorkbenchRendererKind::Shell;
-    workbench.pages[0].renderer.view_id = Some("explorer".into());
-    workbench.pages[0].renderer.fallback = Some("native".into());
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("cannot request raw resource/job/event/blob/runtime/dev"),
-        "{error}"
-    );
-}
-
-#[test]
-fn runtime_catalog_resolves_collection_row_actions_and_badge_columns() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-    let mut workbench = resource_workbench();
-    workbench.operations.insert(
-        "listItems".to_string(),
-        ResourceWorkbenchOperation {
-            mode: ResourceWorkbenchOperationMode::Invoke,
-            method: "example/item/list".into(),
-            requires: vec!["example/item/list".into()],
-            effect: ResourceWorkbenchEffect::Read,
-            params: Default::default(),
-        },
-    );
-    workbench.operations.insert(
-        "startItem".to_string(),
-        ResourceWorkbenchOperation {
-            mode: ResourceWorkbenchOperationMode::Invoke,
-            method: "example/item/start".into(),
-            requires: vec!["example/item/start".into()],
-            effect: ResourceWorkbenchEffect::Write,
-            params: Default::default(),
-        },
-    );
-    workbench.default_page = "items".into();
-    workbench.pages[0] = ResourceWorkbenchPage {
-        id: "items".into(),
-        title: "Items".into(),
-        renderer: ResourceWorkbenchRenderer {
-            kind: ResourceWorkbenchRendererKind::Native,
-            view_id: None,
-            fallback: None,
-        },
-        load: Some(crate::extension::manifest::ResourceWorkbenchAction {
-            operation: "listItems".into(),
-        }),
-        tab_group_id: None,
-        route: None,
-        links: vec![],
-        stack: vec![ResourceWorkbenchPrimitive::Table(ResourceWorkbenchTable {
-            items_path: "/items".into(),
-            key_paths: vec!["/id".into()],
-            pagination: ResourceWorkbenchPagination {
-                kind: ResourceWorkbenchPaginationKind::None,
-            },
-            columns: vec![ResourceWorkbenchColumn {
-                id: "state".into(),
-                title: "State".into(),
-                path: "/state".into(),
-                value_type: ResourceWorkbenchColumnType::Display,
-                style: ResourceWorkbenchColumnStyle::Badge,
-            }],
-            open: None,
-            actions: vec![ResourceWorkbenchRowAction {
-                id: "start".into(),
-                label: "Start".into(),
-                operation: "startItem".into(),
-            }],
-        })],
-    };
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
-    let workbench = catalog
-        .resource_workbench_for_connection("com.example.tools", "search")
-        .unwrap_or_else(|| panic!("workbench must resolve"));
-    let table = match &workbench.pages[0].stack[0] {
-        ResourceWorkbenchPrimitive::Table(table) => table,
-        other => panic!("expected table primitive, got {other:?}"),
-    };
-    assert_eq!(1, table.actions.len());
-    assert_eq!("startItem", table.actions[0].operation);
-    assert_eq!(ResourceWorkbenchColumnStyle::Badge, table.columns[0].style);
-}
-
-#[test]
-fn runtime_catalog_rejects_collection_action_with_unknown_operation() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-    let mut workbench = resource_workbench();
-    workbench.default_page = "items".into();
-    let mut page = resource_workbench().pages.remove(0);
-    page.id = "items".into();
-    page.load = Some(crate::extension::manifest::ResourceWorkbenchAction {
-        operation: "clusterInfo".into(),
-    });
-    page.stack = vec![ResourceWorkbenchPrimitive::Table(ResourceWorkbenchTable {
-        items_path: "/items".into(),
-        key_paths: vec!["/id".into()],
-        pagination: ResourceWorkbenchPagination {
-            kind: ResourceWorkbenchPaginationKind::None,
-        },
-        columns: vec![],
-        open: None,
-        actions: vec![ResourceWorkbenchRowAction {
-            id: "start".into(),
-            label: "Start".into(),
-            operation: "missingOperation".into(),
-        }],
-    })];
-    workbench.pages = vec![page];
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("table action references an unknown operation"),
-        "{error}"
-    );
-}
-/// 页面 stack 只支持一个内容原语:多原语会被渲染器静默丢弃其中之一,
-/// 注册阶段必须拒绝,而不是接受一份"界面不忠实于声明"的工作台。
-#[test]
-fn runtime_catalog_rejects_page_with_multiple_primitives() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-    let mut workbench = resource_workbench();
-    workbench.default_page = "items".into();
-    let mut page = resource_workbench().pages.remove(0);
-    page.id = "items".into();
-    page.stack = vec![
-        ResourceWorkbenchPrimitive::Viewer(ResourceWorkbenchViewer {
-            format: ResourceWorkbenchViewerFormat::Text,
-        }),
-        ResourceWorkbenchPrimitive::Stream,
-    ];
-    workbench.pages = vec![page];
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("page stack must declare exactly one primitive"),
-        "{error}"
-    );
-}
-
-/// 差异资源验收:events 页面与 paging 绑定已经具备完整执行链,
-/// 注册阶段必须接受这些声明,而不是拒绝。
-#[test]
-fn runtime_catalog_accepts_events_pages_and_paging_bindings() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-    let mut workbench = resource_workbench();
-
-    workbench.operations.insert(
-        "followLogs".to_string(),
-        ResourceWorkbenchOperation {
-            mode: ResourceWorkbenchOperationMode::Invoke,
-            method: "example/logs/follow".into(),
-            requires: vec!["example/logs/follow".into()],
-            effect: ResourceWorkbenchEffect::Read,
-            params: Default::default(),
-        },
-    );
-    workbench.operations.insert(
-        "listItems".to_string(),
-        ResourceWorkbenchOperation {
-            mode: ResourceWorkbenchOperationMode::Invoke,
-            method: "example/item/list".into(),
-            requires: vec!["example/item/list".into()],
-            effect: ResourceWorkbenchEffect::Read,
-            params: [(
-                "page".to_string(),
-                crate::extension::manifest::ResourceWorkbenchBinding {
-                    source: crate::extension::manifest::ResourceWorkbenchBindingSource::Paging,
-                    path: "/page".into(),
-                    value_type: crate::extension::manifest::ResourceWorkbenchValueType::Number,
-                    value: None,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        },
-    );
-
-    let events_page = ResourceWorkbenchPage {
-        id: "events".into(),
-        title: "Events".into(),
-        renderer: ResourceWorkbenchRenderer {
-            kind: ResourceWorkbenchRendererKind::Native,
-            view_id: None,
-            fallback: None,
-        },
-        load: Some(crate::extension::manifest::ResourceWorkbenchAction {
-            operation: "followLogs".into(),
-        }),
-        tab_group_id: None,
-        route: None,
-        links: vec![],
-        stack: vec![ResourceWorkbenchPrimitive::Stream],
-    };
-    let collection_page = ResourceWorkbenchPage {
-        id: "items".into(),
-        title: "Items".into(),
-        renderer: ResourceWorkbenchRenderer {
-            kind: ResourceWorkbenchRendererKind::Native,
-            view_id: None,
-            fallback: None,
-        },
-        load: Some(crate::extension::manifest::ResourceWorkbenchAction {
-            operation: "listItems".into(),
-        }),
-        tab_group_id: None,
-        route: None,
-        links: vec![],
-        stack: vec![ResourceWorkbenchPrimitive::Table(ResourceWorkbenchTable {
-            items_path: "/items".into(),
-            key_paths: vec!["/id".into()],
-            pagination: ResourceWorkbenchPagination {
-                kind: ResourceWorkbenchPaginationKind::Cursor,
-            },
-            columns: vec![],
-            open: None,
-            actions: vec![],
-        })],
-    };
-    workbench.pages = vec![events_page, collection_page];
-    workbench.default_page = "events".into();
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
-    let workbench = catalog
-        .resource_workbench_for_connection("com.example.tools", "search")
-        .unwrap_or_else(|| panic!("workbench must resolve"));
-    assert_eq!(2, workbench.pages.len());
-    assert!(matches!(
-        workbench.pages[0].stack[0],
-        ResourceWorkbenchPrimitive::Stream
-    ));
-    let table = match &workbench.pages[1].stack[0] {
-        ResourceWorkbenchPrimitive::Table(table) => table,
-        other => panic!("expected table primitive, got {other:?}"),
-    };
-    assert_eq!(
-        ResourceWorkbenchPaginationKind::Cursor,
-        table.pagination.kind
-    );
-}
-
 fn terminal_connection() -> ResourceConnectionContrib {
     ResourceConnectionContrib {
         id: "tsh".into(),
@@ -903,7 +617,7 @@ fn terminal_connection() -> ResourceConnectionContrib {
         icon: None,
         runtime_id: String::new(),
         resource_type: String::new(),
-        shell_view_id: None,
+        route: None,
         terminal: Some(ResourceConnectionTerminal {
             command: "tsh".into(),
             args: vec!["ssh".into(), "{{target}}".into()],
@@ -937,51 +651,6 @@ fn terminal_connection() -> ResourceConnectionContrib {
     }
 }
 
-fn resource_workbench() -> ResourceWorkbenchContrib {
-    ResourceWorkbenchContrib {
-        schema_version: 3,
-        id: "search-workbench".into(),
-        title: "Search".into(),
-        connection_ids: vec!["search".into()],
-        runtime_id: "provider".into(),
-        resource_type: "elasticsearch".into(),
-        default_page: "overview".into(),
-        operations: [(
-            "clusterInfo".into(),
-            ResourceWorkbenchOperation {
-                mode: ResourceWorkbenchOperationMode::Invoke,
-                method: "elasticsearch/cluster/info".into(),
-                requires: vec!["elasticsearch/cluster/info".into()],
-                effect: ResourceWorkbenchEffect::Read,
-                params: Default::default(),
-            },
-        )]
-        .into_iter()
-        .collect(),
-        layout: None,
-        pages: vec![ResourceWorkbenchPage {
-            id: "overview".into(),
-            title: "Overview".into(),
-            renderer: ResourceWorkbenchRenderer {
-                kind: ResourceWorkbenchRendererKind::Native,
-                view_id: None,
-                fallback: None,
-            },
-            load: Some(crate::extension::manifest::ResourceWorkbenchAction {
-                operation: "clusterInfo".into(),
-            }),
-            tab_group_id: None,
-            route: None,
-            links: vec![],
-            stack: vec![ResourceWorkbenchPrimitive::Viewer(
-                ResourceWorkbenchViewer {
-                    format: ResourceWorkbenchViewerFormat::Json,
-                },
-            )],
-        }],
-    }
-}
-
 fn resource_connection() -> ResourceConnectionContrib {
     ResourceConnectionContrib {
         id: "search".into(),
@@ -990,7 +659,7 @@ fn resource_connection() -> ResourceConnectionContrib {
         icon: None,
         runtime_id: "provider".into(),
         resource_type: "elasticsearch".into(),
-        shell_view_id: Some("explorer".into()),
+        route: Some("explorer".into()),
         terminal: None,
         form: ResourceConnectionForm {
             tabs: vec![ResourceConnectionFormTab {
@@ -1028,12 +697,12 @@ fn resource_connection() -> ResourceConnectionContrib {
 }
 
 #[test]
-fn runtime_catalog_rejects_shell_view_with_unknown_backend() {
+fn runtime_catalog_rejects_shell_app_with_unknown_backend() {
     let mut manifest = shell_manifest();
-    let mut view = shell_view("ui/explorer.js");
-    view.backends
+    let mut app = shell_app("ui/explorer.js");
+    app.backends
         .insert("search".to_string(), "missing".to_string());
-    manifest.contributes.shell_views.push(view);
+    manifest.contributes.shell_app = Some(app);
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
 
@@ -1041,15 +710,12 @@ fn runtime_catalog_rejects_shell_view_with_unknown_backend() {
 }
 
 #[test]
-fn runtime_catalog_rejects_shell_view_without_shell_exec_permission() {
+fn runtime_catalog_rejects_shell_app_without_shell_exec_permission() {
     let mut manifest = shell_manifest();
     manifest
         .permissions
         .retain(|permission| permission != "shell:exec");
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
+    manifest.contributes.shell_app = Some(shell_app("ui/explorer.js"));
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
 
@@ -1057,13 +723,13 @@ fn runtime_catalog_rejects_shell_view_without_shell_exec_permission() {
 }
 
 #[test]
-fn runtime_catalog_rejects_shell_view_with_reserved_backend_alias() {
+fn runtime_catalog_rejects_shell_app_with_reserved_backend_alias() {
     let mut manifest = shell_manifest();
-    let mut view = shell_view("ui/explorer.js");
-    view.backends.clear();
-    view.backends
+    let mut app = shell_app("ui/explorer.js");
+    app.backends.clear();
+    app.backends
         .insert("navop".to_string(), "provider".to_string());
-    manifest.contributes.shell_views.push(view);
+    manifest.contributes.shell_app = Some(app);
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
 
@@ -1071,12 +737,9 @@ fn runtime_catalog_rejects_shell_view_with_reserved_backend_alias() {
 }
 
 #[test]
-fn runtime_catalog_rejects_shell_view_entry_escape() {
+fn runtime_catalog_rejects_shell_app_entry_escape() {
     let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("../escape.js"));
+    manifest.contributes.shell_app = Some(shell_app("../escape.js"));
 
     let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
 
@@ -1334,6 +997,74 @@ fn runtime_catalog_rebuild_after_uninstall_drops_db_tree_menu() {
     );
 }
 
+#[test]
+fn runtime_catalog_panel_inherits_app_icon_when_panel_has_none() {
+    use crate::extension::manifest::PanelContrib;
+
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("icons")).unwrap();
+    std::fs::write(root.path().join("icons/app.svg"), "<svg/>").unwrap();
+    std::fs::create_dir_all(root.path().join("ui")).unwrap();
+    std::fs::write(root.path().join("ui/explorer.js"), "mount();").unwrap();
+
+    let mut manifest = shell_manifest();
+    manifest.manifest_dir = root.path().to_path_buf();
+    let mut app = shell_app("ui/explorer.js");
+    app.icon = Some("icons/app.svg".to_string());
+    manifest.contributes.shell_app = Some(app);
+    manifest.contributes.panels.push(PanelContrib {
+        id: "inspector".to_string(),
+        title: Some("检查器".to_string()),
+        icon: None,
+        anchor: "db-sidebar".to_string(),
+        order: 0,
+        when: None,
+    });
+
+    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
+    let panels = catalog.panels_for_anchor("db-sidebar");
+
+    assert_eq!(1, panels.len());
+    assert_eq!(
+        Some(root.path().join("icons/app.svg")),
+        panels[0].icon_path,
+        "面板没声明 icon 时应回落到 shellApp.icon"
+    );
+}
+
+#[test]
+fn runtime_catalog_db_tree_menu_items_carry_command_icons() {
+    let mut manifest = base_manifest();
+    manifest.runtime.wasm.push(wasm_runtime("main"));
+    let mut cmd = command("main", "example.export_table");
+    cmd.icon = Some("icons/export.svg".to_string());
+    manifest.contributes.commands.push(cmd);
+    manifest.contributes.menus.insert(
+        "db.tree.table".to_string(),
+        vec![MenuContrib {
+            command: MenuCommandRef {
+                id: "example.export_table".to_string(),
+            },
+            label: Some("导出表".to_string()),
+            group: None,
+            when: None,
+            requires_active: true,
+        }],
+    );
+
+    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
+    let items = catalog
+        .db_tree_menu_registry()
+        .items_for_node(db::DbNodeType::Table);
+
+    assert_eq!(1, items.len());
+    assert_eq!(
+        Some(PathBuf::from("/tmp/com.example.tools/icons/export.svg")),
+        items[0].icon,
+        "菜单项应复用命令声明的图标"
+    );
+}
+
 fn shell_manifest() -> Manifest {
     let mut manifest = base_manifest();
     manifest.permissions = vec![
@@ -1357,22 +1088,19 @@ fn shell_manifest() -> Manifest {
     manifest
 }
 
-fn shell_view(entry: &str) -> ShellViewContrib {
-    ShellViewContrib {
-        id: "explorer".to_string(),
-        title: "Example Explorer".to_string(),
+fn shell_app(entry: &str) -> ShellAppContrib {
+    ShellAppContrib {
+        title: Some("Example Explorer".to_string()),
         description: None,
         icon: None,
         entry: entry.to_string(),
-        surface: ShellSurface::Tab,
         category: None,
         keywords: None,
-        singleton: false,
         backends: std::collections::BTreeMap::from([(
             "search".to_string(),
             "provider".to_string(),
         )]),
-        modules: vec![ShellHostModule::Context, ShellHostModule::Resource],
+        modules: vec![ShellHostModule::Resource],
     }
 }
 
@@ -1398,6 +1126,7 @@ fn command(runtime_id: &str, command_id: &str) -> CommandContrib {
             kind: "wasm".to_string(),
             runtime_id: runtime_id.to_string(),
             function: Some("run".to_string()),
+            route: None,
         },
     }
 }
@@ -1419,7 +1148,7 @@ fn base_manifest() -> Manifest {
         keywords: vec![],
         engines: Engines {
             onetcli: ">=0.1.0".to_string(),
-            gpui_shell: "0.6.4".to_string(),
+            nsh: "0.3.0".to_string(),
         },
         api: ApiVersions::default(),
         activation: vec![],
@@ -1437,230 +1166,32 @@ fn write_composite_manifest(root: &std::path::Path, id: &str, content: &str) {
 }
 
 #[test]
-fn catalog_toolbox_views_exclude_connection_owned_shell_views() {
-    // 独立工具(tab surface + toolbox surface,未被连接引用)进工具箱;
-    // 连接 shellViewId 引用的视图不进。
-    let mut standalone_tab = shell_view("ui/standalone.js");
-    standalone_tab.id = "standalone-tool".into();
-    standalone_tab.singleton = true;
-    standalone_tab.surface = crate::extension::manifest::ShellSurface::Tab;
+fn catalog_toolbox_lists_apps_without_connections() {
+    // 工具箱按 app 列：没有连接型连接的扩展进工具箱；有连接的可通过连接打开，
+    // 不再重复出现在工具箱里。
+    let mut connected = shell_manifest();
+    connected.contributes.shell_app = Some(shell_app("ui/explorer.js"));
+    connected
+        .contributes
+        .connections
+        .push(resource_connection());
 
-    let mut standalone_toolbox = shell_view("ui/toolbox.js");
-    standalone_toolbox.id = "toolbox-tool".into();
-    standalone_toolbox.surface = crate::extension::manifest::ShellSurface::Toolbox;
+    let mut standalone = shell_manifest();
+    standalone.id = "com.example.standalone".to_string();
+    standalone.contributes.shell_app = Some(shell_app("ui/standalone.js"));
 
-    let mut owned = shell_view("ui/explorer.js");
-    owned.id = "explorer".into();
-
-    let mut manifest = shell_manifest();
-    manifest.contributes.shell_views.push(standalone_tab);
-    manifest.contributes.shell_views.push(standalone_toolbox);
-    manifest.contributes.shell_views.push(owned);
-    manifest.contributes.connections.push(resource_connection());
-
-    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
-    let tools = catalog.toolbox_views();
-    let ids: Vec<&str> = tools.iter().map(|view| view.id.as_str()).collect();
-    assert!(
-        ids.contains(&"standalone-tool"),
-        "独立 tab 工具应进工具箱: {ids:?}"
-    );
-    assert!(
-        ids.contains(&"toolbox-tool"),
-        "toolbox surface 工具应进工具箱: {ids:?}"
-    );
-    assert!(
-        !ids.contains(&"explorer"),
-        "连接关联的 shell view 不应进工具箱: {ids:?}"
-    );
-}
-
-#[test]
-fn catalog_toolbox_views_exclude_workbench_page_bodies() {
-    // 工作台页体(被 `pages[*].renderer.viewId` 引用的视图)与任何声明
-    // `workbench` 模块的视图,都只在工作台挂载会话里可运行;独立打开时
-    // 宿主必然失败("navop.workbench requires a borrowed resource-workbench
-    // session"),列进工具箱就是点了就报错的假卡片。
-    let mut page_body = shell_view("ui/page-body.js");
-    page_body.id = "page-body".into();
-    page_body.modules = vec![ShellHostModule::Context, ShellHostModule::Workbench];
-
-    // 没有被任何页面引用,但同样声明了 workbench 模块 —— 同样独立打不开。
-    let mut embedded_only = shell_view("ui/embedded-only.js");
-    embedded_only.id = "embedded-only".into();
-    embedded_only.modules = vec![ShellHostModule::Context, ShellHostModule::Workbench];
-
-    // 真独立工具:context + resource,不经工作台。
-    let mut standalone = shell_view("ui/standalone.js");
-    standalone.id = "standalone-tool".into();
-
-    let mut manifest = shell_manifest();
-    manifest.contributes.shell_views.push(page_body);
-    manifest.contributes.shell_views.push(embedded_only);
-    manifest.contributes.shell_views.push(standalone);
-    // 本用例只关心「页体/嵌入专用视图」的排除,连接一律不挂 shell 视图。
-    let mut connection = resource_connection();
-    connection.shell_view_id = None;
-    manifest.contributes.connections.push(connection);
-
-    let mut workbench = resource_workbench();
-    workbench.pages[0].renderer.kind = ResourceWorkbenchRendererKind::Shell;
-    workbench.pages[0].renderer.view_id = Some("page-body".into());
-    workbench.pages[0].renderer.fallback = Some("native".into());
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap();
+    let catalog = ExtensionRuntimeCatalog::from_manifests(vec![connected, standalone]).unwrap();
     let ids: Vec<&str> = catalog
-        .toolbox_views()
+        .toolbox_apps()
         .iter()
-        .map(|view| view.id.as_str())
+        .map(|app| app.extension_id.as_str())
         .collect();
     assert!(
-        !ids.contains(&"page-body"),
-        "工作台页体不应作为独立工具进工具箱: {ids:?}"
+        ids.contains(&"com.example.standalone"),
+        "无连接的 app 应进工具箱: {ids:?}"
     );
     assert!(
-        !ids.contains(&"embedded-only"),
-        "声明 workbench 模块的视图不应进工具箱: {ids:?}"
-    );
-    assert!(
-        ids.contains(&"standalone-tool"),
-        "独立工具仍应进工具箱: {ids:?}"
-    );
-}
-
-/// `terminal.operation` 是**预留声明**:扩展协议目前只有请求-响应与 job
-/// 两种形态,没有 provider PTY 流式通道,宿主侧必然返回
-/// "runtime terminal operation ... is not supported yet"。
-///
-/// 回归:注册期只校验 operation 存在就放行,于是扩展能装成功、用户点开
-/// 必定失败 —— 失败发生在使用而不是安装。这里固定住"在校验期拒绝"。
-#[test]
-fn runtime_catalog_rejects_terminal_operation_declaration() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-
-    let mut workbench = resource_workbench();
-    // operation 存在,所以拒绝原因必须是"未实现"而不是"未知操作"。
-    workbench.operations.insert(
-        "openShell".to_string(),
-        ResourceWorkbenchOperation {
-            mode: ResourceWorkbenchOperationMode::Invoke,
-            method: "example/exec/open".into(),
-            requires: vec!["example/exec/open".into()],
-            effect: ResourceWorkbenchEffect::Read,
-            params: Default::default(),
-        },
-    );
-    workbench.pages[0].load = None;
-    workbench.pages[0].stack = vec![ResourceWorkbenchPrimitive::Terminal(
-        ResourceWorkbenchTerminal {
-            command: None,
-            args: vec![],
-            env: Default::default(),
-            working_dir: None,
-            operation: Some(ResourceWorkbenchTerminalOperation {
-                operation: "openShell".into(),
-            }),
-        },
-    )];
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error.to_string().contains("terminal.operation is reserved"),
-        "{error}"
-    );
-}
-
-/// 反向守卫:本地 command 形式的终端是**已实现**的,不能被上面的拒绝误伤。
-#[test]
-fn runtime_catalog_accepts_local_command_terminal() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-
-    let mut workbench = resource_workbench();
-    workbench.pages[0].load = None;
-    workbench.pages[0].stack = vec![ResourceWorkbenchPrimitive::Terminal(
-        ResourceWorkbenchTerminal {
-            command: Some("docker".into()),
-            args: vec!["exec".into(), "-it".into(), "{{id}}".into(), "sh".into()],
-            env: Default::default(),
-            working_dir: None,
-            operation: None,
-        },
-    )];
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let catalog =
-        ExtensionRuntimeCatalog::from_manifests(vec![manifest]).expect("command terminal is valid");
-    let page = &catalog
-        .resource_workbench_for_connection("com.example.tools", "search")
-        .expect("workbench must resolve")
-        .pages[0];
-    assert!(matches!(
-        page.stack[0],
-        ResourceWorkbenchPrimitive::Terminal(_)
-    ));
-}
-
-/// route 绑定只接受导航那一刻取得到值的来源:`input`/`paging` 在行点击
-/// 与链接导航中既没有表单输入也没有列表上下文,声明了只会静默产出空值。
-#[test]
-fn runtime_catalog_rejects_route_binding_with_input_source() {
-    let mut manifest = shell_manifest();
-    manifest
-        .contributes
-        .shell_views
-        .push(shell_view("ui/explorer.js"));
-    manifest.contributes.connections.push(resource_connection());
-
-    let mut workbench = resource_workbench();
-    workbench.default_page = "items".into();
-    let mut page = resource_workbench().pages.remove(0);
-    page.id = "items".into();
-    page.load = None;
-    page.stack = vec![ResourceWorkbenchPrimitive::Table(ResourceWorkbenchTable {
-        items_path: "/items".into(),
-        key_paths: vec!["/id".into()],
-        pagination: ResourceWorkbenchPagination {
-            kind: ResourceWorkbenchPaginationKind::None,
-        },
-        columns: vec![],
-        open: Some(ResourceWorkbenchOpen {
-            page_id: "items".into(),
-            route: [(
-                "id".to_string(),
-                ResourceWorkbenchBinding {
-                    source: ResourceWorkbenchBindingSource::Input,
-                    path: "/id".into(),
-                    value_type: ResourceWorkbenchValueType::String,
-                    value: None,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        }),
-        actions: vec![],
-    })];
-    workbench.pages = vec![page];
-    manifest.contributes.resource_workbenches.push(workbench);
-
-    let error = ExtensionRuntimeCatalog::from_manifests(vec![manifest]).unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("table open route binding `id` uses an input/paging source"),
-        "{error}"
+        !ids.contains(&"com.example.tools"),
+        "有连接的 app 不应重复进工具箱: {ids:?}"
     );
 }

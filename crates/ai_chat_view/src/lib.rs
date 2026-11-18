@@ -76,7 +76,6 @@ mod subagent_detail_panel;
 mod theme;
 mod transcript_scroll;
 mod transcript_search;
-mod transcript_selection;
 mod turn;
 mod usage;
 mod usage_history;
@@ -204,8 +203,9 @@ pub use turn::{
     is_risk_message, project_turns,
 };
 pub use workbench::{
-    WorkbenchPanelEntry, WorkbenchPanelKind, WorkbenchPlacement, WorkbenchShell,
-    WorkbenchShellConfig, WorkbenchState, WorkbenchTab,
+    TerminalPanelFactory, WorkbenchPanelEntry, WorkbenchPanelKind, WorkbenchPlacement,
+    WorkbenchShell, WorkbenchShellConfig, WorkbenchState, WorkbenchTab, WorkbenchTerminalProvider,
+    set_workbench_terminal_provider, workbench_terminal_provider,
 };
 
 /// 初始化 `ai_chat_view`:确保全局卡片注册表存在。
@@ -225,5 +225,4 @@ pub fn init(cx: &mut App) {
     find_shortcut::init(cx);
     session_shortcut::init(cx);
     command_palette::init(cx);
-    transcript_selection::init(cx);
 }

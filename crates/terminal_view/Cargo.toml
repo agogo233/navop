@@ -18,6 +18,7 @@ workspace_explorer = { workspace = true }
 
 # GPUI
 gpui = { workspace = true }
+gpui-base = { workspace = true }
 gpui-component = { workspace = true }
 palette = { workspace = true }
 ai_chat_view = { workspace = true, default-features = false }
@@ -26,6 +27,7 @@ one-core = { workspace = true }
 tool_runtime = { workspace = true }
 one-ui = { workspace = true }
 connection-form = { workspace = true }
+ssh_form = { workspace = true }
 # Terminal emulation
 alacritty_terminal.workspace = true
 

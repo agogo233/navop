@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use x11_forwarding::{ForwardRequest, X11Proxy, X11ProxyHandle};
 
+use crate::connection_error::add_private_key_load_hint;
 use crate::remote_forwarding::RemoteForwardTarget;
 use crate::{
     HostKeyAcceptance, HostKeyDetails, HostKeyIdentity, HostKeyProxyType, HostKeyRoute,
@@ -228,6 +229,10 @@ fn build_russh_client_config(
             .keepalive_interval
             .or(Some(defaults::KEEPALIVE_INTERVAL)),
         keepalive_max: config.keepalive_max.unwrap_or(defaults::KEEPALIVE_MAX),
+        // 交互连接必须关掉 Nagle：一次按键就是一个几十字节的小包，等前一个包
+        // 的 ACK 再发会直接变成可感知的输入延迟；而批量流量本来就按 MTU 分段，
+        // 关掉 Nagle 不会让它多出多少小包。
+        nodelay: true,
         ..<_>::default()
     }))
 }
@@ -298,6 +303,8 @@ pub enum SshAuth {
     Agent,
     Pageant,
     AutoPublicKey,
+    /// RFC 4252 `none` authentication for servers that explicitly allow it.
+    None,
     /// 多因素认证链：一次登录需要依次通过多个认证因素。
     ///
     /// 防火墙、交换机等设备会配置 `AuthenticationMethods password,publickey` 这类
@@ -317,6 +324,7 @@ impl SshAuth {
             | SshAuth::Agent
             | SshAuth::Pageant
             | SshAuth::AutoPublicKey => Some(MethodKind::PublicKey),
+            SshAuth::None => Some(MethodKind::None),
             SshAuth::Chain(_) => None,
         }
     }
@@ -358,6 +366,7 @@ pub struct AuthFailureMessages {
     pub agent_no_identities: String,
     pub agent_auth_failed: String,
     pub auto_publickey_failed: String,
+    pub none_failed: String,
     pub no_local_identity: String,
     pub auto_publickey_next_step: String,
     pub keyboard_interactive_required: String,
@@ -735,11 +744,13 @@ async fn add_identities_to_local_agent(identities: &[AgentIdentity]) -> Result<(
             AgentIdentity::PrivateKeyPath {
                 key_path,
                 passphrase,
-            } => load_secret_key(expand_tilde(key_path), passphrase.as_deref())?,
+            } => load_secret_key(expand_tilde(key_path), passphrase.as_deref())
+                .map_err(|error| add_private_key_load_hint(error.into()))?,
             AgentIdentity::PrivateKeyContent {
                 private_key,
                 passphrase,
-            } => decode_secret_key(private_key, passphrase.as_deref())?,
+            } => decode_secret_key(private_key, passphrase.as_deref())
+                .map_err(|error| add_private_key_load_hint(error.into()))?,
         };
         agent
             .add_identity(&key, &[])
@@ -995,6 +1006,12 @@ where
             authenticate_with_pageant(session, username, hash_alg, &messages).await?
         }
         SshAuth::AutoPublicKey => unreachable!("AutoPublicKey 应由高层认证编排处理"),
+        SshAuth::None => {
+            let result = session.authenticate_none(username).await?;
+            if !matches!(result, client::AuthResult::Success) {
+                anyhow::bail!(messages.none_failed.clone());
+            }
+        }
         SshAuth::Chain(_) => {
             unreachable!("SshAuth::Chain 应由 authenticate_with_strategy_for_target 处理")
         }
@@ -1008,15 +1025,14 @@ fn private_key_for_auth(auth: &SshAuth) -> Result<PrivateKey> {
             key_path,
             passphrase,
             ..
-        } => Ok(load_secret_key(
-            expand_tilde(key_path),
-            passphrase.as_deref(),
-        )?),
+        } => load_secret_key(expand_tilde(key_path), passphrase.as_deref())
+            .map_err(|error| add_private_key_load_hint(error.into())),
         SshAuth::PrivateKeyContent {
             private_key,
             passphrase,
             ..
-        } => Ok(decode_secret_key(private_key, passphrase.as_deref())?),
+        } => decode_secret_key(private_key, passphrase.as_deref())
+            .map_err(|error| add_private_key_load_hint(error.into())),
         _ => anyhow::bail!("authentication method does not contain a private key"),
     }
 }
@@ -1409,6 +1425,7 @@ fn default_auth_failure_messages() -> AuthFailureMessages {
         agent_no_identities: t!("Ssh.auth_agent_no_identities").to_string(),
         agent_auth_failed: t!("Ssh.auth_agent_failed").to_string(),
         auto_publickey_failed: t!("Ssh.auth_auto_publickey_failed").to_string(),
+        none_failed: t!("Ssh.auth_none_failed").to_string(),
         no_local_identity: t!("Ssh.auth_no_local_identity").to_string(),
         auto_publickey_next_step: t!("Ssh.auth_auto_publickey_next_step").to_string(),
         keyboard_interactive_required: t!("Ssh.auth_keyboard_interactive_required").to_string(),
@@ -1968,6 +1985,7 @@ mod tests {
             agent_no_identities: "agent_no_identities".to_string(),
             agent_auth_failed: "agent_auth_failed".to_string(),
             auto_publickey_failed: "auto_publickey_failed".to_string(),
+            none_failed: "none_failed".to_string(),
             no_local_identity: "no_local_identity".to_string(),
             auto_publickey_next_step: "next_step".to_string(),
             keyboard_interactive_required: "keyboard_interactive_required".to_string(),
@@ -2095,6 +2113,11 @@ mod tests {
     }
 
     #[test]
+    fn none_authentication_maps_to_the_none_method() {
+        assert_eq!(SshAuth::None.factor_method_kind(), Some(MethodKind::None));
+    }
+
+    #[test]
     fn private_key_content_auth_is_decoded_from_memory() {
         let error = private_key_for_auth(&SshAuth::PrivateKeyContent {
             private_key: "not a private key".to_string(),
@@ -2107,6 +2130,34 @@ mod tests {
         assert!(
             !message.contains("No such file") && !message.contains("os error 2"),
             "inline private key content should not be treated as a file path: {message}"
+        );
+    }
+
+    #[test]
+    fn encrypted_private_key_wrong_passphrase_has_actionable_error() {
+        let key = PrivateKey::random(&mut rand_010::rng(), Algorithm::Ed25519)
+            .expect("test private key should be generated");
+        let encrypted = key
+            .encrypt(&mut rand_010::rng(), "correct-passphrase")
+            .expect("test private key should encrypt")
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("encrypted private key should encode");
+
+        let error = private_key_for_auth(&SshAuth::PrivateKeyContent {
+            private_key: encrypted.to_string(),
+            passphrase: Some("wrong-passphrase".to_string()),
+            certificate_path: None,
+        })
+        .expect_err("a wrong private key passphrase should fail to decode");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("Unable to load the SSH private key"),
+            "错误信息应说明私钥加载失败，实际: {message}"
+        );
+        assert!(
+            message.contains("passphrase"),
+            "错误信息应提示检查密码短语，实际: {message}"
         );
     }
 

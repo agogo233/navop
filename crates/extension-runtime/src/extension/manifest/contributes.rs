@@ -7,17 +7,19 @@ use super::menus::{MenuCommandRef, MenuContrib};
 
 #[path = "contributes/shell.rs"]
 mod shell;
-pub use shell::{ShellHostModule, ShellSurface, ShellViewContrib};
+pub use shell::{ShellAppContrib, ShellHostModule};
+#[path = "contributes/panels.rs"]
+mod panels;
+pub use panels::PanelContrib;
+#[path = "contributes/tools.rs"]
+mod tools;
+pub use tools::{ToolAnnotations, ToolContrib, ToolRisk};
 #[path = "contributes/connection.rs"]
 mod connection;
 #[path = "contributes/terminal_launch.rs"]
 mod terminal_launch;
 pub use connection::*;
 pub use terminal_launch::{ResolvedTerminalLaunch, TerminalLaunchError};
-#[path = "contributes/resource_workbench.rs"]
-mod resource_workbench;
-pub use resource_workbench::*;
-
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ContributesManifest {
     #[serde(default)]
@@ -28,8 +30,8 @@ pub struct ContributesManifest {
     pub drivers: Vec<Value>,
     #[serde(default)]
     pub connections: Vec<ResourceConnectionContrib>,
-    #[serde(default, rename = "resourceWorkbenches")]
-    pub resource_workbenches: Vec<ResourceWorkbenchContrib>,
+    // `resourceWorkbenches` 已废弃：扩展只能提供页面（tab 视图），
+    // 原生工作台不再由清单驱动。旧清单里的这个键会被 serde 忽略。
     #[serde(default)]
     pub commands: Vec<CommandContrib>,
     #[serde(default)]
@@ -46,8 +48,21 @@ pub struct ContributesManifest {
     pub document_exporters: Vec<DocumentExporterContrib>,
     #[serde(default, rename = "remoteFileEditors")]
     pub remote_file_editors: Vec<RemoteFileEditorContrib>,
-    #[serde(default, rename = "shellViews")]
-    pub shell_views: Vec<ShellViewContrib>,
+    /// 一个扩展最多一个 nsh app（多页面在 app 内路由）。
+    #[serde(default, rename = "shellApp")]
+    pub shell_app: Option<ShellAppContrib>,
+    /// 扩展向宿主 UI 锚点贡献的面板（`contributes.panels`）。
+    ///
+    /// 面板是同一 nsh app 的附加 surface（`surface = "panel"`），声明面
+    /// 必须有 shellApp，安装期校验在 `panels_validation.rs`。
+    #[serde(default)]
+    pub panels: Vec<PanelContrib>,
+    /// 扩展向宿主 AI 声明的工具（`contributes.tools`）。
+    ///
+    /// 声明面：必须有 shellApp 且工具的 backend 必须是 `shellApp.backends`
+    /// 的别名，安装期校验在 `tools_validation.rs`。
+    #[serde(default)]
+    pub tools: Vec<ToolContrib>,
     #[serde(default)]
     pub views: Vec<Value>,
     #[serde(default)]
@@ -76,7 +91,6 @@ impl ContributesManifest {
             + self.connection_importers.len()
             + self.drivers.len()
             + self.connections.len()
-            + self.resource_workbenches.len()
             + self.commands.len()
             + self.menus.len()
             + self.toolbars.len()
@@ -85,7 +99,8 @@ impl ContributesManifest {
             + self.document_renderers.len()
             + self.document_exporters.len()
             + self.remote_file_editors.len()
-            + self.shell_views.len()
+            + usize::from(self.shell_app.is_some())
+            + self.tools.len()
             + self.views.len()
             + self.tasks.len()
             + self.data_types.len()
@@ -293,6 +308,10 @@ pub struct CommandHandlerContrib {
     pub runtime_id: String,
     #[serde(default = "default_command_function")]
     pub function: Option<String>,
+    /// 仅 `kind == "nsh"` 时有意义：打开扩展 shell app 时的目标 route。
+    /// 缺省时打开 app 首页。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
 }
 
 impl Default for CommandHandlerContrib {
@@ -301,6 +320,7 @@ impl Default for CommandHandlerContrib {
             kind: default_command_handler_kind(),
             runtime_id: String::new(),
             function: default_command_function(),
+            route: None,
         }
     }
 }

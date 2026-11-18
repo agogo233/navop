@@ -261,7 +261,9 @@ fn terminal_render_owns_internal_tool_dock_regions() {
     assert!(render_source.contains("terminal-tool-dock-bottom"));
     assert!(render_source.contains("terminal-tool-dock-toolbar"));
     assert!(render_source.contains(".child(self.sidebar_toolbar.clone())"));
-    assert!(render_source.contains("right_tool_region_width(&layout, sidebar_size)"));
+    // 右栏宽度必须按“合并后的边”算：只被扩展面板占用时也要留出面板宽度。
+    assert!(render_source.contains("let has_right = layout.has_right() || extension_layout.has_right();"));
+    assert!(render_source.contains("sidebar_size + TOOLBAR_WIDTH"));
 }
 
 #[test]
@@ -767,7 +769,11 @@ fn terminal_command_bar_keeps_oxideterm_keyboard_and_overlay_contracts() {
     assert!(render_source.contains(".child(self.render_collapsed_hint(cx))"));
     assert!(!render_source.contains("TerminalCommandBar.keyboard_hint"));
     assert!(!render_source.contains("render_expanded_hint"));
-    let placeholder = include_str!("../../../locales/terminal_view.yml")
+    let command_bar_locale = include_str!("../../../locales/terminal_view.yml")
+        .split("\nTerminalCommandBar:")
+        .nth(1)
+        .expect("command bar locale section should exist");
+    let placeholder = command_bar_locale
         .split("  placeholder:")
         .nth(1)
         .and_then(|source| source.split("  search_quick_commands:").next())
@@ -944,4 +950,49 @@ fn terminal_render_uses_cached_font_metrics() {
 
     assert!(metric_source.contains("fn refresh_terminal_font_metrics("));
     assert!(!render_setup.contains("cx.text_system().all_font_names()"));
+}
+
+/// 内嵌 dock 的拖动换算同样必须使用 dock 根元素的真实 bounds,
+/// 不能用 `window.bounds()`(嵌入面板时原点/尺寸都不是 dock 的)。
+#[test]
+fn embedded_sidebar_resize_uses_dock_bounds_not_window_bounds() {
+    let render_layout = include_str!("../render_layout.rs");
+    let resize_event_handler = include_str!("../resize_event_handler.rs");
+
+    assert!(
+        render_layout.contains(".on_prepaint(move |bounds, _, cx|"),
+        "tool dock root must capture its own bounds via on_prepaint"
+    );
+    assert!(
+        render_layout.contains("view.view_bounds = bounds"),
+        "tool dock root prepaint must write view_bounds"
+    );
+    assert!(
+        !resize_event_handler.contains("window.bounds()"),
+        "resize event handler must not derive view bounds from the window"
+    );
+}
+
+#[test]
+fn workspace_mode_renders_extension_panels_in_free_edges() {
+    let layout = include_str!("../../workspace/layout.rs");
+
+    // 工作区分屏里扩展面板要跟内嵌模式同一套「内建优先、扩展补空边」规则，
+    // 否则把终端弹成独立窗格后扩展面板会静默消失。
+    assert!(layout.contains("extension_layout.left.clone()"));
+    assert!(layout.contains("extension_layout.right.clone()"));
+    assert!(layout.contains("extension_layout.bottom.clone()"));
+    assert!(layout.contains("self.render_extension_tool_panel("));
+    assert!(layout.contains("layout.right.is_some() || extension_layout.right.is_some()"));
+}
+
+#[test]
+fn extension_panel_frame_is_shared_by_both_render_modes() {
+    let frame = include_str!("../../sidebar/tool_dock.rs");
+    assert!(frame.contains("pub(crate) fn render_extension_tool_panel_frame"));
+    assert!(frame.contains("sidebar.move_extension_panel(&id, target, cx)"));
+    assert!(frame.contains("sidebar.close_extension_panel(&remove_id, cx)"));
+
+    assert!(include_str!("../tool_dock.rs").contains("render_extension_tool_panel_frame"));
+    assert!(include_str!("../../workspace/render.rs").contains("render_extension_tool_panel_frame"));
 }

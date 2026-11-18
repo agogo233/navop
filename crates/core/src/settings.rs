@@ -1,4 +1,5 @@
 use crate::cloud_sync::{GlobalCloudUser, UserInfo};
+use crate::sidebar_contribution::SidebarPlacement;
 use crate::storage::get_config_dir;
 use crate::utils::auto_save_config::AutoSaveConfig;
 use agent_runtime::{
@@ -8,10 +9,16 @@ use gpui::http_client::Url;
 use gpui::{App, Font, FontFallbacks, Global, font, px};
 use gpui_component::{Theme, ThemeMode};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
+
+/// 本次运行是否从「无法解析」的 settings.json 起步。
+///
+/// 为 `true` 时禁止再写盘：坏文件已被隔离成 `.corrupt-*`，放任后续保存会用默认值
+/// 重写 `settings.json`，把「哪一份才是好配置」彻底搅乱（2026-11-01 事故的翻版）。
+static LOAD_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 mod locale;
 mod remote_file_editor;
@@ -199,6 +206,8 @@ pub enum ConnectionSortOrder {
     Natural,
     /// 最近使用优先（LRU）：最近打开过的连接排在最前
     Lru,
+    /// 手动排序：按用户拖拽后保存的 `sort_order`，同序时按名称自然排序
+    Manual,
 }
 
 impl ConnectionSortOrder {
@@ -206,12 +215,14 @@ impl ConnectionSortOrder {
         match self {
             Self::Natural => "natural",
             Self::Lru => "lru",
+            Self::Manual => "manual",
         }
     }
 
     pub fn from_value(value: &str) -> Self {
         match value {
             "lru" => Self::Lru,
+            "manual" => Self::Manual,
             _ => Self::Natural,
         }
     }
@@ -485,8 +496,16 @@ pub struct ToolExposureToolsetSettings {
     pub redis: bool,
     #[serde(default)]
     pub mongo: bool,
+    /// 内置笔记工具（列表、读取、创建、写入）。
+    #[serde(default)]
+    pub notes: bool,
     #[serde(default)]
     pub internal_functions: bool,
+    /// 扩展声明的 AI 工具（`contributes.tools`）。
+    ///
+    /// 默认关闭：扩展工具默认不进任何对话面，需要显式打开。
+    #[serde(default)]
+    pub extensions: bool,
 }
 
 impl ToolExposureToolsetSettings {
@@ -500,7 +519,9 @@ impl ToolExposureToolsetSettings {
             database: false,
             redis: false,
             mongo: false,
+            notes: false,
             internal_functions: false,
+            extensions: false,
         }
     }
 
@@ -514,7 +535,9 @@ impl ToolExposureToolsetSettings {
             database: true,
             redis: true,
             mongo: true,
+            notes: true,
             internal_functions: true,
+            extensions: false,
         }
     }
 }
@@ -533,6 +556,9 @@ pub struct ToolExposureSettings {
     pub mcp: ToolExposureToolsetSettings,
     #[serde(default = "ToolExposureToolsetSettings::agent_default")]
     pub agent: ToolExposureToolsetSettings,
+    /// 按扩展 id 禁用其全部工具（对 agent 与 mcp 两个面同时生效）。
+    #[serde(default)]
+    pub disabled_extension_tools: std::collections::BTreeSet<String>,
 }
 
 impl Default for ToolExposureSettings {
@@ -540,6 +566,7 @@ impl Default for ToolExposureSettings {
         Self {
             mcp: ToolExposureToolsetSettings::public_mcp_default(),
             agent: ToolExposureToolsetSettings::agent_default(),
+            disabled_extension_tools: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -554,6 +581,9 @@ pub struct McpSettings {
     pub permission_mode: McpPermissionMode,
     #[serde(default = "default_mcp_approval_timeout_ms")]
     pub approval_timeout_ms: u64,
+    /// 独立产品首次启动时是否已经把本产品的核心工具集写入设置。
+    #[serde(default)]
+    pub toolsets_initialized: bool,
     #[serde(default, rename = "toolsets", skip_serializing)]
     pub legacy_toolsets: Option<ToolExposureToolsetSettings>,
 }
@@ -574,6 +604,7 @@ impl Default for McpSettings {
             server_mode: McpServerMode::Temporary,
             permission_mode: McpPermissionMode::Deny,
             approval_timeout_ms: default_mcp_approval_timeout_ms(),
+            toolsets_initialized: false,
             legacy_toolsets: None,
         }
     }
@@ -1155,6 +1186,143 @@ impl CloseButtonBehavior {
     }
 }
 
+/// 更新通道：稳定版 / 测试版（Beta）。
+///
+/// 通道只决定「去哪份更新清单里找新版本」，安装包本身仍是同一套。稳定通道读
+/// `updates/latest.json`，测试通道读 `updates/beta/latest.json`，两边互不覆盖。
+///
+/// 设置里存的是 `Option<UpdateChannel>`：`None` 表示「跟随当前构建」——正式构建走
+/// 稳定通道，带预发布后缀的构建（例如 `0.23.0-beta.2`）自动走测试通道。否则手动下载
+/// 了测试版的人会因为默认值停在稳定清单上，永远收不到后续的 beta。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    /// 稳定版
+    #[default]
+    Stable,
+    /// 测试版（Beta）
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UpdateChannel::Stable => "stable",
+            UpdateChannel::Beta => "beta",
+        }
+    }
+
+    /// 未知取值回退到 [`UpdateChannel::Stable`]：旧版本写下的值不能把新版本卡住。
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "beta" => UpdateChannel::Beta,
+            _ => UpdateChannel::Stable,
+        }
+    }
+
+    /// 由当前版本号推断「跟随构建」时的通道：带预发布后缀即测试通道。
+    pub fn from_version(version: &str) -> Self {
+        if version.contains('-') {
+            UpdateChannel::Beta
+        } else {
+            UpdateChannel::Stable
+        }
+    }
+
+    /// 把「跟随构建」解析成实际通道。
+    pub fn resolve(configured: Option<Self>, version: &str) -> Self {
+        configured.unwrap_or_else(|| Self::from_version(version))
+    }
+}
+
+/// 检查更新时优先使用的镜像源。
+///
+/// 选中的源只是「排在第一位」，不是「只用它」：连不上或清单缺失时仍会按内置顺序
+/// 依次尝试其它源，避免用户手动选错一次就再也查不到更新。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMirror {
+    /// 自动：使用内置顺序（R2 清单 → CNB 镜像 → GitHub Releases）
+    #[default]
+    Auto,
+    /// Cloudflare 上的 JSON 清单（R2 公开域名）
+    Cloudflare,
+    /// GitHub Releases API
+    Github,
+    /// CNB 镜像
+    Cnb,
+}
+
+impl UpdateMirror {
+    /// 下拉框里的全部可选值，顺序即下拉展示顺序（自动排在第一位）。
+    pub const ALL: [UpdateMirror; 4] = [
+        UpdateMirror::Auto,
+        UpdateMirror::Cloudflare,
+        UpdateMirror::Cnb,
+        UpdateMirror::Github,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UpdateMirror::Auto => "auto",
+            UpdateMirror::Cloudflare => "cloudflare",
+            UpdateMirror::Github => "github",
+            UpdateMirror::Cnb => "cnb",
+        }
+    }
+
+    /// 未知取值回退到「自动」：旧版本写下的新枚举值不能让检查卡在某个不可用的源上。
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "cloudflare" => UpdateMirror::Cloudflare,
+            "github" => UpdateMirror::Github,
+            "cnb" => UpdateMirror::Cnb,
+            _ => UpdateMirror::Auto,
+        }
+    }
+}
+
+/// 日志级别，对应启动时给 tracing 装的全局过滤器。
+///
+/// 用户可在「设置 → 通用 → 日志」里随时切换，改完立即生效（不需要重启）；
+/// 环境变量 `RUST_LOG` 仍然优先——它存在时启动阶段以环境变量为准，方便开发者
+/// 临时抓一次 debug 日志而不必先进设置页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    /// 默认：只留告警与关键流程，日志文件不会涨得太快。
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    /// 写进 `EnvFilter` 的指令字符串。
+    pub fn as_directive(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+
+    /// 未知取值回退到默认级别：旧版本写下的新级别不该让日志在启动时静默消失。
+    pub fn from_directive(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "error" => LogLevel::Error,
+            "warn" => LogLevel::Warn,
+            "debug" => LogLevel::Debug,
+            "trace" => LogLevel::Trace,
+            _ => LogLevel::Info,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -1175,6 +1343,7 @@ pub struct AppSettings {
     pub dark_theme: String,
     #[serde(default)]
     pub navop_theme_migrated: bool,
+    /// 窗口背景不透明度；文字、图标和控件保持不透明。
     #[serde(default = "default_window_opacity")]
     pub window_opacity: f32,
     #[serde(default)]
@@ -1256,14 +1425,32 @@ pub struct AppSettings {
     /// 终端左边距展示行号
     #[serde(default)]
     pub terminal_show_line_numbers: bool,
+    /// 终端侧栏各工具面板的停靠位置。
+    ///
+    /// 键是 `SidebarPanel::local_id()`（如 `terminal.ai-chat`），值是左 / 右 / 底。
+    /// 用户从面板的「移动到」菜单改过位置后写回这里，之后新建或重启的终端侧栏沿用；
+    /// 没有记录的面板保持默认右侧。
+    #[serde(default)]
+    pub terminal_tool_panel_placements: BTreeMap<String, SidebarPlacement>,
     #[serde(default)]
     pub local_terminal_profile: LocalTerminalProfileSettings,
     #[serde(default)]
     pub log_file_path: String,
+    /// 日志级别（见 [`LogLevel`]）；空值/旧配置一律按 `info`。
+    #[serde(default)]
+    pub log_level: LogLevel,
     #[serde(default = "default_true")]
     pub auto_update: bool,
     #[serde(default)]
     pub skipped_update_version: Option<String>,
+    /// 更新通道偏好；`None` 表示跟随当前构建（预发布构建自动进入测试通道）。
+    #[serde(default)]
+    pub update_channel: Option<UpdateChannel>,
+    /// 更新镜像源偏好；`None` 表示自动选择（Cloudflare → CNB → GitHub）。
+    ///
+    /// 选中的镜像只排到第一位，失败时仍会依次回退到其余镜像。
+    #[serde(default)]
+    pub update_mirror: Option<UpdateMirror>,
     /// 插件更新提示最近一次通知的更新集合签名，用于避免每次启动都重复提示。
     #[serde(default)]
     pub plugin_update_notified_signature: Option<String>,
@@ -1672,10 +1859,14 @@ impl Default for AppSettings {
             terminal_selection_highlight: default_true(),
             terminal_show_timestamps: false,
             terminal_show_line_numbers: false,
+            terminal_tool_panel_placements: BTreeMap::new(),
             local_terminal_profile: LocalTerminalProfileSettings::default(),
             log_file_path: String::new(),
+            log_level: LogLevel::default(),
             auto_update: true,
             skipped_update_version: None,
+            update_channel: None,
+            update_mirror: None,
             plugin_update_notified_signature: None,
             sync_enabled: false,
             sync_provider: SyncProvider::OnetCloud,
@@ -1841,8 +2032,9 @@ impl AppSettings {
     pub fn normalize_terminal_settings(&mut self) {
         self.terminal_scrollback_lines =
             Self::normalize_terminal_scrollback_lines(self.terminal_scrollback_lines);
-        self.terminal_suggestion_popup_opacity =
-            Self::normalize_terminal_suggestion_popup_opacity(self.terminal_suggestion_popup_opacity);
+        self.terminal_suggestion_popup_opacity = Self::normalize_terminal_suggestion_popup_opacity(
+            self.terminal_suggestion_popup_opacity,
+        );
         let terminal_theme = self.terminal_theme.trim();
         self.terminal_theme = if terminal_theme.is_empty() {
             default_terminal_theme()
@@ -1933,6 +2125,27 @@ impl AppSettings {
         Self::peek_log_file_path_from(&path)
     }
 
+    /// 启动阶段只读一句配置：日志级别要在 `load()` 之前装好过滤器。
+    pub fn peek_log_level() -> LogLevel {
+        let Some(path) = Self::config_path() else {
+            return LogLevel::default();
+        };
+
+        Self::peek_log_level_from(&path)
+    }
+
+    fn peek_log_level_from(path: &Path) -> LogLevel {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return LogLevel::default();
+        };
+
+        serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| value.get("log_level").cloned())
+            .and_then(|value| serde_json::from_value::<LogLevel>(value).ok())
+            .unwrap_or_default()
+    }
+
     fn peek_log_file_path_from(path: &Path) -> String {
         let Ok(content) = std::fs::read_to_string(path) else {
             return String::new();
@@ -1974,6 +2187,7 @@ impl AppSettings {
                     };
                     error!("{message}");
                     eprintln!("[settings] {message}");
+                    LOAD_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
                     Self::default()
                 }
             },
@@ -1982,12 +2196,40 @@ impl AppSettings {
                 let message = format!("Failed to read settings file: {read_error}");
                 error!("{message}");
                 eprintln!("[settings] {message}");
+                LOAD_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
                 Self::default()
             }
         }
     }
 
+    /// 把整份设置写回 `settings.json`。
+    ///
+    /// 两道硬闸，都是为了「设置不能被静默还原」：
+    ///
+    /// 1. 应用路径未初始化时拒绝落盘。测试进程、命令行辅助路径、以及任何在
+    ///    `initialize_app_paths` 之前触发的保存，目录都会经 `app_dirs::config_dir()`
+    ///    回落成正式安装目录，一次整份原子写就把用户真实设置覆盖成默认值
+    ///    （2026-11-01：`cargo test -p db_view` 的用例把 `~/.config/navop/settings.json`
+    ///    写成了 `AppSettings::default()`）。
+    /// 2. 本次运行是从读不出/解析不了的 settings.json 起步时拒绝落盘，避免默认值
+    ///    覆盖已经被隔离成 `.corrupt-*` 的现场（下次启动会正常加载/重建）。
     pub fn save(&self) {
+        if crate::app_paths::initialized_paths().is_none() {
+            let message = "Refusing to save settings: application paths are not initialized, \
+                 so the write target would fall back to the installed config directory";
+            error!("{message}");
+            eprintln!("[settings] {message}");
+            return;
+        }
+        if LOAD_DEGRADED.load(std::sync::atomic::Ordering::Relaxed) {
+            let message = "Refusing to save settings: this run started from a settings.json \
+                 that could not be loaded (it has been quarantined); saving defaults would \
+                 hide the cause";
+            error!("{message}");
+            eprintln!("[settings] {message}");
+            return;
+        }
+
         let Some(path) = Self::config_path() else {
             error!("Could not determine config path");
             return;
@@ -2095,27 +2337,61 @@ impl AppSettings {
     }
 }
 
-/// 原子写 settings.json，并在覆盖前保留上一份为 `settings.json.bak`。
+/// 原子写 settings.json，并在覆盖前把上一份滚进多代备份。
 ///
 /// 直接 `fs::write` 覆盖有两个老问题：写到一半崩溃会留下半截 JSON，而半截 JSON 会让
 /// [`AppSettings::load`] 走进 `Err` 分支、把整份设置回落成默认值；覆盖前也没有任何可回滚的副本。
+///
+/// 备份保留多代（`settings.json.bak`、`.bak.1`、`.bak.2`）：只留一代时，坏掉的默认值
+/// 被启动期连续 save 两次就会把仅有的好配置顶掉，之后再无回滚可能。
 fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("settings.json");
-    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    // 临时文件名带进程号：两个实例同时保存时，固定名 `.tmp` 会互相写穿，
+    // 落盘的就是半截 JSON。
+    let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp_path, content)?;
 
     if path.exists() {
-        let backup_path = path.with_file_name(format!("{file_name}.bak"));
-        // 备份失败不阻断主写入：保住用户这次的改动比保住旧副本更重要。
-        if let Err(e) = std::fs::copy(path, &backup_path) {
-            error!("Failed to back up settings file: {}", e);
-        }
+        rotate_settings_backups(path, file_name);
     }
 
     std::fs::rename(&tmp_path, path)
+}
+
+/// 备份代数上限：`.bak`、`.bak.1`、`.bak.2`。
+const SETTINGS_BACKUP_GENERATIONS: usize = 3;
+
+fn rotate_settings_backups(path: &Path, file_name: &str) {
+    let generation_path = |generation: usize| {
+        if generation == 0 {
+            path.with_file_name(format!("{file_name}.bak"))
+        } else {
+            path.with_file_name(format!("{file_name}.bak.{generation}"))
+        }
+    };
+
+    let oldest = generation_path(SETTINGS_BACKUP_GENERATIONS - 1);
+    if oldest.exists() {
+        let _ = std::fs::remove_file(&oldest);
+    }
+    for generation in (0..SETTINGS_BACKUP_GENERATIONS - 1).rev() {
+        let from = generation_path(generation);
+        if from.exists() {
+            let to = generation_path(generation + 1);
+            if let Err(error) = std::fs::rename(&from, &to) {
+                error!("Failed to rotate settings backup: {}", error);
+            }
+        }
+    }
+
+    // 备份失败不阻断主写入：保住用户这次的改动比保住旧副本更重要。
+    let backup_path = generation_path(0);
+    if let Err(error) = std::fs::copy(path, &backup_path) {
+        error!("Failed to back up settings file: {}", error);
+    }
 }
 
 /// 把无法解析的 settings.json 改名保留为 `settings.json.corrupt-<时间戳>`。
@@ -2150,11 +2426,12 @@ mod tests {
         CloseButtonBehavior, ConnectionSortOrder, CustomFont, DEFAULT_AI_REQUEST_TIMEOUT_SECS,
         DEFAULT_MCP_APPROVAL_TIMEOUT_MS, DEFAULT_SQL_EXPORT_ROWS_PER_STATEMENT,
         DEFAULT_TERMINAL_THEME, HomeConnectionLayout, LOCALE_SYSTEM, LargeTextCellEditorOpenMode,
-        LocalTerminalProfileKind, LocalTerminalProfileSettings, MAX_AI_REQUEST_TIMEOUT_SECS,
-        MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MAX_RECENT_WORKSPACE_ROOTS, MAX_REMEMBERED_ACP_SESSIONS,
-        MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState, MasterKeyStorage, McpPermissionMode,
-        McpServerMode, PersonalSyncBackendKind, RemoteFileOpenMode, SqlFormatSettings,
-        SqlIndentStyle, SqlKeywordCase, StartupDefaultPage, SyncProvider, TableViewMode,
+        LocalTerminalProfileKind, LocalTerminalProfileSettings, LogLevel,
+        MAX_AI_REQUEST_TIMEOUT_SECS, MAX_CUSTOM_SYSTEM_PROMPT_CHARS, MAX_RECENT_WORKSPACE_ROOTS,
+        MAX_REMEMBERED_ACP_SESSIONS, MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState,
+        MasterKeyStorage, McpPermissionMode, McpServerMode, PersonalSyncBackendKind,
+        RemoteFileOpenMode, SidebarPlacement, SqlFormatSettings, SqlIndentStyle, SqlKeywordCase,
+        StartupDefaultPage, SyncProvider, TableViewMode, UpdateChannel, UpdateMirror,
         default_grid_font_fallback_families, default_grid_monospace_font_family,
         grid_monospace_font, installed_grid_monospace_font, is_installed_font_family,
         resolve_installed_grid_monospace_font_family,
@@ -2236,13 +2513,43 @@ mod tests {
         )
         .expect("write settings");
 
-        assert_eq!(AppSettings::peek_log_file_path_from(&path), "/tmp/navop.log");
+        assert_eq!(
+            AppSettings::peek_log_file_path_from(&path),
+            "/tmp/navop.log"
+        );
         assert!(
             serde_json::from_str::<AppSettings>(
                 &std::fs::read_to_string(&path).expect("read settings")
             )
             .is_err(),
             "整份反序列化应当失败，而 peek 仍要能取到日志路径"
+        );
+    }
+
+    #[test]
+    fn log_level_round_trips_and_degrades_to_info() {
+        assert_eq!(AppSettings::default().log_level, LogLevel::Info);
+        assert_eq!(LogLevel::Info.as_directive(), "info");
+        assert_eq!(LogLevel::from_directive("DEBUG"), LogLevel::Debug);
+        // 未知取值回退到 info：宁可多写一点日志，也不要让日志静默消失。
+        assert_eq!(LogLevel::from_directive("verbose-ish"), LogLevel::Info);
+
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"log_level":"trace"}"#).expect("只写日志级别的旧配置应能解析");
+        assert_eq!(settings.log_level, LogLevel::Trace);
+
+        // 启动期 peek 不能依赖整份配置解析成功，否则坏配置会把级别悄悄打回默认。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"log_level":"debug","font_size":"坏值"}"#)
+            .expect("write settings");
+        assert_eq!(AppSettings::peek_log_level_from(&path), LogLevel::Debug);
+        assert!(
+            serde_json::from_str::<AppSettings>(
+                &std::fs::read_to_string(&path).expect("read settings")
+            )
+            .is_err(),
+            "整份反序列化应当失败，而 peek 仍要能取到日志级别"
         );
     }
 
@@ -2629,6 +2936,7 @@ mod tests {
         assert!(!settings.tool_exposure.mcp.database);
         assert!(!settings.tool_exposure.mcp.redis);
         assert!(!settings.tool_exposure.mcp.sftp);
+        assert!(!settings.tool_exposure.mcp.notes);
         assert!(settings.tool_exposure.agent.terminal);
         assert!(settings.tool_exposure.agent.terminal_ssh_exec);
         assert!(settings.tool_exposure.agent.terminal_exec);
@@ -2636,6 +2944,7 @@ mod tests {
         assert!(settings.tool_exposure.agent.database);
         assert!(settings.tool_exposure.agent.redis);
         assert!(settings.tool_exposure.agent.sftp);
+        assert!(settings.tool_exposure.agent.notes);
     }
 
     #[test]
@@ -2920,9 +3229,14 @@ mod tests {
     fn connection_sort_order_round_trips_via_value() {
         assert_eq!("natural", ConnectionSortOrder::Natural.as_str());
         assert_eq!("lru", ConnectionSortOrder::Lru.as_str());
+        assert_eq!("manual", ConnectionSortOrder::Manual.as_str());
         assert_eq!(
             ConnectionSortOrder::Lru,
             ConnectionSortOrder::from_value("lru")
+        );
+        assert_eq!(
+            ConnectionSortOrder::Manual,
+            ConnectionSortOrder::from_value("manual")
         );
         assert_eq!(
             ConnectionSortOrder::Natural,
@@ -2998,6 +3312,52 @@ mod tests {
         .expect("connection sidebar tree state should deserialize");
 
         assert!(settings.connection_sidebar_tree_state.hide_empty_workspaces);
+    }
+
+    #[test]
+    fn app_settings_defaults_to_no_terminal_tool_panel_placements() {
+        let settings = AppSettings::default();
+
+        assert!(settings.terminal_tool_panel_placements.is_empty());
+    }
+
+    #[test]
+    fn app_settings_round_trips_terminal_tool_panel_placements() {
+        let mut settings = AppSettings::default();
+        settings
+            .terminal_tool_panel_placements
+            .insert("terminal.ai-chat".to_string(), SidebarPlacement::Left);
+        settings.terminal_tool_panel_placements.insert(
+            "terminal.file-manager".to_string(),
+            SidebarPlacement::Bottom,
+        );
+
+        let saved = serde_json::to_value(&settings).expect("settings should serialize");
+        assert_eq!(
+            saved["terminal_tool_panel_placements"]["terminal.ai-chat"],
+            "left"
+        );
+        assert_eq!(
+            saved["terminal_tool_panel_placements"]["terminal.file-manager"],
+            "bottom"
+        );
+
+        let restored: AppSettings =
+            serde_json::from_value(saved).expect("settings should round trip");
+        assert_eq!(
+            restored.terminal_tool_panel_placements,
+            settings.terminal_tool_panel_placements
+        );
+    }
+
+    #[test]
+    fn app_settings_without_terminal_tool_panel_placements_keeps_defaults() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "terminal_theme": "Default Dark"
+        }))
+        .expect("旧版 settings.json 应能读取");
+
+        assert!(settings.terminal_tool_panel_placements.is_empty());
     }
 
     #[test]
@@ -3136,7 +3496,9 @@ mod tests {
         assert!(settings.tool_exposure.mcp.terminal_ssh_exec);
         assert!(settings.tool_exposure.mcp.terminal_exec);
         assert!(settings.tool_exposure.mcp.connections);
+        assert!(!settings.tool_exposure.mcp.notes);
         assert!(settings.tool_exposure.agent.database);
+        assert!(settings.tool_exposure.agent.notes);
     }
 
     #[test]
@@ -3410,6 +3772,7 @@ mod tests {
         settings.tool_exposure.mcp.connections = false;
         settings.tool_exposure.mcp.database = true;
         settings.tool_exposure.mcp.redis = true;
+        settings.tool_exposure.mcp.notes = true;
         settings.tool_exposure.agent.terminal_exec = false;
 
         let json = serde_json::to_string(&settings).expect("应序列化 AppSettings");
@@ -3425,6 +3788,7 @@ mod tests {
         assert!(!loaded.tool_exposure.mcp.connections);
         assert!(loaded.tool_exposure.mcp.database);
         assert!(loaded.tool_exposure.mcp.redis);
+        assert!(loaded.tool_exposure.mcp.notes);
         assert!(!loaded.tool_exposure.agent.terminal_exec);
     }
 
@@ -3849,5 +4213,83 @@ mod tests {
             "/opt/homebrew/bin/fish --login -C 'echo ready'",
             profile.command
         );
+    }
+
+    #[test]
+    fn update_channel_values_match_the_persisted_snake_case_values() {
+        assert_eq!("stable", UpdateChannel::Stable.as_str());
+        assert_eq!("beta", UpdateChannel::Beta.as_str());
+        assert_eq!(UpdateChannel::Stable, UpdateChannel::from_str("stable"));
+        assert_eq!(UpdateChannel::Beta, UpdateChannel::from_str("beta"));
+        // 未知取值必须回退到稳定通道，不能把用户卡在收不到更新的状态。
+        assert_eq!(UpdateChannel::Stable, UpdateChannel::from_str(""));
+        assert_eq!(UpdateChannel::Stable, UpdateChannel::from_str("canary"));
+    }
+
+    #[test]
+    fn update_channel_follows_the_build_unless_the_user_overrides_it() {
+        assert_eq!(
+            UpdateChannel::Stable,
+            UpdateChannel::resolve(None, "0.22.0")
+        );
+        assert_eq!(
+            UpdateChannel::Beta,
+            UpdateChannel::resolve(None, "0.23.0-beta.2")
+        );
+        // 显式选择优先于构建后缀：手动装过测试版的人也能主动留在稳定通道。
+        assert_eq!(
+            UpdateChannel::Stable,
+            UpdateChannel::resolve(Some(UpdateChannel::Stable), "0.23.0-beta.2")
+        );
+        assert_eq!(
+            UpdateChannel::Beta,
+            UpdateChannel::resolve(Some(UpdateChannel::Beta), "0.22.0")
+        );
+    }
+
+    #[test]
+    fn update_channel_round_trips_through_settings_json_and_tolerates_missing_fields() {
+        let mut settings = AppSettings::default();
+        assert_eq!(None, settings.update_channel);
+
+        settings.update_channel = Some(UpdateChannel::Beta);
+        let json = serde_json::to_string(&settings).expect("序列化设置失败");
+        let restored: AppSettings = serde_json::from_str(&json).expect("反序列化设置失败");
+        assert_eq!(Some(UpdateChannel::Beta), restored.update_channel);
+
+        // 老版本的 settings.json 没有这个字段，必须照常读出来并落到「跟随构建」。
+        let legacy: AppSettings = serde_json::from_str("{}").expect("空对象也应可解析");
+        assert_eq!(None, legacy.update_channel);
+    }
+
+    #[test]
+    fn update_mirror_values_match_the_persisted_snake_case_values() {
+        assert_eq!("auto", UpdateMirror::Auto.as_str());
+        assert_eq!("cloudflare", UpdateMirror::Cloudflare.as_str());
+        assert_eq!("github", UpdateMirror::Github.as_str());
+        assert_eq!("cnb", UpdateMirror::Cnb.as_str());
+        assert_eq!(
+            UpdateMirror::Cloudflare,
+            UpdateMirror::from_str("cloudflare")
+        );
+        assert_eq!(UpdateMirror::Github, UpdateMirror::from_str("github"));
+        assert_eq!(UpdateMirror::Cnb, UpdateMirror::from_str("cnb"));
+        // 未知取值回退到「自动」，否则用户会被一个已删除的源永久卡住。
+        assert_eq!(UpdateMirror::Auto, UpdateMirror::from_str(""));
+        assert_eq!(UpdateMirror::Auto, UpdateMirror::from_str("gitee"));
+    }
+
+    #[test]
+    fn update_mirror_round_trips_through_settings_json_and_tolerates_missing_fields() {
+        let mut settings = AppSettings::default();
+        assert_eq!(None, settings.update_mirror);
+
+        settings.update_mirror = Some(UpdateMirror::Cnb);
+        let json = serde_json::to_string(&settings).expect("序列化设置失败");
+        let restored: AppSettings = serde_json::from_str(&json).expect("反序列化设置失败");
+        assert_eq!(Some(UpdateMirror::Cnb), restored.update_mirror);
+
+        let legacy: AppSettings = serde_json::from_str("{}").expect("空对象也应可解析");
+        assert_eq!(None, legacy.update_mirror);
     }
 }

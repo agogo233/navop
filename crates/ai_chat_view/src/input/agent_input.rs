@@ -103,6 +103,10 @@ pub enum AgentInputEvent {
     RemoveQueued { index: usize },
     /// 把队列中第 `index` 条拉回输入框继续编辑（由上层负责从队列移除）。
     EditQueued { index: usize },
+    /// 立刻把队列中第 `index` 条插进正在跑的轮次（steer），不等这一轮收尾。
+    ///
+    /// 插话是**显式动作**：默认提交只排在输入框上方，插队要用户自己点这一下。
+    SendQueuedNow { index: usize },
     /// 回答 agent 的提问：`content` 已按属性名收集好，直接送回 ACP。
     SubmitElicitation { content: BTreeMap<String, Value> },
     /// 明确拒绝回答 agent 的提问。
@@ -1117,11 +1121,12 @@ impl AgentInput {
     /// overlay，弹层宽度按最长候选估，名字被省略时 tooltip 给全名。
     fn render_model_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.local_theme(cx);
-        let model_label = match &self.context.model {
-            Some(model) if model.model_only => model.model.clone(),
-            Some(model) => SharedString::from(format!("{} / {}", model.provider, model.model)),
-            None => SharedString::from(t!("AgentUi.select_model").to_string()),
-        };
+        let model_label = self
+            .context
+            .model
+            .as_ref()
+            .map(|model| model.display_label())
+            .unwrap_or_else(|| SharedString::from(t!("AgentUi.select_model").to_string()));
         composer_model_chip(
             &self.model_select,
             "agent-model-control",
@@ -1176,6 +1181,18 @@ impl AgentInput {
                             .child(format!("{}", index + 1)),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(text))
+                    .child(
+                        Button::new(SharedString::from(format!("agent-queued-send-{index}")))
+                            .debug_selector(|| "agent-input-queued-send".to_string())
+                            .icon(IconName::ArrowUp)
+                            .ghost()
+                            .small()
+                            .tooltip(t!("AgentUi.send_queued_now").to_string())
+                            .on_click(cx.listener(move |_this, _, _window, cx| {
+                                cx.emit(AgentInputEvent::SendQueuedNow { index });
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new(SharedString::from(format!("agent-queued-edit-{index}")))
                             .icon(IconName::Edit)

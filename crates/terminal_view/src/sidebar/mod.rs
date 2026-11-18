@@ -8,6 +8,10 @@
 
 mod broadcast_input_panel;
 mod composer_context;
+mod connection_notes_panel;
+mod extension_panel_state;
+pub mod extension_panels;
+use extension_panel_state::ExtensionPanelEntry;
 pub mod file_manager_panel;
 mod history_command_panel;
 mod quick_command_panel;
@@ -17,9 +21,13 @@ mod settings_panel;
 pub(crate) mod tool_dock;
 
 use broadcast_input_panel::{BroadcastInputPanel, BroadcastInputPanelConfig};
+use connection_notes_panel::ConnectionNotesPanel;
+pub use extension_panels::{
+    ExtensionPanelSpec, TerminalExtensionPanelHost, init_terminal_extension_panels,
+};
 pub use file_manager_panel::{FileManagerPanel, FileManagerPanelEvent};
 pub use history_command_panel::{HistoryCommandPanel, HistoryCommandPanelEvent};
-pub use quick_command_panel::QuickCommandPanel;
+pub use quick_command_panel::{QuickCommandPanel, QuickCommandPanelEvent};
 pub use server_monitor_panel::{ServerMonitorPanel, ServerMonitorPanelEvent};
 pub use settings_panel::SettingsPanel;
 
@@ -37,7 +45,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
-    Window, div,
+    Window, div, px,
 };
 use gpui_component::{
     ActiveTheme, Icon, Selectable, Sizable, Size, Theme,
@@ -46,6 +54,7 @@ use gpui_component::{
 };
 use one_assets::IconName;
 use one_core::layout::TOOLBAR_WIDTH;
+use one_core::settings::AppSettings;
 use one_core::sidebar_contribution::SidebarPlacement;
 use one_core::storage::{
     ConnectionRepository, GlobalStorageState, TerminalHistoryScope, models::StoredConnection,
@@ -57,7 +66,7 @@ use one_ui::{
 };
 use rust_i18n::t;
 use ssh::SshSessionManager;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use terminal::ReportedWorkingDir;
@@ -139,7 +148,11 @@ fn terminal_ai_system_instruction(connection_kind: TerminalConnectionKind) -> St
 4. 如果任务需要多步骤，请拆成多个独立代码块，每个代码块只对应一步的一条命令。
 5. 解释、注意事项、风险提示、步骤标题必须写在代码块外面，保持简洁。
 6. 如果命令依赖 sudo、包管理器或发行版差异，请先简短说明再给命令。
-7. 如果用户明确要求其他平台、非命令答案或更详细的解释，再按用户要求调整。"#
+7. 如果用户明确要求其他平台、非命令答案或更详细的解释，再按用户要求调整。
+8. 资源作用域里的 cwd / screen / selection 是这台终端此刻的现场：涉及路径或「当前目录」时直接使用，不要猜测，也不要默认 $HOME 或 /root。
+9. 需要继承当前目录、已激活虚拟环境、alias/函数或临时环境变量时，用 terminal_exec（即 terminal.exec）；省略 target 时会落到当前终端，正在前台输入时可能返回 Busy，此时不要改用 ssh_exec 去猜目录。若进入 sudo -i / su 等嵌套 shell 后 terminal_exec 一直 Busy，而提示符空闲，可用 terminal_write_command（即 terminal.write_command）直接写入一条命令，再用 terminal_read 读取可见结果。
+10. 用 ssh_exec（即 ssh.exec）做后台远程执行时，省略 cwd 会继承目标终端的当前目录；若作用域里的 cwd 与目标机器不一致（例如终端里又 ssh 到了另一台机器），必须显式传 cwd；需要干净目录时显式传 cwd（绝对路径或 $HOME）。
+11. 作用域里没有 cwd 时不要假设任何目录：先用 terminal_read 确认现场，或直接询问用户。"#
     )
 }
 
@@ -338,8 +351,6 @@ pub enum SidebarPanel {
     FileExplorer,
     /// 设置面板（搜索 + 字体 + 主题）
     Settings,
-    /// 快捷命令面板
-    QuickCommand,
     /// 历史命令面板
     HistoryCommand,
     /// AI 聊天面板
@@ -348,6 +359,8 @@ pub enum SidebarPanel {
     BroadcastInput,
     /// 文件管理器面板（仅 SSH 终端）
     FileManager,
+    /// 当前连接的备注与运维笔记
+    ConnectionNotes,
     /// 服务器监控面板（仅 SSH 终端）
     ServerMonitor,
 }
@@ -356,11 +369,11 @@ impl SidebarPanel {
     pub const ALL: [SidebarPanel; 8] = [
         SidebarPanel::FileExplorer,
         SidebarPanel::Settings,
-        SidebarPanel::QuickCommand,
         SidebarPanel::HistoryCommand,
         SidebarPanel::AiChat,
         SidebarPanel::BroadcastInput,
         SidebarPanel::FileManager,
+        SidebarPanel::ConnectionNotes,
         SidebarPanel::ServerMonitor,
     ];
 
@@ -372,11 +385,11 @@ impl SidebarPanel {
         match self {
             SidebarPanel::FileExplorer => "terminal.file-explorer",
             SidebarPanel::Settings => "terminal.settings",
-            SidebarPanel::QuickCommand => "terminal.quick-command",
             SidebarPanel::HistoryCommand => "terminal.history-command",
             SidebarPanel::AiChat => "terminal.ai-chat",
             SidebarPanel::BroadcastInput => "terminal.broadcast-input",
             SidebarPanel::FileManager => "terminal.file-manager",
+            SidebarPanel::ConnectionNotes => "terminal.connection-notes",
             SidebarPanel::ServerMonitor => "terminal.server-monitor",
         }
     }
@@ -386,11 +399,11 @@ impl SidebarPanel {
         match self {
             SidebarPanel::FileExplorer => Icon::new(IconName::FolderOpen),
             SidebarPanel::Settings => Icon::new(IconName::Settings),
-            SidebarPanel::QuickCommand => Icon::new(IconName::SquareTerminal),
             SidebarPanel::HistoryCommand => Icon::new(IconName::BookOpen),
             SidebarPanel::AiChat => Icon::new(IconName::AILine),
             SidebarPanel::BroadcastInput => Icon::new(IconName::Network),
             SidebarPanel::FileManager => Icon::new(IconName::Folder),
+            SidebarPanel::ConnectionNotes => Icon::new(IconName::File),
             SidebarPanel::ServerMonitor => Icon::new(IconName::Monitor),
         }
     }
@@ -400,11 +413,11 @@ impl SidebarPanel {
         match self {
             SidebarPanel::FileExplorer => t!("TerminalSidebar.file_explorer"),
             SidebarPanel::Settings => t!("TerminalSidebar.settings"),
-            SidebarPanel::QuickCommand => t!("TerminalSidebar.quick_commands"),
             SidebarPanel::HistoryCommand => t!("TerminalSidebar.history_commands"),
             SidebarPanel::AiChat => t!("TerminalSidebar.ai_chat"),
             SidebarPanel::BroadcastInput => t!("TerminalSidebar.broadcast_input"),
             SidebarPanel::FileManager => t!("TerminalSidebar.file_manager"),
+            SidebarPanel::ConnectionNotes => t!("TerminalSidebar.connection_notes"),
             SidebarPanel::ServerMonitor => t!("TerminalSidebar.server_monitor"),
         }
         .into()
@@ -477,6 +490,7 @@ fn terminal_sidebar_available_panels(
     has_file_explorer: bool,
     has_file_manager: bool,
     has_server_monitor: bool,
+    has_connection_notes: bool,
     history_supported: bool,
     broadcast_supported: bool,
 ) -> Vec<SidebarPanel> {
@@ -493,13 +507,15 @@ fn terminal_sidebar_available_panels(
     if has_file_manager {
         panels.push(SidebarPanel::FileManager);
     }
+    if has_connection_notes {
+        panels.push(SidebarPanel::ConnectionNotes);
+    }
     if has_server_monitor {
         panels.push(SidebarPanel::ServerMonitor);
     }
     if history_supported {
         panels.push(SidebarPanel::HistoryCommand);
     }
-    panels.push(SidebarPanel::QuickCommand);
     panels
 }
 
@@ -676,6 +692,34 @@ impl TerminalToolDockState {
     pub fn first_open_panel(&self) -> Option<SidebarPanel> {
         self.open_panels().first().map(|(panel, _)| *panel)
     }
+
+    /// 当前可用面板的停靠位置快照（含未展开的面板），用于写回设置。
+    pub fn panel_placements(&self) -> Vec<(SidebarPanel, SidebarPlacement)> {
+        self.panels
+            .iter()
+            .map(|panel| (*panel, self.panel_placement(*panel)))
+            .collect()
+    }
+
+    /// 按持久化的停靠位置复位各面板，返回真正被改动位置的面板。
+    ///
+    /// 只看已经存在的面板：设置里其它会话的面板（例如 SSH 的文件管理器）
+    /// 在这台终端上还没建出来，留给 `update_available_panels` 之后的那次复位。
+    pub fn apply_persisted_placements(
+        &mut self,
+        persisted: &BTreeMap<String, SidebarPlacement>,
+    ) -> Vec<SidebarPanel> {
+        let mut moved = Vec::new();
+        for panel in self.panels.clone() {
+            let Some(placement) = persisted.get(panel.local_id()).copied() else {
+                continue;
+            };
+            if self.panel_placement(panel) != placement && self.move_tool(panel, placement) {
+                moved.push(panel);
+            }
+        }
+        moved
+    }
 }
 
 /// 终端侧边栏事件
@@ -699,8 +743,6 @@ pub enum TerminalSidebarEvent {
     ScrollbackLinesChanged(usize),
     /// 粘贴命令到终端输入区（不自动回车）
     ExecuteCommand(String),
-    /// 快捷命令数据已变更
-    QuickCommandsChanged,
     /// 请求询问 AI
     AskAi,
     /// 粘贴代码到终端（用于AI生成的代码块）
@@ -769,14 +811,20 @@ impl PendingSshToolPanels {
     }
 }
 
+/// 扩展面板在设置里的存档键。
+///
+/// 用 `ext:` 前缀把扩展面板与内建 `SidebarPanel::local_id`（`terminal.settings`
+/// 之类）隔开，两类 id 都带点号，不加前缀会撞。
+fn extension_panel_placement_key(id: &str) -> String {
+    format!("ext:{id}")
+}
+
 /// 终端侧边栏组件
 pub struct TerminalSidebar {
     /// 终端工具面板 dock 状态
     tool_dock: TerminalToolDockState,
     /// 设置面板
     settings_panel: Entity<SettingsPanel>,
-    /// 快捷命令面板
-    quick_command_panel: Entity<QuickCommandPanel>,
     /// 历史命令面板
     history_command_panel: Option<Entity<HistoryCommandPanel>>,
     /// AI 聊天面板
@@ -787,6 +835,8 @@ pub struct TerminalSidebar {
     broadcast_input_panel: Option<Entity<BroadcastInputPanel>>,
     /// 文件管理器面板（仅 SSH 终端时创建）
     file_manager_panel: Option<Entity<FileManagerPanel>>,
+    /// 当前连接的备注与运维笔记
+    connection_notes_panel: Option<Entity<ConnectionNotesPanel>>,
     /// 本地工作区文件浏览器（仅本地终端时创建）
     file_explorer_panel: Option<Entity<WorkspaceExplorer>>,
     /// 服务器监控面板（仅 SSH 终端时创建）
@@ -797,6 +847,8 @@ pub struct TerminalSidebar {
     stored_connection: Option<StoredConnection>,
     /// 尚未创建的 SSH 工具面板（凭据就绪后补建）
     pending_ssh_tool_panels: Option<PendingSshToolPanels>,
+    /// 扩展面板条目（宿主注入的 nsh 面板；view 惰性创建）
+    extension_panels: Vec<ExtensionPanelEntry>,
     /// 焦点句柄
     focus_handle: FocusHandle,
     /// 终端主题配色（用于侧边栏工具栏）
@@ -824,11 +876,6 @@ fn subscribe_server_monitor_panel(
 }
 
 impl TerminalSidebar {
-    pub(crate) fn refresh_quick_commands(&mut self, cx: &mut Context<Self>) {
-        self.quick_command_panel
-            .update(cx, |panel, cx| panel.load_commands(cx));
-    }
-
     fn handle_file_manager_event(&mut self, event: &FileManagerPanelEvent, cx: &mut Context<Self>) {
         match event {
             FileManagerPanelEvent::Close => {
@@ -884,6 +931,11 @@ impl TerminalSidebar {
             .as_ref()
             .filter(|connection| connection.id.is_none())
             .cloned()
+    }
+
+    /// 当前终端对应的连接；本地终端返回 `None`。
+    pub(crate) fn stored_connection(&self) -> Option<StoredConnection> {
+        self.stored_connection.clone()
     }
 
     /// 请求把当前临时连接保存为正式连接。
@@ -1001,13 +1053,32 @@ impl TerminalSidebar {
                 self.file_explorer_panel.is_some(),
                 self.file_manager_panel.is_some(),
                 self.server_monitor_panel.is_some(),
+                self.connection_notes_panel.is_some(),
                 self.history_command_panel.is_some(),
                 self.broadcast_input_panel.is_some(),
             ));
-        if changed {
+        // 扩展面板规格可能随扩展启用/停用变化，一并同步（保留状态）。
+        let extension_changed = {
+            let specs = extension_panels::terminal_extension_panel_specs(cx);
+            let next = extension_panel_state::sync_extension_panels(
+                std::mem::take(&mut self.extension_panels),
+                specs,
+            );
+            let differs = next.len() != self.extension_panels.len()
+                || next
+                    .iter()
+                    .zip(self.extension_panels.iter())
+                    .any(|(a, b)| *a.id != *b.id);
+            self.extension_panels = next;
+            differs
+        };
+        if changed || extension_changed {
             cx.notify();
         }
-        changed
+        // 后补建的面板（SSH 文件管理器 / 服务器监控）落在默认右侧，
+        // 这里再套一次用户上次选好的位置。
+        self.restore_tool_panel_placements(cx);
+        changed || extension_changed
     }
 
     pub(crate) fn new(
@@ -1075,8 +1146,14 @@ impl TerminalSidebar {
                 };
                 cx.new(|cx| BroadcastInputPanel::new(config, window, cx))
             });
-        let quick_command_panel =
-            cx.new(|cx| QuickCommandPanel::new(connection_id, colors.clone(), window, cx));
+        let connection_notes_panel = sidebar_connection
+            .as_ref()
+            .filter(|connection| connection.id.is_some())
+            .map(|connection| {
+                cx.new(|cx| {
+                    ConnectionNotesPanel::new(connection.clone(), colors.clone(), window, cx)
+                })
+            });
         let history_command_panel = history_scope.map(|scope| {
             cx.new(|cx| {
                 HistoryCommandPanel::new(scope, history_user.clone(), colors.clone(), window, cx)
@@ -1290,22 +1367,6 @@ impl TerminalSidebar {
             },
         );
 
-        // 订阅快捷命令面板事件
-        let quick_sub = cx.subscribe(
-            &quick_command_panel,
-            |this, _, event: &quick_command_panel::QuickCommandPanelEvent, cx| match event {
-                quick_command_panel::QuickCommandPanelEvent::Close => {
-                    this.close_tool(SidebarPanel::QuickCommand, cx);
-                }
-                quick_command_panel::QuickCommandPanelEvent::ExecuteCommand(cmd) => {
-                    cx.emit(TerminalSidebarEvent::ExecuteCommand(cmd.clone()));
-                }
-                quick_command_panel::QuickCommandPanelEvent::QuickCommandsChanged => {
-                    cx.emit(TerminalSidebarEvent::QuickCommandsChanged);
-                }
-            },
-        );
-
         let history_sub = history_command_panel.as_ref().map(|panel| {
             cx.subscribe(
                 panel,
@@ -1339,7 +1400,7 @@ impl TerminalSidebar {
             },
         );
 
-        let mut subs = vec![set_sub, quick_sub, ai_chat_sub];
+        let mut subs = vec![set_sub, ai_chat_sub];
         if let Some(sub) = history_sub {
             subs.push(sub);
         }
@@ -1390,28 +1451,37 @@ impl TerminalSidebar {
             file_explorer_panel.is_some(),
             file_manager_panel.is_some(),
             server_monitor_panel.is_some(),
+            connection_notes_panel.is_some(),
             history_command_panel.is_some(),
             broadcast_input_panel.is_some(),
         );
-        Self {
+        let mut sidebar = Self {
             tool_dock: TerminalToolDockState::new(available_panels),
             settings_panel,
-            quick_command_panel,
             history_command_panel,
             ai_chat_panel,
             ai_connection_resource,
             broadcast_input_panel,
             file_manager_panel,
+            connection_notes_panel,
             file_explorer_panel,
             server_monitor_panel,
             sync_path_enabled,
             stored_connection: sidebar_connection,
             pending_ssh_tool_panels: (!pending_ssh_tool_panels.is_empty())
                 .then_some(pending_ssh_tool_panels),
+            extension_panels: extension_panel_state::sync_extension_panels(
+                Vec::new(),
+                extension_panels::terminal_extension_panel_specs(cx),
+            ),
             focus_handle: cx.focus_handle(),
             colors,
             _subs: subs,
-        }
+        };
+        // 上次用「移动到」选好的停靠位置在设置里，构造时就复位，
+        // 否则新建终端会把面板全部拉回默认的右侧。
+        sidebar.restore_tool_panel_placements(cx);
+        sidebar
     }
 
     /// 获取当前激活的面板
@@ -1442,7 +1512,7 @@ impl TerminalSidebar {
 
     /// 是否显示侧边栏
     pub fn is_visible(&self) -> bool {
-        !self.tool_dock.open_panels().is_empty()
+        !self.tool_dock.open_panels().is_empty() || self.extension_panels.iter().any(|p| p.open)
     }
 
     pub fn toolbar_visible(&self) -> bool {
@@ -1457,6 +1527,115 @@ impl TerminalSidebar {
         self.tool_dock.open_panels()
     }
 
+    /// 扩展面板当前打开的（键，停靠位置）列表。
+    pub fn open_extension_panels(&self) -> Vec<(SharedString, SidebarPlacement)> {
+        self.extension_panels
+            .iter()
+            .filter(|p| p.open)
+            .map(|p| (p.id.clone(), p.placement))
+            .collect()
+    }
+
+    /// 指定扩展面板是否打开。
+    pub fn is_extension_panel_open(&self, id: &str) -> bool {
+        self.extension_panels
+            .iter()
+            .any(|p| p.id.as_ref() == id && p.open)
+    }
+
+    /// 打开扩展面板（首次打开时经宿主创建视图）。
+    pub fn open_extension_panel(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_extension_panel_view(id, cx) {
+            return;
+        }
+        let Some(entry) = self
+            .extension_panels
+            .iter_mut()
+            .find(|p| p.id.as_ref() == id)
+        else {
+            return;
+        };
+        if !entry.open {
+            entry.open = true;
+            cx.emit(TerminalSidebarEvent::PanelChanged(None));
+            cx.notify();
+        }
+    }
+
+    /// 关闭扩展面板（不销毁视图，再次打开复用）。
+    pub fn close_extension_panel(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(entry) = self.extension_panels.iter_mut().find(|p| p.id.as_ref() == id) {
+            if entry.open {
+                entry.open = false;
+                cx.emit(TerminalSidebarEvent::PanelChanged(None));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 切换扩展面板。
+    pub fn toggle_extension_panel(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.is_extension_panel_open(id) {
+            self.close_extension_panel(id, cx);
+        } else {
+            self.open_extension_panel(id, cx);
+        }
+    }
+
+    /// 移动扩展面板停靠边。
+    pub fn move_extension_panel(
+        &mut self,
+        id: &str,
+        placement: SidebarPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.extension_panels.iter_mut().find(|p| p.id.as_ref() == id) {
+            if entry.placement != placement {
+                entry.placement = placement;
+                cx.emit(TerminalSidebarEvent::PanelChanged(None));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 确保扩展面板视图存在（不存在时经宿主创建），返回是否可用。
+    fn ensure_extension_panel_view(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let has_view = self
+            .extension_panels
+            .iter()
+            .any(|p| p.id.as_ref() == id && p.view.is_some());
+        if has_view {
+            return true;
+        }
+        let colors = self.colors.clone();
+        let Some(view) = extension_panels::open_terminal_extension_panel(id, &colors, cx) else {
+            return false;
+        };
+        match self.extension_panels.iter_mut().find(|p| p.id.as_ref() == id) {
+            Some(entry) => {
+                entry.view = Some(view);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 扩展面板视图（未创建时 None）。
+    pub fn extension_panel_view(&self, id: &str) -> Option<AnyView> {
+        self.extension_panels
+            .iter()
+            .find(|p| p.id.as_ref() == id)
+            .and_then(|p| p.view.clone())
+    }
+
+    /// 扩展面板标题。
+    pub fn extension_panel_title(&self, id: &str) -> Option<SharedString> {
+        self.extension_panels
+            .iter()
+            .find(|p| p.id.as_ref() == id)
+            .map(|p| p.title.clone())
+    }
+
     pub fn on_host_activated(&mut self, cx: &mut Context<Self>) {
         if self.tool_dock.is_tool_open(SidebarPanel::AiChat) {
             self.ai_chat_panel.update(cx, |panel, cx| {
@@ -1467,6 +1646,82 @@ impl TerminalSidebar {
 
     pub fn panel_placement(&self, panel: SidebarPanel) -> SidebarPlacement {
         self.tool_dock.panel_placement(panel)
+    }
+
+    /// 各工具面板当前的停靠位置，键与设置里的存档一致（`SidebarPanel::local_id`；
+    /// 扩展面板用 `ext:{extension_id}:{panel_id}` 前缀，避免与内建 id 相撞）。
+    pub fn tool_panel_placements(&self) -> BTreeMap<String, SidebarPlacement> {
+        let mut placements = self
+            .tool_dock
+            .panel_placements()
+            .into_iter()
+            .map(|(panel, placement)| (panel.local_id().to_string(), placement))
+            .collect::<BTreeMap<_, _>>();
+        for (key, placement) in self.extension_panel_placements() {
+            placements.insert(key, placement);
+        }
+        placements
+    }
+
+    /// 扩展面板的（存档键，停靠位置）列表。
+    pub fn extension_panel_placements(&self) -> BTreeMap<String, SidebarPlacement> {
+        self.extension_panels
+            .iter()
+            .map(|entry| (extension_panel_placement_key(&entry.id), entry.placement))
+            .collect()
+    }
+
+    /// 扩展面板当前的停靠位置。
+    pub fn extension_panel_placement(&self, id: &str) -> Option<SidebarPlacement> {
+        self.extension_panels
+            .iter()
+            .find(|entry| entry.id.as_ref() == id)
+            .map(|entry| entry.placement)
+    }
+
+    /// 按设置里记录的停靠位置复位扩展面板，返回被移动的面板 id。
+    ///
+    /// 与内建面板不同，扩展面板可能还没创建视图也能恢复位置（位置是纯状态），
+    /// 所以这里不要求 `view` 已存在。
+    pub(crate) fn apply_persisted_extension_placements(
+        &mut self,
+        persisted: &BTreeMap<String, SidebarPlacement>,
+    ) -> Vec<SharedString> {
+        let mut moved = Vec::new();
+        for entry in &mut self.extension_panels {
+            let key = extension_panel_placement_key(&entry.id);
+            let Some(placement) = persisted.get(&key) else {
+                continue;
+            };
+            if entry.placement != *placement {
+                entry.placement = *placement;
+                moved.push(entry.id.clone());
+            }
+        }
+        moved
+    }
+
+    /// 按设置里记录的停靠位置复位面板（只改位置，不动展开状态）。
+    ///
+    /// 侧栏构造、补建 SSH 面板、以及设置变更后都会走这里。
+    pub(crate) fn restore_tool_panel_placements(&mut self, cx: &mut Context<Self>) {
+        let persisted = AppSettings::current(cx).terminal_tool_panel_placements;
+        if persisted.is_empty() {
+            return;
+        }
+        let moved = self.tool_dock.apply_persisted_placements(&persisted);
+        for panel in &moved {
+            let placement = self.tool_dock.panel_placement(*panel);
+            self.update_panel_frame_placement(*panel, placement, cx);
+            cx.emit(TerminalSidebarEvent::PanelChanged(Some(*panel)));
+        }
+        let moved_extensions = self.apply_persisted_extension_placements(&persisted);
+        if !moved_extensions.is_empty() {
+            cx.emit(TerminalSidebarEvent::PanelChanged(None));
+        }
+        if !moved.is_empty() || !moved_extensions.is_empty() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn colors(&self) -> TerminalColors {
@@ -1480,7 +1735,6 @@ impl TerminalSidebar {
                 .as_ref()
                 .map(|panel| panel.clone().into()),
             SidebarPanel::Settings => Some(self.settings_panel.clone().into()),
-            SidebarPanel::QuickCommand => Some(self.quick_command_panel.clone().into()),
             SidebarPanel::HistoryCommand => self
                 .history_command_panel
                 .as_ref()
@@ -1494,11 +1748,79 @@ impl TerminalSidebar {
                 .file_manager_panel
                 .as_ref()
                 .map(|panel| panel.clone().into()),
+            SidebarPanel::ConnectionNotes => self
+                .connection_notes_panel
+                .as_ref()
+                .map(|panel| panel.clone().into()),
             SidebarPanel::ServerMonitor => self
                 .server_monitor_panel
                 .as_ref()
                 .map(|panel| panel.clone().into()),
         }
+    }
+
+    /// 扩展面板当前激活（第一个打开的）键。
+    pub fn active_extension_panel(&self) -> Option<SharedString> {
+        self.extension_panels
+            .iter()
+            .find(|p| p.open)
+            .map(|p| p.id.clone())
+    }
+
+    /// 渲染扩展面板内容（内嵌头部 + 视图）。
+    pub fn render_extension_panel_content(
+        &self,
+        id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(entry) = self.extension_panels.iter().find(|p| p.id == id) else {
+            return div().into_any_element();
+        };
+        let Some(view) = entry.view.clone() else {
+            return div().into_any_element();
+        };
+
+        let border = self.colors.border;
+        let header_bg = self.colors.muted;
+        let text = self.colors.foreground;
+        let title = entry.title.clone();
+        let icon = entry.icon.clone().with_size(IconSize::Small).text_color(text);
+        let close_id = entry.id.clone();
+
+        let header = PanelHeader::new(SharedString::from(format!(
+            "terminal-embedded-ext-panel-header-{id}"
+        )))
+        .variant(PanelHeaderVariant::Embedded)
+        .border_color(border)
+        .background(header_bg)
+        .leading(icon)
+        .title(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(self.colors.foreground)
+                .child(title),
+        )
+        .trailing(
+            IconButton::new(
+                SharedString::from(format!("close-terminal-sidebar-ext-panel-{id}")),
+                IconName::Close,
+            )
+            .role(IconButtonRole::Compact)
+            .custom(self.colors.icon_button_variant(text, cx))
+            .tooltip(t!("Common.close").to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.close_extension_panel(&close_id, cx);
+            })),
+        )
+        .into_any_element();
+
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(div().flex_1().min_h_0().overflow_hidden().child(view))
+            .into_any_element()
     }
 
     fn toolbar_snapshot(&self) -> TerminalToolbarSnapshot {
@@ -1512,6 +1834,16 @@ impl TerminalSidebar {
                 .map(|panel| TerminalToolbarButtonSnapshot {
                     panel,
                     open: self.tool_dock.is_tool_open(panel),
+                })
+                .collect(),
+            extension_buttons: self
+                .extension_panels
+                .iter()
+                .map(|entry| ExtensionToolbarButtonSnapshot {
+                    id: entry.id.clone(),
+                    title: entry.title.clone(),
+                    icon: entry.icon.clone(),
+                    open: entry.open,
                 })
                 .collect(),
             save_as_connection: self.save_as_connection_available(),
@@ -1616,9 +1948,6 @@ impl TerminalSidebar {
         let theme_clone = theme.clone();
         self.settings_panel.update(cx, |panel, cx| {
             panel.set_current_theme(theme_clone, window, cx);
-        });
-        self.quick_command_panel.update(cx, |panel, cx| {
-            panel.set_colors(self.colors.clone(), cx);
         });
         if let Some(ref history_panel) = self.history_command_panel {
             history_panel.update(cx, |panel, cx| {
@@ -1812,13 +2141,6 @@ impl TerminalSidebar {
         cx.notify();
     }
 
-    /// 添加快捷命令（外部调用）
-    pub fn add_quick_command(&self, command: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.quick_command_panel.update(cx, |panel, cx| {
-            panel.add_command_external(command, window, cx);
-        });
-    }
-
     /// 从终端 OSC 7 同步路径到文件管理器
     ///
     /// 检查 `sync_path_enabled` 且存在文件管理器面板时，导航到指定路径。
@@ -1903,6 +2225,36 @@ impl TerminalSidebar {
         }))
     }
 
+    /// 渲染扩展面板的工具栏按钮
+    fn render_extension_toolbar_button(
+        &self,
+        entry: &ExtensionPanelEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = entry.open;
+        let item_size = Size::Size(one_ui::theme_geometry().layout.global_rail_item);
+        let id = entry.id.clone();
+        let title = entry.title.clone();
+        let style = ButtonCustomVariant::new(cx)
+            .foreground(self.colors.foreground)
+            .hover(self.colors.muted)
+            .active(self.colors.muted);
+
+        IconButton::new(
+            SharedString::from(format!("terminal-sidebar-ext-btn-{}", entry.id)),
+            entry.icon.clone(),
+        )
+        .hit_size(item_size)
+        .glyph_size(OneIconSize::Small)
+        .custom(style)
+        .selected(is_active)
+        .tooltip(title)
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.toggle_extension_panel(&id, cx);
+        }))
+    }
+
     /// 渲染工具栏
     pub fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let border_color = self.colors.border;
@@ -1923,6 +2275,21 @@ impl TerminalSidebar {
                         .iter()
                         .copied()
                         .map(|panel| self.render_toolbar_button(panel, window, cx)),
+                )
+                .when(!self.extension_panels.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(1.0))
+                            .my_1()
+                            .bg(self.colors.border),
+                    )
+                })
+                .children(
+                    self.extension_panels
+                        .iter()
+                        .map(|entry| self.render_extension_toolbar_button(entry, window, cx))
+                        .collect::<Vec<_>>(),
                 ),
             )
             .into_any_element()
@@ -1941,9 +2308,9 @@ impl TerminalSidebar {
         let needs_embedded_header = matches!(
             panel,
             SidebarPanel::Settings
-                | SidebarPanel::QuickCommand
                 | SidebarPanel::HistoryCommand
                 | SidebarPanel::BroadcastInput
+                | SidebarPanel::ConnectionNotes
                 | SidebarPanel::ServerMonitor
         );
         if !needs_embedded_header {
@@ -2002,6 +2369,8 @@ impl TerminalSidebar {
 struct TerminalToolbarSnapshot {
     colors: TerminalColors,
     buttons: Vec<TerminalToolbarButtonSnapshot>,
+    /// 扩展面板按钮（分离式工具栏 / workspace 模式也显示）。
+    extension_buttons: Vec<ExtensionToolbarButtonSnapshot>,
     /// 当前是临时连接（无数据库 ID）时展示“保存为连接”
     save_as_connection: bool,
 }
@@ -2012,6 +2381,14 @@ struct TerminalToolbarButtonSnapshot {
     open: bool,
 }
 
+#[derive(Clone)]
+struct ExtensionToolbarButtonSnapshot {
+    id: SharedString,
+    title: SharedString,
+    icon: Icon,
+    open: bool,
+}
+
 pub(crate) struct TerminalSidebarToolbar {
     sidebar: Entity<TerminalSidebar>,
 }
@@ -2019,6 +2396,36 @@ pub(crate) struct TerminalSidebarToolbar {
 impl TerminalSidebarToolbar {
     pub(crate) fn new(sidebar: Entity<TerminalSidebar>) -> Self {
         Self { sidebar }
+    }
+
+    fn render_extension_button(
+        &self,
+        button: ExtensionToolbarButtonSnapshot,
+        item_size: Size,
+        colors: &TerminalColors,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let sidebar = self.sidebar.clone();
+        let id = button.id;
+        let style = ButtonCustomVariant::new(cx)
+            .foreground(colors.foreground)
+            .hover(colors.muted)
+            .active(colors.muted);
+
+        IconButton::new(
+            SharedString::from(format!("terminal-detached-toolbar-ext-btn-{id}")),
+            button.icon,
+        )
+        .hit_size(item_size)
+        .glyph_size(OneIconSize::Small)
+        .custom(style)
+        .selected(button.open)
+        .tooltip(button.title)
+        .on_click(move |_, _window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.toggle_extension_panel(&id, cx);
+            });
+        })
     }
 
     fn render_button(
@@ -2068,13 +2475,22 @@ impl Render for TerminalSidebarToolbar {
             .border_l_1()
             .border_color(snapshot.colors.border)
             .child(
-                v_flex().flex_1().items_center().py_2().gap_1().children(
-                    snapshot
-                        .buttons
-                        .iter()
-                        .copied()
-                        .map(|button| self.render_button(button, item_size, &snapshot.colors, cx)),
-                ),
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .py_2()
+                    .gap_1()
+                    .children(
+                        snapshot.buttons.iter().copied().map(|button| {
+                            self.render_button(button, item_size, &snapshot.colors, cx)
+                        }),
+                    )
+                    .when(!snapshot.extension_buttons.is_empty(), |this| {
+                        this.child(div().w(px(16.0)).h(px(1.0)).my_1().bg(snapshot.colors.border))
+                    })
+                    .children(snapshot.extension_buttons.iter().cloned().map(|button| {
+                        self.render_extension_button(button, item_size, &snapshot.colors, cx)
+                    })),
             )
             .when_some(save_button, |this, button| {
                 this.child(v_flex().w_full().items_center().pb_2().child(button))
@@ -2116,13 +2532,19 @@ impl Render for TerminalSidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg_color = self.colors.background;
         let active_panel = self.active_panel();
+        let active_extension = self.active_extension_panel();
 
         h_flex()
             .h_full()
             .flex_shrink_0()
             .bg(bg_color)
-            .when(active_panel.is_some(), |this| this.w_full())
-            .when(active_panel.is_none(), |this| this.w(TOOLBAR_WIDTH))
+            .when(active_panel.is_some() || active_extension.is_some(), |this| {
+                this.w_full()
+            })
+            .when(
+                active_panel.is_none() && active_extension.is_none(),
+                |this| this.w(TOOLBAR_WIDTH),
+            )
             .when_some(active_panel, |this, panel| {
                 this.child(
                     v_flex()
@@ -2134,6 +2556,21 @@ impl Render for TerminalSidebar {
                         .child(self.render_panel_content(panel, window, cx)),
                 )
             })
+            .when_some(active_extension, |this, id| {
+                // 内建面板未打开时才显示扩展面板（内嵌模式每侧一个面板）。
+                if active_panel.is_some() {
+                    return this;
+                }
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .h_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .bg(bg_color)
+                        .child(self.render_extension_panel_content(&id, window, cx)),
+                )
+            })
             .child(self.render_toolbar(window, cx))
     }
 }
@@ -2142,6 +2579,7 @@ impl Render for TerminalSidebar {
 mod tests {
     use super::{
         SidebarPanel, TerminalToolDockState, agent_theme_from_terminal_theme,
+        extension_panel_placement_key,
         build_live_terminal_ai_context, build_terminal_ai_context, terminal_ai_system_instruction,
         terminal_sidebar_available_panels, workspace_theme_from_terminal_colors,
     };
@@ -2151,6 +2589,7 @@ mod tests {
     use gpui_component::{Theme, ThemeColor};
     use one_core::sidebar_contribution::SidebarPlacement;
     use one_core::storage::{ConnectionType, StoredConnection};
+    use std::collections::BTreeMap;
     use terminal::terminal::TerminalConnectionKind;
 
     fn stored_connection(id: i64, name: &str, connection_type: ConnectionType) -> StoredConnection {
@@ -2252,6 +2691,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ai_instruction_points_path_work_at_the_live_scope() {
+        for kind in [TerminalConnectionKind::Local, TerminalConnectionKind::Ssh] {
+            let instruction = terminal_ai_system_instruction(kind);
+
+            assert!(instruction.contains("cwd"), "{kind:?}: {instruction}");
+            assert!(instruction.contains("terminal_exec"));
+            assert!(instruction.contains("terminal_write_command"));
+            assert!(instruction.contains("ssh_exec"));
+            assert!(
+                instruction.contains("不要猜测"),
+                "{kind:?} 应明确禁止猜当前目录"
+            );
+            assert!(
+                instruction.contains("没有 cwd"),
+                "{kind:?} 应说明 cwd 缺失时先确认"
+            );
+        }
+    }
+
+    #[test]
     fn tool_dock_keeps_toolbar_visible_when_no_panel_is_open() {
         let dock = TerminalToolDockState::new([SidebarPanel::Settings, SidebarPanel::AiChat]);
 
@@ -2293,35 +2752,38 @@ mod tests {
 
     #[test]
     fn history_command_panel_is_available_for_local_terminals() {
-        let panels = terminal_sidebar_available_panels(true, false, false, true, false);
+        let panels = terminal_sidebar_available_panels(true, false, false, false, true, false);
 
         assert!(panels.contains(&SidebarPanel::FileExplorer));
         assert!(panels.contains(&SidebarPanel::HistoryCommand));
         assert!(!panels.contains(&SidebarPanel::BroadcastInput));
         assert!(!panels.contains(&SidebarPanel::FileManager));
+        assert!(!panels.contains(&SidebarPanel::ConnectionNotes));
         assert!(!panels.contains(&SidebarPanel::ServerMonitor));
     }
 
     #[test]
     fn history_command_panel_is_available_for_ssh_terminals() {
-        let panels = terminal_sidebar_available_panels(false, true, true, true, true);
+        let panels = terminal_sidebar_available_panels(false, true, true, true, true, true);
 
         assert!(!panels.contains(&SidebarPanel::FileExplorer));
         assert!(panels.contains(&SidebarPanel::HistoryCommand));
         assert!(panels.contains(&SidebarPanel::BroadcastInput));
         assert!(panels.contains(&SidebarPanel::FileManager));
+        assert!(panels.contains(&SidebarPanel::ConnectionNotes));
         assert!(panels.contains(&SidebarPanel::ServerMonitor));
     }
 
     #[test]
     fn ai_chat_is_available_in_the_terminal_sidebar() {
-        for (explorer, manager, monitor, history, broadcast) in [
-            (true, false, false, true, false),
-            (false, true, true, true, true),
-            (false, false, false, false, false),
+        for (explorer, manager, monitor, notes, history, broadcast) in [
+            (true, false, false, false, true, false),
+            (false, true, true, true, true, true),
+            (false, false, false, false, false, false),
         ] {
-            let panels =
-                terminal_sidebar_available_panels(explorer, manager, monitor, history, broadcast);
+            let panels = terminal_sidebar_available_panels(
+                explorer, manager, monitor, notes, history, broadcast,
+            );
             assert!(
                 panels.contains(&SidebarPanel::AiChat),
                 "原始终端侧栏应保留 AI 面板: {panels:?}"
@@ -2331,12 +2793,13 @@ mod tests {
 
     #[test]
     fn history_command_panel_is_not_available_for_serial_terminals() {
-        let panels = terminal_sidebar_available_panels(false, false, false, false, false);
+        let panels = terminal_sidebar_available_panels(false, false, false, false, false, false);
 
         assert!(!panels.contains(&SidebarPanel::FileExplorer));
         assert!(!panels.contains(&SidebarPanel::HistoryCommand));
         assert!(!panels.contains(&SidebarPanel::BroadcastInput));
         assert!(!panels.contains(&SidebarPanel::FileManager));
+        assert!(!panels.contains(&SidebarPanel::ConnectionNotes));
         assert!(!panels.contains(&SidebarPanel::ServerMonitor));
     }
 
@@ -2346,6 +2809,7 @@ mod tests {
         assert!(!SidebarPanel::FileExplorer.needs_internal_tool_frame_header());
         assert!(SidebarPanel::Settings.needs_internal_tool_frame_header());
         assert!(!SidebarPanel::AiChat.needs_internal_tool_frame_header());
+        assert!(SidebarPanel::ConnectionNotes.needs_internal_tool_frame_header());
         assert!(SidebarPanel::ServerMonitor.needs_internal_tool_frame_header());
     }
 
@@ -2514,6 +2978,81 @@ mod tests {
     }
 
     #[test]
+    fn tool_dock_restores_persisted_placements_for_available_panels() {
+        let mut dock = TerminalToolDockState::new([SidebarPanel::Settings, SidebarPanel::AiChat]);
+        let mut persisted = BTreeMap::new();
+        persisted.insert(
+            SidebarPanel::AiChat.local_id().to_string(),
+            SidebarPlacement::Left,
+        );
+        // 只在别的会话里存在的面板（SSH 文件管理器）这里忽略，不能凭空建出来。
+        persisted.insert(
+            SidebarPanel::FileManager.local_id().to_string(),
+            SidebarPlacement::Bottom,
+        );
+
+        let moved = dock.apply_persisted_placements(&persisted);
+
+        assert_eq!(moved, vec![SidebarPanel::AiChat]);
+        assert_eq!(
+            dock.panel_placement(SidebarPanel::AiChat),
+            SidebarPlacement::Left
+        );
+        assert_eq!(
+            dock.panel_placement(SidebarPanel::Settings),
+            SidebarPlacement::Right
+        );
+    }
+
+    #[test]
+    fn tool_dock_reapplies_persisted_placement_to_late_added_panels() {
+        let mut dock = TerminalToolDockState::new([SidebarPanel::Settings]);
+        let mut persisted = BTreeMap::new();
+        persisted.insert(
+            SidebarPanel::ServerMonitor.local_id().to_string(),
+            SidebarPlacement::Bottom,
+        );
+
+        assert!(dock.apply_persisted_placements(&persisted).is_empty());
+
+        assert!(dock.update_available_panels([
+            SidebarPanel::Settings,
+            SidebarPanel::ServerMonitor,
+        ]));
+        assert_eq!(
+            dock.apply_persisted_placements(&persisted),
+            vec![SidebarPanel::ServerMonitor]
+        );
+        assert_eq!(
+            dock.panel_placement(SidebarPanel::ServerMonitor),
+            SidebarPlacement::Bottom
+        );
+    }
+
+    #[test]
+    fn tool_dock_placement_snapshot_keeps_one_entry_per_available_panel() {
+        let mut dock =
+            TerminalToolDockState::new([SidebarPanel::Settings, SidebarPanel::HistoryCommand]);
+        dock.move_tool(SidebarPanel::Settings, SidebarPlacement::Bottom);
+
+        let snapshot = dock
+            .panel_placements()
+            .into_iter()
+            .map(|(panel, placement)| (panel.local_id().to_string(), placement))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot.get(SidebarPanel::Settings.local_id()),
+            Some(&SidebarPlacement::Bottom)
+        );
+        assert_eq!(
+            snapshot.get(SidebarPanel::HistoryCommand.local_id()),
+            Some(&SidebarPlacement::Right)
+        );
+    }
+
+    #[test]
     fn tool_dock_closes_one_panel_without_hiding_toolbar_or_other_panels() {
         let mut dock = TerminalToolDockState::new([SidebarPanel::Settings, SidebarPanel::AiChat]);
 
@@ -2526,5 +3065,15 @@ mod tests {
             vec![(SidebarPanel::AiChat, SidebarPlacement::Right)],
         );
         assert!(dock.toolbar_visible());
+    }
+
+    #[test]
+    fn extension_placement_keys_do_not_collide_with_builtin_panel_ids() {
+        let key = extension_panel_placement_key("com.example.tools:demo");
+        assert_eq!(key, "ext:com.example.tools:demo");
+        for panel in SidebarPanel::ALL {
+            assert!(panel.local_id().starts_with("terminal."));
+            assert_ne!(panel.local_id(), key.as_str());
+        }
     }
 }

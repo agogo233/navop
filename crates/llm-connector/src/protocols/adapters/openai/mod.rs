@@ -129,6 +129,11 @@ impl Protocol for OpenAIProtocol {
     }
 
     fn models_endpoint(&self, base_url: &str) -> Option<String> {
+        if self.service_name == "opencode-go"
+            && let Some(prefix) = base_url.trim_end_matches('/').strip_suffix("/openai/v1")
+        {
+            return Some(format!("{prefix}/v1/models"));
+        }
         Some(resolve_endpoint(base_url, "", "/models"))
     }
 
@@ -394,6 +399,26 @@ mod tests {
     use crate::types::{FunctionCall, Message, MessageBlock, Role, Tool, ToolCall, ToolChoice};
 
     #[test]
+    fn opencode_go_models_endpoint_uses_go_v1_models() {
+        let protocol = OpenAIProtocol::with_service("test-key", "opencode-go");
+
+        assert_eq!(
+            Some("https://opencode.ai/inference/go/v1/models".to_string()),
+            protocol.models_endpoint("https://opencode.ai/inference/go/openai/v1")
+        );
+    }
+
+    #[test]
+    fn regular_openai_compatible_models_endpoint_stays_under_base_url() {
+        let protocol = OpenAIProtocol::with_service("test-key", "custom");
+
+        assert_eq!(
+            Some("https://llm.example.com/v1/models".to_string()),
+            protocol.models_endpoint("https://llm.example.com/v1")
+        );
+    }
+
+    #[test]
     fn test_openai_request_downgrade_for_deepseek() {
         let protocol = OpenAIProtocol::new("test-key");
         let request = ChatRequest {
@@ -545,6 +570,34 @@ mod tests {
                 "type": "function",
                 "function": { "name": "get_weather" }
             }))
+        );
+    }
+
+    #[test]
+    fn test_openai_request_serializes_reasoning_effort_none_with_tools() {
+        // #487：gpt-6 系列在 chat/completions 上不允许「推理 + 函数工具」，
+        // 上游要求显式传 reasoning_effort: "none"，两者必须能同时出现在请求体里。
+        let protocol = OpenAIProtocol::new("test-key");
+        let request = ChatRequest::new("gpt-6.1-sol")
+            .add_message(Message::user("hello"))
+            .with_tools(vec![Tool::function(
+                "echo",
+                None,
+                serde_json::json!({"type": "object"}),
+            )])
+            .with_reasoning_effort(ReasoningEffort::None);
+
+        let body = protocol
+            .build_chat_request_body(&request)
+            .expect("请求体应可构建");
+
+        assert_eq!(
+            Some("none"),
+            body.get("reasoning_effort").and_then(|v| v.as_str())
+        );
+        assert!(
+            body.get("tools").is_some_and(|v| !v.is_null()),
+            "关闭推理的同时工具必须照常下发"
         );
     }
 

@@ -150,7 +150,11 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   );
   const packageInstallers = workflowStep(
     release,
-    "Package Linux installers (x86_64)",
+    "Package Linux installers",
+  );
+  const uploadInstallers = workflowStep(
+    release,
+    "Upload Linux installer artifacts",
   );
 
   // Linux ships exactly one build per architecture. The portable archive is an
@@ -170,11 +174,11 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   );
   assert.match(
     release,
-    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_arm64,\$windows_x64,\$windows_x86\]"/,
+    /all\)[\s\S]*?matrix="\$combined"/,
   );
-  assert.match(release, /linux-x64\) matrix="\[\$linux_x64\]"/);
-  assert.match(release, /linux-arm64\) matrix="\[\$linux_arm64\]"/);
-  assert.match(release, /name: Build \(\$\{\{ matrix\.target \}\}\)$/m);
+  assert.match(release, /linux-x64\)\s*\n\s*full_matrix="\[\$linux_x64\]"\s*\n\s*standalone_matrix="\[\$shell_linux_x64,\$data_linux_x64\]"/);
+  assert.match(release, /linux-arm64\)\s*\n\s*full_matrix="\[\$linux_arm64\]"\s*\n\s*standalone_matrix=""/);
+  assert.match(release, /name: Build \(\$\{\{ matrix\.product \}\} \/ \$\{\{ matrix\.target \}\}\)/);
 
   // Zig is what lowers the C runtime requirement to glibc 2.28, so it now runs
   // for every Linux build rather than only for the retired portable variant.
@@ -197,10 +201,10 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   assert.match(build, /if \[ "\$\{\{ runner\.os \}\}" = "Linux" \]/);
   assert.match(
     build,
-    /cargo zigbuild[\s\S]*--release[\s\S]*-p main[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"/,
+    /cargo zigbuild[\s\S]*--release[\s\S]*-p \$\{\{ matrix\.product \}\}[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"/,
   );
   // No platform drops the default feature set: `embedded-webview` is off in the
-  // default set itself (see main/Cargo.toml), so the shape that gets published is
+  // default set itself (see crates/navop_app/Cargo.toml), so the shape that gets published is
   // the plain default build on all three platforms. The guard for that lives in
   // its own test below.
   assert.doesNotMatch(build, /--no-default-features/);
@@ -218,7 +222,7 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   assert.doesNotMatch(build, /extra_features/);
   assert.match(
     build,
-    /cargo build --release -p main --target "\$\{\{ matrix\.target \}\}"/,
+    /cargo build --release -p \$\{\{ matrix\.product \}\} --target "\$\{\{ matrix\.target \}\}"/,
   );
   assert.match(
     build,
@@ -251,10 +255,16 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   // Portable mode exists at all only because this detection stays platform
   // independent; a Windows-only guard here would make the Linux archive ship a
   // marker file that nothing ever reads.
-  assert.match(appPathsSource, /join\(PORTABLE_MARKER_FILE\)\.is_file\(\)/);
+  assert.match(appPathsSource, /join\(app_path_names\(\)\.portable_marker\)\s*\.is_file\(\)/);
   assert.doesNotMatch(appPathsSource, /cfg\(windows\)/);
   assert.doesNotMatch(appPathsSource, /cfg\(target_os = "windows"\)/);
-  assert.match(packageLinux, new RegExp(`PORTABLE_MARKER_FILE="${markerFile}"`));
+  // 统一发布后 marker 名来自 matrix.portable_marker（源头是 identity.rs），
+  // 全量条目的值必须仍是 app_paths.rs 读的那个常量。
+  assert.match(packageLinux, /PORTABLE_MARKER_FILE="\$\{\{ matrix\.portable_marker \}\}"/);
+  assert.match(
+    read("crates/domain_api/src/identity.rs"),
+    new RegExp(`portable_marker: "${markerFile}"`),
+  );
   assert.match(packageLinux, /rm -rf portable-package/);
   assert.match(packageLinux, /mkdir -p portable-package/);
   assert.match(
@@ -270,13 +280,14 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   assert.doesNotMatch(packageLinux, /cargo (?:zig)?build/);
   assert.match(
     release,
-    /navop-\*-\$\{\{ matrix\.public_label \}\}-portable\.tar\.gz/,
+    /\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}-portable\.tar\.gz/,
   );
-  // The Windows portable ZIP ships the same contract and hardcodes the same
-  // marker name, so both platforms have to agree with the Rust constant.
+  // The Windows portable ZIP ships the same contract: the marker name now
+  // arrives via matrix.portable_marker, whose full-product value must still
+  // equal the Rust constant both platforms read.
   assert.match(
     release,
-    new RegExp(`"portable-package/${markerFile.replace(/\./g, "\\.")}"`),
+    /Set-Content -Path "portable-package\/\$\{\{ matrix\.portable_marker \}\}"/,
   );
 
   // The dependency stack is a second asset for the same target, built against
@@ -292,22 +303,77 @@ test("Linux publishes one package per architecture plus a separate GPU dependenc
   );
   assert.match(
     release,
-    /navop-\*-\$\{\{ matrix\.public_label \}\}-gpu-stack\.tar\.gz/,
+    /\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}-gpu-stack\.tar\.gz/,
   );
 
-  assert.match(packageInstallers, /if: matrix\.target == 'x86_64-unknown-linux-gnu'/);
+  // deb / rpm / AppImage are built for every Linux target. dpkg, rpm and
+  // linuxdeploy spell the architecture differently, so all three names are
+  // derived from the matrix target instead of being hard-coded to x86_64.
+  assert.match(
+    packageInstallers,
+    /if: matrix\.product == 'navop' && runner\.os == 'Linux'/,
+  );
+  assert.match(
+    packageInstallers,
+    /x86_64-\*\) DEB_ARCH="amd64"; RPM_ARCH="x86_64"; LINUXDEPLOY_ARCH="x86_64"/,
+  );
+  assert.match(
+    packageInstallers,
+    /aarch64-\*\) DEB_ARCH="arm64"; RPM_ARCH="aarch64"; LINUXDEPLOY_ARCH="aarch64"/,
+  );
+  assert.match(
+    packageInstallers,
+    /DEB_NAME="navop_\$\{PACKAGE_VERSION\}_\$\{DEB_ARCH\}\.deb"/,
+  );
+  assert.match(
+    packageInstallers,
+    /RPM_NAME="navop-\$\{PACKAGE_VERSION\}-1\.\$\{RPM_ARCH\}\.rpm"/,
+  );
+  assert.match(
+    packageInstallers,
+    /APPIMAGE_NAME="navop_\$\{PACKAGE_VERSION\}_\$\{DEB_ARCH\}\.AppImage"/,
+  );
+  assert.match(packageInstallers, /Architecture: \$\{DEB_ARCH\}/);
+  assert.match(packageInstallers, /BuildArch: \$\{RPM_ARCH\}/);
+  assert.match(
+    packageInstallers,
+    /"linuxdeploy-\$\{LINUXDEPLOY_ARCH\}\.AppImage"/,
+  );
+  assert.doesNotMatch(packageInstallers, /_amd64\.(?:deb|AppImage)/);
+  assert.doesNotMatch(packageInstallers, /1\.x86_64\.rpm/);
+  const installDeps = workflowStep(
+    release,
+    "Install Linux packaging dependencies",
+  );
+  assert.match(
+    installDeps,
+    /if: matrix\.product == 'navop' && runner\.os == 'Linux'/,
+  );
+  assert.match(installDeps, /sudo apt-get install -y rpm/);
+
+  // The two Linux jobs must not collide on the artifact name: upload-artifact
+  // v4 refuses two jobs writing the same artifact in one run.
+  assert.match(
+    uploadInstallers,
+    /if: matrix\.product == 'navop' && runner\.os == 'Linux'/,
+  );
+  assert.match(
+    uploadInstallers,
+    /name: navop-\$\{\{ matrix\.public_label \}\}-installers/,
+  );
+  assert.match(uploadInstallers, /if-no-files-found: error/);
 });
 
 test("the embedded webview is an opt-in feature on every platform", () => {
   const workspaceCargo = read("Cargo.toml");
   const cargo = read("crates/ai_chat_view/Cargo.toml");
-  const mainCargo = read("main/Cargo.toml");
+  const mainCargo = read("crates/navop_app/Cargo.toml");
   const universalPluginsCargo = read("crates/universal-plugins/Cargo.toml");
   const htmlCodeBlock = read(
     "crates/ai_chat_view/src/html_code_block.rs",
   );
   const dependentCargoFiles = [
-    "main/Cargo.toml",
+    "crates/navop_app/Cargo.toml",
     "crates/db_view/Cargo.toml",
     "crates/mongodb_view/Cargo.toml",
     "crates/redis_view/Cargo.toml",
@@ -345,24 +411,31 @@ test("the embedded webview is an opt-in feature on every platform", () => {
   assert.match(htmlCodeBlock, /HtmlPreview\.webview_unavailable/);
   assert.match(
     mainCargo,
-    /^default = \["wasm-components", "windows-native-rdp", "shell-plugins"\]$/m,
+    /^default = \["wasm-components", "windows-native-rdp", "nsh-host", "database", "shell"\]$/m,
   );
   assert.doesNotMatch(mainCargo, /default = \[[^\]]*embedded-webview/);
   assert.match(
     mainCargo,
     /embedded-webview = \["ai_chat_view\/embedded-webview"\]/,
   );
+  // The extension UI plane is the nsh host. Its GPUI backend also ships a
+  // `webview` feature (wry / WebKitGTK), so the same opt-in rule applies: the
+  // host must ask for `default-features = false` and list the modules it wants.
   assert.match(
     mainCargo,
-    /shell-plugins = \["universal-plugins\/shell-plugins"\]/,
+    /nsh-host = \[\s*"universal-plugins\/nsh-host"\s*\]\s*nsh-db = \[\s*"nsh-host",\s*"universal-plugins\/nsh-db"\s*\]\s*nsh-terminal = \[\s*"nsh-host",\s*"universal-plugins\/nsh-terminal"\s*\]/,
   );
   assert.match(
     universalPluginsCargo,
-    /gpui-shell = \{[^}]*optional = true[^}]*\}/,
+    /nsh-platform-gpui = \{[^}]*optional = true[^}]*\}/,
   );
   assert.match(
     universalPluginsCargo,
-    /shell-plugins = \["dep:gpui-shell"\]/,
+    /nsh-host = \[\s*"dep:nsh-platform-gpui",\s*"dep:nsh-core",\s*"dep:nsh-engine",\s*"dep:nsh-base",\s*"dep:ai_chat_view",\s*"dep:one-ui",\s*"dep:serde",\s*"dep:extension-component",\s*\]/,
+  );
+  assert.match(
+    workspaceCargo,
+    /^nsh-platform-gpui = \{ git = [^}]*default-features = false, features = \["js"\] \}$/m,
   );
   assert.match(
     workspaceCargo,
@@ -384,7 +457,7 @@ test("no release build enables the embedded webview, while the opt-in path still
   // WebKitGTK 4.1 cannot travel with the package: the distributions that carry it
   // sit on glibc 2.39+, and `WebKitWebProcess` is resolved through a compile-time
   // path. Instead of giving Linux a feature set of its own, the feature is off in
-  // the default set (see main/Cargo.toml), so all three platforms publish the same
+  // the default set (see crates/navop_app/Cargo.toml), so all three platforms publish the same
   // shape and there is no per-platform list to keep in sync.
   assert.doesNotMatch(release, /--features[^\n]*embedded-webview/);
   const build = workflowStep(release, "Build release binary");
@@ -393,7 +466,7 @@ test("no release build enables the embedded webview, while the opt-in path still
   assert.doesNotMatch(build, /--features[^\n]*wasm-components/);
   assert.match(
     build,
-    /cargo zigbuild[\s\S]*--release[\s\S]*-p main[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"/,
+    /cargo zigbuild[\s\S]*--release[\s\S]*-p \$\{\{ matrix\.product \}\}[\s\S]*--target "\$\{\{ matrix\.target \}\}\.2\.28"/,
   );
 
   // Windows 32-bit is the one platform that has to name features explicitly (it
@@ -412,7 +485,7 @@ test("no release build enables the embedded webview, while the opt-in path still
     optIn,
     /cargo check -p ai_chat_view --features embedded-webview --tests/,
   );
-  assert.match(optIn, /cargo check -p main --features embedded-webview/);
+  assert.match(optIn, /cargo check -p navop_app --features embedded-webview/);
 });
 
 test("Linux GPU dependency stack replaces the retired portable runtime", () => {
@@ -621,7 +694,7 @@ test("Linux GPU dependency stack installer is additive and reversibly removable"
 test("Linux install guides document the GPU dependency stack and the portable archive", () => {
   const guides = [
     ["docs-site/docs/guide/install-update.md", /图形依赖包/],
-    ["docs-site/docs/en-US/guide/install-update.md", /graphics dependency package/],
+    ["docs-site/docs/en-US/guide/install-update.md", /GPU stack package/],
     ["docs-site/docs/zh-TW/guide/install-update.md", /圖形相依套件/],
   ];
 
@@ -675,6 +748,28 @@ test("Linux install guides document the GPU dependency stack and the portable ar
       guide,
       /NAVOP_PORTABLE/,
       `${guidePath} must document the NAVOP_PORTABLE environment variable`,
+    );
+    // deb / rpm / AppImage used to be documented as x86_64-only; both Linux
+    // targets ship them now, with the architecture spelled per format.
+    assert.match(
+      guide,
+      /navop_<version>_amd64\.deb/,
+      `${guidePath} must name the x86_64 deb`,
+    );
+    assert.match(
+      guide,
+      /navop_<version>_arm64\.deb/,
+      `${guidePath} must name the arm64 deb`,
+    );
+    assert.match(
+      guide,
+      /navop-<version>-1\.aarch64\.rpm/,
+      `${guidePath} must name the arm64 rpm`,
+    );
+    assert.match(
+      guide,
+      /navop_<version>_arm64\.AppImage/,
+      `${guidePath} must name the arm64 AppImage`,
     );
   }
 });
@@ -805,7 +900,7 @@ test("Windows release publishes versioned Win32 artifacts while preserving updat
   );
   assert.match(
     release,
-    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_arm64,\$windows_x64,\$windows_x86\]"/,
+    /all\)[\s\S]*?matrix="\$combined"/,
   );
   assert.match(
     release,
@@ -814,7 +909,7 @@ test("Windows release publishes versioned Win32 artifacts while preserving updat
   assert.match(release, /-arch \$\{\{ matrix\.windows_arch \}\}/);
   assert.match(release, /\$\{env:PUBLIC_BASENAME\}\.msi/);
   assert.match(release, /\$\{env:PUBLIC_BASENAME\}\.exe/);
-  assert.match(release, /PUBLIC_BASENAME=navop-\$\{VERSION#v\}-\$\{\{ matrix\.public_label \}\}/);
+  assert.match(release, /PUBLIC_BASENAME=\$\{\{ matrix\.product \}\}-\$\{VERSION#v\}-\$\{\{ matrix\.public_label \}\}/);
 
   assert.match(upload, /navop-i686-pc-windows-msvc\.zip/);
   assert.match(
@@ -882,7 +977,7 @@ test("Windows release keeps the legacy ZIP standard and publishes portable separ
   assert.match(release, /navop\.portable/);
   assert.match(
     release,
-    /Set-Content -Path "portable-package\/navop\.portable"/,
+    /Set-Content -Path "portable-package\/\$\{\{ matrix\.portable_marker \}\}"/,
   );
   assert.doesNotMatch(
     release,
@@ -905,24 +1000,24 @@ test("Windows release keeps the legacy ZIP standard and publishes portable separ
   );
   assert.match(
     release,
-    /name: navop-\$\{\{ matrix\.public_label \}\}-packages/,
+    /name: \$\{\{ matrix\.product \}\}-\$\{\{ matrix\.public_label \}\}-packages/,
   );
   assert.match(
     release,
-    /navop-\*-\$\{\{ matrix\.public_label \}\}-portable\.zip/,
+    /\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}-portable\.zip/,
   );
   assert.match(
     release,
-    /navop-\*-\$\{\{ matrix\.public_label \}\}\.msi/,
+    /\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}\.msi/,
   );
   assert.match(
     release,
-    /navop-\*-\$\{\{ matrix\.public_label \}\}\.exe/,
+    /\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}\.exe/,
   );
   for (const [guide, installerLabel] of [
     [installGuides[0], /EXE 安装包/],
-    [installGuides[1], /EXE installer/],
-    [installGuides[2], /EXE 安裝包/],
+    [installGuides[1], /\*\*Installer:\*\*/],
+    [installGuides[2], /EXE 安裝檔/],
   ]) {
     assert.match(guide, /navop-<version>-windows-x64\.exe/);
     assert.match(guide, installerLabel);
@@ -1068,9 +1163,71 @@ test("Windows MSI shortcuts inherit the executable's embedded icon", () => {
   // 控制面板的卸载项仍走 Icon 表；快捷方式图标则由 exe 的内嵌资源提供。
   assert.match(wix, /<Icon Id="NavopIcon" SourceFile="\$\(IconPath\)"\s*\/>/);
   assert.match(wix, /<Property Id="ARPPRODUCTICON" Value="NavopIcon"\s*\/>/);
+  // 图标与清单必须由**二进制 crate 自己**嵌入：`cargo:rustc-link-arg` 只作用于本包的
+  // targets，`crates/navop_app` 是库，它的 build.rs 嵌出来的资源到不了 `apps/navop*/`
+  // 里的 exe（v0.23.0-beta.4 的 navop.exe 因此没有 .rsrc）。
+  const embed = read("resources/windows/embed_app_resources.rs");
+  assert.match(embed, /res\.set_icon\(icon\)/);
+  for (const product of ["navop", "navop-shell", "navop-data"]) {
+    const build = read(`apps/${product}/build.rs`);
+    assert.match(
+      build,
+      /include!\("\.\.\/\.\.\/resources\/windows\/embed_app_resources\.rs"\)/,
+    );
+    assert.match(build, /embed_windows_resources\(/);
+    // 三个产品各有自己的 ico：exe 内嵌图标、任务栏与快捷方式才不会长得一样。
+    assert.match(
+      build,
+      new RegExp(`"\\.\\./\\.\\./resources/windows/${product}\\.ico"`),
+    );
+    assert.ok(
+      fs.existsSync(`resources/windows/${product}.ico`),
+      `missing icon for ${product}`,
+    );
+  }
+});
+
+test("Each product ships its own icon on every platform", () => {
+  const release = read(".github/workflows/release.yml");
+  const bundle = read("script/bundle-macos.sh");
+  const productInstaller = read("installer/windows/build-product-installer.ps1");
+
+  // macOS：三个产品各自的 icns，Info.plist 里仍统一叫 Navop.icns。
+  for (const [product, icns] of [
+    ["navop", "Navop"],
+    ["navop-shell", "NavopShell"],
+    ["navop-data", "NavopData"],
+  ]) {
+    assert.ok(
+      bundle.includes(`PACKAGE_NAME="${product}"`) &&
+        bundle.includes(`ICNS_NAME="${icns}"`),
+      `missing icns mapping for ${product}`,
+    );
+    assert.ok(
+      fs.existsSync(`resources/macos/${icns}.icns`),
+      `missing icns file for ${product}`,
+    );
+  }
+  assert.match(bundle, /ICNS_PATH="\$\{RESOURCE_DIR\}\/\$\{ICNS_NAME\}\.icns"/);
+
+  // Linux 的 desktop/icon 由 package-linux-product.sh 按产品取 png。
+  for (const product of ["navop-shell", "navop-data"]) {
+    for (const size of [128, 256, 512]) {
+      assert.ok(
+        fs.existsSync(`resources/linux/${product}-${size}.png`),
+        `missing ${product}-${size}.png`,
+      );
+    }
+  }
+
+  // Windows 独立产品的 MSI/卸载项用产品自己的 ico。
   assert.match(
-    read("main/build.rs"),
-    /set_icon\("\.\.\/resources\/windows\/navop\.ico"\)/,
+    productInstaller,
+    /\[string\]\$IconPath = "resources\/windows\/navop\.ico"/,
+  );
+  assert.ok(
+    release.includes("\\resources\\windows\\${{ matrix.product }}.ico"),
+    "standalone Windows installer must pass the product icon",
   );
 });
 
@@ -1080,20 +1237,22 @@ test("GitHub and R2 publish every installer while the updater manifest remains c
 
   assert.match(
     release,
-    /name: navop-\$\{\{ matrix\.public_label \}\}-packages[\s\S]*?navop-\*-\$\{\{ matrix\.public_label \}\}\.msi/,
+    /name: \$\{\{ matrix\.product \}\}-\$\{\{ matrix\.public_label \}\}-packages[\s\S]*?\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}\.msi/,
   );
   assert.match(release, /new_files=\(artifacts\/navop-\* artifacts\/navop_\*\)/);
   // Every asset, including the Linux GPU dependency stack, is matched by the
   // release globs rather than being enumerated by hand.
-  assert.match(release, /navop-\*-\$\{\{ matrix\.public_label \}\}-gpu-stack\.tar\.gz/);
+  assert.match(release, /\$\{\{ matrix\.product \}\}-\*-\$\{\{ matrix\.public_label \}\}-gpu-stack\.tar\.gz/);
   assert.match(upload, /--pattern "navop-\*"/);
   assert.match(upload, /--pattern "navop_\*"/);
   assert.match(upload, /release_files=\(artifacts\/navop-\* artifacts\/navop_\*\)/);
   assert.match(upload, /schema_version: 1/);
-  assert.match(upload, /downloads: objectUrls\("releases", updaterAssets\)/);
-  assert.match(upload, /fallback_downloads: githubReleaseUrls\(updaterAssets\)/);
-  assert.match(upload, /sha256s: objectChecksums\(updaterAssets\)/);
-  assert.match(upload, /packages,/);
+  assert.match(upload, /downloads: objectUrls\("releases", product\.updaterAssets\)/);
+  assert.match(upload, /fallback_downloads: githubReleaseUrls\(product\.updaterAssets\)/);
+  assert.match(upload, /sha256s: objectChecksums\(product\.updaterAssets\)/);
+  // Manifest packages are filtered per product (shared single release), so
+  // every installer lands only in its own product manifest.
+  assert.match(upload, /packages: packagesByProduct\[product\.id\]/);
   assert.match(upload, /publicUpdaterAlternatives/);
   assert.match(upload, /`navop-\$\{version\}-win32\.zip`/);
   assert.match(upload, /\["win32", "i686-pc-windows-msvc"\]/);
@@ -1131,7 +1290,7 @@ test("R2 uploads are single-dispatch, revalidated, and verified after overwrite"
   assert.doesNotMatch(upload, /max-age=31536000, immutable/);
 });
 
-test("R2 keeps only the release it just uploaded", () => {
+test("R2 prunes old releases but keeps both channel manifests alive", () => {
   const upload = read(".github/workflows/upload-r2.yml");
 
   // 清理必须排在上传与逐对象校验之后，而且不能总是执行：上传失败时一个对象
@@ -1147,12 +1306,22 @@ test("R2 keeps only the release it just uploaded", () => {
     pruneStep,
     /if: \$\{\{ steps\.r2_config\.outputs\.skip != 'true' && steps\.release\.outputs\.skip != 'true' \}\}/,
   );
-  // 只动 releases/<tag>/：updates/latest.json 是更新入口，任何时候都不能删。
+  // 只删 releases/<tag>/：updates/ 下的清单是更新入口，任何时候都不能删。
+  // （prune 会读 updates/beta/latest.json 来保住它指向的安装包，只读不删。）
   assert.match(pruneStep, /prefix="releases"/);
-  assert.doesNotMatch(pruneStep, /updates\//);
-  // 只有稳定版本号才清理，预发布不能把上一个稳定版本的安装包带走。
-  assert.match(pruneStep, /=\~ \^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$ \]\]/);
-  assert.match(pruneStep, /Skipping R2 prune for non-stable release tag/);
+  const pruneDeletes = (pruneStep.match(/aws s3 rm[\s\S]*?--recursive/g) ?? []).join("\n");
+  assert.ok(pruneDeletes, "prune must delete through aws s3 rm");
+  assert.doesNotMatch(pruneDeletes, /updates\//);
+  // 不再按 tag 形态跳过清理：预发布留下的安装包同样是纯占空间。
+  assert.doesNotMatch(pruneStep, /Skipping R2 prune for non-stable release tag/);
+  // beta 发布同样要清理，否则每个 beta（约 2.2 GB）都会永久占一份空间。
+  assert.match(pruneStep, /read_manifest_tag "updates\/latest\.json"/);
+  assert.match(pruneStep, /read_manifest_tag "updates\/beta\/latest\.json"/);
+  // 稳定清单读不到时必须整体放弃清理，而不是「只保留本次 tag」把稳定版删掉。
+  assert.match(
+    pruneStep,
+    /Cannot read updates\/latest\.json; skipping R2 prune/,
+  );
 
   const pruneRun = pruneStep
     .match(/run: \|\n([\s\S]*)/)?.[1]
@@ -1189,6 +1358,31 @@ case "\${1:-} \${2:-}" in
     done
     [[ -z "\$line" ]] || printf '%s\\n' "\$line"
     ;;
+  "s3api get-object")
+    # 按 --key 提供假清单：两条通道的清单都要能被读到，用于验证「按清单里的
+    # version 精确保留」，而不是笼统留下版本号最大的那个。
+    bucket_key=""
+    last=""
+    for argument in "\$@"; do
+      case "\$argument" in
+        updates/*) bucket_key="\$argument" ;;
+      esac
+      last="\$argument"
+    done
+    case "\$bucket_key" in
+      "updates/latest.json")
+        [ -n "\${FAKE_R2_STABLE_MANIFEST:-}" ] || exit 1
+        printf '%s' "\${FAKE_R2_STABLE_MANIFEST}" > "\$last"
+        ;;
+      "updates/beta/latest.json")
+        [ -n "\${FAKE_R2_BETA_MANIFEST:-}" ] || exit 1
+        printf '%s' "\${FAKE_R2_BETA_MANIFEST}" > "\$last"
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
   "s3 rm")
     target=""
     for argument in "\$@"; do
@@ -1209,7 +1403,11 @@ esac
     { mode: 0o755 },
   );
 
-  const runPrune = (tags, releaseTag = "v0.19.5") => {
+  const runPrune = (
+    tags,
+    releaseTag = "v0.19.5",
+    { stableManifest = "", betaManifest = "" } = {},
+  ) => {
     fs.writeFileSync(statePath, `${tags.join("\n")}\n`);
     fs.writeFileSync(deletedPath, "");
     const result = spawnSync("bash", ["-c", pruneRun], {
@@ -1219,6 +1417,8 @@ esac
         PATH: `${fixtureDir}:${process.env.PATH}`,
         FAKE_R2_STATE: statePath,
         FAKE_R2_DELETED: deletedPath,
+        FAKE_R2_STABLE_MANIFEST: stableManifest,
+        FAKE_R2_BETA_MANIFEST: betaManifest,
         CLOUDFLARE_ACCOUNT_ID: "test-account",
         CLOUDFLARE_R2_BUCKET: "test-bucket",
         RELEASE_TAG: releaseTag,
@@ -1241,34 +1441,514 @@ esac
   };
 
   try {
-    const pruned = runPrune(["v0.19.5", "v0.19.4", "v0.19.3"]);
+    // 稳定发布：本次 tag + 稳定清单指向的 tag，其余的旧稳定版统统删掉。
+    const pruned = runPrune(["v0.19.5", "v0.19.4", "v0.19.3"], "v0.19.5", {
+      stableManifest: JSON.stringify({ version: "0.19.5" }),
+    });
     assert.equal(pruned.result.status, 0, pruned.result.stderr);
     assert.deepEqual(pruned.remaining, ["v0.19.5"]);
     assert.deepEqual(pruned.deleted, [
       "releases/v0.19.3",
       "releases/v0.19.4",
     ]);
-    assert.match(pruned.result.stdout, /R2 now keeps only releases\/v0\.19\.5\//);
+    assert.match(pruned.result.stdout, /R2 now keeps .*v0\.19\.5/);
+
+    // beta 发布同样清理：只留本次 beta + 稳定清单指向的稳定版，旧 beta 必须被
+    // 删掉，否则每发一个 beta 就永久多占约 2.2 GB。
+    const betaPruned = runPrune(
+      ["v0.19.5", "v0.20.0-beta.1", "v0.20.0-beta.2"],
+      "v0.20.0-beta.2",
+      {
+        stableManifest: JSON.stringify({ version: "0.19.5" }),
+        betaManifest: JSON.stringify({ version: "0.20.0-beta.2" }),
+      },
+    );
+    assert.equal(betaPruned.result.status, 0, betaPruned.result.stderr);
+    assert.deepEqual(betaPruned.remaining, ["v0.19.5", "v0.20.0-beta.2"]);
+    assert.deepEqual(betaPruned.deleted, ["releases/v0.20.0-beta.1"]);
+    assert.match(
+      betaPruned.result.stdout,
+      /Keeping releases\/v0\.19\.5\/ for the stable channel manifest/,
+    );
+
+    // beta 清单还指着上一个 beta（清单尚未切换或上一次上传中断）时，两个都得留。
+    const betaRaced = runPrune(
+      ["v0.19.5", "v0.20.0-beta.2", "v0.20.0-beta.3"],
+      "v0.20.0-beta.3",
+      {
+        stableManifest: JSON.stringify({ version: "0.19.5" }),
+        betaManifest: JSON.stringify({ version: "0.20.0-beta.2" }),
+      },
+    );
+    assert.equal(betaRaced.result.status, 0, betaRaced.result.stderr);
+    assert.deepEqual(betaRaced.remaining, ["v0.19.5", "v0.20.0-beta.2", "v0.20.0-beta.3"]);
+    assert.deepEqual(betaRaced.deleted, []);
+
+    // beta 清单读不到时退回「保留版本号最大的 beta」，稳定版照旧保留。
+    const betaFallback = runPrune(
+      ["v0.19.5", "v0.20.0-beta.2", "v0.19.4"],
+      "v0.20.0-beta.2",
+      { stableManifest: JSON.stringify({ version: "0.19.5" }) },
+    );
+    assert.equal(betaFallback.result.status, 0, betaFallback.result.stderr);
+    assert.deepEqual(betaFallback.remaining, ["v0.19.5", "v0.20.0-beta.2"]);
+    assert.deepEqual(betaFallback.deleted, ["releases/v0.19.4"]);
+
+    // 能读到清单时必须按清单里的 version 精确保留，而不是笼统留下最大的那个。
+    const betaExact = runPrune(
+      ["v0.19.5", "v0.20.0-beta.1", "v0.20.0-beta.3", "v0.19.4"],
+      "v0.19.5",
+      {
+        stableManifest: JSON.stringify({ version: "0.19.5" }),
+        betaManifest: JSON.stringify({ version: "0.20.0-beta.1" }),
+      },
+    );
+    assert.equal(betaExact.result.status, 0, betaExact.result.stderr);
+    assert.deepEqual(betaExact.remaining, ["v0.19.5", "v0.20.0-beta.1"]);
+    assert.deepEqual(betaExact.deleted, [
+      "releases/v0.19.4",
+      "releases/v0.20.0-beta.3",
+    ]);
 
     // 本次 tag 不在桶里（上传其实没成功）时，一个旧版本都不能删。
-    const missing = runPrune(["v0.19.4", "v0.19.3"]);
+    const missing = runPrune(["v0.19.4", "v0.19.3"], "v0.19.5", {
+      stableManifest: JSON.stringify({ version: "0.19.5" }),
+    });
     assert.notEqual(missing.result.status, 0);
     assert.match(missing.result.stdout, /Refusing to prune/);
     assert.deepEqual(missing.deleted, []);
     assert.deepEqual(missing.remaining, ["v0.19.4", "v0.19.3"]);
 
-    // 预发布不清理，既有稳定版本原样保留。
-    const prerelease = runPrune(["v0.19.5", "v0.19.4"], "v0.20.0-rc.1");
-    assert.equal(prerelease.result.status, 0, prerelease.result.stderr);
-    assert.deepEqual(prerelease.deleted, []);
-    assert.deepEqual(prerelease.remaining, ["v0.19.5", "v0.19.4"]);
+    // 稳定清单读不到时整体放弃清理：既有的稳定安装包一个都不能少。
+    const noStableManifest = runPrune(
+      ["v0.20.0-rc.1", "v0.19.5", "v0.19.4"],
+      "v0.20.0-rc.1",
+      { stableManifest: "", betaManifest: '{"version":"0.20.0-rc.1"}' },
+    );
+    assert.equal(noStableManifest.result.status, 0, noStableManifest.result.stderr);
+    assert.deepEqual(noStableManifest.deleted, []);
+    assert.deepEqual(noStableManifest.remaining, [
+      "v0.20.0-rc.1",
+      "v0.19.5",
+      "v0.19.4",
+    ]);
     assert.match(
-      prerelease.result.stdout,
-      /Skipping R2 prune for non-stable release tag/,
+      noStableManifest.result.stdout,
+      /Cannot read updates\/latest\.json; skipping R2 prune/,
     );
   } finally {
     fs.rmSync(fixtureDir, { recursive: true, force: true });
   }
+});
+
+test("release workflow derives the channel and marks only beta releases as prerelease", () => {
+  const release = read(".github/workflows/release.yml");
+  const upload = read(".github/workflows/upload-r2.yml");
+
+  // prepare job 暴露 channel，后续 step 只从这里取，避免两处各推导一遍。
+  assert.match(release, /channel: \$\{\{ steps\.release\.outputs\.channel \}\}/);
+  assert.match(release, /echo "channel=\$CHANNEL"/);
+  // 与 upload-r2.yml 共用同一条推导规则：纯稳定版本号 stable，其余 beta。
+  assert.ok(
+    release.includes(
+      'if [[ "$RELEASE_TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then CHANNEL=stable; else CHANNEL=beta; fi',
+    ),
+    "release.yml 缺少按 tag 推导通道的逻辑",
+  );
+  assert.ok(
+    upload.includes(
+      'if [[ "$release_tag" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then CHANNEL=stable; else CHANNEL=beta; fi',
+    ),
+    "upload-r2.yml 缺少按 tag 推导通道的逻辑",
+  );
+
+  const publishStep = workflowStep(release, "Create or update GitHub Release");
+  assert.match(publishStep, /CHANNEL: \$\{\{ needs\.prepare\.outputs\.channel \}\}/);
+  assert.match(
+    publishStep,
+    /if \[ "\$CHANNEL" = "beta" \]; then\n\s+prerelease_args\+=\(--prerelease\)/,
+  );
+  // 稳定通道绝不能出现 --prerelease：误标会让 /releases/latest 跳过稳定版。
+  assert.equal(
+    (publishStep.match(/--prerelease/g) ?? []).length,
+    1,
+    "--prerelease 只能出现在 beta 条件分支里",
+  );
+  // 空数组在 set -u 下的展开必须显式兜底，否则 stable 发布会直接报 unbound variable。
+  assert.match(
+    publishStep,
+    /gh release create "\$RELEASE_TAG"[\s\S]*?\$\{prerelease_args\[@\]\+"\$\{prerelease_args\[@\]\}"\}/,
+  );
+  assert.match(
+    publishStep,
+    /gh release edit "\$RELEASE_TAG"[\s\S]*?\$\{prerelease_args\[@\]\+"\$\{prerelease_args\[@\]\}"\}/,
+  );
+  // dispatch upload-r2 时必须显式带 channel，不能让它自己从 tag 猜。
+  assert.match(publishStep, /-f channel="\$CHANNEL"/);
+
+  // upload-r2 的 channel input 与白名单校验。
+  assert.match(
+    upload,
+    /channel:\n\s+description: 发布通道[\s\S]*?required: false\n\s+default: ""\n\s+type: string/,
+  );
+  assert.match(upload, /CHANNEL="\$\{INPUT_CHANNEL:-\}"/);
+  assert.match(upload, /::error::Invalid channel '\$\{CHANNEL\}'; expected stable or beta/);
+  // 清单 key 由通道计算，上传行不再硬编码稳定 key。
+  assert.match(upload, /stable\)[\s\S]*?manifest_key="updates\/latest\.json"/);
+  assert.match(upload, /beta\)[\s\S]*?manifest_key="updates\/beta\/latest\.json"/);
+  assert.match(upload, /upload_object "artifacts\/updates\/latest\.json" "\$\{manifest_key\}"/);
+  assert.doesNotMatch(
+    upload,
+    /upload_object "artifacts\/updates\/latest\.json" "updates\/latest\.json"/,
+  );
+});
+
+test("beta tag uploads the update manifest under updates/beta and never overwrites the stable feed", () => {
+  const upload = read(".github/workflows/upload-r2.yml");
+  const resolveStep = workflowStep(upload, "Resolve release tag");
+  const uploadStep = workflowStep(upload, "Upload update archives and manifest to R2");
+
+  const stepRun = (step) =>
+    step
+      .match(/run: \|\n([\s\S]*)/)?.[1]
+      .split("\n")
+      .map((line) => line.replace(/^ {10}/, ""))
+      .join("\n");
+
+  const resolveRun = stepRun(resolveStep);
+  const uploadRun = stepRun(uploadStep);
+  assert.ok(resolveRun, "Resolve release tag step must have a run script");
+  assert.ok(uploadRun, "Upload step must have a run script");
+
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "navop-r2-beta-"));
+  const workDir = path.join(fixtureDir, "work");
+  const objectsPath = path.join(fixtureDir, "objects");
+  const outputPath = path.join(fixtureDir, "github-output");
+
+  // 假 gh：本仿真只用到 `gh release view`，Release 存在即成功。
+  fs.writeFileSync(
+    path.join(fixtureDir, "gh"),
+    `#!/usr/bin/env bash
+exit 0
+`,
+    { mode: 0o755 },
+  );
+
+  // 假 sha256sum：让仿真在 Linux 与 macOS 上都能跑（macOS 默认没有 sha256sum）。
+  fs.writeFileSync(
+    path.join(fixtureDir, "sha256sum"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+for file in "$@"; do
+  digest="$(node -e 'const crypto=require("crypto"),fs=require("fs");const f=process.argv[1];process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex"))' "$file")"
+  printf '%s  %s\\n' "$digest" "$file"
+done
+`,
+    { mode: 0o755 },
+  );
+
+  // 假 jq：只覆盖这一步的三种查询（ContentLength / Metadata.sha256 / CacheControl）。
+  fs.writeFileSync(
+    path.join(fixtureDir, "jq"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+filter="\${!#}"
+input="$(cat)"
+case "$filter" in
+  ".ContentLength")
+    sed -n 's/.*"ContentLength":\\([0-9][0-9]*\\).*/\\1/p' <<< "$input"
+    ;;
+  ".Metadata.sha256 // empty")
+    sed -n 's/.*"sha256":"\\([^"]*\\)".*/\\1/p' <<< "$input"
+    ;;
+  ".CacheControl // empty")
+    sed -n 's/.*"CacheControl":"\\([^"]*\\)".*/\\1/p' <<< "$input"
+    ;;
+  *)
+    echo "unexpected jq filter: $filter" >&2
+    exit 42
+    ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+
+  // 假 aws：实现 s3 cp 与 s3api head-object，并把 key 记下来供断言。
+  fs.writeFileSync(
+    path.join(fixtureDir, "aws"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-} \${2:-}" in
+  "s3 cp")
+    shift 2
+    source=""
+    target=""
+    cache_control=""
+    metadata=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --endpoint-url|--content-type) shift 2 ;;
+        --cache-control) cache_control="\${2:-}"; shift 2 ;;
+        --metadata) metadata="\${2:-}"; shift 2 ;;
+        s3://*) target="$1"; shift ;;
+        *) source="$1"; shift ;;
+      esac
+    done
+    key="\${target#s3://*/}"
+    printf '%s\\t%s\\t%s\\t%s\\n' "$key" "$source" "$cache_control" "$metadata" >> "\${FAKE_R2_OBJECTS}"
+    ;;
+  "s3api head-object")
+    shift 2
+    key=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --key) key="\${2:-}"; shift 2 ;;
+        --bucket|--endpoint-url|--output) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    row="$(awk -F'\\t' -v key="$key" '$1 == key { print; exit }' "\${FAKE_R2_OBJECTS}")"
+    if [ -z "$row" ]; then
+      echo "head-object for unknown key: $key" >&2
+      exit 1
+    fi
+    source="$(cut -f2 <<< "$row")"
+    cache_control="$(cut -f3 <<< "$row")"
+    metadata="$(cut -f4 <<< "$row")"
+    size="$(wc -c < "$source" | tr -d '[:space:]')"
+    sha="\${metadata#sha256=}"
+    printf '{"ContentLength":%s,"Metadata":{"sha256":"%s"},"CacheControl":"%s"}\\n' "$size" "$sha" "$cache_control"
+    ;;
+  *)
+    echo "unexpected aws invocation: $*" >&2
+    exit 42
+    ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+
+  fs.mkdirSync(path.join(workDir, "artifacts", "updates"), { recursive: true });
+  fs.writeFileSync(
+    path.join(workDir, "artifacts", "navop-x86_64-unknown-linux-gnu.tar.gz"),
+    "fake package",
+  );
+  // 上传段按固定路径读取三份产品清单（由 node 生成步骤产出），仿真里预置。
+  for (const productManifest of [
+    "updates/latest.json",
+    "updates/navop-shell/shell/latest.json",
+    "updates/navop-data/data/latest.json",
+  ]) {
+    const manifestPath = path.join(workDir, "artifacts", productManifest);
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+    fs.writeFileSync(manifestPath, '{"schema_version":1}\n');
+  }
+
+  const baseEnv = {
+    ...process.env,
+    PATH: `${fixtureDir}:${process.env.PATH}`,
+    GH_TOKEN: "test-token",
+    GITHUB_REPOSITORY: "feigeCode/navop",
+    FAKE_R2_OBJECTS: objectsPath,
+    CLOUDFLARE_ACCOUNT_ID: "test-account",
+    CLOUDFLARE_R2_BUCKET: "test-bucket",
+  };
+
+  const resolveChannel = (tag, channel) => {
+    fs.writeFileSync(outputPath, "");
+    const result = spawnSync("bash", ["-c", resolveRun], {
+      encoding: "utf8",
+      cwd: workDir,
+      env: {
+        ...baseEnv,
+        INPUT_TAG: tag,
+        INPUT_CHANNEL: channel,
+        GITHUB_OUTPUT: outputPath,
+      },
+    });
+    const outputs = Object.fromEntries(
+      fs
+        .readFileSync(outputPath, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return [line.slice(0, separator), line.slice(separator + 1)];
+        }),
+    );
+    return { result, outputs };
+  };
+
+  const runUpload = (channel, releaseTag) => {
+    fs.writeFileSync(objectsPath, "");
+    const result = spawnSync("bash", ["-c", uploadRun], {
+      encoding: "utf8",
+      cwd: workDir,
+      env: { ...baseEnv, RELEASE_TAG: releaseTag, CHANNEL: channel },
+    });
+    const keys = fs
+      .readFileSync(objectsPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((row) => row.split("\t")[0]);
+    return { result, keys };
+  };
+
+  try {
+    // beta tag：留空 channel 时按 tag 自动推导，清单只写 beta 前缀。
+    const beta = resolveChannel("v0.23.0-beta.1", "");
+    assert.equal(beta.result.status, 0, beta.result.stderr);
+    assert.equal(beta.outputs.channel, "beta");
+
+    const betaUpload = runUpload("beta", "v0.23.0-beta.1");
+    assert.equal(betaUpload.result.status, 0, betaUpload.result.stderr);
+    assert.ok(betaUpload.keys.includes("updates/beta/latest.json"));
+    assert.ok(
+      !betaUpload.keys.includes("updates/latest.json"),
+      "beta 发布绝不能写稳定清单 updates/latest.json",
+    );
+    assert.ok(
+      betaUpload.keys.some((key) => key.startsWith("releases/v0.23.0-beta.1/")),
+      "beta 安装包仍需按 releases/<tag>/<file> 上传",
+    );
+
+    // 稳定 tag：清单仍落在老客户端认识的 updates/latest.json。
+    const stable = resolveChannel("v0.23.0", "");
+    assert.equal(stable.result.status, 0, stable.result.stderr);
+    assert.equal(stable.outputs.channel, "stable");
+
+    const stableUpload = runUpload("stable", "v0.23.0");
+    assert.equal(stableUpload.result.status, 0, stableUpload.result.stderr);
+    assert.ok(stableUpload.keys.includes("updates/latest.json"));
+    // 稳定发布同时把同一份清单写进 beta 键位：beta 客户端只读 beta 清单，
+    // 不刷新这里它就永远停在最后一个 beta，收不到新的正式版。
+    assert.ok(
+      stableUpload.keys.includes("updates/beta/latest.json"),
+      "stable 发布必须同时刷新 updates/beta/latest.json",
+    );
+    assert.ok(stableUpload.keys.includes("updates/navop-shell/shell/latest.json"));
+    assert.ok(stableUpload.keys.includes("updates/navop-shell/shell/beta/latest.json"));
+    assert.ok(stableUpload.keys.includes("updates/navop-data/data/latest.json"));
+    assert.ok(stableUpload.keys.includes("updates/navop-data/data/beta/latest.json"));
+
+    // 显式 channel 优先；非法值必须在推导阶段就被拒绝，不能走到上传。
+    assert.equal(resolveChannel("v0.23.0-beta.1", "stable").outputs.channel, "stable");
+    const invalid = resolveChannel("v0.23.0", "nightly");
+    assert.notEqual(invalid.result.status, 0);
+    assert.match(invalid.result.stdout, /::error::Invalid channel/);
+  } finally {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("update feed assets ride the GitHub Release so the CNB mirror can serve them", () => {
+  const upload = read(".github/workflows/upload-r2.yml");
+
+  // CNB 只同步 GitHub Release 资产，所以三份清单必须以扁平资产名 feed-*.json
+  // 回写上 Release，两种通道各一套命名。
+  for (const assetName of [
+    "feed-navop.json",
+    "feed-navop-beta.json",
+    "feed-navop-shell.json",
+    "feed-navop-data-beta.json",
+  ]) {
+    assert.ok(
+      upload.includes(assetName),
+      `upload-r2.yml 缺少 feed 资产命名 ${assetName}`,
+    );
+  }
+
+  const publishStep = workflowStep(upload, "Publish update feed assets for mirrors");
+  // 同一个 tag 的修复重跑必须能覆盖上一次的 feed 资产。
+  assert.match(
+    publishStep,
+    /gh release upload "\$RELEASE_TAG"[\s\S]*?--repo "\$GITHUB_REPOSITORY"[\s\S]*?--clobber[\s\S]*?artifacts\/feed\/\*\.json/,
+  );
+  // stable 额外发一份 -beta 资产，内容与稳定清单相同（同一个源文件）：beta
+  // 客户端只读 beta 清单/资产，不发这份它永远停在最后一个 beta，收不到新的
+  // 正式版。
+  assert.match(
+    publishStep,
+    /if \[ "\$\{CHANNEL\}" = "stable" \]; then[\s\S]*?cp artifacts\/updates\/latest\.json artifacts\/feed\/feed-navop\.json[\s\S]*?cp artifacts\/updates\/latest\.json artifacts\/feed\/feed-navop-beta\.json/,
+  );
+  // beta 通道只产 beta 命名的资产，稳定资产名归稳定 Release。
+  assert.match(
+    publishStep,
+    /else\n\s+#[^\n]*\n(?:\s+#[^\n]*\n)*\s+cp artifacts\/updates\/latest\.json artifacts\/feed\/feed-navop-beta\.json/,
+  );
+  assert.match(
+    publishStep,
+    /else\n[\s\S]*?cp artifacts\/updates\/navop-data\/data\/latest\.json artifacts\/feed\/feed-navop-data-beta\.json/,
+  );
+
+  // 必须先按通道写好 R2 清单，再把同一批清单回写成 Release 资产。
+  assert.ok(
+    upload.indexOf("Publish update feed assets for mirrors") >
+      upload.indexOf("Upload update archives and manifest to R2"),
+  );
+
+  // feed 资产绝不能被当成安装包：下载过滤与 packages 前缀都只认 navop- / navop_。
+  assert.doesNotMatch(upload, /--pattern "feed-\*"/);
+  const generateStep = workflowStep(upload, "Generate R2 update manifest");
+  assert.match(generateStep, /filter\(\(fileName\) => \/\^navop\[-_\]\/\.test\(fileName\)\)/);
+  // 安装包上传循环也只用 navop- / navop_ 通配，feed-*.json 不会进 R2 的
+  // releases/<tag>/ 前缀。
+  assert.match(upload, /release_files=\(artifacts\/navop-\* artifacts\/navop_\*\)/);
+});
+
+test("CNB mirror sync is dispatched after the feed assets exist", () => {
+  const upload = read(".github/workflows/upload-r2.yml");
+  const release = read(".github/workflows/release.yml");
+
+  const dispatchStep = workflowStep(upload, "Dispatch CNB release asset sync");
+  assert.match(
+    dispatchStep,
+    /gh workflow run sync-cnb-release-assets\.yml[\s\S]*?--repo "\$GITHUB_REPOSITORY"[\s\S]*?--ref main[\s\S]*?-f tag="\$RELEASE_TAG"/,
+  );
+  // 派发必须在 feed 资产上传之后，而且就是最后一步。
+  assert.ok(
+    upload.indexOf("Dispatch CNB release asset sync") >
+      upload.indexOf("Publish update feed assets for mirrors"),
+  );
+  const tail = upload.slice(upload.indexOf("Dispatch CNB release asset sync"));
+  assert.doesNotMatch(tail, /\n {6}- name:/, "CNB 派发必须是 upload-r2.yml 的最后一步");
+  // 它靠 actions: write 才能派发别的 workflow，并靠 contents: write 回写资产。
+  assert.match(upload, /permissions:\n {2}actions: write\n {2}contents: write/);
+
+  // release.yml 不再并发派发 CNB 同步：feed 资产还没生成时同步会什么都拿不到。
+  assert.doesNotMatch(release, /gh workflow run sync-cnb-release-assets\.yml/);
+  // 派发 upload-r2 的那段必须保留，且显式传 channel 与 tag。
+  assert.match(
+    release,
+    /gh workflow run upload-r2\.yml[\s\S]*?--ref main[\s\S]*?-f tag="\$RELEASE_TAG"[\s\S]*?-f channel="\$CHANNEL"/,
+  );
+});
+
+test("stable releases refresh the beta feed so beta clients can move to the stable build", () => {
+  const upload = read(".github/workflows/upload-r2.yml");
+  const uploadStep = workflowStep(upload, "Upload update archives and manifest to R2");
+
+  // stable 分支同时写稳定键位与 beta 键位，同一份清单、同样的 no-store 头。
+  assert.match(uploadStep, /stable\)\n\s+manifest_key="updates\/latest\.json"/);
+  assert.match(
+    uploadStep,
+    /if \[ "\$\{CHANNEL\}" = "stable" \]; then\n\s+upload_object "artifacts\/updates\/latest\.json" "updates\/beta\/latest\.json" "application\/json; charset=utf-8" "no-store, max-age=0"/,
+  );
+  assert.match(
+    uploadStep,
+    /upload_object "artifacts\/updates\/navop-shell\/shell\/latest\.json" "updates\/navop-shell\/shell\/beta\/latest\.json"/,
+  );
+  assert.match(
+    uploadStep,
+    /upload_object "artifacts\/updates\/navop-data\/data\/latest\.json" "updates\/navop-data\/data\/beta\/latest\.json"/,
+  );
+  // 稳定键位不得被硬编码成 beta 键位：上传行仍旧走 ${manifest_key} 变量。
+  assert.match(uploadStep, /upload_object "artifacts\/updates\/latest\.json" "\$\{manifest_key\}"/);
+  // beta 通道不写稳定键位（仿真用例已覆盖，这里守住脚本形态）。
+  assert.doesNotMatch(
+    uploadStep,
+    /beta\)\n\s+upload_object[\s\S]*?"updates\/latest\.json"/,
+  );
 });
 
 test("CNB release synchronization replaces moved tags before syncing assets", () => {
@@ -1370,7 +2050,7 @@ test("release builds are cacheable and individually repairable", () => {
   assert.match(trigger, /-f platform=all/);
   assert.match(
     release,
-    /all\) matrix="\[\$macos_arm64,\$macos_x64,\$linux_x64,\$linux_arm64,\$windows_x64,\$windows_x86\]"/,
+    /all\)[\s\S]*?matrix="\$combined"/,
   );
   assert.equal(fs.existsSync(".github/workflows/build-arm-linux.yml"), false);
 });
@@ -1420,18 +2100,18 @@ test("Rust workflows share one cache strategy without archiving target", () => {
 });
 
 test("application updates prefer navop while accepting legacy package names", () => {
-  const install = read("main/src/update/install.rs");
+  const install = read("crates/app_kit/src/update/install.rs");
 
-  assert.match(install, /\["navop\.exe", "onetcli\.exe"\]/);
+  assert.match(install, /let mut names = vec!\[format!\("\{binary_name\}\.exe"\)/);
   assert.match(install, /find_file_named\(staging_dir, name\)/);
   assert.match(
     install,
-    /\["usr\/bin\/navop", "navop", "usr\/bin\/onetcli", "onetcli"\]/,
+    /format!\("usr\/bin\/\{binary_name\}"\)[\s\S]*"usr\/bin\/onetcli"\.to_string\(\),[\s\S]*"onetcli"\.to_string\(\)/,
   );
 });
 
 test("Windows 产物由宿主自己内嵌 Common-Controls v6 清单", () => {
-  const build = read("main/build.rs");
+  const build = read("resources/windows/embed_app_resources.rs");
   const manifest = read("resources/windows/navop.manifest.xml");
   const release = read(".github/workflows/release.yml");
 
@@ -1462,21 +2142,31 @@ test("Windows 产物由宿主自己内嵌 Common-Controls v6 清单", () => {
   // 上游 gpui-fast 只在宿主没声明「我自己提供清单」时才嵌（gpui-kit 声明了
   // windows-manifest-provided-by-host，而 Cargo 特性只做并集、下游关不掉），
   // 所以这份清单只能由 navop 自己嵌。
-  assert.match(
-    build,
-    /set_manifest\(include_str!\("\.\.\/resources\/windows\/navop\.manifest\.xml"\)\)/,
+  assert.match(build, /set_manifest\(include_str!\("navop\.manifest\.xml"\)\)/);
+  // 资源嵌入必须留在二进制 crate：库的 build.rs 嵌不到依赖方的 exe。
+  assert.equal(
+    fs.existsSync("crates/navop_app/build.rs"),
+    false,
+    "crates/navop_app 是库，资源嵌入必须放在 apps/<product>/build.rs",
   );
+  for (const product of ["navop", "navop-shell", "navop-data"]) {
+    assert.match(
+      read(`apps/${product}/build.rs`),
+      /embed_windows_resources\(/,
+      `${product} 的 build.rs 必须嵌入 Windows 资源`,
+    );
+  }
   // winresource 只在 VersionInfo::FILETYPE 存在时才写清单块：漏了这行会静默不嵌。
   assert.match(build, /set_version_info\(winresource::VersionInfo::FILETYPE/);
   assert.match(
     build,
-    /rerun-if-changed=\.\.\/resources\/windows\/navop\.manifest\.xml/,
+    /rerun-if-changed=\.\.\/\.\.\/resources\/windows\/navop\.manifest\.xml/,
   );
 
   // 发布流程必须在打包前校验真实产物（静态检查拦不住「清单被上游吃掉」这类回归）。
   const validateStep = workflowStep(release, "Validate Windows executable manifest");
   assert.match(validateStep, /node script\/validate-windows-exe\.mjs/);
-  assert.match(validateStep, /\$\{\{ matrix\.target \}\}\/release\/navop\.exe/);
+  assert.match(validateStep, /\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.binary \}\}/);
   assert.ok(
     release.indexOf("- name: Validate Windows executable manifest") >
       release.indexOf("- name: Build release binary (Windows)"),
@@ -1531,4 +2221,172 @@ test("Windows 清单门禁能识别缺失清单的 PE（含真实失败现象的
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
+});
+
+test("release version source stays aligned with the navop product package", () => {
+  const versionOf = (source) => source.match(/^version = "([^"]+)"/m)?.[1];
+  const mainVersion = versionOf(read("crates/navop_app/Cargo.toml"));
+  const navopVersion = versionOf(read("apps/navop/Cargo.toml"));
+  assert.ok(mainVersion, "crates/navop_app/Cargo.toml must declare a version");
+  assert.equal(navopVersion, mainVersion, "apps/navop/Cargo.toml version must match main");
+});
+
+test("standalone products ship their own Linux desktop identity and portable marker", () => {
+  const shellDesktop = read("resources/linux/navop-shell.desktop");
+  const dataDesktop = read("resources/linux/navop-data.desktop");
+  const script = read("script/package-linux-product.sh");
+  const shellIdentity = read("crates/domain_api/src/identity.rs");
+
+  assert.match(shellDesktop, /^Name=Navop Shell$/m);
+  assert.match(shellDesktop, /^Exec=navop-shell %F$/m);
+  assert.match(shellDesktop, /^StartupWMClass=navop-shell$/m);
+  assert.match(dataDesktop, /^Name=Navop Data$/m);
+  assert.match(dataDesktop, /^Exec=navop-data %F$/m);
+  assert.match(dataDesktop, /^StartupWMClass=navop-data$/m);
+  assert.match(script, /PORTABLE_MARKER="navop-shell\.portable"/);
+  assert.match(script, /PORTABLE_MARKER="navop-data\.portable"/);
+  assert.match(shellIdentity, /portable_marker: "navop-shell\.portable"/);
+  assert.match(shellIdentity, /portable_marker: "navop-data\.portable"/);
+});
+
+test("unified release workflow builds Shell and Data on every primary platform", () => {
+  const release = read(".github/workflows/release.yml");
+
+  // 独立产品不再有专属工作流：release.yml 的矩阵直接携带 navop-shell /
+  // navop-data 条目，复用与全量一致的构建、打包与上传步骤。
+  assert.match(release, /"product":"navop-shell"/);
+  assert.match(release, /"product":"navop-data"/);
+  assert.match(release, /"archive":"navop-shell-aarch64-apple-darwin\.tar\.gz"/);
+  assert.match(release, /"archive":"navop-data-x86_64-pc-windows-msvc\.zip"/);
+  assert.match(
+    release,
+    /script\/bundle-macos\.sh \$\{\{ matrix\.target \}\} \$\{\{ matrix\.product \}\}/,
+  );
+  assert.match(
+    release,
+    /script\/package-linux-product\.sh "\$\{\{ matrix\.product \}\}"/,
+  );
+  assert.match(
+    release,
+    /cargo build --release -p \$\{\{ matrix\.product \}\} --target "\$\{\{ matrix\.target \}\}"/,
+  );
+  // 独立产品产物用自身前缀发布，与全量并列。
+  assert.match(release, /PUBLIC_BASENAME=\$\{\{ matrix\.product \}\}-\$\{VERSION#v\}-\$\{\{ matrix\.public_label \}\}/);
+  assert.equal(
+    fs.existsSync(".github/workflows/standalone-products.yml"),
+    false,
+    "standalone builds belong to the unified release workflow",
+  );
+});
+
+
+test("standalone Windows installers keep distinct upgrade identities", () => {
+  const script = read("installer/windows/build-product-installer.ps1");
+  const msi = read("installer/windows/navop-product.wxs");
+  const bundle = read("installer/windows/navop-product-bundle.wxs");
+  const full = read("installer/windows/navop.wxs");
+
+  assert.match(script, /"navop-shell"\s*=\s*@\{/);
+  assert.match(script, /"navop-data"\s*=\s*@\{/);
+  assert.match(script, /6B438332-1757-4910-965B-F85C7B6B0F37/);
+  assert.match(script, /E3605D1B-559A-4C46-B03A-A4770236A48A/);
+  assert.doesNotMatch(script, /2EAB58E6-27F7-4D97-81A1-7CE4B50FA294/);
+  assert.match(msi, /UpgradeCode="\$\(var\.UpgradeCode\)"/);
+  assert.match(msi, /Source="\$\(var\.SourceDir\)\\\$\(var\.ExeName\)"/);
+  assert.match(bundle, /Id="feigeCode\.\$\(var\.BundleId\)"/);
+  assert.doesNotMatch(msi, /CFBundle|ProgId/);
+  assert.match(full, /2EAB58E6-27F7-4D97-81A1-7CE4B50FA294/);
+});
+
+
+test("unified release workflow builds Windows installers for both products", () => {
+  const release = read(".github/workflows/release.yml");
+
+  // 独立产品在 Windows 上走 build-product-installer.ps1（与原
+  // standalone-products.yml 相同的入口），全量仍走 navop.wxs 那套。
+  assert.match(
+    release,
+    /"product":"navop-shell","binary":"navop-shell\.exe","archive":"navop-shell-x86_64-pc-windows-msvc\.zip"/,
+  );
+  assert.match(
+    release,
+    /"product":"navop-data","binary":"navop-data\.exe","archive":"navop-data-x86_64-pc-windows-msvc\.zip"/,
+  );
+  assert.match(release, /build-product-installer\.ps1/);
+  assert.match(
+    release,
+    /-Product "\$\{\{ matrix\.product \}\}"[\s\S]*?-Version "\$env:ONETCLI_VERSION"/,
+  );
+
+  // CI 传的 -OutDir 是绝对路径（${{ github.workspace }}\dist-product），
+  // 脚本里不能无脑 Join-Path $repoRoot，否则拼出 `D:\a\...\D:\a\...` 直接失败。
+  const script = read("installer/windows/build-product-installer.ps1");
+  assert.match(script, /\[System\.IO\.Path\]::IsPathRooted\(\$OutDir\)/);
+  assert.doesNotMatch(script, /\$resolvedOutDir = Join-Path \$repoRoot \$OutDir/);
+});
+
+test("release matrix keeps spaces inside macOS bundle names", () => {
+  const release = read(".github/workflows/release.yml");
+  const step = workflowStep(release, "Resolve platform matrix");
+
+  // 拼接矩阵时不能把空格当分隔符：`bundle_name` 里带空格（"Navop Shell"），
+  // 用 `tr ' ' ','` 会拼出 `Navop,Shell`，macOS 打包步骤随后 `tar` 找不到 .app。
+  assert.doesNotMatch(step, /\| tr ' ' ','/);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "navop-matrix-"));
+  const output = path.join(dir, "github_output.txt");
+  // 只取 `run: |` 之后、缩进 10 空格的块，遇到下一个 job（缩进 2）就停，
+  // 否则会把后面的 `build:` job 头当成脚本内容。
+  const body = [];
+  let inBody = false;
+  for (const line of step.split("\n")) {
+    if (!inBody) {
+      inBody = line.trim() === "run: |";
+      continue;
+    }
+    if (line !== "" && !line.startsWith("          ")) break;
+    body.push(line.replace(/^ {10}/, ""));
+  }
+  const script = body.join("\n");
+  const scriptPath = path.join(dir, "matrix.sh");
+  fs.writeFileSync(scriptPath, script);
+
+  const result = spawnSync("bash", [scriptPath], {
+    env: {
+      ...process.env,
+      RELEASE_PLATFORM: "all",
+      RELEASE_PRODUCTS: "all",
+      GITHUB_OUTPUT: output,
+    },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const entry = fs.readFileSync(output, "utf8").match(/^matrix=(.*)$/m);
+  assert.ok(entry, "matrix output is missing");
+  const matrix = JSON.parse(entry[1]);
+  assert.equal(matrix.length, 14);
+  assert.deepEqual(
+    [...new Set(matrix.map((item) => item.bundle_name))].sort(),
+    ["Navop", "Navop Data", "Navop Shell"],
+  );
+});
+
+test("Windows build-shape checks run in a developer PowerShell", () => {
+  const ci = read(".github/workflows/ci.yml");
+  assert.match(ci, /uses: ilammy\/msvc-dev-cmd@v1/);
+
+  // Git Bash 的 PATH 里 `link.exe` 是 GNU coreutils 的 link，会把 MSVC 链接器盖掉，
+  // 于是 cargo check 编到 build script 时全挂（`/usr/bin/link: extra operand`）。
+  // `shell:` 不支持 matrix 上下文（Unrecognized named-value: 'matrix'），
+  // 所以 Windows 单独一步写死 pwsh，其余平台仍是 bash。
+  assert.match(
+    ci,
+    /- name: Check the product build shape \(Windows\)\n\s+if: \$\{\{ matrix\.platform == 'windows' \}\}\n\s+shell: pwsh\n\s+run: cargo check --locked/,
+  );
+  assert.match(
+    ci,
+    /- name: Check the product build shape\n\s+if: \$\{\{ matrix\.platform != 'windows' \}\}\n\s+shell: bash\n/,
+  );
+  assert.doesNotMatch(ci, /shell: \$\{\{ matrix\./);
 });

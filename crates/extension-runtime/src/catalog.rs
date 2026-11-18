@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "database")]
 use db_view::extension_menu::DbTreeExtensionMenuRegistry;
 use one_core::{
     command_registry::{CommandHandler, CommandRegistry},
@@ -16,11 +17,11 @@ use crate::extension::manifest::{Manifest, WasmRuntimeKind};
 
 use super::registration::load_installed_composite_manifests;
 use super::types::{
-    ExtensionRuntimeError, RegisteredDbTreeMenuContribution, RegisteredDocumentExporter,
-    RegisteredDocumentRenderer, RegisteredHtmlPreviewTransform, RegisteredIpcRuntimeBinding,
-    RegisteredKeybindingContribution, RegisteredRemoteFileEditorContribution,
-    RegisteredResourceConnectionContribution, RegisteredResourceWorkbenchContribution,
-    RegisteredShellViewContribution, WasmRuntimeBinding,
+    ExtensionRuntimeError, RegisteredDocumentExporter, RegisteredDocumentRenderer,
+    RegisteredHtmlPreviewTransform, RegisteredIpcRuntimeBinding, RegisteredKeybindingContribution,
+    RegisteredPanelContribution, RegisteredRemoteFileEditorContribution,
+    RegisteredResourceConnectionContribution, RegisteredShellAppContribution,
+    RegisteredToolContribution, WasmRuntimeBinding,
 };
 
 static WASM_CATALOG_LOG_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -30,7 +31,8 @@ pub struct ExtensionRuntimeCatalog {
     pub(super) commands: CommandRegistry,
     pub(super) wasm_runtimes: BTreeMap<String, WasmRuntimeBinding>,
     pub(super) ipc_runtimes: BTreeMap<String, RegisteredIpcRuntimeBinding>,
-    pub(super) db_tree_menus: Vec<RegisteredDbTreeMenuContribution>,
+    #[cfg(feature = "database")]
+    pub(super) db_tree_menus: Vec<crate::types::RegisteredDbTreeMenuContribution>,
     pub(super) toolbar_slots: SlotRegistry,
     pub(super) menu_slots: SlotRegistry,
     pub(super) keybindings: Vec<RegisteredKeybindingContribution>,
@@ -44,9 +46,13 @@ pub struct ExtensionRuntimeCatalog {
     pub(super) document_exporter_runtimes:
         Mutex<HashMap<String, Arc<extension_wasm::DocumentExporterRuntime>>>,
     pub(super) remote_file_editors: Vec<RegisteredRemoteFileEditorContribution>,
-    pub(super) shell_views: BTreeMap<String, RegisteredShellViewContribution>,
+    /// 扩展 id → nsh app（一个扩展最多一个）。
+    pub(super) shell_apps: BTreeMap<String, RegisteredShellAppContribution>,
+    /// 全部已注册面板（`contributes.panels`），按 (anchor, order, id) 排序。
+    pub(super) panels: Vec<RegisteredPanelContribution>,
     pub(super) resource_connections: BTreeMap<String, RegisteredResourceConnectionContribution>,
-    pub(super) resource_workbenches: BTreeMap<String, RegisteredResourceWorkbenchContribution>,
+    /// `{extension}::{tool_id}` → 已注册扩展工具。
+    pub(super) tools: BTreeMap<String, RegisteredToolContribution>,
 }
 
 #[derive(Debug)]
@@ -70,6 +76,7 @@ impl ExtensionRuntimeCatalog {
             commands: CommandRegistry::new(),
             wasm_runtimes: BTreeMap::new(),
             ipc_runtimes: BTreeMap::new(),
+            #[cfg(feature = "database")]
             db_tree_menus: Vec::new(),
             toolbar_slots: SlotRegistry::default(),
             menu_slots: SlotRegistry::default(),
@@ -82,9 +89,10 @@ impl ExtensionRuntimeCatalog {
             #[cfg(feature = "wasm-components")]
             document_exporter_runtimes: Mutex::new(HashMap::new()),
             remote_file_editors: Vec::new(),
-            shell_views: BTreeMap::new(),
+            shell_apps: BTreeMap::new(),
+            panels: Vec::new(),
             resource_connections: BTreeMap::new(),
-            resource_workbenches: BTreeMap::new(),
+            tools: BTreeMap::new(),
         }
     }
 
@@ -124,6 +132,7 @@ impl ExtensionRuntimeCatalog {
         Ok(ExtensionRuntimeCatalogLoadReport { catalog, loaded })
     }
 
+    #[cfg(feature = "database")]
     pub fn db_tree_menu_registry(&self) -> DbTreeExtensionMenuRegistry {
         let mut registry = DbTreeExtensionMenuRegistry::default();
         for menu in &self.db_tree_menus {
@@ -166,66 +175,56 @@ impl ExtensionRuntimeCatalog {
         self.ipc_runtimes.values()
     }
 
-    pub fn shell_views(&self) -> impl Iterator<Item = &RegisteredShellViewContribution> {
-        self.shell_views.values()
+    /// 目录里登记的全部 nsh app。
+    pub fn shell_apps(&self) -> impl Iterator<Item = &RegisteredShellAppContribution> {
+        self.shell_apps.values()
     }
 
-    /// 工具箱聚合的独立 shell 工具，按 title 排序。
+    /// 工具箱聚合的独立 app，按 title 排序。
     ///
-    /// 成员 = 没有任何「非工具箱归属」引用的 shell 视图。三类视图必须排除：
-    ///
-    /// 1. 连接的 `shellViewId` 指向的视图（连接打开，不由工具箱打开）；
-    /// 2. 资源工作台页面的**页体**：`pages[*].renderer.viewId` 指向的视图；
-    /// 3. 声明了 `workbench` 模块的视图 —— `navop.workbench` 只在工作台挂载
-    ///    会话里可用，独立打开时宿主必然失败（"navop.workbench requires a
-    ///    borrowed resource-workbench session"）。把它列进工具箱只会产出
-    ///    「点了就报错」的假卡片。
-    ///
-    /// `surface` 不参与判定：`surface: "tab"` 的独立工具（如 dev-tools 的
-    /// `workbench`）同样要进工具箱，只有「被别的入口占用」才排除。
-    pub fn toolbox_views(&self) -> Vec<&RegisteredShellViewContribution> {
-        let connection_view_keys: HashSet<(&str, &str)> = self
+    /// 有非终端连接的扩展从工具箱排除：它是从连接打开的，工具箱打开只会
+    /// 停在「请先打开一条连接」的空态。没有连接的 app（如 dev-tools）才
+    /// 作为独立工具出现。
+    pub fn toolbox_apps(&self) -> Vec<&RegisteredShellAppContribution> {
+        let connection_extensions: HashSet<&str> = self
             .resource_connections()
-            .filter_map(|conn| {
-                conn.shell_view_id
-                    .as_deref()
-                    .map(|view_id| (conn.extension_id.as_str(), view_id))
-            })
-            .collect();
-        let embedded_view_keys: HashSet<(&str, &str)> = self
-            .resource_workbenches()
-            .flat_map(|workbench| {
-                workbench.pages.iter().filter_map(|page| {
-                    page.renderer
-                        .view_id
-                        .as_deref()
-                        .map(|view_id| (workbench.extension_id.as_str(), view_id))
-                })
-            })
+            .filter(|conn| conn.terminal.is_none())
+            .map(|conn| conn.extension_id.as_str())
             .collect();
         let mut tools: Vec<_> = self
-            .shell_views
+            .shell_apps
             .values()
-            .filter(|view| {
-                let key = (view.extension_id.as_str(), view.id.as_str());
-                if connection_view_keys.contains(&key) || embedded_view_keys.contains(&key) {
-                    return false;
-                }
-                !view
-                    .modules
-                    .contains(&crate::extension::manifest::ShellHostModule::Workbench)
-            })
+            .filter(|app| !connection_extensions.contains(app.extension_id.as_str()))
             .collect();
         tools.sort_by(|a, b| a.title.cmp(&b.title));
         tools
     }
 
-    pub fn shell_view(
-        &self,
-        extension_id: &str,
-        view_id: &str,
-    ) -> Option<&RegisteredShellViewContribution> {
-        self.shell_views.get(&format!("{extension_id}::{view_id}"))
+    pub fn shell_app(&self, extension_id: &str) -> Option<&RegisteredShellAppContribution> {
+        self.shell_apps.get(extension_id)
+    }
+
+    /// 指定锚点的全部面板，按 (order, extension_id, id) 排序。
+    pub fn panels_for_anchor(&self, anchor: &str) -> Vec<&RegisteredPanelContribution> {
+        let mut panels: Vec<_> = self
+            .panels
+            .iter()
+            .filter(|panel| panel.anchor == anchor)
+            .collect();
+        panels.sort_by(|a, b| {
+            a.order
+                .cmp(&b.order)
+                .then_with(|| a.extension_id.cmp(&b.extension_id))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        panels
+    }
+
+    /// 找一个已注册面板（extension_id + panel id）。
+    pub fn panel(&self, extension_id: &str, panel_id: &str) -> Option<&RegisteredPanelContribution> {
+        self.panels
+            .iter()
+            .find(|panel| panel.extension_id == extension_id && panel.id == panel_id)
     }
 
     pub fn resource_connections(
@@ -243,33 +242,13 @@ impl ExtensionRuntimeCatalog {
             .get(&format!("{extension_id}::{connection_id}"))
     }
 
-    pub fn resource_workbenches(
-        &self,
-    ) -> impl Iterator<Item = &RegisteredResourceWorkbenchContribution> {
-        self.resource_workbenches.values()
+    /// 目录里登记的全部扩展工具。
+    pub fn tools(&self) -> impl Iterator<Item = &RegisteredToolContribution> {
+        self.tools.values()
     }
 
-    pub fn resource_workbench(
-        &self,
-        extension_id: &str,
-        workbench_id: &str,
-    ) -> Option<&RegisteredResourceWorkbenchContribution> {
-        self.resource_workbenches
-            .get(&format!("{extension_id}::{workbench_id}"))
-    }
-
-    pub fn resource_workbench_for_connection(
-        &self,
-        extension_id: &str,
-        connection_id: &str,
-    ) -> Option<&RegisteredResourceWorkbenchContribution> {
-        self.resource_workbenches.values().find(|workbench| {
-            workbench.extension_id == extension_id
-                && workbench
-                    .connection_ids
-                    .iter()
-                    .any(|id| id == connection_id)
-        })
+    pub fn tool(&self, extension_id: &str, tool_id: &str) -> Option<&RegisteredToolContribution> {
+        self.tools.get(&format!("{extension_id}::{tool_id}"))
     }
 
     pub fn document_renderer_for_kind(
@@ -449,6 +428,17 @@ impl ExtensionRuntimeCatalog {
         _html: &str,
     ) -> Result<Option<html_preview::HtmlPreviewTransformOutput>, ExtensionRuntimeError> {
         Ok(None)
+    }
+
+    /// 查询一个命令是否是 `kind == "nsh"` 的 shell app 打开型命令。
+    /// 返回 (extension_id, route)。
+    pub fn nsh_command(&self, command_id: &str) -> Option<(String, Option<String>)> {
+        let command = self.commands.get(command_id)?;
+        let CommandHandler::Nsh { route } = &command.handler else {
+            return None;
+        };
+        let extension_id = command.extension_id.clone()?;
+        Some((extension_id, route.clone()))
     }
 
     pub(super) fn component_binding_for_command(

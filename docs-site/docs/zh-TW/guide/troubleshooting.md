@@ -26,7 +26,7 @@ Linux 啟動報「無法建立表面」（Failed to create surface）代表主�
 
 模型失敗時檢查 Provider、API key、base URL、模型、網路與額度。工具缺少可能來自模式、資源或權限；ACP 授權不會移除 Public MCP 的審批。
 
-Public MCP 檢查 Navop 執行狀態、服務模式、Node.js 20+、`npx`、用戶端設定、discovery 權限、Tool Exposure 和即時 Schema。endpoint 重啟後重新連線，不要猜測資源 ID。
+Public MCP 檢查目前應用程式的執行狀態、服務模式、Node.js 20+、`npx`、用戶端設定、discovery 權限、Tool Exposure 和即時 Schema。endpoint 重啟後重新連線，不要猜測資源 ID。
 
 ## 同步、加密與更新
 

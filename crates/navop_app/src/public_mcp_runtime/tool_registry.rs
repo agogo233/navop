@@ -1,0 +1,1152 @@
+use super::{access_guard, diagnostics, internal_functions, notes_tools, resource_pool};
+use gpui::App;
+use one_core::settings::ToolExposureToolsetSettings;
+use one_core::tab_container::TabOpenMode;
+use public_mcp::tools::{
+    PublicMcpToolProvider, PublicMcpToolRegistry, ToolRuntimeMcpProvider,
+    internal_function_tool_registry,
+};
+#[cfg(feature = "shell")]
+use public_mcp::tools::{
+    remote_ops_tool_registry, terminal_control_tool_registry, terminal_exec_tool_registry,
+    terminal_read_tool_registry, terminal_write_command_tool_registry,
+    terminal_write_keys_tool_registry,
+};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolRegistrySurface {
+    Agent,
+    PublicMcp,
+}
+
+impl ToolRegistrySurface {
+    fn connection_session_open_mode(self) -> TabOpenMode {
+        match self {
+            Self::Agent => TabOpenMode::Background,
+            Self::PublicMcp => TabOpenMode::Activate,
+        }
+    }
+}
+
+pub(super) fn build_tool_registry(
+    cx: &mut App,
+    toolsets: &ToolExposureToolsetSettings,
+) -> anyhow::Result<PublicMcpToolRegistry> {
+    build_tool_registry_for_surface(cx, toolsets, ToolRegistrySurface::PublicMcp)
+}
+
+pub(super) fn build_agent_tool_registry(
+    cx: &mut App,
+    toolsets: &ToolExposureToolsetSettings,
+) -> anyhow::Result<PublicMcpToolRegistry> {
+    build_tool_registry_for_surface(cx, toolsets, ToolRegistrySurface::Agent)
+}
+
+#[cfg(test)]
+fn ensure_test_runtime_mcp_providers() {
+    domain_api::register_runtime_mcp_provider(Arc::new(data_domain::DataRuntimeMcp));
+}
+
+fn build_tool_registry_for_surface(
+    cx: &mut App,
+    toolsets: &ToolExposureToolsetSettings,
+    surface: ToolRegistrySurface,
+) -> anyhow::Result<PublicMcpToolRegistry> {
+    #[cfg(test)]
+    ensure_test_runtime_mcp_providers();
+    let mut providers: Vec<Arc<dyn PublicMcpToolProvider>> = Vec::new();
+    let mut runtime_registries = vec![diagnostics::runtime_status_tool_registry(toolsets)];
+    if toolsets.internal_functions {
+        runtime_registries.push(navop_runtime::builtin_tool_registry_with_version(env!(
+            "CARGO_PKG_VERSION"
+        )));
+        runtime_registries.push(internal_function_tool_registry(
+            internal_functions::definitions(cx),
+        ));
+    }
+    if toolsets.notes {
+        runtime_registries.push(notes_tools::notes_tool_registry());
+    }
+    if toolsets.connections {
+        if let Some(storage) = cx.try_global::<one_core::storage::GlobalStorageState>() {
+            if let Some(repo) = storage
+                .storage
+                .get::<one_core::storage::ConnectionRepository>()
+            {
+                let workspace_repo = storage
+                    .storage
+                    .get::<one_core::storage::WorkspaceRepository>();
+                let session_opener = super::connection_sessions::connection_session_opener(
+                    cx,
+                    surface.connection_session_open_mode(),
+                );
+                let save_notifier = super::connection_sessions::connection_save_notifier(cx);
+                runtime_registries.push(
+                    navop_runtime::connections::connection_tool_registry_with_workspaces_and_hooks(
+                        repo,
+                        workspace_repo.clone(),
+                        navop_runtime::connections::ConnectionToolHooks::default()
+                            .with_session_opener(Some(session_opener))
+                            .with_save_notifier(Some(save_notifier)),
+                    ),
+                );
+                if let Some(workspace_repo) = workspace_repo {
+                    runtime_registries.push(navop_runtime::workspaces::workspace_tool_registry(
+                        workspace_repo,
+                    ));
+                } else {
+                    tracing::warn!(
+                        "Public MCP connection tools enabled without WorkspaceRepository"
+                    );
+                }
+            } else {
+                tracing::warn!("Public MCP connection tools enabled without ConnectionRepository");
+            }
+        } else {
+            tracing::warn!("Public MCP connection tools enabled before storage is initialized");
+        }
+    }
+    #[cfg(feature = "shell")]
+    if toolsets.terminal {
+        if let Some(registry) = terminal_view::public_mcp::registry(cx) {
+            if toolsets.terminal_ssh_exec {
+                runtime_registries.push(remote_ops_tool_registry(registry.clone()));
+            }
+            if toolsets.terminal_exec {
+                runtime_registries.push(terminal_exec_tool_registry(registry.clone()));
+                runtime_registries.push(terminal_read_tool_registry(registry.clone()));
+                runtime_registries.push(terminal_control_tool_registry(registry.clone()));
+                runtime_registries.push(terminal_write_command_tool_registry(registry.clone()));
+                runtime_registries.push(terminal_write_keys_tool_registry(registry));
+            }
+        } else {
+            tracing::warn!("Public MCP terminal registry is not initialized");
+        }
+    }
+    let selection = domain_api::RuntimeMcpSelection {
+        database: false,
+        redis: toolsets.redis,
+        mongo: toolsets.mongo,
+        terminal: false,
+        terminal_ssh_exec: toolsets.terminal_ssh_exec,
+        terminal_exec: toolsets.terminal_exec,
+        terminal_control: false,
+        terminal_read: false,
+        terminal_write_keys: false,
+        sftp: false,
+    };
+    runtime_registries.extend(domain_api::runtime_mcp_registries(cx, &selection));
+    #[cfg(feature = "shell")]
+    if toolsets.sftp {
+        if let Some(storage) = cx.try_global::<one_core::storage::GlobalStorageState>() {
+            if let Some(repo) = storage
+                .storage
+                .get::<one_core::storage::ConnectionRepository>()
+            {
+                runtime_registries.push(navop_runtime::sftp_tools::sftp_tool_registry(repo));
+            } else {
+                tracing::warn!("Public MCP SFTP tools enabled without ConnectionRepository");
+            }
+        } else {
+            tracing::warn!("Public MCP SFTP tools enabled before storage is initialized");
+        }
+    }
+    #[cfg(feature = "database")]
+    if toolsets.database {
+        if let Some(storage) = cx.try_global::<one_core::storage::GlobalStorageState>() {
+            if let Some(repo) = storage
+                .storage
+                .get::<one_core::storage::ConnectionRepository>()
+            {
+                runtime_registries
+                    .push(navop_runtime::database_tools::database_tool_registry(repo));
+            } else {
+                tracing::warn!("Public MCP database tools enabled without ConnectionRepository");
+            }
+        } else {
+            tracing::warn!("Public MCP database tools enabled before storage is initialized");
+        }
+    }
+    if !runtime_registries.is_empty() {
+        // 连接级 AI 访问策略：合并后的 registry 不继承子 registry 的 guard，这里统一挂一次。
+        let registry = tool_runtime::ToolRegistry::merge(runtime_registries)?
+            .with_optional_access_guard(access_guard::connection_ai_access_guard(cx));
+        let mut provider = ToolRuntimeMcpProvider::new(registry);
+        if let Some(resource_pool_provider) = resource_pool::app_resource_pool_provider(cx) {
+            provider = provider.with_resource_pool_provider(resource_pool_provider);
+        }
+        providers.push(Arc::new(provider));
+    }
+    if providers.is_empty() {
+        tracing::warn!("Public MCP runtime enabled without any tool providers");
+    }
+    Ok(PublicMcpToolRegistry::try_new(providers)?)
+}
+
+#[cfg(test)]
+pub(crate) mod tests_helpers {
+
+    /// 写入临时 extension.json 并把 catalog + UniversalPluginService
+    /// 注册进 GPUI globals（扩展工具注册测试用）。
+    pub(crate) fn install_extension_catalog(cx: &mut gpui::App, manifest_json: &str) {
+        let directory = tempfile::tempdir().expect("temporary extension dir");
+        // shellApp.entry 要求文件存在：解析前先落一个占位入口。
+        let entry = directory.path().join("./app/index.html");
+        if let Some(parent) = entry.parent() {
+            std::fs::create_dir_all(parent).expect("app dir should be created");
+        }
+        std::fs::write(&entry, "<!doctype html><title>app</title>")
+            .expect("app entry should be written");
+        std::fs::write(directory.path().join("extension.json"), manifest_json)
+            .expect("temporary manifest should be written");
+        let manifest = extension_runtime::extension::manifest::load_from_dir(directory.path())
+            .expect("manifest should parse");
+        let catalog = extension_runtime::ExtensionRuntimeCatalog::from_manifests(vec![manifest])
+            .expect("catalog should build");
+
+        let global_catalog = cx.default_global::<extension_runtime::GlobalExtensionRuntimeCatalog>();
+        global_catalog.replace(catalog);
+        // tempdir 生命周期只到本函数；catalog 已经把需要的路径收进结构，安全。
+        std::mem::forget(directory);
+        // universal_plugins 需要 GPUI 全局 Tokio；测试里用不起 monitor 的变体，
+        // 避免真实 Tokio worker 唤醒确定性测试调度器。
+        one_core::gpui_tokio::init(cx);
+        universal_plugins::init_for_tests(cx);
+    }
+
+    /// 与 tests 模块共用的连接仓库注册。
+    pub(crate) fn register_connection_repository(cx: &mut gpui::App) {
+        use one_core::storage::{
+            ConnectionRepository, GlobalStorageState, StorageManager, WorkspaceRepository,
+        };
+
+        let storage = StorageManager::new_with_connection(in_memory_sqlite());
+        let repo = ConnectionRepository::new(storage.connection());
+        storage.register(repo);
+        storage.register(WorkspaceRepository::new(storage.connection()));
+        cx.set_global(GlobalStorageState { storage });
+    }
+
+    fn in_memory_sqlite() -> one_core::storage::connection::SqliteConnection {
+        let conn = one_core::storage::connection::SqliteConnection::open_with_pool_size(
+            ":memory:", 1,
+        )
+        .expect("sqlite should open");
+        conn.with_connection(|db| {
+            one_core::storage::migration::run_migrations(db)?;
+            Ok(())
+        })
+        .expect("migrations should run");
+        conn
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolRegistrySurface, build_tool_registry};
+    use crate::public_mcp_runtime::register_internal_function;
+    use gpui::TestAppContext;
+    use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
+    use one_core::settings::ToolExposureToolsetSettings;
+    use one_core::storage::connection::SqliteConnection;
+    use one_core::storage::migration::run_migrations;
+    use one_core::storage::traits::Repository;
+    use one_core::storage::{
+        ConnectionRepository, DatabaseType, DbConnectionConfig, GlobalStorageState, SshAuthMethod,
+        SshParams, StorageManager, StoredConnection, WorkspaceRepository,
+    };
+    use public_mcp::approval::{
+        PublicMcpApprovalFuture, PublicMcpApprovalManager, PublicMcpApprovalOutcome,
+        PublicMcpApprovalRequest, PublicMcpApprover,
+    };
+    use public_mcp::permissions::PermissionMode;
+    use public_mcp::registry::{
+        ConnectionState, TerminalConnectionKind, TerminalControlSessionHandle,
+        TerminalExecSessionHandle, TerminalSessionHandle, TerminalSessionSnapshot,
+    };
+    use public_mcp::terminal_control::{
+        TerminalControlReadiness, TerminalControlRequest, TerminalControlResult,
+    };
+    use public_mcp::terminal_exec::{
+        TerminalExecCompletion, TerminalExecRequest, TerminalExecResult,
+    };
+    use public_mcp::tools::{InternalFunctionDefinition, PublicMcpToolContext};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn registry_surface_selects_connection_session_open_mode() {
+        assert_eq!(
+            one_core::tab_container::TabOpenMode::Background,
+            ToolRegistrySurface::Agent.connection_session_open_mode()
+        );
+        assert_eq!(
+            one_core::tab_container::TabOpenMode::Activate,
+            ToolRegistrySurface::PublicMcp.connection_session_open_mode()
+        );
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_includes_internal_function_tools(cx: &mut TestAppContext) {
+        let toolsets = internal_function_toolsets();
+
+        let tools = cx.update(|cx| {
+            build_tool_registry(cx, &toolsets)
+                .expect("internal function registry should build")
+                .tools()
+        });
+
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "internal_functions.list")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "internal_functions.call")
+        );
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_includes_redis_tools(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            redis: true,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            build_tool_registry(cx, &toolsets)
+                .expect("redis registry should build")
+                .tools()
+        });
+
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "redis.list_connections")
+        );
+        assert!(tools.iter().any(|tool| tool.name == "redis.command"));
+        assert!(tools.iter().any(|tool| tool.name == "redis.keys"));
+        assert!(tools.iter().any(|tool| tool.name == "redis.get"));
+        assert!(tools.iter().any(|tool| tool.name == "redis.set"));
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_includes_mongo_tools(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            mongo: true,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            cx.set_global(mongodb_view::GlobalMongoState::new());
+            build_tool_registry(cx, &toolsets)
+                .expect("MongoDB registry should build")
+                .tools()
+        });
+
+        for expected in [
+            "mongo.list_connections",
+            "mongo.list_databases",
+            "mongo.list_collections",
+            "mongo.find",
+            "mongo.aggregate",
+            "mongo.count",
+            "mongo.list_indexes",
+            "mongo.create_index",
+            "mongo.drop_index",
+            "mongo.create_collection",
+            "mongo.drop_database",
+            "mongo.get_validation",
+            "mongo.set_validation",
+            "mongo.insert",
+            "mongo.replace",
+            "mongo.update",
+            "mongo.delete",
+            "mongo.explain",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool.name == expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_includes_connection_tools(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: true,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            register_connection_repository(cx);
+            build_tool_registry(cx, &toolsets)
+                .expect("connection registry should build")
+                .tools()
+        });
+
+        assert!(tools.iter().any(|tool| tool.name == "connections.list"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "connections.list_sessions")
+        );
+        assert!(tools.iter().any(|tool| tool.name == "connections.show"));
+        assert!(tools.iter().any(|tool| tool.name == "connections.validate"));
+        assert!(tools.iter().any(|tool| tool.name == "connections.find"));
+        assert!(tools.iter().any(|tool| tool.name == "connections.save"));
+        assert!(tools.iter().any(|tool| tool.name == "connections.delete"));
+        assert!(tools.iter().any(|tool| tool.name == "connections.test"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "connections.open_session")
+        );
+        assert!(tools.iter().any(|tool| tool.name == "workspaces.list"));
+        assert!(tools.iter().any(|tool| tool.name == "workspaces.show"));
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.name.starts_with("onetcli.connections."))
+        );
+    }
+
+    #[gpui::test]
+    fn connection_save_emits_connection_created_event(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: true,
+            ..Default::default()
+        };
+        let events = Arc::new(Mutex::new(Vec::<ConnectionDataEvent>::new()));
+        let events_for_subscription = events.clone();
+
+        let (registry, _subscription) = cx.update(|cx| {
+            one_core::connection_notifier::init(cx);
+            register_connection_repository(cx);
+            let notifier = get_notifier(cx).expect("connection notifier should be initialized");
+            let subscription = cx.subscribe(&notifier, move |_, event: &ConnectionDataEvent, _| {
+                events_for_subscription
+                    .lock()
+                    .expect("events lock")
+                    .push(event.clone());
+            });
+            (
+                build_tool_registry(cx, &toolsets).expect("connection registry should build"),
+                subscription,
+            )
+        });
+
+        let result = futures::executor::block_on(registry.call_tool(
+            "connections.save",
+            Some(serde_json::Map::from_iter([
+                ("kind".to_string(), json!("database")),
+                ("database_type".to_string(), json!("MySQL")),
+                (
+                    "values".to_string(),
+                    json!({
+                        "name": "created mysql",
+                        "host": "10.0.1.20",
+                        "username": "app"
+                    }),
+                ),
+            ])),
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Allow,
+                approver: PublicMcpApprovalManager::new(Arc::new(AlwaysApprove)),
+            },
+        ))
+        .expect("connections.save should create a connection");
+
+        assert_eq!(
+            Some(&json!(true)),
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("ok"))
+        );
+        cx.run_until_parked();
+        let events = events.lock().expect("events lock");
+        assert_eq!(1, events.len());
+        match &events[0] {
+            ConnectionDataEvent::ConnectionCreated { connection } => {
+                assert_eq!("created mysql", connection.name);
+            }
+            other => panic!("unexpected connection event: {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_includes_sftp_tools(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            sftp: true,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            register_connection_repository(cx);
+            build_tool_registry(cx, &toolsets)
+                .expect("sftp registry should build")
+                .tools()
+        });
+
+        assert!(tools.iter().any(|tool| tool.name == "sftp.list"));
+        assert!(tools.iter().any(|tool| tool.name == "sftp.read"));
+        assert!(tools.iter().any(|tool| tool.name == "sftp.write"));
+        assert!(tools.iter().any(|tool| tool.name == "sftp.stat"));
+        assert!(tools.iter().any(|tool| tool.name == "sftp.upload"));
+        assert!(tools.iter().any(|tool| tool.name == "sftp.download"));
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_includes_database_tools(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            database: true,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            register_connection_repository(cx);
+            build_tool_registry(cx, &toolsets)
+                .expect("database registry should build")
+                .tools()
+        });
+
+        assert!(tools.iter().any(|tool| tool.name == "db.schema"));
+        assert!(tools.iter().any(|tool| tool.name == "db.query"));
+        assert!(tools.iter().any(|tool| tool.name == "db.exec"));
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_resolves_saved_connection_target_alias(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            database: true,
+            ..Default::default()
+        };
+
+        let registry = cx.update(|cx| {
+            let repo = register_connection_repository(cx);
+            insert_database_connection(&repo, "prod-db", "127.0.0.1");
+            build_tool_registry(cx, &toolsets).expect("database registry should build")
+        });
+
+        let error = futures::executor::block_on(registry.call_tool(
+            "db.query",
+            Some(serde_json::Map::from_iter([
+                ("target".to_string(), json!("127.0.0.1")),
+                (
+                    "sql".to_string(),
+                    json!("create table unsafe_write(id integer)"),
+                ),
+            ])),
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Deny,
+                approver: Default::default(),
+            },
+        ))
+        .expect_err("resolved target should reach db.query validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("db.query only accepts query statements"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_terminal_toolset_includes_terminal_exec(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            connections: false,
+            internal_functions: false,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            build_tool_registry(cx, &toolsets)
+                .expect("terminal registry should build")
+                .tools()
+        });
+
+        assert!(tools.iter().any(|tool| tool.name == "ssh.exec"));
+        assert!(tools.iter().any(|tool| tool.name == "terminal.exec"));
+        assert!(tools.iter().any(|tool| tool.name == "terminal.control"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "terminal.write_command")
+        );
+    }
+
+    #[gpui::test]
+    fn terminal_toolset_can_disable_visible_terminal_exec(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            terminal_ssh_exec: true,
+            terminal_exec: false,
+            connections: false,
+            internal_functions: false,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            build_tool_registry(cx, &toolsets)
+                .expect("terminal registry should build")
+                .tools()
+        });
+
+        assert!(tools.iter().any(|tool| tool.name == "ssh.exec"));
+        assert!(!tools.iter().any(|tool| tool.name == "terminal.exec"));
+        assert!(!tools.iter().any(|tool| tool.name == "terminal.control"));
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.name == "terminal.write_command")
+        );
+    }
+
+    #[gpui::test]
+    fn terminal_toolset_can_disable_structured_ssh_exec(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            terminal_ssh_exec: false,
+            terminal_exec: true,
+            connections: false,
+            internal_functions: false,
+            ..Default::default()
+        };
+
+        let tools = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            build_tool_registry(cx, &toolsets)
+                .expect("terminal registry should build")
+                .tools()
+        });
+
+        assert!(!tools.iter().any(|tool| tool.name == "ssh.exec"));
+        assert!(tools.iter().any(|tool| tool.name == "terminal.exec"));
+        assert!(tools.iter().any(|tool| tool.name == "terminal.read"));
+        assert!(tools.iter().any(|tool| tool.name == "terminal.control"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "terminal.write_command")
+        );
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_resolves_active_terminal_target_alias(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            connections: false,
+            internal_functions: false,
+            database: true,
+            ..Default::default()
+        };
+
+        let (registry, terminal) = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            let terminal_registry =
+                terminal_view::public_mcp::registry(cx).expect("terminal registry should exist");
+            let repo = register_connection_repository(cx);
+            let connection_id = insert_ssh_connection(&repo, "prod-a", "10.2.4.54");
+            let terminal = FakeTerminalSession::new(
+                "ssh-terminal-prod-a",
+                Some(connection_id),
+                "prod-a",
+                "root@zn-54:~",
+            );
+            terminal_registry.register(terminal.clone());
+            terminal_registry.register_terminal_exec(terminal.clone());
+            terminal_registry.register_terminal_control(terminal.clone());
+            insert_database_connection(&repo, "prod-db", "10.2.4.54");
+            (
+                build_tool_registry(cx, &toolsets).expect("terminal registry should build"),
+                terminal,
+            )
+        });
+
+        for target in ["10.2.4.54", "root@zn-54:~"] {
+            let content = call_terminal_exec(&registry, target);
+            assert_eq!(json!("ssh-terminal-prod-a"), content["target"]);
+            let control = call_terminal_control(&registry, target);
+            assert_eq!(json!("ssh-terminal-prod-a"), control["target"]);
+            assert_eq!(json!(true), control["sent"]);
+        }
+
+        assert_eq!(
+            vec!["df -h\n".to_string(), "df -h\n".to_string()],
+            terminal.inserted()
+        );
+    }
+
+    #[gpui::test]
+    fn denied_connection_blocks_tool_execution_until_reallowed(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            connections: false,
+            internal_functions: false,
+            ..Default::default()
+        };
+
+        let (registry, terminal, connection_id) = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            let terminal_registry =
+                terminal_view::public_mcp::registry(cx).expect("terminal registry should exist");
+            let repo = register_connection_repository(cx);
+            let connection_id = insert_ssh_connection(&repo, "仅手动管理的生产机", "10.2.4.54");
+            let terminal = FakeTerminalSession::new(
+                "ssh-terminal-manual",
+                Some(connection_id),
+                "prod-manual",
+                "root@manual:~",
+            );
+            terminal_registry.register(terminal.clone());
+            terminal_registry.register_terminal_exec(terminal.clone());
+            let registry = build_tool_registry(cx, &toolsets).expect("registry should build");
+            (registry, terminal, connection_id)
+        });
+
+        let repo = cx.update(|cx| {
+            cx.try_global::<GlobalStorageState>()
+                .expect("storage global")
+                .storage
+                .get::<ConnectionRepository>()
+                .expect("connection repository")
+        });
+        repo.set_ai_access_level(connection_id, tool_runtime::AiAccessLevel::Denied)
+            .expect("policy should save");
+
+        let denied = futures::executor::block_on(registry.call_tool(
+            "terminal.exec",
+            Some(serde_json::Map::from_iter([
+                ("target".to_string(), json!("ssh-terminal-manual")),
+                ("command".to_string(), json!("rm -rf /tmp/important")),
+                ("submit".to_string(), json!(true)),
+            ])),
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Allow,
+                approver: PublicMcpApprovalManager::new(Arc::new(AlwaysApprove)),
+            },
+        ));
+        let error = denied.expect_err("被禁止的连接不允许 AI 执行命令");
+        tracing::info!(error = %error, "denied error");
+        assert!(
+            terminal.inserted().is_empty(),
+            "被拒绝的命令不能真的送进终端: {:?}",
+            terminal.inserted()
+        );
+
+        // 策略回落为默认级别后，同一个 registry 实例应立即恢复可用（不需要重启运行时）。
+        repo.set_ai_access_level(connection_id, tool_runtime::AiAccessLevel::Allowed)
+            .expect("policy should clear");
+        let content = call_terminal_exec(&registry, "ssh-terminal-manual");
+        assert_eq!(json!("ssh-terminal-manual"), content["target"]);
+        assert_eq!(vec!["df -h\n".to_string()], terminal.inserted());
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_uses_live_resource_pool_for_new_terminal_targets(
+        cx: &mut TestAppContext,
+    ) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: true,
+            connections: false,
+            internal_functions: false,
+            database: true,
+            ..Default::default()
+        };
+
+        let (registry, terminal, connection_id) = cx.update(|cx| {
+            terminal_view::public_mcp::init(cx);
+            let terminal_registry =
+                terminal_view::public_mcp::registry(cx).expect("terminal registry should exist");
+            let repo = register_connection_repository(cx);
+            let registry =
+                build_tool_registry(cx, &toolsets).expect("terminal registry should build");
+            let connection_id = insert_ssh_connection(&repo, "prod-a", "10.2.4.54");
+            let terminal = FakeTerminalSession::new(
+                "ssh-terminal-prod-a",
+                Some(connection_id),
+                "prod-a",
+                "root@zn-54:~",
+            );
+            terminal_registry.register(terminal.clone());
+            terminal_registry.register_terminal_exec(terminal.clone());
+            terminal_registry.register_terminal_control(terminal.clone());
+            insert_database_connection(&repo, "prod-db", "10.2.4.54");
+            (registry, terminal, connection_id)
+        });
+
+        let content = call_terminal_exec(&registry, &connection_id.to_string());
+
+        assert_eq!(json!("ssh-terminal-prod-a"), content["target"]);
+        assert_eq!(vec!["df -h\n".to_string()], terminal.inserted());
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_uses_registered_internal_functions(cx: &mut TestAppContext) {
+        let toolsets = internal_function_toolsets();
+        let registry = cx.update(|cx| {
+            register_internal_function(cx, runtime_status_function());
+            build_tool_registry(cx, &toolsets).expect("internal function registry should build")
+        });
+
+        let result = futures::executor::block_on(registry.call_tool(
+            "internal_functions.list",
+            None,
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Deny,
+                approver: Default::default(),
+            },
+        ))
+        .expect("list tool should run");
+
+        assert_eq!(
+            Some(json!({
+                "functions": [{
+                    "name": "onetcli.runtime_status",
+                    "description": "Read the public MCP runtime status.",
+                    "read_only": true,
+                    "input_schema": {
+                        "type": "object"
+                    }
+                }]
+            })),
+            result.structured_content
+        );
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_exposes_tool_runtime_app_info(cx: &mut TestAppContext) {
+        let toolsets = internal_function_toolsets();
+        let registry = cx.update(|cx| {
+            build_tool_registry(cx, &toolsets).expect("tool runtime registry should build")
+        });
+
+        let tools = registry.tools();
+        assert!(tools.iter().any(|tool| tool.name == "onetcli.app_info"));
+
+        let result = futures::executor::block_on(registry.call_tool(
+            "onetcli.app_info",
+            None,
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Deny,
+                approver: Default::default(),
+            },
+        ))
+        .expect("app info tool should run");
+
+        assert_eq!(
+            Some(json!({
+                "name": "Navop",
+                "version": env!("CARGO_PKG_VERSION")
+            })),
+            result.structured_content
+        );
+    }
+
+    #[gpui::test]
+    fn build_tool_registry_exposes_the_dedicated_notes_group(cx: &mut TestAppContext) {
+        let toolsets = ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            notes: true,
+            ..Default::default()
+        };
+        let registry = cx
+            .update(|cx| build_tool_registry(cx, &toolsets).expect("notes registry should build"));
+
+        let tool_names = registry
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        for name in ["notes.list", "notes.read", "notes.create", "notes.write"] {
+            assert!(
+                tool_names.iter().any(|tool| tool == name),
+                "missing {name}: {tool_names:?}"
+            );
+        }
+    }
+
+    fn internal_function_toolsets() -> ToolExposureToolsetSettings {
+        ToolExposureToolsetSettings {
+            terminal: false,
+            connections: false,
+            internal_functions: true,
+            ..Default::default()
+        }
+    }
+
+    fn runtime_status_function() -> InternalFunctionDefinition {
+        InternalFunctionDefinition::read_only(
+            "onetcli.runtime_status",
+            "Read the public MCP runtime status.",
+            |_| async { Ok(json!({ "state": "disabled" })) },
+        )
+    }
+
+    #[derive(Clone)]
+    struct FakeTerminalSession {
+        session_id: String,
+        connection_id: Option<i64>,
+        host_label: String,
+        title: String,
+        inserted: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeTerminalSession {
+        fn new(
+            session_id: &str,
+            connection_id: Option<i64>,
+            host_label: &str,
+            title: &str,
+        ) -> Self {
+            Self {
+                session_id: session_id.to_string(),
+                connection_id,
+                host_label: host_label.to_string(),
+                title: title.to_string(),
+                inserted: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn inserted(&self) -> Vec<String> {
+            self.inserted.lock().expect("inserted lock").clone()
+        }
+
+        fn snapshot(&self) -> TerminalSessionSnapshot {
+            TerminalSessionSnapshot {
+                session_id: self.session_id.clone(),
+                connection_id: self.connection_id,
+                title: self.title.clone(),
+                host_label: self.host_label.clone(),
+                cwd: Some("/root".to_string()),
+                rows: 24,
+                cols: 120,
+                connection_kind: TerminalConnectionKind::Ssh,
+                connection_state: ConnectionState::Connected,
+            }
+        }
+    }
+
+    impl TerminalSessionHandle for FakeTerminalSession {
+        fn snapshot(&self) -> TerminalSessionSnapshot {
+            self.snapshot()
+        }
+    }
+
+    impl TerminalExecSessionHandle for FakeTerminalSession {
+        fn snapshot(&self) -> TerminalSessionSnapshot {
+            self.snapshot()
+        }
+
+        fn exec_in_terminal(
+            &self,
+            request: TerminalExecRequest,
+            _cancellation: public_mcp::registry::TerminalExecCancellation,
+        ) -> public_mcp::registry::TerminalExecFuture {
+            let suffix = if request.submit { "\n" } else { "" };
+            self.inserted
+                .lock()
+                .expect("inserted lock")
+                .push(format!("{}{suffix}", request.command));
+            Box::pin(async move {
+                Ok(TerminalExecResult {
+                    target: request.target,
+                    command: request.command,
+                    submitted: request.submit,
+                    command_id: None,
+                    completion: TerminalExecCompletion::SubmittedOnly,
+                    exit_code: None,
+                    output: String::new(),
+                    truncated: false,
+                    captured_bytes: 0,
+                    discarded_bytes: 0,
+                    response_truncated: false,
+                    response_bytes: 0,
+                    duration_ms: 0,
+                })
+            })
+        }
+    }
+
+    impl TerminalControlSessionHandle for FakeTerminalSession {
+        fn snapshot(&self) -> TerminalSessionSnapshot {
+            self.snapshot()
+        }
+
+        fn control_terminal(
+            &self,
+            request: TerminalControlRequest,
+            _cancellation: public_mcp::registry::TerminalControlCancellation,
+        ) -> public_mcp::registry::TerminalControlFuture {
+            Box::pin(async move {
+                Ok(TerminalControlResult {
+                    target: request.target,
+                    action: request.action,
+                    sent: true,
+                    readiness_before: Some(TerminalControlReadiness::CommandRunning),
+                })
+            })
+        }
+    }
+
+    fn call_terminal_exec(
+        registry: &public_mcp::tools::PublicMcpToolRegistry,
+        target: &str,
+    ) -> serde_json::Value {
+        futures::executor::block_on(registry.call_tool(
+            "terminal.exec",
+            Some(serde_json::Map::from_iter([
+                ("target".to_string(), json!(target)),
+                ("command".to_string(), json!("df -h")),
+                ("submit".to_string(), json!(true)),
+            ])),
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Allow,
+                approver: PublicMcpApprovalManager::new(Arc::new(AlwaysApprove)),
+            },
+        ))
+        .expect("terminal target alias should resolve to active terminal session")
+        .structured_content
+        .expect("terminal.exec should return structured content")
+    }
+
+    fn call_terminal_control(
+        registry: &public_mcp::tools::PublicMcpToolRegistry,
+        target: &str,
+    ) -> serde_json::Value {
+        futures::executor::block_on(registry.call_tool(
+            "terminal.control",
+            Some(serde_json::Map::from_iter([
+                ("target".to_string(), json!(target)),
+                ("action".to_string(), json!("interrupt")),
+            ])),
+            PublicMcpToolContext {
+                permission_mode: PermissionMode::Allow,
+                approver: PublicMcpApprovalManager::new(Arc::new(AlwaysApprove)),
+            },
+        ))
+        .expect("terminal control target alias should resolve to active terminal session")
+        .structured_content
+        .expect("terminal.control should return structured content")
+    }
+
+    struct AlwaysApprove;
+
+    impl PublicMcpApprover for AlwaysApprove {
+        fn request_approval(&self, _request: PublicMcpApprovalRequest) -> PublicMcpApprovalFuture {
+            Box::pin(async { PublicMcpApprovalOutcome::Approved })
+        }
+    }
+
+    fn register_connection_repository(cx: &mut gpui::App) -> Arc<ConnectionRepository> {
+        let storage = StorageManager::new_with_connection(test_connection());
+        let repo = ConnectionRepository::new(storage.connection());
+        let repo_for_insert = Arc::new(repo.clone());
+        storage.register(repo);
+        storage.register(WorkspaceRepository::new(storage.connection()));
+        cx.set_global(GlobalStorageState { storage });
+        repo_for_insert
+    }
+
+    fn insert_database_connection(repo: &ConnectionRepository, name: &str, host: &str) {
+        let mut connection =
+            StoredConnection::new_database(name.to_string(), db_config(host), None);
+        repo.insert(&mut connection)
+            .expect("database connection should insert");
+    }
+
+    fn insert_ssh_connection(repo: &ConnectionRepository, name: &str, host: &str) -> i64 {
+        let mut connection = StoredConnection::new_ssh(name.to_string(), ssh_params(host), None);
+        repo.insert(&mut connection)
+            .expect("ssh connection should insert");
+        connection
+            .id
+            .expect("inserted ssh connection should have id")
+    }
+
+    fn db_config(host: &str) -> DbConnectionConfig {
+        DbConnectionConfig {
+            id: String::new(),
+            database_type: DatabaseType::SQLite,
+            name: String::new(),
+            host: host.to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            credential_reference: None,
+            database: None,
+            service_name: None,
+            sid: None,
+            workspace_id: None,
+            proxy: None,
+            extra_params: Default::default(),
+        }
+    }
+
+    fn ssh_params(host: &str) -> SshParams {
+        SshParams { otp: None,
+            remote_file: None,
+            sftp_default_directory: None,
+            disabled_jump_server: None,
+            sftp_account: None,
+            host: host.to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_method: SshAuthMethod::Agent,
+            credential_reference: None,
+            prompt_username: None,
+            prompt_password: None,
+            keyboard_interactive: None,
+            terminal_encoding: Default::default(),
+            terminal_type: Default::default(),
+            connect_timeout: None,
+            keepalive_interval: None,
+            keepalive_max: None,
+            default_directory: None,
+            init_script: None,
+            disable_shell_integration: None,
+            x11_forwarding: None,
+            allow_legacy_algorithms: None,
+            forward_agent: None,
+            agent_forward_key: None,
+            jump_server: None,
+            proxy: None,
+            os_id: None,
+            icon: None,
+            icon_file_path: None,
+            account_expect: Default::default(),
+        }
+    }
+
+    fn test_connection() -> SqliteConnection {
+        let conn = SqliteConnection::open_with_pool_size(":memory:", 1)
+            .expect("sqlite connection should open");
+        conn.with_connection(|db| {
+            run_migrations(db)?;
+            Ok(())
+        })
+        .expect("migrations should run");
+        conn
+    }
+}

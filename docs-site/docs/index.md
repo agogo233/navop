@@ -1,37 +1,51 @@
 # Navop 使用说明
 
-Navop 是 AI 时代的开发和运维工作台，将数据库、Redis、MongoDB、SSH、SFTP、终端、远程桌面、Notes、AI 和团队同步放在同一个原生工作区。
+Navop 是一个**基于 Rust 与 GPUI 原生构建**的桌面工作台：没有 WebView，也没有 Electron，界面、终端、表格和图表都由 GPU 加速渲染。它把数据库、服务器、远程桌面和 AI Agent 放进同一个窗口，覆盖从连接管理、SQL 开发、文件传输到远程排查的日常工作。
 
-## 当前版本：v0.19.5
+## 为什么是 Navop
 
-前往[官网下载中心](https://navop.dev/zh-CN/extensions)下载最新稳定版。
+- **原生性能**：GPUI 直接绘制界面，多连接、终端分屏和大结果集不会因为浏览器布局而变慢。
+- **全栈 Rust**：数据库驱动、SSH/SFTP、终端模拟、AI 运行时与界面共享同一套 Rust 代码。
+- **一个窗口完成工作**：SQL 工作区、终端、文件管理、远程桌面和 AI 侧边栏可以并排组织，不必在多个工具之间切换。
+- **可扩展**：数据库驱动、远程桌面、文档渲染和资源工作台都可以通过 WASM 扩展安装，无需重启应用。
+- **跨平台一致**：macOS（arm64/x64）、Windows（x64/win32）和 Linux（x64/arm64）使用同一套界面与能力。
 
-- 个人同步新增 WebDAV 后端：与「文件夹」「Git」并列，填服务器地址、用户名、密码即可用，密码加密后落盘、不明文保存。协议只用 GET / PUT / DELETE 加 Basic 认证，不做 PROPFIND 探测，以兼容坚果云、群晖、Nextcloud 与自建服务；首次写入用 MKCOL 建目录，服务端返回 409 会提示「目录不可用」而不是误报版本冲突。设置页只显示当前后端的项，密码框可切换明文/掩码，WebDAV 没有本地目录可监听，同步由 60 秒周期扫描驱动。
-- SSH Agent 转发：凭据里的私钥可勾选「通过 ssh-agent 转发此密钥」，连接侧也有「SSH Agent 转发」（ForwardAgent）开关。本地 ssh-agent 转发给远端后，远端（例如跳板机）能代表你用本机私钥向更内层主机认证，对新开的终端会话生效。
-- 表结构设计页新增「刷新表结构」：重新读取最新的列、索引与表信息；设计器里有未保存改动时会先提示，确认后「放弃并刷新」。
-- 终端粘贴确认弹窗补上「打开设置」与「不再提示」：多行粘贴、高危命令、大段粘贴三类提示都能直接跳到对应设置项；大段粘贴是硬阈值，不提供「不再提示」。
-- 外部驱动改为按调用类别区分请求超时，并支持连接级覆盖：查询、执行、游标、导入导出等用户操作默认 30 分钟，元数据与结构浏览保持 30 秒；连接高级设置新增「请求超时（秒）」（留空按类别默认，0 表示不限制），慢库上的大查询、大导入不再被统一的 30 秒硬超时打断。
-- SQL 编辑器手动事务的提交/回滚按钮、表数据页的「提交更改」在写库期间显示 loading，能看出哪一步还在跑，另一个按钮只禁用、不跟着转。
-- 修复 WHERE / ORDER BY 过滤输入框里输入中文导致崩溃（#326），过滤条输入框比迁移前高出一行的问题也已修正（40px → 20px）；修复 AI 对话取消回答后会话被误判为失败、达梦等方言改完列注释仍显示旧注释。
-- 修复 Linux（Arch + Hyprland / Wayland）应用内退出以 SIGABRT 收尾并留下 core（#336）；macOS Touch Bar 机型关闭窗口闪退交由上游 zed#65186 修复，撤销「关闭即隐藏」实验开关，macOS 两个架构、Windows、Linux 统一回到「关闭即销毁」。
+## Navop 支持什么
+
+- **数据库**：MySQL、PostgreSQL、MariaDB、SQLite、DuckDB、SQL Server、Oracle、ClickHouse、TDengine，以及达梦、金仓、GBase、OceanBase、openGauss、IoTDB、Oscar 等扩展驱动。
+- **数据工具**：对象浏览、SQL 编辑器与执行计划、导入导出、结构与数据比较、ER 图、表数据批量编辑。
+- **Redis / MongoDB / MQTT**：Key 与值管理、集合与文档查询、订阅与发布。
+- **SSH 与终端**：本地/远程终端、原生分屏、广播输入、快捷命令、Shell 集成、会话录制回放与日志搜索。
+- **文件传输**：SFTP、FTP、FTPS，拖拽上传下载、远程文件编辑、ZMODEM、服务器间复制。
+- **远程访问**：本地/远程/SOCKS 端口转发、X11、RDP、VNC、串口、Telnet、主机密钥管理与 SecureCRT 导入。
+- **AI 与自动化**：SQL 生成与解释、结果分析、图表、终端辅助、ACP Agent（Codex / Claude Code / OpenCode）、Agent Hub。
+- **协作与扩展**：Notes、团队与共享连接、加密同步、扩展市场、Public MCP、Navop CLI 与 Agent Skill。
+
+## 安装与版本
+
+从[官网下载中心](https://navop.dev/zh-CN/extensions)、[GitHub Releases](https://github.com/feigeCode/navop/releases) 或 [CNB](https://cnb.cool/navop-dev/navop/-/releases) 获取最新安装包。安装包命名遵循 `navop-<version>-<label>.<ext>`，支持 macOS、Windows 和 Linux；每次发布都附带校验文件。
+
+同一份源码还会构建两个更小的版本：**Navop Shell**（SSH、终端与远程桌面）和 **Navop Data**（数据库与数据浏览）。它们与 Navop 共享原生外壳、AI、同步与扩展体系，适合只需要部分能力的场景；大多数用户直接使用 Navop 即可。
+
+安装包矩阵、平台差异与升级说明见[安装与更新](./guide/install-update)。
 
 ## 从这里开始
 
-- [快速开始](./guide/quick-start)
-- [安装与更新](./guide/install-update)
+- [快速开始：完成第一个连接与任务](./guide/quick-start)
+- [安装与更新：安装包、平台差异与数据目录](./guide/install-update)
 - [首页、工作区与连接管理](./guide/workspace-connections)
 
 ## 按任务查找
 
-- [数据库连接、SQL、导入导出与 Schema 工具](./guide/database-connections)
-- [SQL 编辑器、事务与查询结果](./guide/sql-editor)
-- [SSH、SFTP、端口转发与 Agent Hub](./guide/ssh-terminal)
-- [FTP 与 FTPS 远程文件](./guide/ftp-remote-files)
-- [远程桌面、串口与服务器监控](./guide/remote-access)
-- [原生资源工作台（Docker 等）](./guide/resource-workbench)
-- [Notes Markdown 预览与源码编辑](./guide/notes)
-- [AI 工作台、Navop Skill 与 Public MCP](./guide/ai-workbench)
-- [团队同步与安全](./guide/teams-sync-security)
-- [设置与疑难排解](./guide/settings-shortcuts)
+- 数据库连接、SQL、导入导出与 Schema 工具：[数据库连接](./guide/database-connections)
+- SQL 编辑器、事务与查询结果：[SQL 编辑器](./guide/sql-editor)
+- SSH、SFTP、端口转发与 Agent Hub：[SSH 与终端](./guide/ssh-terminal)
+- FTP 与 FTPS 远程文件：[FTP 与远程文件](./guide/ftp-remote-files)
+- 远程桌面、串口与服务器监控：[远程接入](./guide/remote-access)
+- 原生资源工作台（Docker 等）：[资源工作台](./guide/resource-workbench)
+- Notes Markdown 预览与源码编辑：[Notes](./guide/notes)
+- AI 工作台、Navop Skill 与 Public MCP：[AI 与 MCP](./guide/ai-workbench)
+- 团队同步与安全：[团队同步](./guide/teams-sync-security)
+- 设置与疑难排解：[设置与疑难排解](./guide/settings-shortcuts)
 
-文档内容随 Navop 桌面端持续更新。涉及生产数据库、远程服务器、写入 SQL、文件覆盖和批量同步时，请先确认当前环境和操作范围。
+文档内容随 Navop 持续更新。涉及生产数据库、远程服务器、写入 SQL、文件覆盖和批量同步时，请先确认当前环境和操作范围。

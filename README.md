@@ -1,8 +1,8 @@
 <div align="center">
   <p><img src="resources/navop-icon.png" alt="Navop" width="120" /></p>
   <h1>Navop</h1>
-  <p><strong>A native, all-in-one workspace for databases, SSH, SFTP, terminals, remote desktop, monitoring, and AI agents.</strong></p>
-  <p>Built with <a href="https://gpui.rs">GPUI</a> and Rust · GPU-accelerated rendering · No WebView</p>
+  <p><strong>A native desktop workspace for databases, servers, and AI — written in Rust, rendered with <a href="https://gpui.rs">GPUI</a>.</strong></p>
+  <p>Rust + GPUI · GPU-accelerated rendering · No WebView · No Electron</p>
 
   <p>
     <a href="https://github.com/feigeCode/navop/releases"><img src="https://img.shields.io/github/downloads/feigeCode/navop/total?style=for-the-badge&color=blue" alt="Downloads" /></a>
@@ -42,7 +42,9 @@
   <p>
     <a href="README_CN.md">中文</a> ·
     <a href="https://docs.navop.dev/en-US/">Documentation</a> ·
-    <a href="#features">Features</a> ·
+    <a href="https://navop.dev/en-US/extensions">Download center</a> ·
+    <a href="#built-with-rust--gpui">Rust + GPUI</a> ·
+    <a href="#what-navop-supports">Capabilities</a> ·
     <a href="#screenshots">Screenshots</a> ·
     <a href="#install">Install</a> ·
     <a href="https://github.com/feigeCode/navop/releases/latest">Latest Release</a> ·
@@ -52,52 +54,50 @@
   <p><img src="app.png" alt="Navop overview" width="820" /></p>
 </div>
 
-## Features
+## What Navop is
 
-### Databases and data tools
+Navop is a native desktop workspace for the work around databases, servers, and AI. Database and Redis/MongoDB clients, SSH/SFTP and terminals, remote desktops, and AI agents share one window instead of separate tools.
 
-- Built-in support for MySQL, PostgreSQL, SQLite, DuckDB, SQL Server, and Oracle; ClickHouse and TDengine are provided as installable extension drivers, alongside Dameng DM, KingbaseES, GBase 8s, OceanBase, openGauss, Apache IoTDB, and Oscar.
-- Browse database objects, edit and run SQL with execution plans, import and export data, compare schemas and data, and visualize relationships with ER diagrams.
-- Dedicated Redis and MongoDB interfaces; middleware connections such as MQTT are provided through installable extensions (MQTT 3.1.1 over rustls, SSH tunneling, auto-resubscribe), with subscribe, messages, and publish views.
-- Table-data tabs support batch-editing selected cells, typed editors for date/time/numeric columns, and copying table or column names from context menus.
+It is written in Rust and rendered with [GPUI](https://gpui.rs), the GPU-accelerated UI framework from Zed. There is no WebView, no Electron, and no embedded browser runtime.
 
-### Remote access and operations
+## Built with Rust + GPUI
 
-- SSH and local terminals with draggable split panes, quick commands, broadcast input, shell integration, session lock, recording and replay, searchable session logs with batch delete and incremental loading; Telnet and serial connections are also supported.
-- Manage remote files with SFTP, FTP, and FTPS: uploads, downloads, search, favorites, remote editing (configurable size limits and default editor), drag-and-drop, ZMODEM transfer, and server-to-server copy. Create standalone FTP/FTPS connections, or switch the remote-file protocol on an SSH connection while its terminal keeps using SSH; an open-mode preference decides whether a double-click opens the terminal or the dual-pane file view.
-- Reusable local, remote (`ssh -R`), and dynamic SOCKS port forwarding; X11 forwarding; host-key change warnings with explicit fingerprints; a Known Hosts page for reviewing, importing, and removing trusted SSH host keys; optional legacy SSH algorithms.
-- Import SecureCRT sessions, monitor servers with native charts, and connect to remote desktops over RDP and VNC. On Windows, native MSTSC integration embeds the Microsoft RDP ActiveX control directly in the app via a C++ host, so you can use it inside a tab, in a fullscreen window, or launch the native `mstsc.exe` client; across platforms a pure-Rust IronRDP canvas backend renders RDP sessions.
+| | |
+|:-:|:--|
+| **Language** | Rust 2024 for the UI, database drivers, SSH/SFTP stack, terminal emulation, AI runtime, and MCP server |
+| **UI** | GPUI with GPU-accelerated layout and painting; large grids, terminals, and charts stay responsive |
+| **Runtime** | One self-contained native binary with no embedded browser, Node.js, or web assets |
+| **Platforms** | macOS arm64/x64, Windows x64/win32, Linux x64/arm64 |
+| **Native integration** | Native menus, shortcuts, file dialogs, tray, keychain, file associations, and auto-update |
+| **Extensibility** | WASM component extensions for drivers, renderers, and resource workbenches, loaded without restarting |
 
-### Editing, AI, and extensibility
+Why it is built this way:
 
-- Local Markdown notes with Mermaid diagrams, math rendering, and export to HTML, PDF, or DOCX; the built-in editor supports save shortcuts and WASM language parsers for syntax highlighting.
-- AI for SQL generation and explanation, data analysis, charts, terminal assistance, tool calling, and agent workflows; connect external agents through ACP for Codex, Claude Code, and OpenCode.
-- Agent Hub keeps a terminal agent, project files, Git branches, changes, and side-by-side diffs in one workspace; the toolbox aggregates extension tools alongside connection extensions.
-- The extension marketplace adds database drivers, remote desktop providers, document renderers, connection importers, external editors, and native resource workbenches rendered by the host (starting with a Docker workbench for containers, images, logs, processes, and exec terminals). First-party extensions are built and published from the [navop-extensions](https://github.com/feigeCode/navop-extensions) repository.
-- Quick open supports ad-hoc SSH connections from the tab bar, so throwaway sessions no longer need a saved connection.
+- **One language end to end.** Drivers, SSH transport, terminal emulation, and UI share one Rust workspace, so features compose without a browser bridge or a second runtime.
+- **GPU rendering instead of DOM layout.** GPUI paints only what changed, keeping multi-pane terminals, wide tables, and charts smooth while several connections are live.
+- **No WebView.** Native text rendering, input methods, accessibility, window management, and shortcuts on every platform — in a smaller, self-contained install.
 
-### Native desktop experience
+## What Navop supports
 
-- Native GPUI interface with GPU-accelerated rendering; light, dark, and system themes, importable themes, accent colors, and window opacity.
-- Home page with a unified grid layout, tree view, recent connections, batch connection management, and workspace drag-order persistence.
-- Settings organized into dedicated database, terminal, Agent, and MCP pages; shortcuts can be cleared and system-wide hotkeys disabled.
-- English, Simplified Chinese, and Traditional Chinese interfaces.
-- Encrypted synchronization of personal connections, credentials, and settings across devices by Navop Cloud Sync or Personal Sync(Folder / Git / WebDAV).
+- **Databases** — MySQL, PostgreSQL, MariaDB, SQLite, DuckDB, SQL Server, Oracle, ClickHouse, TDengine; Dameng, KingbaseES, GBase, OceanBase, openGauss, IoTDB, and Oscar via extension drivers. SQL editor with plans, import/export, schema and data compare, ER diagrams.
+- **Redis, MongoDB, MQTT** — key/value and document browsing plus MQTT pub/sub through an extension.
+- **SSH and terminals** — local and remote shells, split panes, quick commands, broadcast input, session recording, and searchable logs.
+- **Files and remote access** — SFTP/FTP/FTPS with remote editing, port forwarding, X11, RDP/VNC, Telnet, and serial.
+- **AI and automation** — SQL generation and analysis, charts, terminal help, ACP agents (Codex, Claude Code, OpenCode), Agent Hub, and Public MCP.
+- **Desktop and teams** — native themes, English/简体中文/繁體中文, encrypted sync, shared connections, extension marketplace, and Markdown notes.
+
+Navop is the complete build. The same source also ships **Navop Shell** (SSH, terminals, port forwarding, remote desktop) and **Navop Data** (SQL, Redis, MongoDB, ER diagrams) as focused editions for narrower installs.
 
 ## Public MCP, Navop CLI, and Agent Skill
 
-Navop can expose selected host-authoritative tools to external Codex, Claude, MCP clients, and automation. Enable the server under **Settings > General > MCP > MCP Server**, choose a permission profile (Safe / Confirm / Auto), and select the required groups under **Tool Exposure**. The runtime listens on a dynamic loopback-only port and authenticates clients with a user-only discovery token; Navop remains authoritative for live tools, schemas, permissions, approvals, and audit records.
-
-For terminal-capable agents, install the [`@navop/cli`](https://github.com/feigeCode/navop-mcp) package and the bundled Navop Skill:
+Navop can expose host-authoritative tools to Codex, Claude, and other MCP clients. Enable **Settings > General > MCP > MCP Server**, choose Safe / Confirm / Auto, and limit exposed tools under **Tool Exposure**. The server binds to a loopback-only port and authenticates clients with a user-only discovery token.
 
 ```bash
 npm install -g @navop/cli@latest
-
-# Install the Skill for Codex, or use --target agents for Agents-compatible clients
 navop skill install --target codex --scope user
 ```
 
-The separate [`@navop/mcp`](https://github.com/feigeCode/navop-mcp) package is only the stdio bridge for native MCP clients (`npx -y @navop/mcp@latest`). See the [Navop MCP and CLI repository](https://github.com/feigeCode/navop-mcp) and the [Public MCP guide](https://docs.navop.dev/en-US/guide/public-mcp) for the full command reference and client configuration.
+`@navop/mcp` is the stdio bridge for native MCP clients (`npx -y @navop/mcp@latest`). See the [Public MCP guide](https://docs.navop.dev/en-US/guide/public-mcp) for client configuration.
 
 ## Screenshots
 
@@ -109,47 +109,29 @@ The separate [`@navop/mcp`](https://github.com/feigeCode/navop-mcp) package is o
 |:-:|:-:|
 | [![Database](database.png)](database.png) | [![SSH](ssh.png)](ssh.png) |
 
+| AI Chat | Agent Hub |
+|:-:|:-:|
+| [![AI Chat](ai_chat.png)](ai_chat.png) | [![Agent Hub](agent_hub.png)](agent_hub.png) |
+
 | SFTP | Redis |
 |:-:|:-:|
 | [![SFTP](sftp.png)](sftp.png) | [![Redis](redis.png)](redis.png) |
 
-| MongoDB |                AI Chat                |
-|:-:|:-------------------------------------:|
-| [![MongoDB](mongodb.png)](mongodb.png) | [![AI Chat](ai_chat.png)](ai_chat.png) |
-
-| Agent Hub | Extensions |
-|:-:|:-:|
-| [![Agent Hub](agent_hub.png)](agent_hub.png) | [![Extensions](extension.png)](extension.png) |
-
-| Remote File Editor | ER Diagram |
-|:-:|:-:|
-| [![Remote File Editor](remote_file_editor.png)](remote_file_editor.png) | [![ER Diagram](er.png)](er.png) |
-
-| Monitoring | Themes |
-|:-:|:-:|
-| [![Monitoring](monitor.png)](monitor.png) | [![Themes](theme.png)](theme.png) |
-
 ## Install
 
-Download the latest build from [GitHub Releases](https://github.com/feigeCode/navop/releases/latest). Each release includes `sha256sums.txt` for checksum verification. Artifacts are available for macOS (DMG and tar.gz, Apple Silicon / Intel), Windows (MSI and EXE installers, plus standard and portable ZIP), and Linux (tar.gz, deb, rpm, and AppImage), following the `navop-<version>-<platform>-<arch>.<ext>` naming convention.
+Download Navop from the [download center](https://navop.dev/en-US/extensions), [GitHub Releases](https://github.com/feigeCode/navop/releases), or the [CNB mirror](https://cnb.cool/navop-dev/navop/-/releases). Every asset is also available at `https://navop.pdyyds.cn/releases/<tag>/<file>`, with `sha256sums.txt` for verification.
 
-If macOS Gatekeeper reports that Apple cannot check the app, run `sudo xattr -rd com.apple.quarantine /Applications/Navop.app`.
+| Platform | Packages |
+|:-:|:-:|
+| macOS | `.dmg`, `.tar.gz` (arm64, x64) |
+| Windows | `.msi`, `.exe`, `.zip`, `-portable.zip` (x64, win32) |
+| Linux | `.tar.gz`, `-portable.tar.gz` (x64, arm64); `.deb`, `.rpm`, `.AppImage` (x64) |
 
-On Windows, Navop is also available through [Scoop](https://scoop.sh) (installing the portable edition with data persistence handled by Scoop):
+- **macOS:** open the `.dmg` and move `Navop.app` to `/Applications`; if Gatekeeper blocks it, run `sudo xattr -rd com.apple.quarantine /Applications/Navop.app`.
+- **Windows:** run the `.msi` or `.exe`; the `.zip` is portable, and `-portable.zip` keeps data beside the executable. Also available via `scoop install navop`.
+- **Linux:** run the archive from any directory, or install the `.deb`, `.rpm`, or `.AppImage`.
 
-```powershell
-scoop bucket add extras
-scoop install navop
-```
-
-Navop is also available from [FlatPark](https://flatpark.org/apps/dev.navop.Navop/) as a community Flatpak package:
-
-```bash
-flatpak --user remote-add --if-not-exists flatpark https://dl.flatpark.org/flatpark.flatpakrepo
-flatpak --user install flatpark dev.navop.Navop
-```
-
-For the full artifact table, Windows portable-mode notes, upgrade migration from v0.10.1 or earlier ZIPs, and the Oracle Instant Client / pure-Go driver note, see the [Install & update guide](https://docs.navop.dev/en-US/guide/install-update).
+The same source also builds two smaller editions: **Navop Shell** (SSH, terminals, port forwarding, and remote desktop) and **Navop Data** (SQL, Redis, MongoDB, and ER diagrams). They share Navop's native shell, AI, sync, and extension system and can be installed side by side; most users should start with Navop. Their packages use the `navop-shell-` and `navop-data-` prefixes. See the [install guide](https://docs.navop.dev/en-US/guide/install-update) for the full artifact table and portable-mode details.
 
 ## Build from source
 
@@ -160,7 +142,7 @@ Navop uses the Rust 2024 edition and requires platform-specific system dependenc
 ./script/bootstrap
 
 # Run the application
-cargo run -p main
+cargo run -p navop
 ```
 
 On Windows, install dependencies from PowerShell with:

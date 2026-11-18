@@ -41,13 +41,6 @@ fn trim_leading_blank_lines(content: &str) -> &str {
     &content[content_start..]
 }
 
-/// 单条消息该被复制的文本；不可复制的消息（工具卡片等）返回 `None`。
-///
-/// 对 crate 内公开：块级选中复制要复用同一口径，别让两种复制给出不同答案。
-pub(crate) fn message_copy_text(message: &ChatMessageUI) -> Option<SharedString> {
-    message_copy_value(message)
-}
-
 fn message_copy_value<E: MessageExtension>(
     message: &ChatMessageUIGeneric<E>,
 ) -> Option<SharedString> {

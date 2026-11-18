@@ -2,8 +2,8 @@
 <div align="center">
   <p><img src="resources/navop-icon.png" alt="Navop" width="120" /></p>
   <h1>Navop</h1>
-  <p><strong>数据库、SSH、SFTP、终端、远程桌面、监控与 AI 一体化的原生桌面工作台。</strong></p>
-  <p>基于 <a href="https://gpui.rs">GPUI</a> 与 Rust 构建 · GPU 加速渲染 · 无 WebView</p>
+  <p><strong>面向数据库、服务器与 AI 的原生桌面工作台 —— Rust 编写，<a href="https://gpui.rs">GPUI</a> 渲染。</strong></p>
+  <p>Rust + GPUI · GPU 加速渲染 · 无 WebView · 无 Electron</p>
 
   <p>
     <a href="https://github.com/feigeCode/navop/releases"><img src="https://img.shields.io/github/downloads/feigeCode/navop/total?style=for-the-badge&color=blue" alt="下载量" /></a>
@@ -43,7 +43,9 @@
   <p>
     <a href="README.md">English</a> ·
     <a href="https://docs.navop.dev/">使用文档</a> ·
-    <a href="#功能特性">功能特性</a> ·
+    <a href="https://navop.dev/zh-CN/extensions">下载中心</a> ·
+    <a href="#基于-rust--gpui-构建">Rust + GPUI</a> ·
+    <a href="#navop-支持什么">能力</a> ·
     <a href="#应用截图">应用截图</a> ·
     <a href="#安装">安装</a> ·
     <a href="https://github.com/feigeCode/navop/releases/latest">最新版本</a> ·
@@ -53,104 +55,84 @@
   <p><img src="app.png" alt="Navop 概览" width="820" /></p>
 </div>
 
-## 功能特性
+## Navop 是什么
 
-### 数据库与数据工具
+Navop 是一个面向数据库、服务器与 AI 的原生桌面工作台。数据库与 Redis/MongoDB 客户端、SSH/SFTP 与终端、远程桌面和 AI Agent 共用一个窗口，不必在多个工具之间切换。
 
-- 内置支持 MySQL、PostgreSQL、SQLite、DuckDB、SQL Server、Oracle；ClickHouse 与 TDengine 改为可安装的扩展驱动，与达梦 DM、金仓 KingbaseES、GBase 8s、OceanBase、openGauss、Apache IoTDB 和神通 Oscar 驱动一同通过扩展市场安装。
-- 浏览数据库对象，编辑和执行 SQL 并查看执行计划，导入导出数据，比较 Schema/Data，并通过 ER 图查看关系。
-- 专用的 Redis 与 MongoDB 界面；MQTT 等中间件连接改为通过扩展市场安装的扩展提供（MQTT 3.1.1 + rustls 加密，支持 SSH 隧道与断线自动重订阅），提供订阅、消息、发布三个视图。
-- 表数据页签支持批量编辑选中单元格，日期/时间/数值列使用对应的类型化编辑控件，支持右键复制表名与字段名。
+它用 Rust 编写，由 [GPUI](https://gpui.rs)（Zed 的 GPU 加速 UI 框架）直接渲染：没有 WebView，没有 Electron，也没有内嵌浏览器运行时。
 
-### 远程连接与运维
+## 基于 Rust + GPUI 构建
 
-- 可拖拽分屏的 SSH 与本地终端，支持快捷命令、广播输入、Shell integration、会话锁定、会话录制回放；会话日志支持搜索、批量删除与增量加载；同时支持 Telnet 与串口连接。
-- 通过 SFTP、FTP 与 FTPS 上传下载、搜索、收藏、远程编辑（可配置大小上限与默认编辑器）、拖拽传输、ZMODEM 传输和跨服务器复制管理远程文件。可单独创建 FTP/FTPS 连接，也可在 SSH 连接的远程文件面板中切换协议（终端仍走 SSH）；打开方式偏好可决定双击默认进入终端还是双栏文件视图。
-- 可复用的本地、远程（`ssh -R`）与动态 SOCKS 端口转发；X11 转发；主机密钥变更指纹确认；「已知主机」页面可查看、导入和移除信任的 SSH 主机密钥；可按连接启用旧版 SSH 算法。
-- 导入 SecureCRT 等外部工具的会话，进行服务器监控，并支持 RDP/VNC 远程桌面。Windows 上集成原生 MSTSC：通过 C++ 宿主将微软 RDP ActiveX 控件直接内嵌到应用中，可在页签内、全屏窗口中连接，也可一键启动原生 `mstsc.exe` 客户端；跨平台则由纯 Rust 的 IronRDP canvas 后端渲染 RDP 会话。
+| | |
+|:-:|:--|
+| **语言** | Rust 2024，覆盖界面、数据库驱动、SSH/SFTP、终端模拟、AI 运行时与 MCP 服务 |
+| **界面** | GPUI 负责布局与绘制，由 GPU 加速；大结果集、终端分屏和图表保持流畅 |
+| **运行时** | 单一原生二进制，不内嵌浏览器、Node.js 或 Web 资源 |
+| **平台** | macOS arm64/x64、Windows x64/win32、Linux x64/arm64 |
+| **原生集成** | 原生菜单、快捷键、文件对话框、托盘、钥匙串、文件关联与自动更新 |
+| **扩展** | WASM 组件扩展驱动、渲染器与资源工作台，安装后无需重启 |
 
-### 编辑、AI 与扩展
+为什么这样构建：
 
-- 本地 Markdown 笔记，支持 Mermaid 图、数学公式，并可导出为 HTML、PDF 或 DOCX；内置编辑器支持保存快捷键与 WASM 语言解析器语法高亮。
-- 使用 AI 生成和解释 SQL、分析数据、生成图表、辅助终端操作、调用工具和运行 Agent 工作流；通过 ACP 接入 Codex、Claude Code 和 OpenCode 等外部 Agent。
-- Agent Hub 在同一工作区查看终端 Agent、项目文件、Git 分支、变更列表和并排 Diff；工具箱聚合扩展小工具并与连接扩展区分。
-- 扩展市场提供数据库驱动、远程桌面 provider、文档渲染器、连接导入器、外部编辑器，以及由宿主原生渲染的资源工作台（首个为 Docker 工作台，管理容器、镜像、日志、进程与 exec 终端）。官方扩展在 [navop-extensions](https://github.com/feigeCode/navop-extensions) 仓库独立构建发布。
-- 快速打开支持临时 SSH 连接，标签栏提供新建连接入口，临时会话无需先保存连接。
+- **从头到尾一种语言。** 驱动、SSH 传输、终端模拟和界面共享同一套 Rust 工作区，能力可以组合，不需要浏览器桥接或第二套运行时。
+- **GPU 绘制，而不是 DOM 布局。** GPUI 只重绘变化的部分，多连接并行时，终端分屏、宽表格和图表依然顺滑。
+- **没有 WebView。** 原生文本渲染、输入法、辅助功能、窗口管理与快捷键在各平台保持一致，安装包也更小。
 
-### 原生桌面体验
+## Navop 支持什么
 
-- 基于 GPUI 的原生界面与 GPU 加速渲染；亮色、深色、跟随系统模式，可导入主题，并配置强调色和窗口透明度。
-- 主页统一网格布局与树形视图，最近连接、批量连接管理，工作区拖拽排序持久化。
-- 设置页按数据库、终端、Agent、MCP 拆分为独立分页；快捷键支持清除与禁用系统快捷键。
-- 支持 English、简体中文和繁体中文界面。
-- 加密同步不同设备上的个人连接、凭据与设置，支持 Navop 云同步和个人同步（文件夹 / Git / WebDAV）。
+- **数据库** —— MySQL、PostgreSQL、MariaDB、SQLite、DuckDB、SQL Server、Oracle、ClickHouse、TDengine；达梦、金仓、GBase、OceanBase、openGauss、IoTDB、Oscar 通过扩展驱动接入。SQL 编辑器、执行计划、导入导出、结构与数据比较、ER 图。
+- **Redis / MongoDB / MQTT** —— Key 与文档浏览，以及通过扩展提供的 MQTT 订阅与发布。
+- **SSH 与终端** —— 本地/远程终端、分屏、快捷命令、广播输入、会话录制与可搜索日志。
+- **文件与远程访问** —— SFTP/FTP/FTPS 与远程编辑、端口转发、X11、RDP/VNC、Telnet、串口。
+- **AI 与自动化** —— SQL 生成与分析、图表、终端协助、ACP Agent（Codex、Claude Code、OpenCode）、Agent Hub 与 Public MCP。
+- **桌面与团队** —— 原生主题、English/简体中文/繁體中文、加密同步、共享连接、扩展市场与 Markdown 笔记。
+
+Navop 是完整版本。同一份源码还会构建 **Navop Shell**（SSH、终端、端口转发、远程桌面）和 **Navop Data**（SQL、Redis、MongoDB、ER 图）两个范围更小的版本，适合只需要其中一部分能力的安装场景。
 
 ## Public MCP、Navop CLI 与 Agent Skill
 
-Navop 可将选定的宿主权威工具开放给外部 Codex、Claude、MCP 客户端和自动化程序。请在 **设置 > 通用 > MCP > MCP Server** 中开启服务、选择权限档位（安全 / 确认 / 自动），并在 **Tool Exposure** 中只启用需要的工具组。runtime 只监听动态 loopback 端口，并使用用户专属 discovery token 验证客户端；实时工具、Schema、权限、审批和审计始终由正在运行的 Navop 控制。
-
-终端型 Agent 需要安装 [`@navop/cli`](https://github.com/feigeCode/navop-mcp) 及其内置的 Navop Skill：
+Navop 可以把宿主侧的工具开放给 Codex、Claude 和其他 MCP 客户端。在 **设置 > 通用 > MCP > MCP Server** 启用，选择 Safe / Confirm / Auto 权限档位，并在 **Tool Exposure** 中限定工具范围。服务只监听回环地址，客户端需使用仅当前用户可读的发现令牌。
 
 ```bash
 npm install -g @navop/cli@latest
-
-# 为 Codex 安装 Skill；Agents 兼容客户端可改用 --target agents
 navop skill install --target codex --scope user
 ```
 
-独立的 [`@navop/mcp`](https://github.com/feigeCode/navop-mcp) 仅用于为原生 MCP 客户端提供 stdio bridge（`npx -y @navop/mcp@latest`）。完整命令参考和客户端配置请查看 [Navop MCP 与 CLI 仓库](https://github.com/feigeCode/navop-mcp)与 [Public MCP 使用指南](https://docs.navop.dev/guide/public-mcp)。
+`@navop/mcp` 只是原生 MCP 客户端的 stdio 桥接（`npx -y @navop/mcp@latest`）。客户端配置见 [Public MCP 指南](https://docs.navop.dev/guide/public-mcp)。
 
 ## 应用截图
 
-| 工作台总览 |
+| 工作区 |
 |:-:|
-| [![工作台总览](app1.png)](app1.png) |
+| [![工作区](app1.png)](app1.png) |
 
 | 数据库 | SSH |
 |:-:|:-:|
 | [![数据库](database.png)](database.png) | [![SSH](ssh.png)](ssh.png) |
 
+| AI 对话 | Agent Hub |
+|:-:|:-:|
+| [![AI 对话](ai_chat.png)](ai_chat.png) | [![Agent Hub](agent_hub.png)](agent_hub.png) |
+
 | SFTP | Redis |
 |:-:|:-:|
 | [![SFTP](sftp.png)](sftp.png) | [![Redis](redis.png)](redis.png) |
 
-| MongoDB |                AI 对话                 |
-|:-:|:------------------------------------:|
-| [![MongoDB](mongodb.png)](mongodb.png) | [![AI 对话](ai_chat.png)](ai_chat.png) |
-
-| Agent Hub | 扩展市场 |
-|:-:|:-:|
-| [![Agent Hub](agent_hub.png)](agent_hub.png) | [![扩展市场](extension.png)](extension.png) |
-
-| 远程文件编辑 | ER 图 |
-|:-:|:-:|
-| [![远程文件编辑](remote_file_editor.png)](remote_file_editor.png) | [![ER 图](er.png)](er.png) |
-
-| 服务器监控 | 主题 |
-|:-:|:-:|
-| [![服务器监控](monitor.png)](monitor.png) | [![主题](theme.png)](theme.png) |
-
 ## 安装
 
-请从 [GitHub Releases](https://github.com/feigeCode/navop/releases/latest) 下载最新版本。每个版本都包含用于校验文件的 `sha256sums.txt`。安装包覆盖 macOS（DMG 与 tar.gz，Apple Silicon / Intel）、Windows（MSI 与 EXE 安装版，以及普通与便携 ZIP）和 Linux（tar.gz、deb、rpm、AppImage），命名遵循 `navop-<version>-<平台>-<架构>.<扩展名>` 规则。
+从[下载中心](https://navop.dev/zh-CN/extensions)、[GitHub Releases](https://github.com/feigeCode/navop/releases)或 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases)获取 Navop。所有资源也可从 `https://navop.pdyyds.cn/releases/<tag>/<file>` 下载，并用 `sha256sums.txt` 校验。
 
-如果 macOS 提示“Apple 无法检查其是否包含恶意软件”，请执行 `sudo xattr -rd com.apple.quarantine /Applications/Navop.app`。
+| 平台 | 安装包 |
+|:-:|:-:|
+| macOS | `.dmg`、`.tar.gz`（arm64、x64） |
+| Windows | `.msi`、`.exe`、`.zip`、`-portable.zip`（x64、win32） |
+| Linux | `.tar.gz`、`-portable.tar.gz`（x64、arm64）；`.deb`、`.rpm`、`.AppImage`（x64） |
 
-Windows 用户也可以通过 [Scoop](https://scoop.sh) 安装（使用便携版包，数据持久化由 Scoop 管理）：
+- **macOS：** 打开 `.dmg` 并把 `Navop.app` 拖入 `/Applications`；如果 Gatekeeper 拦截，执行 `sudo xattr -rd com.apple.quarantine /Applications/Navop.app`。
+- **Windows：** 运行 `.msi` 或 `.exe`；`.zip` 为便携版，`-portable.zip` 把数据放在程序目录。也可以通过 `scoop install navop` 安装。
+- **Linux：** 压缩包可在任意目录运行，也可以安装 `.deb`、`.rpm` 或 `.AppImage`。
 
-```powershell
-scoop bucket add extras
-scoop install navop
-```
-
-Navop 也已在 [FlatPark](https://flatpark.org/zh-Hans/apps/dev.navop.Navop/) 上架社区 Flatpak 软件包：
-
-```bash
-flatpak --user remote-add --if-not-exists flatpark https://dl.flatpark.org/flatpark.flatpakrepo
-flatpak --user install flatpark dev.navop.Navop
-```
-
-完整的安装包选择表、Windows 便携模式说明、v0.10.1 及更早版本 ZIP 的升级迁移，以及 Oracle Instant Client / 纯 Go 驱动说明，请参阅[安装与更新指南](https://docs.navop.dev/guide/install-update)。
+同一份源码还会构建两个更小的版本：**Navop Shell**（SSH、终端、端口转发与远程桌面）和 **Navop Data**（SQL、Redis、MongoDB 与 ER 图）。它们共享 Navop 的原生外壳、AI、同步与扩展体系，可与 Navop 并存安装；大多数用户直接使用 Navop 即可。安装包分别使用 `navop-shell-` 和 `navop-data-` 前缀。完整产物表与便携模式说明见[安装指南](https://docs.navop.dev/guide/install-update)。
 
 ## 从源码构建
 
@@ -161,7 +143,7 @@ Navop 使用 Rust 2024 edition，并需要安装各平台的系统依赖。
 ./script/bootstrap
 
 # 运行应用
-cargo run -p main
+cargo run -p navop
 ```
 
 Windows 请在 PowerShell 中安装依赖：

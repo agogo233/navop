@@ -1185,9 +1185,9 @@ TerminalView:
     zh-CN: "已进入 Vi 模式。再次按 %{shortcut} 或按 Esc 退出。"
     zh-HK: "已進入 Vi 模式。再次按 %{shortcut} 或按 Esc 退出。"
   vi_mode_disabled:
-    en: "Vi mode disabled."
-    zh-CN: "已退出 Vi 模式。"
-    zh-HK: "已退出 Vi 模式。"
+    en: "Vi mode disabled. Press %{shortcut} to enable it again."
+    zh-CN: "已退出 Vi 模式。再次按 %{shortcut} 可重新进入。"
+    zh-HK: "已退出 Vi 模式。再次按 %{shortcut} 可重新進入。"
   font_reset_triggered:
     en: "Terminal font size has been reset to 15."
     zh-CN: "已触发终端字体重置为 15。"
@@ -1228,6 +1228,10 @@ TerminalView:
     en: Paste preview
     zh-CN: 粘贴预览
     zh-HK: 貼上預覽
+  paste_edit:
+    en: Review and edit
+    zh-CN: 检查并编辑
+    zh-HK: 檢查並編輯
   paste_summary:
     en: "%{lines} lines · %{chars} chars"
     zh-CN: 共 %{lines} 行 · %{chars} 字符
@@ -1236,6 +1240,10 @@ TerminalView:
     en: Paste as single line
     zh-CN: 合并为单行粘贴
     zh-HK: 合併為單行貼上
+  paste_line_by_line:
+    en: Send line by line
+    zh-CN: 逐行发送
+    zh-HK: 逐行傳送
   paste_open_settings:
     en: Open Settings
     zh-CN: 打开设置
@@ -1286,6 +1294,10 @@ TerminalSidebar:
     en: File Manager
     zh-CN: 文件管理器
     zh-HK: 檔案管理器
+  connection_notes:
+    en: Connection Notes
+    zh-CN: 连接笔记
+    zh-HK: 連線筆記
   server_monitor:
     en: Server Monitor
     zh-CN: 服务器监控
@@ -1330,6 +1342,22 @@ ServerMonitor:
     en: Server Monitor
     zh-CN: 服务器监控
     zh-HK: 伺服器監控
+  overview:
+    en: Overview
+    zh-CN: 总览
+    zh-HK: 總覽
+  gpu:
+    en: GPU
+    zh-CN: GPU
+    zh-HK: GPU
+  npu:
+    en: NPU
+    zh-CN: NPU
+    zh-HK: NPU
+  utilization:
+    en: Utilization
+    zh-CN: 使用率
+    zh-HK: 使用率
   start:
     en: Start Monitoring
     zh-CN: 开始监控
@@ -1399,6 +1427,40 @@ ServerMonitor:
     zh-CN: 暂不可用
     zh-HK: 暫不可用
 
+ConnectionNotes:
+  placeholder:
+    en: Record server details, setup commands, maintenance steps, or reminders...
+    zh-CN: 记录服务器信息、安装命令、维护步骤或备忘事项...
+    zh-HK: 記錄伺服器資訊、安裝命令、維護步驟或備忘事項...
+  description:
+    en: Notes are saved with this connection and remain available whenever it is opened.
+    zh-CN: 笔记随当前连接保存，之后再次打开该连接时仍可查看。
+    zh-HK: 筆記會隨目前連線儲存，之後再次開啟該連線時仍可查看。
+  security_hint:
+    en: Do not store plaintext passwords or other secrets here.
+    zh-CN: 请勿在此保存明文密码或其他密钥。
+    zh-HK: 請勿在此儲存明文密碼或其他密鑰。
+  save:
+    en: Save notes
+    zh-CN: 保存笔记
+    zh-HK: 儲存筆記
+  unsaved:
+    en: Unsaved changes
+    zh-CN: 有未保存的修改
+    zh-HK: 有未儲存的修改
+  saved:
+    en: Saved
+    zh-CN: 已保存
+    zh-HK: 已儲存
+  storage_unavailable:
+    en: Connection storage is unavailable.
+    zh-CN: 连接存储不可用。
+    zh-HK: 連線儲存不可用。
+  save_failed:
+    en: "Failed to save notes: %{error}"
+    zh-CN: "保存笔记失败：%{error}"
+    zh-HK: "儲存筆記失敗：%{error}"
+
 QuickCommand:
   search:
     en: Search
@@ -1437,9 +1499,21 @@ QuickCommand:
     zh-CN: 命令
     zh-HK: 命令
   command_placeholder:
-    en: Enter command
-    zh-CN: 输入命令
-    zh-HK: 輸入命令
+    en: "Enter command, e.g. ssh {{host}} — use {{name}} for parameters"
+    zh-CN: "输入命令，如 ssh {{host}}；用 {{name}} 定义参数"
+    zh-HK: "輸入命令，如 ssh {{host}}；用 {{name}} 定義參數"
+  parameters_title:
+    en: Fill Command Parameters
+    zh-CN: 填写命令参数
+    zh-HK: 填寫命令參數
+  parameters_hint:
+    en: "Use {{name}} placeholders in the command; fill their values here before sending."
+    zh-CN: "在命令中使用 {{name}} 占位符，发送前在这里填写对应值。"
+    zh-HK: "在命令中使用 {{name}} 佔位符，傳送前在這裡填寫對應值。"
+  parameter_placeholder:
+    en: Enter %{name}
+    zh-CN: 输入 %{name}
+    zh-HK: 輸入 %{name}
   auto_run:
     en: Execute on click
     zh-CN: 点击执行
