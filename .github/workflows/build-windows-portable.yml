@@ -106,10 +106,10 @@ jobs:
               /^\[package\]$/ { in_package = 1; next }
               /^\[/ { in_package = 0 }
               in_package && /^version = "/ { print $2; exit }
-            ' main/Cargo.toml
+            ' crates/navop_app/Cargo.toml
           )"
           if [ -z "$version" ]; then
-            echo "::error::Failed to read version from main/Cargo.toml"
+            echo "::error::Failed to read version from crates/navop_app/Cargo.toml"
             exit 1
           fi
           echo "ONETCLI_VERSION=$version" >> "$GITHUB_ENV"
