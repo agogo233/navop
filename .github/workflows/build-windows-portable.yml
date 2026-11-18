@@ -37,10 +37,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # gpui 单个 crate 的 rustc 命令行在 Windows 上约 35K 字符（大量
+      # --extern / -L dependency 长路径），超过 CreateProcess 的 32,767
+      # 上限；sccache 冷编译时会以 os error 206 失败。把 target 目录换到
+      # 短路径可以把命令行压到 ~24K（对齐上游 ci.yml 的做法）。
+      - name: Shorten Windows build paths
+        shell: pwsh
+        run: echo "CARGO_TARGET_DIR=D:\t" >> $env:GITHUB_ENV
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: x86_64-pc-windows-msvc
+          # 固定 1.99.1：cargo 1.100 的新构建布局在 Windows 上把 rustc
+          # 命令行撑到 4.4 万字符，超过 CreateProcess 上限，sccache 无法 spawn。
+          toolchain: 1.99.1
           cache: false
           rustflags: ""
 
@@ -155,7 +166,7 @@ jobs:
             --features windows-native-rdp `
             --target $target
 
-          $binary = "target\$target\release\navop.exe"
+          $binary = "D:\t\$target\release\navop.exe"
           if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
             throw "Release binary was not created: '$binary'"
           }
@@ -167,13 +178,13 @@ jobs:
           # 在进 main 前就以 STATUS_ENTRYPOINT_NOT_FOUND / 0xC0000139 退出（弹「无法定位
           # 程序输入点」），编译期没有任何信号，所以必须在打包前对真实产物校验一次。
           node script/validate-windows-exe.mjs `
-            "target\x86_64-pc-windows-msvc\release\navop.exe"
+            "D:\t\x86_64-pc-windows-msvc\release\navop.exe"
 
       - name: Assemble portable package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force portable-package | Out-Null
-          Copy-Item "target\x86_64-pc-windows-msvc\release\navop.exe" "portable-package\navop.exe"
+          Copy-Item "D:\t\x86_64-pc-windows-msvc\release\navop.exe" "portable-package\navop.exe"
           Set-Content -Path "portable-package\navop.portable" -Value "" -NoNewline
 
       - name: Upload artifact
