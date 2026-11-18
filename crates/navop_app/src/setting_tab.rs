@@ -19,9 +19,6 @@ use crate::settings::remote_file_editor_settings::remote_file_editor_setting_gro
 use crate::settings::tool_exposure_settings::{
     agent_tool_exposure_setting_group, mcp_tool_exposure_setting_group,
 };
-use crate::settings::update_channel::{beta_exit_notice_item, update_channel_item};
-use crate::settings::update_mirror::update_mirror_item;
-use crate::update;
 use font_kit::{file_type::FileType, font::Font};
 use gpui::http_client::{AsyncBody, Method, Request};
 use gpui::prelude::FluentBuilder;
@@ -605,8 +602,6 @@ pub struct SettingsPanel {
     focus_handle: FocusHandle,
     llm_providers_view: Entity<LlmProvidersView>,
     acp_agents_view: Entity<AcpAgentsView>,
-    update_check_state: Entity<update::UpdateCheckState>,
-    _update_check_subscription: gpui::Subscription,
     size: Size,
     group_variant: GroupBoxVariant,
     initial_page: InitialPage,
@@ -638,16 +633,10 @@ impl SettingsPanel {
     fn new_with_initial_page(initial_page: InitialPage, cx: &mut Context<Self>) -> Self {
         let llm_providers_view = cx.new(|cx| LlmProvidersView::new(cx));
         let acp_agents_view = cx.new(|cx| AcpAgentsView::new(cx));
-        // 检查更新状态由 app 持有（启动时的自动检查可能早于设置页打开），这里只观察它，
-        // 让「检查中」和「上次检查结果」能驱动设置页重绘。
-        let update_check_state = update::update_check_state(cx);
-        let _update_check_subscription = cx.observe(&update_check_state, |_, _, cx| cx.notify());
         Self {
             focus_handle: cx.focus_handle(),
             llm_providers_view,
             acp_agents_view,
-            update_check_state,
-            _update_check_subscription,
             size: Size::default(),
             group_variant: GroupBoxVariant::Outline,
             initial_page,
@@ -1376,11 +1365,7 @@ impl SettingsPanel {
                                 t!("Settings.About.data_safety_title").to_string(),
                             ]),
                     ),
-                )
-                .group(about_update_setting_group(
-                    default_settings.auto_update,
-                    self.update_check_state.clone(),
-                )),
+                ),
         ]);
         (pages, sync_page_ix)
     }
@@ -2134,94 +2119,6 @@ impl Render for SettingsPanel {
                 .pages(pages),
         )
     }
-}
-
-/// 关于页的“更新”分组：自动检查更新开关与手动检查入口
-fn about_update_setting_group(
-    auto_update_default: bool,
-    update_check_state: Entity<update::UpdateCheckState>,
-) -> SettingGroup {
-    let mut items = vec![
-        SettingItem::new(
-            t!("Settings.About.Update.auto_update"),
-            SettingField::switch(
-                |cx: &App| AppSettings::global(cx).auto_update,
-                |val: bool, cx: &mut App| {
-                    AppSettings::update_and_save(cx, |settings| {
-                        settings.auto_update = val;
-                    });
-                },
-            )
-            .default_value(auto_update_default),
-        )
-        .description(t!("Settings.About.Update.auto_update_desc").to_string()),
-        // 稳定/测试通道选择：切到测试通道会先弹确认框
-        update_channel_item(),
-        // 镜像源偏好：选中的源排第一，失败仍会回退到其余镜像
-        update_mirror_item(),
-    ];
-    // 只有预发布构建才可能「在用 beta 却选了稳定通道」，稳定性构建不放这条提示。
-    if crate::settings::update_channel::current_build_is_prerelease() {
-        items.push(beta_exit_notice_item());
-    }
-    items.push(
-        SettingItem::render(move |_options, _window, cx| {
-            render_manual_update_check_item(&update_check_state, cx)
-        })
-        .keywords([
-            t!("Settings.About.Update.group_title").to_string(),
-            t!("Settings.About.Update.check_now").to_string(),
-            t!("Settings.About.Update.check_now_desc").to_string(),
-        ]),
-    );
-    SettingGroup::new()
-        .title(t!("Settings.About.Update.group_title"))
-        .items(items)
-}
-
-fn render_manual_update_check_item(
-    update_check_state: &Entity<update::UpdateCheckState>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    let state = update_check_state.read(cx);
-    let checking = state.is_checking();
-    // 检查完成后就地记下结果，避免用户只靠一闪而过的通知判断「到底查过了没有」。
-    let status = state
-        .last_check_label()
-        .unwrap_or_else(|| t!("Settings.About.Update.check_now_desc").to_string());
-
-    h_flex()
-        .w_full()
-        .justify_between()
-        .items_center()
-        .gap_3()
-        .child(
-            v_flex()
-                .gap_1()
-                .flex_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .child(t!("Settings.About.Update.check_now").to_string()),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(status),
-                ),
-        )
-        .child(
-            Button::new("settings-check-update")
-                .icon(IconName::Refresh)
-                .label(t!("Settings.About.Update.check_now"))
-                // loading 态的按钮不会响应点击，因此检查期间天然防重复触发。
-                .loading(checking)
-                .on_click(|_, _window, cx| {
-                    update::check_for_updates_manually(cx);
-                }),
-        )
-        .into_any_element()
 }
 
 fn render_global_proxy_settings_item(cx: &mut App) -> gpui::AnyElement {
@@ -4241,43 +4138,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_update_check_shows_progress_and_last_result() {
-        let source = include_str!("setting_tab.rs");
-        let item = source
-            .split("fn render_manual_update_check_item(")
-            .nth(1)
-            .expect("手动检查更新入口存在")
-            .split("fn render_global_proxy_settings_item")
-            .next()
-            .expect("手动检查更新入口有结尾");
-
-        // loading 态的按钮不响应点击，检查期间天然防重复触发。
-        assert!(item.contains(".loading(checking)"));
-        assert!(item.contains("last_check_label()"));
-        // 状态挂在 app 上并由设置页观察，自动检查也能驱动按钮重绘。
-        assert!(source.contains("cx.observe(&update_check_state"));
-    }
-
-    /// 关于页的「更新」分组必须挂上通道下拉；预发布构建还要挂「退出测试」提示。
-    #[test]
-    fn about_update_group_exposes_the_update_channel_switch() {
-        let group = method_source(implementation_source(), "fn about_update_setting_group(");
-
-        assert!(
-            group.contains("update_channel_item()"),
-            "更新分组缺少通道下拉入口"
-        );
-        assert!(
-            group.contains("beta_exit_notice_item()"),
-            "更新分组缺少预发布构建的退出测试提示"
-        );
-        assert!(
-            group.contains("update_mirror_item()"),
-            "更新分组缺少镜像源下拉入口"
-        );
-    }
-
-    #[test]
     fn global_proxy_settings_build_proxy_url_without_auth() {
         let settings = GlobalProxySettings {
             enabled: true,
@@ -4768,7 +4628,7 @@ fn render_about_section(cx: &App) -> gpui::AnyElement {
             tag::Tag::warning()
                 .small()
                 .rounded_full()
-                .child(t!("Settings.About.Update.channel_beta").to_string()),
+                .child(t!("Settings.About.beta_tag").to_string()),
         );
     }
 

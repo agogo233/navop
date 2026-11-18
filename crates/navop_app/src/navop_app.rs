@@ -2229,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_and_update_quit_paths_await_all_application_resource_shutdown() {
+    fn confirmed_quit_paths_await_all_application_resource_shutdown() {
         let source = include_str!("navop_app.rs").replace("\r\n", "\n");
         let helper_start = source
             .find("pub(crate) fn shutdown_application_resources_and_quit")
@@ -2262,19 +2262,6 @@ mod tests {
         let confirm_quit = &source[confirm_start..confirm_end];
         assert!(confirm_quit.contains("shutdown_application_resources_and_quit"));
         assert!(!confirm_quit.contains("cx.quit()"));
-
-        // 更新弹窗已迁到 `app_kit::update`：它必须走宿主持有的退出漏斗
-        // （`app_kit::update::host::shutdown_application`，main 注册的 hook 正是
-        // `shutdown_application_resources_and_quit`），而不是自己调 `cx.quit()`。
-        let update_dialog = include_str!("../../../crates/app_kit/src/update/dialog.rs");
-        assert!(update_dialog.contains("shutdown_application(cx"));
-        assert!(!update_dialog.contains("cx.quit()"));
-
-        let main_lib = include_str!("lib.rs").replace("\r\n", "\n");
-        assert!(
-            main_lib
-                .contains("set_shutdown_hook(navop_app::shutdown_application_resources_and_quit)")
-        );
     }
 
     /// 退出漏斗必须先把留在主线程 TLS 上的原生平台句柄释放掉，再调 `cx.quit()`。

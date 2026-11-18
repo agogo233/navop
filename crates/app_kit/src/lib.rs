@@ -18,7 +18,6 @@ pub mod integration;
 pub mod new_connection;
 pub mod settings;
 pub mod tabs;
-pub mod update;
 pub mod visuals;
 pub mod vault;
 
@@ -28,6 +27,25 @@ pub use connection_actions::{
 };
 pub use host::{ExtensionsHost, ShellHost, set_extensions_host, set_shell_host, shell_host};
 pub use settings::open_settings;
+
+/// 当前产品版本号；未覆盖时用 `app_kit` 自身版本（workspace 统一）。
+static APP_VERSION: OnceLock<&'static str> = OnceLock::new();
+
+/// 覆盖当前产品版本号；只有第一次调用生效。
+///
+/// 前置条件：各产品入口（`run_with`）必须在任何 `Domain::init` 之前调用，
+/// 否则 DB 驱动 IPC 握手会拿到 `app_kit` 自身的 `0.1.0` 而不是产品版本。
+pub fn set_app_version(version: &'static str) {
+    let _ = APP_VERSION.set(version);
+}
+
+/// 当前产品版本号。
+pub fn app_version() -> &'static str {
+    APP_VERSION
+        .get()
+        .copied()
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 static DOMAIN_REGISTRY: OnceLock<DomainRegistry> = OnceLock::new();
 static EMPTY_DOMAIN_REGISTRY: OnceLock<DomainRegistry> = OnceLock::new();

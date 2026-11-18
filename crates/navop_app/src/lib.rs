@@ -27,8 +27,6 @@ mod dev_extension_registry;
 #[cfg(feature = "shell")]
 mod dev_host_ops;
 mod env_file;
-#[cfg(feature = "nsh-host")]
-mod extension_update;
 mod file_association;
 mod file_open;
 mod home;
@@ -59,7 +57,6 @@ mod db_extension_panels;
 #[cfg(all(feature = "nsh-terminal", feature = "shell"))]
 mod terminal_extension_panels;
 mod toolbox_tab;
-mod update;
 mod window_visibility;
 #[cfg(any(target_os = "windows", test))]
 mod windows_single_instance;
@@ -412,16 +409,9 @@ where
         }
     }
 
-    // 更新与文件关联的实现已迁入 `app_kit`，这里注入只有本产品才知道的三件事：
-    // 版本号（与 Cargo 包版本一致，`app_kit` 自身版本恒为 0.1.0）、退出前的资源清理
-    // （RDP/SSH/插件），以及更新弹窗用的品牌图标路径。
-    app_kit::update::set_current_version(version);
-    app_kit::update::set_shutdown_hook(navop_app::shutdown_application_resources_and_quit);
-    app_kit::update::set_icon_asset_path(NAVOP_ICON_ASSET_PATH);
-
-    if update::handle_update_command() {
-        return;
-    }
+    // 文件关联的实现已迁入 `app_kit`；版本号注入给 `app_kit` 供
+    // DB 驱动 IPC 握手等需要产品版本号的路径使用（`app_kit` 自身版本恒为 0.1.0）。
+    app_kit::set_app_version(version);
 
     let startup_arguments =
         match one_core::app_paths::parse_startup_arguments(std::env::args_os().skip(1)) {
@@ -584,7 +574,8 @@ where
         // 领域快捷键必须再登记一次，才能在编辑器里按得动 cmd+/（#290 反馈）。
         app_kit::refresh_domain_keybindings(cx);
         extension_runtime::init(cx);
-        // 扩展下载跟随「关于 → 更新」里的镜像偏好；设置还没加载完时退回「自动」。
+        // 扩展下载跟随设置里的镜像偏好（`update_mirror` 字段，现仅服务扩展市场）；
+        // 设置还没加载完时退回「自动」。
         extension_runtime::set_extension_mirror(
             AppSettings::current(cx).update_mirror.unwrap_or_default(),
         );
@@ -667,10 +658,6 @@ where
                 // 「隐藏」还是「退出确认」。此处已在主线程且 GPUI 事件
                 // 循环已启动（macOS 的 NSStatusItem 要求如此）。
                 system_tray::init(cx);
-                update::schedule_update_check(cx);
-                // 扩展市场与更新都跑在 nsh 宿主里；没有宿主（32 位 Windows）时不排期。
-                #[cfg(feature = "nsh-host")]
-                extension_update::schedule_plugin_update_check(window, cx);
                 let view = cx.new(|cx| NavopApp::new(window, cx));
                 let root = cx.new(|cx| Root::new(view, window, cx));
                 system_tray::sync_sessions_from(cx);
@@ -785,20 +772,6 @@ mod embedded_cli_removal_tests {
         let handler_name = ["handle", "cli", "command"].join("_");
 
         assert!(!source.contains(&handler_name));
-        assert!(source.contains("update::handle_update_command()"));
-    }
-
-    #[test]
-    fn startup_loads_environment_files_before_handling_commands() {
-        let source = include_str!("lib.rs");
-        let load = source
-            .find("env_file::load_env_files()")
-            .expect("environment file loading");
-        let update = source
-            .find("update::handle_update_command()")
-            .expect("update command handling");
-
-        assert!(load < update);
     }
 
     #[test]

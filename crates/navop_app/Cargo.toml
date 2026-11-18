@@ -147,9 +147,7 @@ builtin-duckdb = ["db_view/builtin-duckdb", "navop_runtime/builtin-duckdb"]
 builtin-mongodb = ["mongodb_view/builtin-mongodb"]
 builtin-data-drivers = ["builtin-mongodb"]
 embedded-webview = ["ai_chat_view/embedded-webview"]
-github-distribution = ["github-updates", "github-marketplace"]
 github-marketplace = ["extension-runtime/github-marketplace"]
-github-updates = ["app_kit/github-updates"]
 # `macos-touchbar-window-hide`：关闭窗口只隐藏原生窗口、绝不销毁，规避带 Touch Bar 的 Mac
 # 上关闭窗口闪退（navop#262 / #308 / #314）。
 #

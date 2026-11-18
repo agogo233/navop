@@ -114,7 +114,7 @@ impl Domain for DataDomain {
     }
 
     fn init(&self, cx: &mut App) -> anyhow::Result<()> {
-        db::ipc::set_host_version(app_kit::update::current_version())
+        db::ipc::set_host_version(app_kit::app_version())
             .map_err(|error| anyhow::anyhow!("invalid product version: {error}"))?;
         app_kit::visuals::set_connection_visuals(Arc::new(visuals::DataConnectionVisuals::new()));
         db::init_cache(cx);

@@ -17,7 +17,6 @@ pub struct AppIdentity {
     pub portable_marker: &'static str,
     pub mcp_app_name: &'static str,
     pub mcp_legacy_app_name: Option<&'static str>,
-    pub mcp_update_channel: &'static str,
     pub file_associations: &'static [&'static str],
 }
 
@@ -37,7 +36,6 @@ impl AppIdentity {
         portable_marker: "navop.portable",
         mcp_app_name: "navop",
         mcp_legacy_app_name: Some("onetcli"),
-        mcp_update_channel: "stable",
         file_associations: &["db", "duckdb", "md", "cast"],
     };
 
@@ -55,7 +53,6 @@ impl AppIdentity {
         portable_marker: "navop-shell.portable",
         mcp_app_name: "navop-shell",
         mcp_legacy_app_name: None,
-        mcp_update_channel: "shell",
         file_associations: &[],
     };
 
@@ -73,7 +70,6 @@ impl AppIdentity {
         portable_marker: "navop-data.portable",
         mcp_app_name: "navop-data",
         mcp_legacy_app_name: None,
-        mcp_update_channel: "data",
         file_associations: &[],
     };
 }

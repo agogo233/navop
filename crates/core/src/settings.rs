@@ -1186,55 +1186,6 @@ impl CloseButtonBehavior {
     }
 }
 
-/// 更新通道：稳定版 / 测试版（Beta）。
-///
-/// 通道只决定「去哪份更新清单里找新版本」，安装包本身仍是同一套。稳定通道读
-/// `updates/latest.json`，测试通道读 `updates/beta/latest.json`，两边互不覆盖。
-///
-/// 设置里存的是 `Option<UpdateChannel>`：`None` 表示「跟随当前构建」——正式构建走
-/// 稳定通道，带预发布后缀的构建（例如 `0.23.0-beta.2`）自动走测试通道。否则手动下载
-/// 了测试版的人会因为默认值停在稳定清单上，永远收不到后续的 beta。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UpdateChannel {
-    /// 稳定版
-    #[default]
-    Stable,
-    /// 测试版（Beta）
-    Beta,
-}
-
-impl UpdateChannel {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            UpdateChannel::Stable => "stable",
-            UpdateChannel::Beta => "beta",
-        }
-    }
-
-    /// 未知取值回退到 [`UpdateChannel::Stable`]：旧版本写下的值不能把新版本卡住。
-    pub fn from_str(value: &str) -> Self {
-        match value {
-            "beta" => UpdateChannel::Beta,
-            _ => UpdateChannel::Stable,
-        }
-    }
-
-    /// 由当前版本号推断「跟随构建」时的通道：带预发布后缀即测试通道。
-    pub fn from_version(version: &str) -> Self {
-        if version.contains('-') {
-            UpdateChannel::Beta
-        } else {
-            UpdateChannel::Stable
-        }
-    }
-
-    /// 把「跟随构建」解析成实际通道。
-    pub fn resolve(configured: Option<Self>, version: &str) -> Self {
-        configured.unwrap_or_else(|| Self::from_version(version))
-    }
-}
-
 /// 检查更新时优先使用的镜像源。
 ///
 /// 选中的源只是「排在第一位」，不是「只用它」：连不上或清单缺失时仍会按内置顺序
@@ -1439,21 +1390,11 @@ pub struct AppSettings {
     /// 日志级别（见 [`LogLevel`]）；空值/旧配置一律按 `info`。
     #[serde(default)]
     pub log_level: LogLevel,
-    #[serde(default = "default_true")]
-    pub auto_update: bool,
-    #[serde(default)]
-    pub skipped_update_version: Option<String>,
-    /// 更新通道偏好；`None` 表示跟随当前构建（预发布构建自动进入测试通道）。
-    #[serde(default)]
-    pub update_channel: Option<UpdateChannel>,
     /// 更新镜像源偏好；`None` 表示自动选择（Cloudflare → CNB → GitHub）。
     ///
     /// 选中的镜像只排到第一位，失败时仍会依次回退到其余镜像。
     #[serde(default)]
     pub update_mirror: Option<UpdateMirror>,
-    /// 插件更新提示最近一次通知的更新集合签名，用于避免每次启动都重复提示。
-    #[serde(default)]
-    pub plugin_update_notified_signature: Option<String>,
     /// Whether any configured synchronization provider is allowed to run.
     #[serde(default)]
     pub sync_enabled: bool,
@@ -1863,11 +1804,7 @@ impl Default for AppSettings {
             local_terminal_profile: LocalTerminalProfileSettings::default(),
             log_file_path: String::new(),
             log_level: LogLevel::default(),
-            auto_update: true,
-            skipped_update_version: None,
-            update_channel: None,
             update_mirror: None,
-            plugin_update_notified_signature: None,
             sync_enabled: false,
             sync_provider: SyncProvider::OnetCloud,
             global_proxy: GlobalProxySettings::default(),
@@ -2431,7 +2368,7 @@ mod tests {
         MAX_REMEMBERED_ACP_SESSIONS, MIN_AI_REQUEST_TIMEOUT_SECS, MainWindowState,
         MasterKeyStorage, McpPermissionMode, McpServerMode, PersonalSyncBackendKind,
         RemoteFileOpenMode, SidebarPlacement, SqlFormatSettings, SqlIndentStyle, SqlKeywordCase,
-        StartupDefaultPage, SyncProvider, TableViewMode, UpdateChannel, UpdateMirror,
+        StartupDefaultPage, SyncProvider, TableViewMode, UpdateMirror,
         default_grid_font_fallback_families, default_grid_monospace_font_family,
         grid_monospace_font, installed_grid_monospace_font, is_installed_font_family,
         resolve_installed_grid_monospace_font_family,
@@ -4213,53 +4150,6 @@ mod tests {
             "/opt/homebrew/bin/fish --login -C 'echo ready'",
             profile.command
         );
-    }
-
-    #[test]
-    fn update_channel_values_match_the_persisted_snake_case_values() {
-        assert_eq!("stable", UpdateChannel::Stable.as_str());
-        assert_eq!("beta", UpdateChannel::Beta.as_str());
-        assert_eq!(UpdateChannel::Stable, UpdateChannel::from_str("stable"));
-        assert_eq!(UpdateChannel::Beta, UpdateChannel::from_str("beta"));
-        // 未知取值必须回退到稳定通道，不能把用户卡在收不到更新的状态。
-        assert_eq!(UpdateChannel::Stable, UpdateChannel::from_str(""));
-        assert_eq!(UpdateChannel::Stable, UpdateChannel::from_str("canary"));
-    }
-
-    #[test]
-    fn update_channel_follows_the_build_unless_the_user_overrides_it() {
-        assert_eq!(
-            UpdateChannel::Stable,
-            UpdateChannel::resolve(None, "0.22.0")
-        );
-        assert_eq!(
-            UpdateChannel::Beta,
-            UpdateChannel::resolve(None, "0.23.0-beta.2")
-        );
-        // 显式选择优先于构建后缀：手动装过测试版的人也能主动留在稳定通道。
-        assert_eq!(
-            UpdateChannel::Stable,
-            UpdateChannel::resolve(Some(UpdateChannel::Stable), "0.23.0-beta.2")
-        );
-        assert_eq!(
-            UpdateChannel::Beta,
-            UpdateChannel::resolve(Some(UpdateChannel::Beta), "0.22.0")
-        );
-    }
-
-    #[test]
-    fn update_channel_round_trips_through_settings_json_and_tolerates_missing_fields() {
-        let mut settings = AppSettings::default();
-        assert_eq!(None, settings.update_channel);
-
-        settings.update_channel = Some(UpdateChannel::Beta);
-        let json = serde_json::to_string(&settings).expect("序列化设置失败");
-        let restored: AppSettings = serde_json::from_str(&json).expect("反序列化设置失败");
-        assert_eq!(Some(UpdateChannel::Beta), restored.update_channel);
-
-        // 老版本的 settings.json 没有这个字段，必须照常读出来并落到「跟随构建」。
-        let legacy: AppSettings = serde_json::from_str("{}").expect("空对象也应可解析");
-        assert_eq!(None, legacy.update_channel);
     }
 
     #[test]
