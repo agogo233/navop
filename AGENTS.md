@@ -836,6 +836,13 @@
 - **验证方式**：`cargo test -p terminal --lib ssh_shell_integration` 覆盖 Bootstrap marker 分段、失败 marker、超时立即放行和真实 bash/zsh；`cargo test -p terminal --test ssh_runtime_integration_live -- --ignored --nocapture` 连续跑 5 次，真机 ready 约 130–160ms 且命令记录、零远端写入均正常。只跑 `bash -i -c` 不能替代真实 PTY。
 - **适用范围**：`crates/terminal/src/ssh_backend.rs`、`crates/terminal/src/ssh_shell_integration.rs`、所有通过 PTY stdin 注入多行/长脚本的终端初始化链路。
 
+- **标题**：合并上游后自建 Windows workflow 要跟上 product-split 目录与「rustc 命令行超长」修复
+- **触发信号**：合并 upstream 后 `build-windows-portable.yml` 连续失败：先报 `Failed to read version from main/Cargo.toml`，再报 `cannot specify features for packages outside of workspace`（`-p main`），最后编译 gpui 时 sccache 报 `The filename or extension is too long. (os error 206)`。
+- **根因 / 约束**：上游 product-split（46a597844）把 `main/` 目录拆成 `crates/navop_app`（逻辑库，包名 `navop_app`）与 `apps/navop`（bin crate，包名 `navop`，产物 `navop.exe`，`windows-native-rdp` 等 feature 在此声明并转发给 navop_app）；`crates/navop-shell`、`crates/navop-data` 同理。另外 gpui 单 crate 的 rustc 命令行约 35K 字符，超过 Windows CreateProcess 的 32,767 上限，sccache 冷编译必挂 os error 206；cargo 1.100 的构建布局还会把它撑到 4.4 万字符。
+- **正确做法**：workflow 里的包路径读 `crates/navop_app/Cargo.toml`；构建目标用 `-p navop`（不是 navop_app，feature 也要写在 navop 上）；产物路径仍为 `navop.exe`。命令行超长对齐上游 ci.yml：steps 早期 `echo "CARGO_TARGET_DIR=D:\t" >> $env:GITHUB_ENV` 把 target 目录换到短路径（命令行压到 ~24K），并固定 `toolchain: 1.99.1`；workflow 内所有 `target\...` 产物引用同步改为 `D:\t\...`（缓存只存 ~/.cargo 输入，不受影响）。
+- **验证方式**：推送 dev 触发 Windows Portable run，观察是否越过此前 ~6/~10 分钟的早期失败点；成功构建约 60 分钟。合并上游后先 `git show upstream/main:.github/workflows/release.yml` 对照 `-p ${{ matrix.product }}` 与产物矩阵，再核对自建 workflow 的包名/路径。
+- **适用范围**：`.github/workflows/build-windows-portable.yml` 及一切从旧 `main/` 结构迁移来的自建脚本、文档路径引用。
+
 ### 执行原则
 
 1. 先澄清，再实现；先缩小边界，再扩展范围。
